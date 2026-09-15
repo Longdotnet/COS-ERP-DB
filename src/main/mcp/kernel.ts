@@ -334,8 +334,14 @@ function setCallerConversation(context: CallContext, conversationId: string | nu
   context.caller.sessionId = exact?.conversationId === conversationId ? exact.sessionId : null;
 }
 
-/** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
-type McpCallContext = Pick<ServerContext, 'sessionId'>;
+/** SDK fields this layer forwards to tools; request identity still comes from ingress ALS. */
+type McpCallContext = Pick<ServerContext, 'sessionId'> & {
+  mcpReq?: Pick<ServerContext['mcpReq'], 'signal'>;
+};
+
+export interface ToolHandlerContext {
+  signal?: AbortSignal;
+}
 
 /**
  * ChatGPT's id for this request, from `x-request-id`, without the per-attempt suffix.
@@ -1109,7 +1115,7 @@ export interface SurfaceRegistrar {
        */
       _meta?: Record<string, unknown>;
     },
-    handler: (args: z.output<Schema>) => Promise<ToolResult>
+    handler: (args: z.output<Schema>, context?: ToolHandlerContext) => Promise<ToolResult>
   ): void;
   /** Runs `fn` only while `cap` is live, and explains the refusal otherwise. */
   guarded(cap: keyof Capabilities, name: string, fn: () => Promise<ToolResult>): Promise<ToolResult>;
@@ -1176,7 +1182,7 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
         dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
+          handler(args, { signal: mcpCtx?.mcpReq?.signal })
         )) as never);
     },
     guarded(cap, name, fn) {

@@ -7,6 +7,7 @@ import { prependUserPrompt } from '../src/shared/user-prompt.js';
 import type { SessionEvent, SessionSummary } from '../src/shared/session.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import type { LocalProject } from '../src/shared/projects.js';
+import type { TerminalLiveUpdate } from '../src/shared/terminal-live.js';
 
 /**
  * The session timeline as the user reads it while a chat is running.
@@ -182,6 +183,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   const live = { events: [...events], inputs: [] as InputEntry[], sent: [] as InputArgs[], automation: 'off', controlCalls: [] as Array<{ id: string; action: string }>, compacting: false, finishHeld: true };
   let sessionListener: () => void = () => undefined;
   const taskProgressListeners = new Set<(progress: any) => void>();
+  const terminalLiveListeners = new Set<(update: TerminalLiveUpdate) => void>();
   const api: any = new Proxy(
     {
       getState: () => ok(state),
@@ -201,6 +203,10 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       onSessionChanged: (fn: any) => {
         sessionListener = fn;
         return () => undefined;
+      },
+      onTerminalLive: (listener: (update: TerminalLiveUpdate) => void) => {
+        terminalLiveListeners.add(listener);
+        return () => terminalLiveListeners.delete(listener);
       },
       listSessions: () => ok({ sessions: options.sessions ?? [{ ...summary(live.events), ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }], activeId: summary(live.events).id, pressure: [] }),
       listProjects: () => ok(projects),
@@ -257,6 +263,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     live,
     notifySession: () => sessionListener(),
     progress: (value: any) => { for (const listener of taskProgressListeners) listener(value); },
+    terminal: (value: TerminalLiveUpdate) => { for (const listener of terminalLiveListeners) listener(value); },
     async append(more: SessionEvent[]) {
       live.events.push(...more);
       sessionListener();
@@ -264,6 +271,31 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     }
   };
 }
+
+it('shows terminal output while exec_command is still running and retires the ephemeral row after finish', async () => {
+  const app = await boot([]);
+  const sessionId = summary([]).id;
+  const startedAt = Date.now();
+  app.terminal({ sessionId, processId: 4321, command: 'npm run build', cwd: '/repo', phase: 'running',
+    output: 'vite building...\n', truncated: false, startedAt, updatedAt: startedAt });
+  let terminal = app.w.document.querySelector('details.live-terminal') as HTMLDetailsElement;
+  expect(terminal).not.toBeNull();
+  expect(terminal.open).toBe(true);
+  expect(terminal.textContent).toContain('npm run build');
+  expect(terminal.querySelector('.live-terminal-output')?.textContent).toContain('vite building...');
+
+  app.terminal({ sessionId, processId: 4321, command: 'npm run build', cwd: '/repo', phase: 'running',
+    output: 'vite building...\n✓ built in 5.48s\n', truncated: false, startedAt, updatedAt: startedAt + 100 });
+  terminal = app.w.document.querySelector('details.live-terminal') as HTMLDetailsElement;
+  expect(terminal.querySelector('.live-terminal-output')?.textContent).toContain('✓ built in 5.48s');
+  expect(app.live.events).toHaveLength(0);
+
+  app.terminal({ sessionId, processId: 4321, command: 'npm run build', cwd: '/repo', phase: 'finished',
+    output: 'vite building...\n✓ built in 5.48s\n', truncated: false, startedAt, updatedAt: startedAt + 200, exitCode: 0 });
+  expect(app.w.document.querySelector('.live-terminal-metric')?.textContent).toBe('✓ exit 0');
+  await settle(800);
+  expect(app.w.document.querySelector('details.live-terminal')).toBeNull();
+});
 
 it.each(['compaction', 'blocked', 'worker'])('retires %s control status when leaving its session, including late IPC and locale refresh', async kind => {
   const { w, append } = await boot([]);

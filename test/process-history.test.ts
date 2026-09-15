@@ -117,17 +117,20 @@ it('real process exit updates history while all output remains available to its 
   const session = await createSession({ conversationId: 'owner', title: 'process' });
   const manager = new UnifiedExecProcessManager(60_000);
   const id = manager.allocateProcessId();
+  const mirrored: Buffer[] = [];
   try {
     const output = await manager.execCommand({ processId: id, command: [process.execPath, '-e',
       'setTimeout(() => { console.log("retained"); process.exitCode = 7; }, 650)'],
       shellType: process.platform === 'win32' ? 'powershell' : 'bash', hookCommand: 'fixture', cwd: dir, displayCwd: dir,
-      env: process.env, tty: false, yieldTimeMs: 250, maxOutputTokens: undefined, truncationPolicy: { kind: 'tokens', tokens: 1000 } });
+      env: process.env, tty: false, yieldTimeMs: 250, maxOutputTokens: undefined, truncationPolicy: { kind: 'tokens', tokens: 1000 },
+      onOutput: chunk => mirrored.push(Buffer.from(chunk)) });
     expect(output.processId).toBe(id);
     await recordToolCall({ tool: 'exec_command', args: { cmd: 'fixture' }, content: [{ type: 'text', text: 'initial' }],
       startedAt: Date.now(), durationMs: 250, outcome: 'ok', conversationId: 'owner', sessionId: session.id,
       requestId: 'request', evidence: { ...emptyEvidence(), running: true, processSessionId: String(id), processCompletion: output.completion } });
     await output.completion; await flushRecorder();
     expect((await readEvents(session.id)).find(e => e.kind === 'tool_call')).toMatchObject({ call: { process: { exitCode: 7 } } });
+    expect(Buffer.concat(mirrored).toString('utf8')).toContain('retained');
     await expect.poll(async () => manager.offerCompletedOutput(new Set([id]), { completedAt: null, failed: false }, 1000)).toMatchObject({ exitCode: 7, output: 'retained\n' });
   } finally { await manager.terminateAllProcesses(); }
 });

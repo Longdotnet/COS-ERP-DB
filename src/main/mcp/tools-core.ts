@@ -50,6 +50,7 @@ import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js'
 import { composeCommandBatch, parseCommandBatchSections } from '../codex/command-batch.js';
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
+import { appendTerminalLive, finishTerminalLive, startTerminalLive } from '../codex/live-output.js';
 import {
   backgroundExecObligations,
   execOwnershipDenied,
@@ -157,6 +158,8 @@ import { registerSessionTool as registerSessionSearchReadTool } from './session-
 import { ArtifactFetchError } from './artifact-fetch.js';
 import { ArtifactTargetError } from './artifact-target.js';
 import { downloadArtifactFile } from './artifact-download.js';
+import { registerDatabaseTool } from './database-tool.js';
+import { configuredDatabaseShellPolicyViolation } from '../database/exec-policy.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
 const MAX_DIR_ENTRIES = 200;
@@ -434,6 +437,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     );
   }
 
+  registerDatabaseTool(reg);
+
   // -------------------------------------------------------------- view_image
 
   if (exposedCaps.read) {
@@ -687,6 +692,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const dir = await resolveCwd(ctx, input.workdir);
           const rawCommands = input.cmd === undefined ? input.cmds! : [input.cmd];
           const isBatch = input.cmd === undefined;
+          const databasePolicyViolation = await configuredDatabaseShellPolicyViolation(rawCommands);
+          if (databasePolicyViolation) return fail(databasePolicyViolation);
           for (const [index, rawCommand] of rawCommands.entries()) {
             const virtualCommandPath = strayVirtualPath(rawCommand, ctx.roots);
             if (virtualCommandPath) {
@@ -757,6 +764,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // but make the deterministic/no-profile path the Windows default.
           const useLoginShell = input.login ?? process.platform !== 'win32';
           const command = deriveExecArgs(shell, boundCommand, useLoginShell);
+          let liveProcessId: number | null = null;
           try {
             // Current Codex intercepts an explicit `apply_patch` shell invocation before spawning
             // the shell process. The parser is the port of apply-patch/src/invocation.rs and uses
@@ -803,10 +811,17 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             }
 
             const processId = unifiedExecManager.allocateProcessId();
+            liveProcessId = processId;
             // Process ids are deliberately small/reusable, while chat ownership lives in a
             // separate registry. Clear any stale row at the allocation boundary so a recycled
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
+            const liveTerminal = startTerminalLive({
+              sessionId: owner,
+              processId,
+              command: commandDetail,
+              cwd: dir.virtual
+            });
 
             const output = await unifiedExecManager.execCommand({
               batchMarker: batch?.marker,
@@ -820,8 +835,13 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               cwd: dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
-              tty: input.tty ?? DEFAULT_TTY
+              tty: input.tty ?? DEFAULT_TTY,
+              ...(liveTerminal ? { onOutput: (chunk: Buffer) => appendTerminalLive(processId, chunk) } : {})
             });
+            if (liveTerminal) {
+              if (output.processId === null) finishTerminalLive(processId, output.exitCode);
+              else void output.completion?.then(completion => finishTerminalLive(processId, completion.exitCode));
+            }
             // Which durable local session may later write to this process id. The frontend
             // conversation is replaceable during Compact & Resume; the local session is not.
             if (output.processId === null) {
@@ -914,6 +934,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               structuredContent: execCommandStructuredOutput(output)
             };
           } catch (error) {
+            if (liveProcessId !== null) finishTerminalLive(liveProcessId, null);
             const detail = error instanceof UnifiedExecError ? error.debug() : friendlyError(error);
             return fail(`exec_command failed for \`${shlexJoin(command)}\`: ${detail}`);
           }

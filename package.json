@@ -1,11 +1,11 @@
 {
   "name": "chat-on-steroids",
-  "version": "2.1.11",
+  "version": "2.1.12",
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",
   "author": "Chat On Steroids",
   "homepage": "https://github.com/totec448-spec/chat-on-steroids",
-  "desktopName": "com.chatonsteroids.app.desktop",
+  "desktopName": "com.longdotnet.cos-erp-db.desktop",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
@@ -54,6 +54,7 @@
     "@modelcontextprotocol/server": "^2.0.0",
     "fflate": "^0.8.3",
     "marked": "18.0.13",
+    "mssql": "^12.7.2",
     "node-pty": "1.2.0-beta.15",
     "quickjs-emscripten-core": "0.32.0",
     "sharp": "0.35.4",
@@ -64,6 +65,7 @@
   },
   "devDependencies": {
     "@types/jsdom": "^30.0.0",
+    "@types/mssql": "^12.3.0",
     "@types/node": "^24.13.4",
     "@types/ws": "8.18.1",
     "electron": "44.3.0",

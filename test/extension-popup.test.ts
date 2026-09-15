@@ -38,6 +38,17 @@ it('reports only app reachability from compatible health and pairing', () => {
   expect(document.getElementById('state')!.textContent).toBe('App not reachable');
 });
 
+it('keeps reconnect visible without opening Advanced after an explicit disconnect', () => {
+  const document = openPopup(vi.fn());
+  const advanced = document.getElementById('more') as HTMLDetailsElement;
+  const reconnect = document.getElementById('retryBtn') as HTMLButtonElement;
+  expect(advanced.open).toBe(false);
+  expect(advanced.contains(reconnect)).toBe(false);
+  (popup!.window as any).paintHeader({ connected: true, paired: false, disconnected: true, compatible: true, port: 8865 });
+  expect(reconnect.hidden).toBe(false);
+  expect(reconnect.textContent).toBe('Connect');
+});
+
 it('explains manual mismatch recovery with both versions and keeps reload available', () => {
   const document = openPopup(vi.fn());
   (popup!.window as any).paintAlert({ connected: true, paired: true, compatible: false, appVersion: '2.0.7', appProtocol: 13, extensionVersion: '2.0.6', extensionProtocol: 12 }, null);

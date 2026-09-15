@@ -5,6 +5,7 @@ import { initSidebarResize } from './sidebar-resize.js';
 import { initPlugins, applyPluginsState } from './plugins.js';
 import { initBrowserPreferences } from './browser-preferences.js';
 import { initSetupGuide } from './setup-guide.js';
+import { initDatabaseSettings } from '../cos-erp-db/renderer/database-settings.js';
 /**
  * Renderer. No Node, no filesystem, no network — everything goes through window.api.
  *
@@ -34,7 +35,7 @@ import {
 } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
-import { chatApply, chatSettingsPatch, chatVisible, initChat, openChatView } from './chat.js';
+import { chatApply, chatSettingsPatch, chatVisible, focusChatComposer, initChat, openChatView } from './chat.js';
 
 declare global {
   interface Window {
@@ -45,6 +46,7 @@ declare global {
 const api = window.api;
 initLanguage();
 initSetupGuide();
+initDatabaseSettings();
 
 /** Same shape the platform uses; mirrored here only to grey out step 2 until it is valid. */
 const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;
@@ -148,6 +150,21 @@ function showTab(name: string): void {
 }
 
 $('backToChat').addEventListener('click', () => showTab('chat'));
+window.addEventListener('cos:database-open-chat', (event) => {
+  showTab('chat');
+  const detail = event instanceof CustomEvent && event.detail && typeof event.detail === 'object'
+    ? event.detail as { suggestedText?: unknown; autoSend?: unknown }
+    : null;
+  const suggestedText = detail
+    && typeof detail.suggestedText === 'string'
+    ? detail.suggestedText
+    : 'Use the current Database Workspace context and selected rows. ';
+  const inserted = focusChatComposer(suggestedText);
+  if (detail?.autoSend === true) {
+    if (inserted) $<HTMLFormElement>('composer').requestSubmit();
+    else toast('Chat draft is not empty. Your draft was kept; send it or clear it before asking AI to explain the investigation.');
+  }
+});
 $('workspaceSettings').addEventListener('click', () => showTab('home'));
 $('chatSettingsBtn').addEventListener('click', () => showTab('settings'));
 $('sessionList').addEventListener('click', () => showTab('chat'));

@@ -40,6 +40,7 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
+import { COS_ERP_DB_BRIDGE_IDENTITY } from '../cos-erp-db/browser-identity.js';
 import type { BridgeStatus } from '../shared/types.js';
 import { positionOf } from '../shared/chronology.js';
 import { CHAT_SILENCE_MS, CONTINUATION_MARKER, isReasoningEffort, toolCallSummary, workSequence, type ReasoningEffort, type SessionEvent, type SessionOrigin } from '../shared/session.js';
@@ -188,9 +189,10 @@ import { conversationHasMcpCallSince } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
+import { COS_ERP_DB_BRIDGE_PORTS } from '../cos-erp-db/browser-identity.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
-export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
+export const DEFAULT_PORTS = [...COS_ERP_DB_BRIDGE_PORTS];
 /**
  * The shipped range is fixed on purpose, but the test suite runs many bridges in parallel
  * forks on a machine where an installed app already holds 8765. A test whose own bind lost
@@ -1377,7 +1379,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       res,
       200,
       {
-        app: 'chat-on-steroids',
+        app: COS_ERP_DB_BRIDGE_IDENTITY,
         version: APP_VERSION,
         bridge: BRIDGE_PROTOCOL,
         compatible: protocolCompatible(req),

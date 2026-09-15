@@ -75,12 +75,12 @@ describe('the user’s own connector instructions', () => {
     const text = serverInstructions(ctx, 'core', 'win32');
     expect(text.startsWith('You are a coding agent working with the user through Chat On Steroids.')).toBe(true);
     const intro = text.split('\n').find(line => line.startsWith('Use the connected tools as needed:'))!;
-    expect(intro).toContain('Chat On Steroids Core for files');
-    expect(intro).toContain('Chat On Steroids Desktop for screen');
-    expect(intro).toContain('Chat On Steroids Plugins for enabled external apps');
+    expect(intro).toContain('COS ERP DB Core for files');
+    expect(intro).toContain('COS ERP DB Desktop for screen');
+    expect(intro).toContain('COS ERP DB Plugins for enabled external apps');
     expect(text.indexOf(intro)).toBeGreaterThan(text.indexOf('# Local tools'));
     expect(text).not.toMatch(/This is Chat On Steroids|https:\/\/chatgpt.com\/#settings\/Plugins/);
-    expect(serverInstructions(ctx, 'core', 'linux')).not.toContain('Chat On Steroids Desktop');
+    expect(serverInstructions(ctx, 'core', 'linux')).not.toContain('COS ERP DB Desktop');
   });
   it('adapts upstream instructions without unsupported facilities and projects live tools', () => {
     const text = serverInstructions(ctx, 'core', 'win32');

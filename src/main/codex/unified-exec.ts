@@ -229,6 +229,8 @@ export interface SpawnParams {
   cwd: string;
   env: NodeJS.ProcessEnv;
   tty: boolean;
+  /** Presentation-only mirror. It must never consume or mutate the model-facing output buffer. */
+  onOutput?: (chunk: Buffer) => void;
 }
 
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
@@ -279,12 +281,14 @@ class UnifiedExecProcess {
   private openStreams = 0;
   private child: ChildProcess | null = null;
   private pty: PtyProcess | null = null;
+  private readonly onOutput: ((chunk: Buffer) => void) | undefined;
   readonly tty: boolean;
   private readonly spawnPid: number;
 
-  private constructor(tty: boolean, pid: number, batchMarker?: string) {
+  private constructor(tty: boolean, pid: number, batchMarker?: string, onOutput?: (chunk: Buffer) => void) {
     this.tty = tty;
     this.spawnPid = pid;
+    this.onOutput = onOutput;
     if (batchMarker) {
       this.batchDisplay = new CommandBatchDisplay(batchMarker);
       this.displayBuffer = new HeadTailBuffer();
@@ -339,7 +343,7 @@ class UnifiedExecProcess {
       } catch (error) {
         throw UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
       }
-      const managed = new UnifiedExecProcess(true, handle.pid, params.batchMarker);
+      const managed = new UnifiedExecProcess(true, handle.pid, params.batchMarker, params.onOutput);
       managed.pty = handle;
       handle.onData((data) => managed.pushChunk(Buffer.from(data, 'utf8')));
       handle.onExit((event) => {
@@ -371,7 +375,7 @@ class UnifiedExecProcess {
       throw UnifiedExecError.createProcess(error instanceof Error ? error.message : String(error));
     }
 
-    const managed = new UnifiedExecProcess(false, child.pid ?? -1, params.batchMarker);
+    const managed = new UnifiedExecProcess(false, child.pid ?? -1, params.batchMarker, params.onOutput);
     managed.child = child;
     // stdout and stderr are combined into one stream, exactly as `combine_output_receivers`
     // does on the local Codex path, so interleaving is preserved in arrival order.
@@ -424,7 +428,12 @@ class UnifiedExecProcess {
   private pushChunk(chunk: Buffer): void {
     if (chunk.length === 0) return;
     this.buffer.pushChunk(chunk);
-    if (this.batchDisplay) this.displayBuffer!.pushChunk(this.batchDisplay.push(chunk));
+    const displayed = this.batchDisplay ? this.batchDisplay.push(chunk) : chunk;
+    if (this.batchDisplay) this.displayBuffer!.pushChunk(displayed);
+    if (displayed.length > 0 && this.onOutput) {
+      try { this.onOutput(displayed); }
+      catch { /* A renderer projection must never break the command or its retained output. */ }
+    }
     this.outputNotify.notifyWaiters();
   }
 
@@ -435,7 +444,14 @@ class UnifiedExecProcess {
 
   private closeOutput(): void {
     if (this.outputClosed) return;
-    if (this.batchDisplay) this.displayBuffer!.pushChunk(this.batchDisplay.push(Buffer.alloc(0), true));
+    if (this.batchDisplay) {
+      const displayed = this.batchDisplay.push(Buffer.alloc(0), true);
+      this.displayBuffer!.pushChunk(displayed);
+      if (displayed.length > 0 && this.onOutput) {
+        try { this.onOutput(displayed); }
+        catch { /* Presentation failure cannot change process semantics. */ }
+      }
+    }
     this.outputClosed = true;
     this.outputClosedNotify.notifyWaiters();
   }
@@ -638,6 +654,7 @@ export interface ExecCommandRequest {
   displayCwd: string;
   env: NodeJS.ProcessEnv;
   tty: boolean;
+  onOutput?: (chunk: Buffer) => void;
 }
 
 export interface WriteStdinRequest {
@@ -732,7 +749,8 @@ export class UnifiedExecProcessManager {
         shellType: request.shellType,
         cwd: request.cwd,
         env: request.env,
-        tty: request.tty
+        tty: request.tty,
+        onOutput: request.onOutput
       });
     } catch (error) {
       this.releaseProcessId(request.processId);

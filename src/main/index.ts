@@ -76,6 +76,9 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
+import { configureCosErpDbIdentity, COS_ERP_DB_AUTO_UPDATE } from '../cos-erp-db/app-identity.js';
+import { initDatabaseSubsystem } from './database/subsystem.js';
+import { closeSqlServerPools } from './database/sqlserver.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -88,6 +91,10 @@ let shutdownStarted = false;
 let shutdownComplete = false;
 let stopSessionRetention: (() => void) | null = null;
 const usageWarmup = new AbortController();
+
+// The fork deliberately runs beside the installed upstream app. Configure Electron identity and
+// userData before acquiring the single-instance lock so the two products never compete for either.
+const cosErpDbIdentity = configureCosErpDbIdentity(app);
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -114,7 +121,7 @@ function createWindow(): void {
     } : {}),
     // Painted before the renderer loads, so a dark window never flashes white.
     backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
-    title: 'Chat On Steroids',
+    title: cosErpDbIdentity.displayName,
     webPreferences: {
       zoomFactor: UI_BASE_ZOOM,
       preload: path.join(__dirname, '../preload/index.js'),
@@ -263,7 +270,7 @@ function refreshTray(): void {
   const running = connected || offline;
   const label = connected ? 'Connected' : offline ? 'No internet' : 'Not connected';
   tray.setImage(trayIcon(running));
-  tray.setToolTip(`Chat On Steroids — ${label.toLowerCase()}`);
+  tray.setToolTip(`${cosErpDbIdentity.displayName} — ${label.toLowerCase()}`);
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label, enabled: false },
@@ -300,6 +307,7 @@ void app.whenReady().then(async () => {
   });
   initConfigPath(userData);
   initSecretsPath(userData);
+  initDatabaseSubsystem(userData);
   initSessionStore(userData);
   initDurableStore(userData);
   await restoreChatModels();
@@ -458,7 +466,7 @@ void app.whenReady().then(async () => {
   // window that is already on screen. Everything it learns arrives through the ordinary state
   // push, every failure ends inside it, and its own timer keeps it running for a tray app that
   // is never restarted.
-  startUpdateChecks();
+  if (COS_ERP_DB_AUTO_UPDATE) startUpdateChecks();
   // Warm the existing derived cache once, after startup, without delaying the UI.
   // A visit to Usage joins this same calculation; unchanged recordings cost no reads.
   void usageOverview(usageWarmup.signal).catch((error: Error) => {
@@ -508,7 +516,7 @@ app.on('will-quit', (event) => {
       {
         name: 'process cleanup',
         budgetMs: 15_000,
-        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), pluginManager.close()]
+        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), pluginManager.close(), closeSqlServerPools()]
       },
       // Phase 3: recorder work can enqueue both session projections and named durable state.
       { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },

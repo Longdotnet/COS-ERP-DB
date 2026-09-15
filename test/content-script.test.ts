@@ -240,6 +240,7 @@ async function harness(
 
   window.chrome = {
     runtime: {
+      id: 'clf-extension-id',
       async sendMessage(message: Record<string, any>) {
         sent.push(message);
         // The durable pre-Send fence. Most tests are not about it and get a permissive
@@ -13343,12 +13344,31 @@ app-owned prompt`, { sent: false });
  * runtime.onInstalled a no-op — leaving the document with a recorder that can never send.
  */
 describe('one live isolated-world recorder per document', () => {
+  it('does not reinsert orphaned composer controls while extension reload is replacing them', async () => {
+    live = await harness();
+    const window = live.window as any;
+    window.chrome.runtime.id = 'clf-extension-id';
+    live.hook.injectControl();
+    const oldControl = live.document.querySelector('[data-clf-composer]');
+    expect(oldControl).not.toBeNull();
+
+    // The old world can outlive runtime invalidation. Its replacement removes the stale
+    // control before the old world's next transport call/timer notices that it is dead.
+    delete window.chrome.runtime.id;
+    oldControl!.remove();
+    await settle();
+
+    expect(oldControl!.isConnected).toBe(false);
+    expect(live.document.querySelector('[data-clf-composer]')).toBeNull();
+    expect(live.listenerCounts()).toEqual({ runtime: 0, storage: 0 });
+  });
+
   it('reports the recorder protocol version rather than the unrelated Fiber protocol version', async () => {
     live = await harness();
 
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
-      recorderVersion: 11
+      recorderVersion: 13
     });
   });
 
@@ -13373,6 +13393,9 @@ describe('one live isolated-world recorder per document', () => {
     window.chrome.runtime.id = 'clf-extension-id';
     // The extension reloads. The old script keeps running, and keeps its globals.
     delete window.chrome.runtime.id;
+    expect(window.__CLF_CONTENT_RECORDER__.healthy()).toBe(false);
+    // The replacement has a valid runtime again; it must not inherit the orphan's death.
+    window.chrome.runtime.id = 'clf-extension-id';
     let successor: any = null;
     window.CLF_TEST_HOOK = (api: any) => {
       successor = api;
@@ -13383,6 +13406,7 @@ describe('one live isolated-world recorder per document', () => {
 
     expect(successor).toBeTruthy();
     expect(successor).not.toBe(live.hook);
+    expect(window.__CLF_CONTENT_RECORDER__.healthy()).toBe(true);
     // And the replacement is the one that observes from here on.
     const before = live.sent.length;
     successor.observe();

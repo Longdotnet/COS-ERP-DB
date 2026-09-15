@@ -595,7 +595,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'download_artifact', 'exec', 'exec_command', 'read', 'session', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'database', 'download_artifact', 'exec', 'exec_command', 'read', 'session', 'update_plan', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -804,7 +804,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(10);
+    expect(coreTools).toHaveLength(11);
     expect(desktopTools).toHaveLength(IS_WINDOWS ? 16 : 3);
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -1031,7 +1031,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['exec', 'find', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['database', 'exec', 'find', 'read', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1567,9 +1567,9 @@ describe('capability gating', () => {
 
   it('always offers read, because that is what the app is for', async () => {
     ctx.caps = withCaps({ browse: false, search: false, read: false, metadata: false });
-    // Nothing is registered when every reading permission is off — but the snapshot is
-    // monotonic, so a surface that started with reading on keeps it and refuses instead.
-    expect(toolNames(await core('tools/list'))).toEqual([]);
+    // Files disappear when every reading permission is off. The separate read-only database
+    // primitive remains discoverable because its authority comes from configured DB profiles.
+    expect(toolNames(await core('tools/list'))).toEqual(['database', 'exec']);
   });
 });
 

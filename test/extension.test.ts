@@ -480,10 +480,9 @@ interface WorkerHarness {
 }
 
 function response(status: number, data: unknown) {
-  const body =
-    data && typeof data === 'object' && (data as Record<string, unknown>).app === 'chat-on-steroids'
-      ? { bridge: BRIDGE_PROTOCOL, compatible: true, ...structuredClone(data as Record<string, unknown>) }
-      : structuredClone(data);
+  const body = data && typeof data === 'object' && (data as Record<string, unknown>).app === 'chat-on-steroids'
+    ? { bridge: BRIDGE_PROTOCOL, compatible: true, ...structuredClone(data as Record<string, unknown>), app: 'cos-erp-db' }
+    : structuredClone(data);
   return {
     ok: status >= 200 && status < 300,
     status,
@@ -496,6 +495,8 @@ function response(status: number, data: unknown) {
 function loadWorker(options: {
   local: FakeStorageArea;
   session: FakeStorageArea;
+  /** Keep an explicitly stored legacy 8765 binding only in tests that exercise migration itself. */
+  preserveLegacyBridgePort?: boolean;
   fetch?: (input: string, init?: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
   tabsGet?: (tabId: number) => Promise<{ id?: number; url?: string; pendingUrl?: string; status?: string; autoDiscardable?: boolean }>;
   tabsQuery?: () => Promise<
@@ -504,6 +505,12 @@ function loadWorker(options: {
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
   windowsGet?: (windowId: number) => Promise<{ focused?: boolean }>;
 }): WorkerHarness {
+  // Most of this suite predates the COS ERP DB fork and its dedicated 8865-8869 browser range.
+  // Those cases are about command/journal semantics, not migration, so adapt their shared paired
+  // fixture once here instead of copying the fork port through dozens of unrelated tests.
+  if (!options.preserveLegacyBridgePort && options.local.data.port === 8765) {
+    options.local.data.port = 8865;
+  }
   let listener: ((message: any, sender: any, sendResponse: (value: any) => void) => boolean) | null = null;
   const tabRemovedListeners: Array<(tabId: number) => void> = [];
   const tabCreatedListeners: Array<(tab: { id?: number; url?: string; pendingUrl?: string }) => void> = [];
@@ -1794,7 +1801,7 @@ describe('extension command delivery', () => {
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 11 });
+    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 13 });
 
     await worker.installed('update');
 
@@ -1925,7 +1932,7 @@ describe('extension revival delivery', () => {
 
   const liveRecorder = async (_tabId: number, message: Record<string, unknown>) =>
     message.type === 'clf-recorder-ping'
-      ? { ok: true, recorderVersion: 11 }
+      ? { ok: true, recorderVersion: 13 }
       : { ok: true, claimed: true };
 
   it('scans before opening and routes to the oldest exact worker tab', async () => {
@@ -3391,6 +3398,27 @@ describe('extension connection', () => {
     };
     return state;
   }
+
+  it('drops an old upstream-range binding and discovers COS ERP DB only on the fork range', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'upstream-token' });
+    const seenPorts: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      seenPorts.push(url.port);
+      if (url.pathname === '/hello' && url.port === '8865') {
+        return response(200, { app: 'chat-on-steroids', paired: false });
+      }
+      if (url.pathname === '/pair' && url.port === '8865') return response(200, { token: 'fork-token' });
+      return response(200, {});
+    });
+    const worker = loadWorker({ local, session: new FakeStorageArea(), fetch, preserveLegacyBridgePort: true });
+
+    const status = await worker.send({ type: 'status' });
+    expect(status).toMatchObject({ connected: true, paired: true, port: 8865 });
+    expect(seenPorts).not.toContain('8765');
+    expect(local.data.port).toBe(8865);
+    expect(local.data.token).toBe('fork-token');
+  });
 
   /**
    * `/pair` mints a fresh credential and invalidates the one before it, so two callers

@@ -67,7 +67,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     CODING_INSTRUCTIONS,
     '',
     '# Local tools',
-    `Use the connected tools as needed: ${surfaceDefinition('core').connectorName} for files, terminal, plans, sessions and workers` +
+    `Use the connected tools as needed: ${surfaceDefinition('core').connectorName} for files, terminal, configured SQL Server databases, plans, sessions and workers` +
     (desktop ? `; ${surfaceDefinition('desktop').connectorName} for screen, input and clipboard` : '') +
     `; ${surfaceDefinition('plugins').connectorName} for enabled external apps and services.`,
     `Host: ${host}. Roots: ${roots}`,
@@ -103,6 +103,9 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
   );
   if (caps.saveArtifact) lines.push(
     'download_artifact saves a user-supplied or ChatGPT-generated file using its native file value and an approved destination path. It refuses to overwrite. Do not recreate the file or put signed URLs, file objects or base64 into shell commands.'
+  );
+  lines.push(
+    'database queries configured SQL Server connections directly through the native database driver. For configured SQL Server profiles, database is the only allowed agent path for data/schema access. Never use exec_command, sqlcmd, Invoke-Sqlcmd, ODBC/SqlClient or custom scripts to bypass a profile access mode. If the user says current/default database or does not name a connection, omit connection so the app resolves its current default; do not reuse a connection id from old chat context. If the user refers to this table, the selected object, or what they are viewing in Database Explorer, use action=workspace_context instead of assuming the default. Use action=list_connections when you need the authoritative configured/default connection list. If database refuses a write, report that refusal instead of routing around it. Queries are currently read-only; database credentials stay local and must never be requested in SQL or tool arguments.'
   );
   if (sessionTools) lines.push(
     '',

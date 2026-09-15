@@ -1,0 +1,155 @@
+.database-growth-dashboard {
+  margin: -2px -2px 18px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--db-purple) 24%, var(--edge));
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--lift);
+}
+
+.database-growth-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 92px;
+  padding: 18px 20px;
+  border-bottom: 1px solid color-mix(in srgb, var(--db-purple) 20%, var(--line));
+  background: linear-gradient(110deg, var(--db-purple-wash), var(--card) 46%);
+}
+
+.database-growth-eyebrow {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--db-purple);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.database-growth-head h2 { margin: 0; color: var(--ink); font-size: 19px; font-weight: 650; }
+.database-growth-head p { max-width: 700px; margin: 5px 0 0; color: var(--soft); font-size: 11.5px; line-height: 1.55; }
+.database-growth-controls { display: flex; align-items: center; gap: 7px; flex: 0 1 430px; justify-content: flex-end; }
+.database-growth-controls select { width: min(280px, 32vw); padding: 7px 9px; background: var(--sunk); }
+.database-growth-controls .btn { flex: none; }
+.database-growth-meta { min-height: 25px; margin: 0; padding: 7px 20px 0; color: var(--faint); font: 10px var(--mono); }
+.database-growth-body { display: grid; gap: 12px; padding: 12px 18px 20px; }
+
+.database-growth-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.database-growth-metric {
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--sunk);
+}
+
+.database-growth-metric.is-data { border-color: color-mix(in srgb, var(--db-blue) 35%, var(--line)); }
+.database-growth-metric.is-log { border-color: color-mix(in srgb, var(--db-purple) 35%, var(--line)); }
+.database-growth-metric.is-danger { border-color: color-mix(in srgb, #d85b62 55%, var(--line)); background: color-mix(in srgb, #d85b62 8%, var(--sunk)); }
+.database-growth-metric-label { display: block; color: var(--faint); font-size: 10.5px; font-weight: 600; }
+.database-growth-metric strong { display: block; margin-top: 5px; overflow: hidden; color: var(--ink); font: 650 21px/1.2 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.database-growth-metric small { display: block; margin-top: 5px; overflow: hidden; color: var(--soft); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+
+.database-growth-panel {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.database-growth-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.database-growth-section-head h3 { margin: 0; color: var(--ink); font-size: 12px; font-weight: 700; }
+.database-growth-section-head > span { color: var(--faint); font-size: 10px; }
+.database-growth-snapshot-badge { padding: 3px 7px; border: 1px solid var(--line); border-radius: var(--pill); background: var(--sunk); }
+
+.database-growth-allocation-bar {
+  display: flex;
+  height: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--sunk);
+}
+
+.database-growth-allocation-bar .is-data { background: var(--db-blue); }
+.database-growth-allocation-bar .is-log { background: var(--db-purple); }
+.database-growth-allocation-legend { display: flex; justify-content: space-between; gap: 12px; margin-top: 7px; color: var(--soft); font: 10px var(--mono); }
+.database-growth-baseline-note { margin: 10px 0 0; padding-top: 9px; border-top: 1px solid var(--line); color: var(--faint); font-size: 10.5px; line-height: 1.5; }
+.database-growth-history-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.database-growth-history-table { margin-top: 10px; min-width: 520px; }
+
+.database-growth-lower-grid { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(260px, .8fr); gap: 12px; align-items: start; }
+.database-growth-finding-list { display: grid; gap: 8px; }
+.database-growth-finding { position: relative; padding: 11px 12px 10px 14px; border: 1px solid var(--line); border-left-width: 3px; border-radius: 8px; background: var(--sunk); }
+.database-growth-finding.is-high { border-left-color: #d85b62; }
+.database-growth-finding.is-medium { border-left-color: var(--db-amber); }
+.database-growth-finding.is-low { border-left-color: var(--db-blue); }
+.database-growth-finding-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.database-growth-finding-head strong { min-width: 0; color: var(--ink); font-size: 11.5px; overflow-wrap: anywhere; }
+.database-growth-severity { flex: none; min-width: 52px; padding: 2px 5px; border-radius: 5px; font: 700 9px var(--mono); text-align: center; }
+.database-growth-severity.is-high { background: color-mix(in srgb, #d85b62 16%, var(--card)); color: #d85b62; }
+.database-growth-severity.is-medium { background: var(--db-amber-wash); color: var(--db-amber); }
+.database-growth-severity.is-low { background: var(--db-blue-wash); color: var(--db-blue); }
+.database-growth-finding p { margin: 7px 0 0; color: var(--soft); font-size: 10.5px; line-height: 1.5; }
+.database-growth-finding small { display: block; margin-top: 6px; color: var(--faint); font-size: 10px; line-height: 1.45; }
+.database-growth-open-object { margin-top: 8px; padding: 4px 7px; font-size: 10px; }
+
+.database-growth-kv { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(0, 1.2fr); margin: 0; border-top: 1px solid var(--line); }
+.database-growth-kv dt, .database-growth-kv dd { margin: 0; padding: 8px 3px; border-bottom: 1px solid var(--line); font-size: 10.5px; }
+.database-growth-kv dt { color: var(--faint); }
+.database-growth-kv dd { color: var(--ink); font-family: var(--mono); text-align: right; overflow-wrap: anywhere; }
+
+.database-growth-table-scroll { max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.database-growth-table { width: 100%; min-width: 650px; border-collapse: collapse; font: 10.5px var(--mono); }
+.database-growth-table th, .database-growth-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+.database-growth-table th { background: var(--sunk); color: var(--soft); font-weight: 600; }
+.database-growth-table th:first-child, .database-growth-table td:first-child { text-align: left; }
+.database-growth-table tbody tr:last-child td { border-bottom: 0; }
+.database-growth-table tbody tr:hover td { background: color-mix(in srgb, var(--db-purple) 5%, var(--card)); }
+.database-growth-table-link { max-width: 420px; padding: 0; overflow: hidden; border: 0; background: transparent; color: var(--db-blue); font: inherit; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.database-growth-table-link:hover { text-decoration: underline; }
+
+.database-growth-actions ol { display: grid; gap: 7px; margin: 0; padding-left: 22px; color: var(--soft); }
+.database-growth-actions li { padding-left: 3px; font-size: 10.5px; line-height: 1.5; }
+.database-growth-actions li::marker { color: var(--db-purple); font: 700 10px var(--mono); }
+
+.database-growth-state {
+  min-height: 170px;
+  display: grid;
+  place-content: center;
+  padding: 24px;
+  text-align: center;
+}
+
+.database-growth-state strong { color: var(--ink); font-size: 12px; }
+.database-growth-state p { max-width: 520px; margin: 6px 0 0; color: var(--faint); font-size: 10.5px; line-height: 1.5; }
+.database-growth-state.is-error strong { color: #d85b62; }
+
+@media (max-width: 980px) {
+  .database-growth-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .database-growth-history-grid { grid-template-columns: minmax(0, 1fr); }
+  .database-growth-lower-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 760px) {
+  .database-growth-head { align-items: flex-start; flex-direction: column; }
+  .database-growth-controls { width: 100%; flex-basis: auto; justify-content: stretch; }
+  .database-growth-controls select { width: 100%; flex: 1; min-width: 0; }
+  .database-growth-metrics { grid-template-columns: minmax(0, 1fr); }
+  .database-growth-body { padding-inline: 12px; }
+}

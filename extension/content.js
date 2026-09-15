@@ -41,7 +41,7 @@
   //
   // So: publish a handle instead of a flag and let a replacement supersede a dead one. A
   // *healthy* incumbent still wins, so the ordinary static/recovery race is unchanged.
-  const RECORDER_VERSION = 11;
+  const RECORDER_VERSION = 13;
   const recorderHandle = {
     version: RECORDER_VERSION,
     healthy: () => false,
@@ -1075,7 +1075,7 @@
       return await chrome.runtime.sendMessage(message);
     } catch (err) {
       const text = String(err && err.message ? err.message : err);
-      if (text.includes('Extension context invalidated')) alive = false;
+      if (text.includes('Extension context invalidated')) recorderHandle.stop();
       return null;
     }
   }
@@ -2674,7 +2674,7 @@
       // world, so `alive` is the ownership fence. Without it every extension reload leaves a
       // watcher behind that still scans connector mutations and starts a MAIN-world Fiber
       // round-trip even though sendToWorker() has correctly gone inert.
-      if (!alive || !sameChat()) {
+      if (!recorderHandle.healthy() || !sameChat()) {
         return;
       }
       let sawConnector = false;
@@ -2708,7 +2708,7 @@
     let timer = null;
     let urgentQueued = false;
     const observer = new MutationObserver((records) => {
-      if (!alive || !sameChat()) return;
+      if (!recorderHandle.healthy() || !sameChat()) return;
       // Attribute-only native updates matter when React reuses the submit button.
       // Ignore unrelated styling/Fiber stamps; they cannot change composer readiness.
       if (records.every(record => record.type === 'attributes')) {
@@ -10035,7 +10035,7 @@
     // hook, and a loop that ticked there could pass a case by accident on a stray tick.
     if (TEST_MODE) return;
     const tick = () => {
-      if (!alive) return;
+      if (!recorderHandle.healthy()) return;
       try {
         const result = fn();
         if (result && typeof result.catch === 'function') result.catch(() => undefined);
@@ -10077,7 +10077,7 @@
     if (activityTimer !== null) return;
     activityTimer = later(async () => {
       activityTimer = null;
-      if (!alive) return;
+      if (!recorderHandle.healthy()) return;
       try {
         await pullActivity();
       } catch {
@@ -10110,7 +10110,7 @@
   function watchComposer() {
     try {
       const observer = new MutationObserver(() => {
-        if (!alive) return;
+        if (!recorderHandle.healthy()) return;
         if (!control || !control.root.isConnected) injectControl();
         if (stagePanel && !stagePanel.root.isConnected) injectStage();
       });
@@ -10880,10 +10880,12 @@
   recorderHandle.healthy = () => {
     if (!alive) return false;
     try {
-      return !!globalThis.chrome && !!chrome.runtime && typeof chrome.runtime.id === 'string';
+      if (globalThis.chrome && chrome.runtime && typeof chrome.runtime.id === 'string') return true;
     } catch {
-      return false;
+      // Runtime invalidation can throw instead of clearing id.
     }
+    recorderHandle.stop();
+    return false;
   };
   recorderHandle.stop = () => {
     // `alive` gates sendToWorker(), so this is what actually silences the old recorder:

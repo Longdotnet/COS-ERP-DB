@@ -35,7 +35,16 @@ export type SurfaceId = (typeof SURFACE_IDS)[number];
  * name and the setup cards, and those three drifting apart is how a user ends up with
  * a connector whose name does not match the thing the instructions told them to type.
  */
-export const CONNECTOR_BRAND = 'Chat On Steroids';
+/**
+ * Fork-facing connector label.
+ *
+ * The upstream desktop app is intentionally allowed to run beside COS ERP DB. Reusing
+ * "Chat On Steroids Core" here makes the two custom apps indistinguishable in ChatGPT and
+ * makes it very easy for a conversation to keep calling the upstream tunnel while the fork
+ * only observes the browser. Keep the wire/server names stable for protocol compatibility;
+ * the user-facing custom-app names must identify this fork.
+ */
+export const CONNECTOR_BRAND = 'COS ERP DB';
 
 export interface SurfaceDefinition {
   id: SurfaceId;
@@ -101,15 +110,15 @@ const CORE: SurfaceDefinition = {
   serverName: 'chat-on-steroids-core',
   connectorName: `${CONNECTOR_BRAND} Core`,
   description:
-    'Read and edit code and text files on this computer, and run commands in a real terminal. ' +
+    'Read and edit code and text files on this computer, run commands in a real terminal, and query configured SQL Server databases directly. ' +
     'Use for: opening and reading files, searching a repository, applying patches, creating, renaming and deleting files, ' +
     'running builds, tests, linters, git, npm and shell commands, continuing long-running or interactive terminal sessions, ' +
-    'and saving images and files ChatGPT generates onto this computer. ' +
+    'querying database data or schema with read-only SQL, and saving images and files ChatGPT generates onto this computer. ' +
     'Also searches and reads local recordings of previous or concurrently running ChatGPT work, and — when the user has ' +
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
-  cardSummary: 'Files, patches and the terminal. Required — this is the coding connector.',
+  cardSummary: 'Files, patches, terminal and configured SQL Server databases. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'database', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
 };
 
 /**

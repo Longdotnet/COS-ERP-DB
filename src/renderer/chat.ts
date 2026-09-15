@@ -22,6 +22,7 @@ import { injectableAttachments } from '../shared/input.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { TaskProgress } from '../shared/task-progress.js';
+import type { TerminalLiveUpdate } from '../shared/terminal-live.js';
 /**
  * Desktop chat workspace: recorded prose/tool truth, exact-session controls and a composer.
  * The extension remains the ChatGPT transport; main owns permissions, delivery, Goal and
@@ -205,6 +206,8 @@ function attachmentCard(file: InputAttachment, inComposer = false): HTMLElement 
 }
 
 let events: SessionEvent[] = [];
+/** Window-local terminal snapshots. Durable history still comes only from recorded tool calls. */
+const liveTerminals = new Map<number, TerminalLiveUpdate>();
 let totalEvents = 0;
 /** The session whose `events`/cursor pair belongs together. */
 let detailFor: string | null = null;
@@ -1551,6 +1554,54 @@ function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>, context?:
   return box;
 }
 
+function liveTerminalRow(update: TerminalLiveUpdate, existing?: HTMLElement): HTMLElement {
+  let row = existing;
+  if (!row) {
+    row = el('div', 'ev ev-tool_call ev-live-terminal');
+    const body = el('div', 'ev-body');
+    const box = document.createElement('details');
+    box.className = 'tool tone-neutral live-terminal';
+    box.open = true;
+    const head = document.createElement('summary');
+    head.append(
+      icon('i-terminal', 'ico tool-ico'),
+      el('b', 'live-terminal-title'),
+      el('em', 'live-terminal-command'),
+      el('span', 'metric live-terminal-metric')
+    );
+    const raw = el('div', 'raw');
+    raw.append(
+      el('p', 'raw-facts live-terminal-cwd'),
+      el('h4', '', () => t("Command")),
+      el('p', 'pre live-terminal-command-full'),
+      el('h4', '', () => t("Live output")),
+      el('p', 'pre live-terminal-output')
+    );
+    box.append(head, raw); body.append(box); row.append(body);
+  }
+
+  const box = row.querySelector<HTMLDetailsElement>('details.live-terminal')!;
+  const title = box.querySelector<HTMLElement>('.live-terminal-title')!;
+  const command = box.querySelector<HTMLElement>('.live-terminal-command')!;
+  const metric = box.querySelector<HTMLElement>('.live-terminal-metric')!;
+  const cwd = box.querySelector<HTMLElement>('.live-terminal-cwd')!;
+  const commandFull = box.querySelector<HTMLElement>('.live-terminal-command-full')!;
+  const output = box.querySelector<HTMLElement>('.live-terminal-output')!;
+  const wasAtBottom = output.scrollHeight - output.clientHeight - output.scrollTop < 32;
+  title.textContent = update.phase === 'running' ? t("Running command") : t("Command finished");
+  command.textContent = update.command;
+  metric.textContent = update.phase === 'running'
+    ? t("live")
+    : update.exitCode === null || update.exitCode === undefined ? t("finished") : update.exitCode === 0 ? '✓ exit 0' : `✕ exit ${update.exitCode}`;
+  box.classList.toggle('tone-good', update.phase === 'finished' && update.exitCode === 0);
+  box.classList.toggle('tone-bad', update.phase === 'finished' && update.exitCode !== null && update.exitCode !== undefined && update.exitCode !== 0);
+  cwd.textContent = update.cwd;
+  commandFull.textContent = update.command;
+  output.textContent = `${update.truncated ? '[earlier output omitted]\n' : ''}${update.output || (update.phase === 'running' ? t("Waiting for output…") : '')}`;
+  if (wasAtBottom) output.scrollTop = output.scrollHeight;
+  return row;
+}
+
 function hasLaterModelActivity(time: number): boolean {
   return events.some(event => event.time > time && ['assistant_message', 'tool_call', 'page_tool', 'agent_message'].includes(event.kind));
 }
@@ -2276,6 +2327,21 @@ function paintDetail(followBottom = historyBefore === null): void {
     timelineRows.push(row);
   }
   appendRetiredInputs(Infinity);
+  if (selectedId && historyBefore === null && agentFilter === null) {
+    const selectedLive = [...liveTerminals.values()]
+      .filter(update => update.sessionId === selectedId)
+      .sort((a, b) => a.startedAt - b.startedAt || a.processId - b.processId);
+    for (const update of selectedLive) {
+      const key = `live-terminal:${update.processId}`;
+      keep.add(key);
+      const cached = rowCache.get(key);
+      const row = liveTerminalRow(update, cached?.row);
+      row.dataset.timelineKey = key;
+      row.dataset.activityBoundary = key;
+      rowCache.set(key, { sig: `${update.startedAt}`, row });
+      timelineRows.push(row);
+    }
+  }
   for (const key of rowCache.keys()) if (!keep.has(key)) rowCache.delete(key);
   reconcileChildren($('timeline'), groupToolRows(timelineRows));
   $('timelineEmpty').hidden = timelineRows.length > 0 || $('inputQueue').childElementCount > 0;
@@ -3430,6 +3496,20 @@ export function openChatView(name: string): void {
   showView(name);
 }
 
+/** Opens the existing composer without overwriting a draft. Returns true only when it inserted the suggestion. */
+export function focusChatComposer(suggestedText = ''): boolean {
+  const input = $<HTMLTextAreaElement>('chatInput');
+  let inserted = false;
+  if (suggestedText && !input.value.trim()) {
+    input.value = suggestedText;
+    rememberDraft();
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    inserted = true;
+  }
+  input.focus();
+  return inserted;
+}
+
 function showView(name: string): void {
   $('composer').hidden = name === 'settings';
   $('composerDock').hidden = name === 'settings';
@@ -3839,6 +3919,20 @@ export function initChat(next: Deps): void {
   });
 
   api.onSessionChanged(scheduleReload);
+  api.onTerminalLive(update => {
+    liveTerminals.set(update.processId, update);
+    if (update.sessionId === selectedId && historyBefore === null) paintDetail();
+    if (update.phase === 'finished') {
+      const finishedAt = update.updatedAt;
+      window.setTimeout(() => {
+        const current = liveTerminals.get(update.processId);
+        if (!current || current.phase !== 'finished' || current.updatedAt !== finishedAt) return;
+        liveTerminals.delete(update.processId);
+        rowCache.delete(`live-terminal:${update.processId}`);
+        if (current.sessionId === selectedId && historyBefore === null) paintDetail(false);
+      }, 750);
+    }
+  });
   api.onTaskProgress(progress => {
     if (!goalProgress || progress.requestId !== goalProgress.requestId || goalProgress.selection !== selectionGeneration) return;
     Object.assign(goalProgress, progress); paintGoalProgress();

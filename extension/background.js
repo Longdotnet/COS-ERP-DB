@@ -20,7 +20,8 @@
  * record the app has not accepted yet.
  */
 
-const PORTS = [8765, 8766, 8767, 8768, 8769];
+const PORTS = [8865, 8866, 8867, 8868, 8869];
+const EXPECTED_APP = 'cos-erp-db';
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /**
@@ -250,8 +251,11 @@ function load() {
 
 async function loadOnce() {
   const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings']);
-  port = typeof stored.port === 'number' ? stored.port : null;
-  token = typeof stored.token === 'string' ? stored.token : null;
+  const storedPort = typeof stored.port === 'number' ? stored.port : null;
+  // Older fork builds shared upstream's 8765-8769 range. Never carry that app/credential
+  // binding into the fork-owned range: a token belongs to one exact local app instance.
+  port = storedPort !== null && PORTS.includes(storedPort) ? storedPort : null;
+  token = port !== null && typeof stored.token === 'string' ? stored.token : null;
   // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
   // restart undoes is not a choice, it is a delay.
   disconnected = stored.disconnected === true;
@@ -943,7 +947,7 @@ async function hello(candidate) {
     }, HELLO_TIMEOUT_MS);
     if (!response.ok) return null;
     const body = await response.json();
-    return body && body.app === 'chat-on-steroids' ? body : null;
+    return body && body.app === EXPECTED_APP ? body : null;
   } catch {
     return null;
   }
@@ -986,6 +990,11 @@ async function discover(force = false) {
     const body = await hello(candidate);
     if (body) {
       if (body.disconnected === true) await latchAppDisconnect();
+      // Reaching the full scan means the previously trusted app/port could not be confirmed.
+      // A bearer token is owned by one app instance, not by "whatever answers next" on the
+      // loopback range. Drop it before adopting the newly discovered COS ERP DB bridge so a
+      // token minted by upstream Chat On Steroids can never be replayed against this fork.
+      token = null;
       port = candidate;
       portCheckedAt = Date.now();
       portCompatible = body.compatible !== false && body.bridge === BRIDGE_PROTOCOL;
@@ -3515,7 +3524,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
  * receive both its static manifest injection and this recovery injection.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 11;
+const PAGE_RECORDER_VERSION = 13;
 
 let deferredRecoveryWork = null;
 

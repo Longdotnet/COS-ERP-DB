@@ -1,6 +1,7 @@
 import type { ChatModelCatalog } from '../shared/chat-models.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import type { TaskProgress } from '../shared/task-progress.js';
+import type { TerminalLiveUpdate } from '../shared/terminal-live.js';
 import type { BrowserPreferences } from '../shared/browser-preferences.js';
 import type { SessionControlsView } from '../main/bridge.js';
 import type { InputAttachment } from '../shared/input.js';
@@ -8,6 +9,7 @@ import type { UsageOverview } from '../shared/usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
+import { createDatabaseApi } from './database-api.js';
 /**
  * The entire renderer-facing API.
  *
@@ -76,6 +78,7 @@ export interface SessionDetail {
 }
 
 const api = {
+  ...createDatabaseApi(call),
   openLegalNotices: () => call<void>('plugins:legalNotices'),
   pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
   pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
@@ -213,6 +216,11 @@ const api = {
     const wrapped = (): void => listener();
     ipcRenderer.on('session:changed', wrapped);
     return () => ipcRenderer.removeListener('session:changed', wrapped);
+  },
+  onTerminalLive: (listener: (update: TerminalLiveUpdate) => void): (() => void) => {
+    const wrapped = (_event: unknown, update: TerminalLiveUpdate): void => listener(update);
+    ipcRenderer.on('terminal:live', wrapped);
+    return () => ipcRenderer.removeListener('terminal:live', wrapped);
   },
   onWriteSession: (listener: (id: string) => void): (() => void) => {
     const wrapped = (_event: unknown, id: string): void => listener(id);
