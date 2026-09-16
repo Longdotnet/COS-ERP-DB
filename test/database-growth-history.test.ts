@@ -2,6 +2,8 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  clearDatabaseGrowthHistory,
+  deleteDatabaseGrowthSnapshot,
   initDatabaseGrowthHistory,
   readDatabaseGrowthHistory,
   resetDatabaseGrowthHistoryForTests,
@@ -80,6 +82,40 @@ describe('database growth history', () => {
     expect(history.snapshots[0]!.tableFingerprints).toHaveLength(3);
     expect(history.snapshots[0]!.schemaTruncated).toBe(false);
     expect(history.snapshots[1]!.largestTables).toHaveLength(1);
+  });
+
+  it('deletes one local snapshot without touching snapshots from another connection', async () => {
+    const first = await saveDatabaseGrowthSnapshot('customer-a', {
+      database: 'ERP',
+      capturedAt: '2026-09-14T00:00:00.000Z',
+      summary: { totalMb: 10, dataMb: 8, logMb: 2, dataUsedMb: 7, logUsedMb: 1, logUsedPercent: 50, tableCount: 1 }
+    });
+    await saveDatabaseGrowthSnapshot('customer-b', {
+      database: 'ERP-B',
+      capturedAt: '2026-09-15T00:00:00.000Z',
+      summary: { totalMb: 20, dataMb: 16, logMb: 4, dataUsedMb: 14, logUsedMb: 2, logUsedPercent: 50, tableCount: 2 }
+    });
+
+    const after = await deleteDatabaseGrowthSnapshot('customer-a', first.snapshots[0]!.id);
+    expect(after.snapshots).toEqual([]);
+    expect((await readDatabaseGrowthHistory('customer-b')).snapshots).toHaveLength(1);
+  });
+
+  it('clears only the selected connection history', async () => {
+    await saveDatabaseGrowthSnapshot('customer-a', {
+      database: 'ERP',
+      capturedAt: '2026-09-14T00:00:00.000Z',
+      summary: { totalMb: 10, dataMb: 8, logMb: 2, dataUsedMb: 7, logUsedMb: 1, logUsedPercent: 50, tableCount: 1 }
+    });
+    await saveDatabaseGrowthSnapshot('customer-b', {
+      database: 'ERP-B',
+      capturedAt: '2026-09-15T00:00:00.000Z',
+      summary: { totalMb: 20, dataMb: 16, logMb: 4, dataUsedMb: 14, logUsedMb: 2, logUsedPercent: 50, tableCount: 2 }
+    });
+
+    expect((await clearDatabaseGrowthHistory('customer-a')).snapshots).toEqual([]);
+    expect((await readDatabaseGrowthHistory('customer-a')).snapshots).toEqual([]);
+    expect((await readDatabaseGrowthHistory('customer-b')).snapshots).toHaveLength(1);
   });
 
   it('compares two saved snapshots without reconnecting to SQL Server', async () => {

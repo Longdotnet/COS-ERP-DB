@@ -40,6 +40,8 @@ export function createDatabaseApi(call: Call) {
     compareDatabaseGrowth: (request: DatabaseGrowthCompareRequest) => call<DatabaseGrowthComparisonResult>('database:growthCompare', request),
     readDatabaseGrowthHistory: (id: string) => call<DatabaseGrowthHistoryResult>('database:growthHistory', { id }),
     saveDatabaseGrowthSnapshot: (id: string, snapshot: DatabaseGrowthSnapshotInput) => call<DatabaseGrowthHistoryResult>('database:growthSnapshotSave', { id, snapshot }),
+    deleteDatabaseGrowthSnapshot: (id: string, snapshotId: string) => call<DatabaseGrowthHistoryResult>('database:growthSnapshotDelete', { id, snapshotId }),
+    clearDatabaseGrowthHistory: (id: string) => call<DatabaseGrowthHistoryResult>('database:growthHistoryClear', { id }),
     searchDatabaseObjects: (request: DatabaseObjectSearchRequest) => call<DatabaseObjectSearchResult>('database:objectsSearch', request),
     readDatabaseTablePage: (request: DatabaseTablePageRequest) => call<DatabaseTablePageResult>('database:tablePage', request),
     updateDatabaseTableCell: (request: DatabaseTableCellUpdateRequest) => call<DatabaseTableCellUpdateResult>('database:tableCellUpdate', request),

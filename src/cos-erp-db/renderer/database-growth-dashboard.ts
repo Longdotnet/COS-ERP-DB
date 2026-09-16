@@ -26,7 +26,15 @@ let comparisonSourcesGeneration = 0;
 let latestSettings: DatabaseSettingsState | null = null;
 const cache = new Map<string, DatabaseGrowthDiagnosticsResult>();
 const historyCache = new Map<string, DatabaseGrowthHistoryResult>();
-let activeComparison: DatabaseGrowthComparisonResult | null = null;
+
+type ComparisonChoice = {
+  source: DatabaseGrowthCompareSource;
+  label: string;
+  group: string;
+  capturedAt?: string;
+};
+
+let comparisonChoices: ComparisonChoice[] = [];
 
 function byId<T extends HTMLElement = HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -172,6 +180,64 @@ function decodeCompareSource(value: string): DatabaseGrowthCompareSource | null 
   return null;
 }
 
+function compareOptions(mode: 'live' | 'snapshot'): HTMLOptGroupElement[] {
+  const groups = new Map<string, HTMLOptGroupElement>();
+  for (const choice of comparisonChoices.filter(candidate => candidate.source.type === mode)) {
+    let group = groups.get(choice.group);
+    if (!group) {
+      group = document.createElement('optgroup');
+      group.label = choice.group;
+      groups.set(choice.group, group);
+    }
+    const option = document.createElement('option');
+    option.value = encodeCompareSource(choice.source);
+    option.textContent = choice.label;
+    group.append(option);
+  }
+  return [...groups.values()];
+}
+
+function populateCompareSource(
+  select: HTMLSelectElement,
+  mode: 'live' | 'snapshot',
+  preferredValue = '',
+  preferredConnection = '',
+  oldestSnapshot = false
+): string {
+  select.replaceChildren(...compareOptions(mode));
+  const values = new Set([...select.options].map(option => option.value));
+  if (preferredValue && values.has(preferredValue)) {
+    select.value = preferredValue;
+    return select.value;
+  }
+  const candidates = comparisonChoices
+    .filter(choice => choice.source.type === mode && (!preferredConnection || choice.source.connection === preferredConnection))
+    .sort((left, right) => {
+      if (mode !== 'snapshot') return 0;
+      const order = (left.capturedAt ?? '').localeCompare(right.capturedAt ?? '');
+      return oldestSnapshot ? order : -order;
+    });
+  const fallback = candidates[0] ?? comparisonChoices.find(choice => choice.source.type === mode);
+  if (fallback) select.value = encodeCompareSource(fallback.source);
+  return select.value;
+}
+
+function updateBaselineDateVisibility(): void {
+  const baseline = decodeCompareSource(byId<HTMLSelectElement>('databaseGrowthCompareBaseline').value);
+  const field = byId<HTMLElement>('databaseGrowthCompareBaselineDateField');
+  field.hidden = baseline?.type !== 'live';
+  if (field.hidden) byId<HTMLInputElement>('databaseGrowthCompareBaselineDate').value = '';
+}
+
+function updateCompareRunState(): void {
+  const baseline = byId<HTMLSelectElement>('databaseGrowthCompareBaseline');
+  const current = byId<HTMLSelectElement>('databaseGrowthCompareCurrent');
+  byId<HTMLButtonElement>('databaseGrowthCompareRun').disabled = baseline.value === ''
+    || current.value === ''
+    || baseline.value === current.value;
+  updateBaselineDateVisibility();
+}
+
 function compareSourceDescription(source: DatabaseGrowthComparisonResult['baseline'] | DatabaseGrowthComparisonResult['current']): string {
   return source.source === 'snapshot'
     ? `saved snapshot captured ${new Date(source.capturedAt).toLocaleString()}`
@@ -232,7 +298,6 @@ function comparisonAiPrompt(result: DatabaseGrowthComparisonResult): string {
 
 function renderComparison(result: DatabaseGrowthComparisonResult): void {
   if (!root) return;
-  activeComparison = result;
   const body = byId('databaseGrowthCompareBody');
   body.hidden = false;
 
@@ -241,6 +306,18 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
     ? `Baseline as of ${result.baseline.asOf}`
     : `${compareSourceDescription(result.baseline)} → ${compareSourceDescription(result.current)}`;
   summary.append(sectionHead('Database comparison', `${result.baseline.database} → ${result.current.database}`));
+  const resultActions = el('div', 'database-growth-compare-result-actions');
+  const explain = document.createElement('button');
+  explain.id = 'databaseGrowthCompareExplain';
+  explain.type = 'button';
+  explain.className = 'btn is-primary';
+  explain.textContent = t('Explain comparison with AI');
+  explain.addEventListener('click', () => {
+    window.dispatchEvent(new window.CustomEvent('cos:database-open-chat', {
+      detail: { suggestedText: comparisonAiPrompt(result), autoSend: true }
+    }));
+  });
+  resultActions.append(explain);
   const metrics = el('div', 'database-growth-metrics');
   metrics.append(
     metric('Total allocation change', signedSize(result.summary.totalAllocatedDeltaMb), dateDetail),
@@ -251,7 +328,8 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
   summary.append(
     metrics,
     el('p', 'database-growth-baseline-note', () => t('Allocated file growth and actually used data are shown separately so preallocated free space is not mistaken for ERP row growth.')),
-    el('p', 'database-growth-baseline-note', `Tables: +${result.summary.addedTableCount.toLocaleString('en-US')} added · −${result.summary.removedTableCount.toLocaleString('en-US')} removed · ${result.summary.schemaChangedTableCount.toLocaleString('en-US')} matching table${result.summary.schemaChangedTableCount === 1 ? '' : 's'} changed columns or indexes.`)
+    el('p', 'database-growth-baseline-note', `Tables: +${result.summary.addedTableCount.toLocaleString('en-US')} added · −${result.summary.removedTableCount.toLocaleString('en-US')} removed · ${result.summary.schemaChangedTableCount.toLocaleString('en-US')} matching table${result.summary.schemaChangedTableCount === 1 ? '' : 's'} changed columns or indexes.`),
+    resultActions
   );
 
   const objects = el('section', 'database-growth-panel database-growth-compare-objects');
@@ -390,7 +468,6 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
     panels.push(limits);
   }
   body.replaceChildren(...panels);
-  byId<HTMLButtonElement>('databaseGrowthCompareExplain').disabled = false;
 }
 
 function renderComparisonState(message: string, isError = false): void {
@@ -399,8 +476,6 @@ function renderComparisonState(message: string, isError = false): void {
   const state = el('div', `database-growth-state${isError ? ' is-error' : ''}`);
   state.append(el('strong', '', () => t(isError ? 'Comparison unavailable' : 'Database comparison')), el('p', '', () => t(message)));
   body.replaceChildren(state);
-  activeComparison = null;
-  byId<HTMLButtonElement>('databaseGrowthCompareExplain').disabled = true;
 }
 
 async function refreshComparisonSources(next: DatabaseSettingsState): Promise<void> {
@@ -408,9 +483,13 @@ async function refreshComparisonSources(next: DatabaseSettingsState): Promise<vo
   const token = ++comparisonSourcesGeneration;
   const baselineSelect = byId<HTMLSelectElement>('databaseGrowthCompareBaseline');
   const currentSelect = byId<HTMLSelectElement>('databaseGrowthCompareCurrent');
+  const baselineType = byId<HTMLSelectElement>('databaseGrowthCompareBaselineType');
+  const currentType = byId<HTMLSelectElement>('databaseGrowthCompareCurrentType');
   const runCompare = byId<HTMLButtonElement>('databaseGrowthCompareRun');
   const previousBaseline = baselineSelect.value;
   const previousCurrent = currentSelect.value;
+  const previousBaselineSource = decodeCompareSource(previousBaseline);
+  const previousCurrentSource = decodeCompareSource(previousCurrent);
   baselineSelect.disabled = true;
   currentSelect.disabled = true;
   runCompare.disabled = true;
@@ -423,29 +502,24 @@ async function refreshComparisonSources(next: DatabaseSettingsState): Promise<vo
   }));
   if (!root || token !== comparisonSourcesGeneration) return;
 
-  const choices: Array<{ source: DatabaseGrowthCompareSource; label: string; capturedAt?: string }> = [];
+  const choices: ComparisonChoice[] = [];
   for (const { profile, history } of histories) {
     choices.push({
       source: { type: 'live', connection: profile.id },
-      label: `Live · ${profile.name} · ${profile.database}`
+      label: `Live · ${profile.database}`,
+      group: profile.name
     });
     for (const snapshot of history.snapshots) {
       choices.push({
         source: { type: 'snapshot', connection: profile.id, snapshotId: snapshot.id },
-        label: `Snapshot · ${profile.name} · ${new Date(snapshot.capturedAt).toLocaleString()} · ${snapshot.database}`,
+        label: `Snapshot · ${new Date(snapshot.capturedAt).toLocaleString()} · ${snapshot.database}`,
+        group: profile.name,
         capturedAt: snapshot.capturedAt
       });
     }
   }
 
-  const makeOptions = () => choices.map(choice => {
-    const option = document.createElement('option');
-    option.value = encodeCompareSource(choice.source);
-    option.textContent = choice.label;
-    return option;
-  });
-  baselineSelect.replaceChildren(...makeOptions());
-  currentSelect.replaceChildren(...makeOptions());
+  comparisonChoices = choices;
   const values = new Set(choices.map(choice => encodeCompareSource(choice.source)));
 
   const defaultCurrent = encodeCompareSource({
@@ -468,16 +542,37 @@ async function refreshComparisonSources(next: DatabaseSettingsState): Promise<vo
     baselineValue = alternate ? encodeCompareSource(alternate.source) : '';
   }
 
-  currentSelect.value = currentValue;
-  baselineSelect.value = baselineValue;
-  const canCompare = Boolean(baselineValue && currentValue && baselineValue !== currentValue);
-  baselineSelect.disabled = choices.length < 2;
-  currentSelect.disabled = choices.length < 2;
-  runCompare.disabled = !canCompare;
-  if (!canCompare) {
-    activeComparison = null;
-    byId<HTMLButtonElement>('databaseGrowthCompareExplain').disabled = true;
+  const resolvedCurrent = decodeCompareSource(currentValue);
+  const resolvedBaseline = decodeCompareSource(baselineValue);
+  currentType.value = resolvedCurrent?.type ?? 'live';
+  baselineType.value = resolvedBaseline?.type ?? (choices.some(choice => choice.source.type === 'snapshot') ? 'snapshot' : 'live');
+  const selectedCurrent = populateCompareSource(
+    currentSelect,
+    currentType.value as 'live' | 'snapshot',
+    currentValue,
+    previousCurrentSource?.connection ?? selectedConnection
+  );
+  const selectedCurrentSource = decodeCompareSource(selectedCurrent);
+  const selectedBaseline = populateCompareSource(
+    baselineSelect,
+    baselineType.value as 'live' | 'snapshot',
+    baselineValue,
+    previousBaselineSource?.connection ?? selectedCurrentSource?.connection ?? selectedConnection,
+    true
+  );
+  baselineValue = selectedBaseline;
+  const hasSnapshots = choices.some(choice => choice.source.type === 'snapshot');
+  for (const typeSelect of [baselineType, currentType]) {
+    const snapshotOption = [...typeSelect.options].find(option => option.value === 'snapshot');
+    if (snapshotOption) snapshotOption.disabled = !hasSnapshots;
   }
+  const canCompare = Boolean(baselineValue && selectedCurrent && baselineValue !== selectedCurrent);
+  baselineType.disabled = choices.length < 2;
+  currentType.disabled = choices.length < 2;
+  baselineSelect.disabled = [...baselineSelect.options].length === 0;
+  currentSelect.disabled = [...currentSelect.options].length === 0;
+  runCompare.disabled = !canCompare;
+  updateBaselineDateVisibility();
 }
 
 function historyPanel(result: DatabaseGrowthDiagnosticsResult): HTMLElement {
@@ -485,12 +580,70 @@ function historyPanel(result: DatabaseGrowthDiagnosticsResult): HTMLElement {
   const history = historyCache.get(selectedConnection);
   const snapshots = history?.snapshots ?? [];
   const baseline = snapshots.at(-1);
-  const head = sectionHead('Saved growth history', snapshots.length ? `${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'}` : 'No baseline yet');
+  const head = sectionHead('Saved baselines', snapshots.length ? `${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'} · max 52` : 'No baseline yet');
+  if (snapshots.length) {
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'btn database-growth-history-clear';
+    clear.textContent = t('Clear history');
+    clear.title = t('Delete all local snapshots for this connection');
+    clear.addEventListener('click', async () => {
+      if (!window.confirm(t('Delete all local snapshots for this connection?'))) return;
+      clear.disabled = true;
+      const next = await run(api.clearDatabaseGrowthHistory(selectedConnection));
+      if (!next) {
+        clear.disabled = false;
+        return;
+      }
+      historyCache.set(selectedConnection, next);
+      render(result);
+      if (latestSettings) void refreshComparisonSources(latestSettings);
+      toast(t('Growth history cleared'));
+    });
+    head.append(clear);
+  }
   panel.append(head);
+  panel.append(el('p', 'database-growth-history-storage', () => t('Stored locally in COS ERP DB app data. Snapshots are measurements, not SQL Server backups. Up to 52 are kept per connection.')));
   if (!baseline) {
     panel.append(el('p', 'database-growth-baseline-note', () => t('Save this investigation as a local snapshot. A later investigation can then prove how total, data and log allocation changed over time.')));
     return panel;
   }
+
+  const snapshotList = el('div', 'database-growth-snapshot-list');
+  for (const snapshot of snapshots) {
+    const row = el('div', 'database-growth-snapshot-row');
+    const identity = el('div', 'database-growth-snapshot-identity');
+    const top = el('div', 'database-growth-snapshot-title');
+    top.append(
+      el('span', 'database-growth-snapshot-kind', () => t('Snapshot')),
+      el('strong', '', snapshot.database)
+    );
+    identity.append(
+      top,
+      el('span', 'database-growth-snapshot-time', `${t('Captured')} ${new Date(snapshot.capturedAt).toLocaleString()} · ${t('Saved')} ${new Date(snapshot.savedAt).toLocaleString()}`)
+    );
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn database-growth-snapshot-delete';
+    remove.textContent = t('Delete');
+    remove.title = t('Delete this local snapshot');
+    remove.addEventListener('click', async () => {
+      if (!window.confirm(t('Delete this local snapshot?'))) return;
+      remove.disabled = true;
+      const next = await run(api.deleteDatabaseGrowthSnapshot(selectedConnection, snapshot.id));
+      if (!next) {
+        remove.disabled = false;
+        return;
+      }
+      historyCache.set(selectedConnection, next);
+      render(result);
+      if (latestSettings) void refreshComparisonSources(latestSettings);
+      toast(t('Growth snapshot deleted'));
+    });
+    row.append(identity, remove);
+    snapshotList.append(row);
+  }
+  panel.append(snapshotList);
 
   const baselineAt = new Date(baseline.capturedAt);
   if (baseline.capturedAt === result.capturedAt) {
@@ -742,34 +895,77 @@ function build(mount: HTMLElement): void {
   const compareBar = el('section', 'database-growth-compare-bar');
   const compareCopy = el('div', 'database-growth-compare-copy');
   compareCopy.append(
-    el('strong', '', () => t('Compare databases')),
-    el('span', '', () => t('Compare live databases or saved snapshots to explain storage, table, column and index changes over time.'))
+    el('span', 'database-growth-compare-eyebrow', () => t('Historical comparison')),
+    el('strong', '', () => t('Compare database states')),
+    el('span', '', () => t('Choose an older baseline and a current state. Saved snapshots stay local and let you compare without reconnecting to the old database.'))
   );
   const compareControls = el('div', 'database-growth-compare-controls');
+  const baselineCard = el('div', 'database-growth-compare-source-card is-baseline');
+  const baselineLabel = el('label', 'database-growth-compare-label');
+  baselineLabel.setAttribute('for', 'databaseGrowthCompareBaseline');
+  baselineLabel.append(el('span', '', () => t('Baseline')), el('small', '', () => t('Older state')));
   const baselineConnection = document.createElement('select');
   baselineConnection.id = 'databaseGrowthCompareBaseline';
   baselineConnection.setAttribute('aria-label', t('Baseline database connection'));
+  const baselineType = document.createElement('select');
+  baselineType.id = 'databaseGrowthCompareBaselineType';
+  baselineType.className = 'database-growth-compare-type';
+  baselineType.setAttribute('aria-label', t('Baseline source type'));
+  for (const [label, value] of [[t('Live database'), 'live'], [t('Saved snapshot'), 'snapshot']] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    baselineType.append(option);
+  }
+  const baselineDateField = el('div', 'database-growth-compare-date-field');
+  baselineDateField.id = 'databaseGrowthCompareBaselineDateField';
+  const baselineDateLabel = document.createElement('label');
+  baselineDateLabel.htmlFor = 'databaseGrowthCompareBaselineDate';
+  baselineDateLabel.textContent = t('Backup represents date (optional)');
   const baselineAsOf = document.createElement('input');
   baselineAsOf.id = 'databaseGrowthCompareBaselineDate';
   baselineAsOf.type = 'date';
-  baselineAsOf.title = t('Optional date represented by the restored baseline backup');
+  baselineAsOf.title = t('Use this only when the baseline is a restored backup and you know the business date it represents.');
   baselineAsOf.setAttribute('aria-label', t('Baseline as-of date'));
+  baselineDateField.append(
+    baselineDateLabel,
+    baselineAsOf,
+    el('small', '', () => t('This is not the snapshot save time. Leave it blank unless the baseline came from an older backup.'))
+  );
+  baselineCard.append(baselineLabel, baselineType, baselineConnection, baselineDateField);
+
+  const direction = el('div', 'database-growth-compare-direction');
+  direction.setAttribute('aria-hidden', 'true');
+  direction.textContent = '→';
+
+  const currentCard = el('div', 'database-growth-compare-source-card is-current');
+  const currentLabel = el('label', 'database-growth-compare-label');
+  currentLabel.setAttribute('for', 'databaseGrowthCompareCurrent');
+  currentLabel.append(el('span', '', () => t('Current')), el('small', '', () => t('Newer state')));
   const currentConnection = document.createElement('select');
   currentConnection.id = 'databaseGrowthCompareCurrent';
   currentConnection.setAttribute('aria-label', t('Current database connection'));
+  const currentType = document.createElement('select');
+  currentType.id = 'databaseGrowthCompareCurrentType';
+  currentType.className = 'database-growth-compare-type';
+  currentType.setAttribute('aria-label', t('Current source type'));
+  for (const [label, value] of [[t('Live database'), 'live'], [t('Saved snapshot'), 'snapshot']] as const) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    currentType.append(option);
+  }
+  currentCard.append(currentLabel, currentType, currentConnection);
+
+  const compareActions = el('div', 'database-growth-compare-actions');
   const runCompare = document.createElement('button');
   runCompare.id = 'databaseGrowthCompareRun';
   runCompare.type = 'button';
   runCompare.className = 'btn';
   runCompare.textContent = t('Compare');
-  const explainCompare = document.createElement('button');
-  explainCompare.id = 'databaseGrowthCompareExplain';
-  explainCompare.type = 'button';
-  explainCompare.className = 'btn is-primary';
-  explainCompare.textContent = t('Explain comparison with AI');
-  explainCompare.disabled = true;
-  compareControls.append(baselineConnection, baselineAsOf, currentConnection, runCompare, explainCompare);
-  compareBar.append(compareCopy, compareControls);
+  compareActions.append(runCompare);
+  compareControls.append(baselineCard, direction, currentCard);
+  compareBar.append(compareCopy, compareControls, compareActions);
 
   const compareBody = el('div', 'database-growth-body database-growth-compare-body');
   compareBody.id = 'databaseGrowthCompareBody';
@@ -791,13 +987,32 @@ function build(mount: HTMLElement): void {
   for (const control of [baselineConnection, currentConnection, baselineAsOf]) {
     control.addEventListener('change', () => {
       comparisonGeneration += 1;
-      activeComparison = null;
-      explainCompare.disabled = true;
-      runCompare.disabled = baselineConnection.value === ''
-        || currentConnection.value === ''
-        || baselineConnection.value === currentConnection.value;
+      updateCompareRunState();
     });
   }
+  baselineType.addEventListener('change', () => {
+    const previous = decodeCompareSource(baselineConnection.value);
+    populateCompareSource(
+      baselineConnection,
+      baselineType.value as 'live' | 'snapshot',
+      '',
+      previous?.connection ?? selectedConnection,
+      true
+    );
+    comparisonGeneration += 1;
+    updateCompareRunState();
+  });
+  currentType.addEventListener('change', () => {
+    const previous = decodeCompareSource(currentConnection.value);
+    populateCompareSource(
+      currentConnection,
+      currentType.value as 'live' | 'snapshot',
+      '',
+      previous?.connection ?? selectedConnection
+    );
+    comparisonGeneration += 1;
+    updateCompareRunState();
+  });
   runCompare.addEventListener('click', async () => {
     const baselineSource = decodeCompareSource(baselineConnection.value);
     const currentSource = decodeCompareSource(currentConnection.value);
@@ -817,12 +1032,6 @@ function build(mount: HTMLElement): void {
       return;
     }
     renderComparison(result);
-  });
-  explainCompare.addEventListener('click', () => {
-    if (!activeComparison) return;
-    window.dispatchEvent(new window.CustomEvent('cos:database-open-chat', {
-      detail: { suggestedText: comparisonAiPrompt(activeComparison), autoSend: true }
-    }));
   });
   saveSnapshot.addEventListener('click', async () => {
     const result = cache.get(selectedConnection);

@@ -136,6 +136,8 @@ beforeEach(() => {
       connection: 'linkq-test',
       snapshots: [{ id: '11111111-1111-4111-8111-111111111111', connection: 'linkq-test', savedAt: '2026-09-15T17:01:00.000Z', ...(snapshot as object) }]
     })),
+    deleteDatabaseGrowthSnapshot: vi.fn((id: string) => reply({ connection: id, snapshots: [] })),
+    clearDatabaseGrowthHistory: vi.fn((id: string) => reply({ connection: id, snapshots: [] })),
     searchDatabaseObjects: vi.fn(() => reply({ objects: [], hasMore: false, elapsedMs: 1 })),
     readDatabaseTablePage: vi.fn(() => reply({
       schema: 'dbo',
@@ -338,9 +340,15 @@ it('offers saved snapshots as compare sources and can compare a snapshot with th
 
   const baseline = document.getElementById('databaseGrowthCompareBaseline') as HTMLSelectElement;
   const current = document.getElementById('databaseGrowthCompareCurrent') as HTMLSelectElement;
-  expect([...baseline.options].some(option => option.textContent?.includes('Snapshot · LinkQ Test'))).toBe(true);
+  const baselineType = document.getElementById('databaseGrowthCompareBaselineType') as HTMLSelectElement;
+  const currentType = document.getElementById('databaseGrowthCompareCurrentType') as HTMLSelectElement;
+  expect([...baseline.options].some(option => option.textContent?.includes('Snapshot ·'))).toBe(true);
+  expect(baseline.querySelector('optgroup')?.label).toBe('LinkQ Test');
+  expect(baselineType.value).toBe('snapshot');
+  expect(currentType.value).toBe('live');
   expect(JSON.parse(baseline.value)).toEqual({ type: 'snapshot', connection: 'linkq-test', snapshotId });
   expect(JSON.parse(current.value)).toEqual({ type: 'live', connection: 'linkq-test' });
+  expect((document.getElementById('databaseGrowthCompareBaselineDateField') as HTMLElement).hidden).toBe(true);
 
   document.getElementById('databaseGrowthCompareRun')!.click();
   await tick();
@@ -348,6 +356,74 @@ it('offers saved snapshots as compare sources and can compare a snapshot with th
     baseline: { type: 'snapshot', connection: 'linkq-test', snapshotId },
     current: { type: 'live', connection: 'linkq-test' }
   });
+});
+
+it('explains local snapshot storage and deletes a saved baseline from the dashboard', async () => {
+  const snapshotId = '33333333-3333-4333-8333-333333333333';
+  api.readDatabaseGrowthHistory!.mockImplementation((id: string) => reply({
+    connection: id,
+    snapshots: [{
+      id: snapshotId,
+      connection: id,
+      savedAt: '2026-09-16T01:01:00.000Z',
+      captureVersion: 2,
+      database: 'L80LINKQ.TEST',
+      capturedAt: '2026-09-16T01:00:00.000Z',
+      summary: { totalMb: 5000, dataMb: 4000, logMb: 1000, dataUsedMb: 3500, logUsedMb: 100, logUsedPercent: 10, tableCount: 220 },
+      files: [], tables: [], tablesTruncated: false, tableFingerprints: [], schemaTruncated: false, limitations: []
+    }]
+  }));
+  api.deleteDatabaseGrowthSnapshot!.mockImplementation((id: string, idToDelete: string) => {
+    expect(idToDelete).toBe(snapshotId);
+    return reply({ connection: id, snapshots: [] });
+  });
+  vi.spyOn(dom.window, 'confirm').mockReturnValue(true);
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+  document.getElementById('databaseGrowthRefresh')!.click();
+  await tick();
+  await tick();
+
+  const history = document.querySelector('.database-growth-history')!;
+  expect(history.textContent).toContain('Stored locally in COS ERP DB app data');
+  expect(history.textContent).toContain('1 snapshot · max 52');
+  expect(history.textContent).toContain('Captured');
+  expect(history.textContent).toContain('Saved');
+
+  document.querySelector<HTMLButtonElement>('.database-growth-snapshot-delete')!.click();
+  await tick();
+  expect(api.deleteDatabaseGrowthSnapshot).toHaveBeenCalledWith('linkq-test', snapshotId);
+  expect(document.querySelector('.database-growth-history')!.textContent).toContain('No baseline yet');
+});
+
+it('clears all local snapshots for the selected connection after confirmation', async () => {
+  const snapshotId = '44444444-4444-4444-8444-444444444444';
+  api.readDatabaseGrowthHistory!.mockImplementation((id: string) => reply({
+    connection: id,
+    snapshots: [{
+      id: snapshotId,
+      connection: id,
+      savedAt: '2026-09-16T01:01:00.000Z',
+      database: 'L80LINKQ.TEST',
+      capturedAt: '2026-09-16T01:00:00.000Z',
+      summary: { totalMb: 5000, dataMb: 4000, logMb: 1000, dataUsedMb: 3500, logUsedMb: 100, logUsedPercent: 10, tableCount: 220 }
+    }]
+  }));
+  vi.spyOn(dom.window, 'confirm').mockReturnValue(true);
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+  document.getElementById('databaseGrowthRefresh')!.click();
+  await tick();
+  await tick();
+
+  document.querySelector<HTMLButtonElement>('.database-growth-history-clear')!.click();
+  await tick();
+  expect(api.clearDatabaseGrowthHistory).toHaveBeenCalledWith('linkq-test');
+  expect(document.querySelector('.database-growth-history')!.textContent).toContain('No baseline yet');
 });
 
 it('shows an explicit unsaved connection on first use', async () => {

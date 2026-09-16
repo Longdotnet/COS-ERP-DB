@@ -39,7 +39,9 @@ import {
 } from './credentials.js';
 import { readDatabaseSettings, removeDatabaseProfile, saveDatabaseProfile } from './store.js';
 import {
+  clearDatabaseGrowthHistory,
   databaseGrowthSnapshotInputSchema,
+  deleteDatabaseGrowthSnapshot,
   readDatabaseGrowthHistory,
   saveDatabaseGrowthSnapshot
 } from './growth-history.js';
@@ -158,6 +160,19 @@ export function registerDatabaseIpc(handle: RegisterHandler): void {
       snapshot: databaseGrowthSnapshotInputSchema
     }).strict().parse(payload) as { id: string; snapshot: DatabaseGrowthSnapshotInput };
     return saveDatabaseGrowthSnapshot(parsed.id, parsed.snapshot);
+  });
+
+  handle<DatabaseGrowthHistoryResult>('database:growthSnapshotDelete', async payload => {
+    const parsed = z.object({
+      id: profileIdArg.shape.id,
+      snapshotId: z.string().uuid()
+    }).strict().parse(payload);
+    return deleteDatabaseGrowthSnapshot(parsed.id, parsed.snapshotId);
+  });
+
+  handle<DatabaseGrowthHistoryResult>('database:growthHistoryClear', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return clearDatabaseGrowthHistory(id);
   });
 
   handle<DatabaseObjectSearchResult>('database:objectsSearch', async payload => {

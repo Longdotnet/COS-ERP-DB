@@ -165,6 +165,37 @@ export function saveDatabaseGrowthSnapshot(connection: string, input: DatabaseGr
   });
 }
 
+export function deleteDatabaseGrowthSnapshot(connection: string, snapshotId: string): Promise<DatabaseGrowthHistoryResult> {
+  return enqueue(async () => {
+    const key = connectionKey(connection);
+    const id = z.string().uuid().parse(snapshotId);
+    const file = await readFile();
+    const snapshots = file.snapshots.filter(snapshot =>
+      snapshot.connection.toLowerCase() !== key || snapshot.id !== id
+    );
+    if (snapshots.length === file.snapshots.length) {
+      throw new Error(`Database growth snapshot ${id} was not found for connection ${connection}.`);
+    }
+    await writeFile({ version: 1, snapshots });
+    return {
+      connection,
+      snapshots: snapshots
+        .filter(snapshot => snapshot.connection.toLowerCase() === key)
+        .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
+    };
+  });
+}
+
+export function clearDatabaseGrowthHistory(connection: string): Promise<DatabaseGrowthHistoryResult> {
+  return enqueue(async () => {
+    const key = connectionKey(connection);
+    const file = await readFile();
+    const snapshots = file.snapshots.filter(snapshot => snapshot.connection.toLowerCase() !== key);
+    if (snapshots.length !== file.snapshots.length) await writeFile({ version: 1, snapshots });
+    return { connection, snapshots: [] };
+  });
+}
+
 export function resetDatabaseGrowthHistoryForTests(): void {
   historyPath = '';
   mutationQueue = Promise.resolve();
