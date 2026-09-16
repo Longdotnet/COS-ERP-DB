@@ -21,19 +21,18 @@ export function registerDatabaseTool(
   reg.register(
     'database',
     toolDeclaration('database', () => ({
-      title: 'Query SQL Server',
+      title: 'SQL Server',
       description:
-        'Query a configured SQL Server connection, list configured connection identities and access modes, run bounded database-growth diagnostics, search its object catalog with bounded cursor pagination, read the user\'s current Database Workspace context, or test that connection. ' +
-        'Credentials stay in local secure storage and are never tool arguments. Raw SQL remains read-only; mutation and multi-statement SQL are refused.',
+        'Read configured SQL Server data/schema, growth and object metadata, workspace context, or connection state. Read-only; credentials stay local.',
       inputSchema: z
         .object({
-          action: z.enum(['query', 'list_connections', 'growth_diagnostics', 'search_objects', 'workspace_context', 'test']).describe('query runs read-only SQL; list_connections returns credential-free configured ids, databases, defaults and access modes; growth_diagnostics returns fixed read-only file/log/largest-table findings; search_objects searches bounded metadata; workspace_context reads the active DB UI object/tab/filter/selected rows; test checks the connection.'),
-          connection: z.string().min(1).max(64).optional().describe('Configured connection id. Omit when one connection or a default is configured.'),
-          sql: z.string().min(1).max(MAX_DATABASE_SQL_CHARS).optional().describe('Read-only SELECT SQL. Required for action=query.'),
-          search: z.string().max(MAX_DATABASE_OBJECT_SEARCH_CHARS).optional().describe('Object/schema name prefix for search_objects.'),
-          types: z.array(z.enum(['table', 'view', 'procedure', 'function', 'synonym'])).min(1).max(5).optional().describe('Object kinds to include for search_objects.'),
-          limit: z.number().int().min(1).max(MAX_DATABASE_OBJECT_PAGE_SIZE).optional().describe('Objects per page for search_objects. Defaults to 50.'),
-          cursor: z.string().min(1).max(1024).optional().describe('Opaque nextCursor returned by a prior search_objects page.')
+          action: z.enum(['query', 'list_connections', 'growth_diagnostics', 'search_objects', 'workspace_context', 'test']),
+          connection: z.string().min(1).max(64).optional().describe('Configured id; omit for default.'),
+          sql: z.string().min(1).max(MAX_DATABASE_SQL_CHARS).optional().describe('SELECT SQL for query.'),
+          search: z.string().max(MAX_DATABASE_OBJECT_SEARCH_CHARS).optional(),
+          types: z.array(z.enum(['table', 'view', 'procedure', 'function', 'synonym'])).min(1).max(5).optional(),
+          limit: z.number().int().min(1).max(MAX_DATABASE_OBJECT_PAGE_SIZE).optional(),
+          cursor: z.string().min(1).max(1024).optional()
         })
         .superRefine((input, ctx) => {
           if (input.action === 'query' && input.sql === undefined) {

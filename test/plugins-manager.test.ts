@@ -20,6 +20,7 @@ import { initDurableStore } from '../src/main/durable.js';
 import { getSecret } from '../src/main/secrets.js';
 import { PluginManager } from '../src/main/plugins/manager.js';
 import { PluginOAuth, PluginNeedsAuth } from '../src/main/plugins/oauth.js';
+import { surfaceDefinition } from '../src/main/mcp/surfaces.js';
 import * as pluginInstaller from '../src/main/plugins/installer.js';
 import * as exposureModule from '../src/main/plugins/exposure.js';
 import * as durableModule from '../src/main/durable.js';
@@ -50,7 +51,7 @@ describe('external plugin authority', () => {
     const result = JSON.stringify(await manager.call('read', { paths: ['/project'] }, outcome));
     expect(result).toContain('PLUGIN_TOOL_UNAVAILABLE');
     expect(result).toContain('wrong connector');
-    expect(result).toContain('Chat On Steroids Core');
+    expect(result).toContain(surfaceDefinition('core').connectorName);
     expect(result).toContain('This call was not dispatched');
     expect(result).not.toContain('PLUGIN_DISABLED');
     expect(upstream).not.toHaveBeenCalled();

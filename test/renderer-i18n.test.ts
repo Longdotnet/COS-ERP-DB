@@ -176,6 +176,7 @@ describe('Chinese app interface', () => {
       const node = walker.currentNode;
       if (node.parentElement?.closest('script, style, svg, code, kbd, textarea, [translate="no"]')) continue;
       const text = node.textContent!.replace(/\s+/g, ' ').trim();
+      if (text === 'COS-ERP-DB') continue; // Product mark, not translatable interface copy.
       if (/[a-zA-Z]{2}/.test(text) && !catalog[text]) missing.push(text);
     }
     for (const node of document.querySelectorAll('[title], [placeholder], [aria-label]')) {

@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { defaultConfig } from '../src/main/config.js';
 import { surfaceDefinition, surfaceIsUseful } from '../src/main/mcp/surfaces.js';
+import { COS_ERP_DB_BRIDGE_PORTS } from '../src/cos-erp-db/browser-identity.js';
 import { browserExtensionRequired } from '../src/shared/types.js';
 
 describe('portable browser-backed feature parity', () => {
@@ -84,11 +85,7 @@ describe('portable browser-backed feature parity', () => {
     expect(manifest.host_permissions).toEqual(
       expect.arrayContaining([
         'https://chatgpt.com/*',
-        'http://127.0.0.1:8765/*',
-        'http://127.0.0.1:8766/*',
-        'http://127.0.0.1:8767/*',
-        'http://127.0.0.1:8768/*',
-        'http://127.0.0.1:8769/*'
+        ...COS_ERP_DB_BRIDGE_PORTS.map(port => `http://127.0.0.1:${port}/*`)
       ])
     );
   });

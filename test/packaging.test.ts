@@ -353,12 +353,12 @@ describe('cross-platform packaging targets', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const iconScript = readFileSync(path.join(root, 'scripts', 'make-icon.mjs'), 'utf8');
     expect(builder.toolsets.appimage).toBe('1.0.3');
-    expect(builder.linux.artifactName).toBe('Chat-On-Steroids-Linux-${env.COS_PACKAGE_ARCH}.${ext}');
+    expect(builder.linux.artifactName).toBe('COS-ERP-DB-Linux-${env.COS_PACKAGE_ARCH}.${ext}');
     expect(builder.deb.depends).toContain('libgtk-3-0 | libgtk-3-0t64');
     expect(builder.deb.depends).toContain('libatspi2.0-0 | libatspi2.0-0t64');
     expect(builder.linux.syncDesktopName).toBe(true);
     expect(builder.linux.maintainer).toMatch(/^Chat On Steroids <[^>]+@users\.noreply\.github\.com>$/);
-    expect(pkg.desktopName).toBe('com.chatonsteroids.app.desktop');
+    expect(pkg.desktopName).toBe('com.longdotnet.cos-erp-db.desktop');
     expect(pkg.homepage).toBe('https://github.com/totec448-spec/chat-on-steroids');
     expect(iconScript).toContain("build', 'icon.png'), pngFor(1024)");
 
@@ -423,7 +423,7 @@ describe('cross-platform packaging targets', () => {
     expect(builder.mac.notarize).toBe(false);
     expect(builder.mac.category).toBe('public.app-category.developer-tools');
     expect(builder.mac.minimumSystemVersion).toBe('13.0');
-    expect(builder.mac.artifactName).toBe('Chat-On-Steroids-macOS-${arch}.${ext}');
+    expect(builder.mac.artifactName).toBe('COS-ERP-DB-macOS-${arch}.${ext}');
     expect(builder.mac.extendInfo.NSUserNotificationAlertStyle).toBe('alert');
     const nativePrep = readFileSync(path.join(root, 'scripts', 'prepare-packaging-native.mjs'), 'utf8');
     expect(nativePrep).toContain("await chmod(path.join(payloadRoot, 'node-pty', 'prebuilds', prebuildDir, 'spawn-helper'), 0o755)");

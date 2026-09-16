@@ -103,7 +103,7 @@ it('lists the same nonempty enabled Core catalog for modern discovery and legacy
   expect(modernList.body.error).toBeUndefined();
   const names = (reply: any): string[] => (reply.body.result?.tools ?? []).map((tool: { name: string }) => tool.name).sort();
   const legacyNames = names(legacyList), modernNames = names(modernList);
-  expect(legacyNames).toHaveLength(7);
+  expect(legacyNames).toHaveLength(8);
   expect(modernNames).toEqual(legacyNames);
-  expect(modernNames).toEqual(expect.arrayContaining(['apply_patch', 'exec_command']));
+  expect(modernNames).toEqual(expect.arrayContaining(['apply_patch', 'database', 'exec_command']));
 });
