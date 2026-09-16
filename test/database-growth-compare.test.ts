@@ -17,6 +17,11 @@ function capture(overrides: Partial<DatabaseGrowthCapture> = {}): DatabaseGrowth
       { objectId: 2, schema: 'dbo', name: 'Master', rows: 10_000, reservedMb: 100, usedMb: 90, dataMb: 80, indexMb: 10 }
     ],
     tablesTruncated: false,
+    tableFingerprints: [
+      { schema: 'dbo', name: 'History', columnCount: 5, indexCount: 2, columnHash: '100', indexHash: '200' },
+      { schema: 'dbo', name: 'Master', columnCount: 3, indexCount: 1, columnHash: '300', indexHash: '400' }
+    ],
+    schemaTruncated: false,
     limitations: [],
     ...overrides
   };
@@ -55,6 +60,8 @@ describe('database growth compare', () => {
     expect(comparison.summary.tableUsedDeltaMb).toBe(11_755);
     expect(comparison.summary.unattributedDataUsedDeltaMb).toBe(3045);
     expect(comparison.summary.attributionPercent).toBeCloseTo(79.43, 2);
+    expect(comparison.summary.addedTableCount).toBe(1);
+    expect(comparison.summary.removedTableCount).toBe(0);
   });
 
   it('matches tables by schema/name instead of object id and reports removals', () => {
@@ -67,10 +74,54 @@ describe('database growth compare', () => {
     const comparison = compareDatabaseGrowthCaptures('old', baseline, 'new', current);
     expect(comparison.tableDeltas.find(row => row.name === 'History')).toMatchObject({ state: 'matched', baselineObjectId: 1, currentObjectId: 500 });
     expect(comparison.tableDeltas.find(row => row.name === 'Master')).toMatchObject({ state: 'removed', usedDeltaMb: -90 });
+    expect(comparison.summary.removedTableCount).toBe(1);
   });
 
   it('keeps attribution limitations when either side was truncated', () => {
     const comparison = compareDatabaseGrowthCaptures('old', capture({ tablesTruncated: true }), 'new', capture());
     expect(comparison.limitations.join(' ')).toMatch(/attribution is incomplete/i);
+  });
+
+  it('detects column and index drift independently of storage and object ids', () => {
+    const baseline = capture();
+    const current = capture({
+      tables: [
+        { objectId: 90, schema: 'dbo', name: 'History', rows: 1_000_000, reservedMb: 800, usedMb: 750, dataMb: 700, indexMb: 50 },
+        { objectId: 91, schema: 'dbo', name: 'Master', rows: 10_000, reservedMb: 100, usedMb: 90, dataMb: 80, indexMb: 10 }
+      ],
+      tableFingerprints: [
+        { schema: 'dbo', name: 'History', columnCount: 6, indexCount: 3, columnHash: '101', indexHash: '201' },
+        { schema: 'dbo', name: 'Master', columnCount: 3, indexCount: 1, columnHash: '300', indexHash: '400' }
+      ]
+    });
+
+    const comparison = compareDatabaseGrowthCaptures('old', baseline, 'new', current);
+    expect(comparison.summary.schemaChangedTableCount).toBe(1);
+    expect(comparison.schemaDeltas).toEqual([
+      expect.objectContaining({
+        schema: 'dbo',
+        name: 'History',
+        baselineObjectId: 1,
+        currentObjectId: 90,
+        columnChanged: true,
+        indexChanged: true,
+        baselineColumnCount: 5,
+        currentColumnCount: 6,
+        baselineIndexCount: 2,
+        currentIndexCount: 3
+      })
+    ]);
+    expect(comparison.tableDeltas).toHaveLength(0);
+  });
+
+  it('reports schema drift as incomplete when a source has no complete fingerprint capture', () => {
+    const comparison = compareDatabaseGrowthCaptures(
+      'old',
+      capture({ tableFingerprints: [], schemaTruncated: true }),
+      'new',
+      capture()
+    );
+    expect(comparison.schemaDeltas).toEqual([]);
+    expect(comparison.limitations.join(' ')).toMatch(/column\/index drift is incomplete/i);
   });
 });

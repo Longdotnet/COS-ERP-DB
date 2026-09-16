@@ -53,6 +53,15 @@ export interface DatabaseGrowthTableSummary {
   indexMb: number;
 }
 
+export interface DatabaseGrowthTableFingerprint {
+  schema: string;
+  name: string;
+  columnCount: number;
+  indexCount: number;
+  columnHash: string;
+  indexHash: string;
+}
+
 export interface DatabaseGrowthFinding {
   id: string;
   severity: DatabaseGrowthSeverity;
@@ -107,6 +116,8 @@ export interface DatabaseGrowthCapture {
   files: DatabaseGrowthFileSummary[];
   tables: DatabaseGrowthTableSummary[];
   tablesTruncated: boolean;
+  tableFingerprints: DatabaseGrowthTableFingerprint[];
+  schemaTruncated: boolean;
   limitations: string[];
 }
 
@@ -120,6 +131,8 @@ export interface DatabaseGrowthSnapshotInput {
   files?: DatabaseGrowthFileSummary[];
   tables?: DatabaseGrowthTableSummary[];
   tablesTruncated?: boolean;
+  tableFingerprints?: DatabaseGrowthTableFingerprint[];
+  schemaTruncated?: boolean;
   limitations?: string[];
 }
 
@@ -134,9 +147,13 @@ export interface DatabaseGrowthHistoryResult {
   snapshots: DatabaseGrowthSnapshot[];
 }
 
+export type DatabaseGrowthCompareSource =
+  | { type: 'live'; connection: string }
+  | { type: 'snapshot'; connection: string; snapshotId: string };
+
 export interface DatabaseGrowthCompareRequest {
-  baselineConnection: string;
-  currentConnection: string;
+  baseline: DatabaseGrowthCompareSource;
+  current: DatabaseGrowthCompareSource;
   /** Optional business date of a restored backup; capture time alone cannot prove backup age. */
   baselineAsOf?: string;
 }
@@ -176,19 +193,38 @@ export interface DatabaseGrowthFileDelta {
   usedDeltaMb: number | null;
 }
 
+export interface DatabaseGrowthSchemaDelta {
+  schema: string;
+  name: string;
+  baselineObjectId: number | null;
+  currentObjectId: number | null;
+  columnChanged: boolean;
+  indexChanged: boolean;
+  baselineColumnCount: number;
+  currentColumnCount: number;
+  baselineIndexCount: number;
+  currentIndexCount: number;
+}
+
 export interface DatabaseGrowthComparisonResult {
   baseline: {
     connection: string;
     database: string;
     capturedAt: string;
     asOf?: string;
+    source: 'live' | 'snapshot';
+    snapshotId?: string;
     tablesTruncated: boolean;
+    schemaTruncated: boolean;
   };
   current: {
     connection: string;
     database: string;
     capturedAt: string;
+    source: 'live' | 'snapshot';
+    snapshotId?: string;
     tablesTruncated: boolean;
+    schemaTruncated: boolean;
   };
   summary: {
     totalAllocatedDeltaMb: number;
@@ -200,12 +236,19 @@ export interface DatabaseGrowthComparisonResult {
     unattributedDataUsedDeltaMb: number;
     attributionPercent: number | null;
     tableCountDelta: number;
+    addedTableCount: number;
+    removedTableCount: number;
+    schemaChangedTableCount: number;
   };
   fileDeltas: DatabaseGrowthFileDelta[];
   tableDeltas: DatabaseGrowthTableDelta[];
   totalTableDifferenceCount: number;
   returnedTableDifferenceCount: number;
   omittedTableDifferenceCount: number;
+  schemaDeltas: DatabaseGrowthSchemaDelta[];
+  totalSchemaDifferenceCount: number;
+  returnedSchemaDifferenceCount: number;
+  omittedSchemaDifferenceCount: number;
   limitations: string[];
 }
 

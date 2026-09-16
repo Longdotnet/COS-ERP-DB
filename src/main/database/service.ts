@@ -10,8 +10,11 @@ import { searchSqlServerObjects } from './metadata.js';
 import type {
   DatabaseAccessMode,
   DatabaseGrowthCapture,
+  DatabaseGrowthCompareRequest,
+  DatabaseGrowthCompareSource,
   DatabaseGrowthComparisonResult,
   DatabaseGrowthDiagnosticsResult,
+  DatabaseGrowthSnapshot,
   DatabaseObjectDetailRequest,
   DatabaseObjectDetailsResult,
   DatabaseObjectSearchInput,
@@ -29,6 +32,7 @@ import { readSqlServerObjectDetails } from './object-details.js';
 import { readSqlServerGrowthDiagnostics } from './growth-diagnostics.js';
 import { readSqlServerGrowthCapture } from './growth-capture.js';
 import { compareDatabaseGrowthCaptures } from './growth-compare.js';
+import { readDatabaseGrowthSnapshot } from './growth-history.js';
 import { getDatabaseWorkspaceContext } from './workspace-context.js';
 import { readDatabaseSettings } from './store.js';
 
@@ -635,23 +639,67 @@ export async function executeDatabaseGrowthCapture(
   }
 }
 
-/** Live database-to-database comparison. Full attribution is computed in main before renderer truncation. */
+function snapshotAsGrowthCapture(snapshot: DatabaseGrowthSnapshot): DatabaseGrowthCapture {
+  const legacy = snapshot.captureVersion !== 2 || !snapshot.tables;
+  const schemaUnavailable = !snapshot.tableFingerprints;
+  return {
+    captureVersion: 2,
+    database: snapshot.database,
+    capturedAt: snapshot.capturedAt,
+    summary: snapshot.summary,
+    files: snapshot.files ?? [],
+    tables: snapshot.tables ?? snapshot.largestTables ?? [],
+    tablesTruncated: snapshot.tablesTruncated ?? legacy,
+    tableFingerprints: snapshot.tableFingerprints ?? [],
+    schemaTruncated: snapshot.schemaTruncated ?? schemaUnavailable,
+    limitations: [
+      ...(snapshot.limitations ?? []),
+      ...(legacy ? ['This legacy snapshot contains only a bounded table list and no complete database-file capture. Table attribution and file-level comparison are incomplete.'] : []),
+      ...(schemaUnavailable ? ['This snapshot predates column/index schema fingerprints. Schema drift is unavailable for this source.'] : [])
+    ]
+  };
+}
+
+async function resolveGrowthCompareSource(
+  source: DatabaseGrowthCompareSource,
+  runtime: DatabaseRuntime,
+  options: { signal?: AbortSignal }
+): Promise<{ connection: string; capture: DatabaseGrowthCapture; source: 'live' | 'snapshot'; snapshotId?: string }> {
+  if (source.type === 'live') {
+    const live = await executeDatabaseGrowthCapture(source.connection, runtime, options);
+    return { ...live, source: 'live' };
+  }
+  const snapshot = await readDatabaseGrowthSnapshot(source.connection, source.snapshotId);
+  return {
+    connection: source.connection,
+    capture: snapshotAsGrowthCapture(snapshot),
+    source: 'snapshot',
+    snapshotId: snapshot.id
+  };
+}
+
+/** Live/saved-source comparison. Full attribution is computed in main before renderer truncation. */
 export async function executeDatabaseGrowthComparison(
-  baselineConnection: string,
-  currentConnection: string,
+  request: DatabaseGrowthCompareRequest,
   runtime: DatabaseRuntime = DEFAULT_RUNTIME,
-  options: { signal?: AbortSignal; baselineAsOf?: string } = {}
+  options: { signal?: AbortSignal } = {}
 ): Promise<DatabaseGrowthComparisonResult> {
   const [baseline, current] = await Promise.all([
-    executeDatabaseGrowthCapture(baselineConnection, runtime, options),
-    executeDatabaseGrowthCapture(currentConnection, runtime, options)
+    resolveGrowthCompareSource(request.baseline, runtime, options),
+    resolveGrowthCompareSource(request.current, runtime, options)
   ]);
   return compareDatabaseGrowthCaptures(
     baseline.connection,
     baseline.capture,
     current.connection,
     current.capture,
-    options.baselineAsOf ? { baselineAsOf: options.baselineAsOf } : {}
+    {
+      ...(request.baselineAsOf ? { baselineAsOf: request.baselineAsOf } : {}),
+      baselineSource: baseline.source,
+      ...(baseline.snapshotId ? { baselineSnapshotId: baseline.snapshotId } : {}),
+      currentSource: current.source,
+      ...(current.snapshotId ? { currentSnapshotId: current.snapshotId } : {})
+    }
   );
 }
 

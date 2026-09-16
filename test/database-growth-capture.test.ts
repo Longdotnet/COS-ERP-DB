@@ -25,6 +25,11 @@ describe('database growth capture', () => {
       ]);
       if (sql.includes('FROM sys.databases')) return result([{ recovery_model_desc: 'FULL', log_reuse_wait_desc: 'NOTHING' }]);
       if (sql.includes('COUNT_BIG')) return result([{ table_count: 3 }]);
+      if (sql.includes('COS_GROWTH_SCHEMA_FINGERPRINTS')) return result([
+        { schema_name: 'dbo', table_name: 'BigOne', column_count: 5, index_count: 2, column_hash: '101', index_hash: '201' },
+        { schema_name: 'dbo', table_name: 'SmallOne', column_count: 3, index_count: 1, column_hash: '102', index_hash: '202' },
+        { schema_name: 'erp', table_name: 'Audit', column_count: 8, index_count: 3, column_hash: '103', index_hash: '203' }
+      ]);
       if (sql.includes('FROM sys.dm_db_partition_stats')) {
         partitionStatsCalls += 1;
         if (partitionStatsCalls === 1) return result([
@@ -47,6 +52,12 @@ describe('database growth capture', () => {
       'dbo.BigOne', 'dbo.SmallOne', 'erp.Audit'
     ]);
     expect(capture.tablesTruncated).toBe(false);
+    expect(capture.tableFingerprints).toEqual([
+      { schema: 'dbo', name: 'BigOne', columnCount: 5, indexCount: 2, columnHash: '101', indexHash: '201' },
+      { schema: 'dbo', name: 'SmallOne', columnCount: 3, indexCount: 1, columnHash: '102', indexHash: '202' },
+      { schema: 'erp', name: 'Audit', columnCount: 8, indexCount: 3, columnHash: '103', indexHash: '203' }
+    ]);
+    expect(capture.schemaTruncated).toBe(false);
     expect(partitionStatsCalls).toBe(2);
   });
 
@@ -57,6 +68,7 @@ describe('database growth capture', () => {
       if (sql.includes('FROM sys.dm_db_log_space_usage')) return result([]);
       if (sql.includes('FROM sys.databases')) return result([{ recovery_model_desc: 'SIMPLE', log_reuse_wait_desc: 'NOTHING' }]);
       if (sql.includes('COUNT_BIG')) return result([{ table_count: MAX_GROWTH_CAPTURE_TABLES + 10 }]);
+      if (sql.includes('COS_GROWTH_SCHEMA_FINGERPRINTS')) return result([]);
       if (sql.includes('FROM sys.dm_db_partition_stats')) {
         partitionStatsCalls += 1;
         if (partitionStatsCalls === 1) return result([]);
@@ -77,6 +89,31 @@ describe('database growth capture', () => {
     const capture = await readSqlServerGrowthCapture(connection, {}, query);
     expect(capture.tables).toHaveLength(MAX_GROWTH_CAPTURE_TABLES);
     expect(capture.tablesTruncated).toBe(true);
+    expect(capture.schemaTruncated).toBe(false);
     expect(capture.limitations.join(' ')).toMatch(/limited to 5,000/i);
+  });
+
+  it('keeps storage capture usable when column/index fingerprint metadata is unavailable', async () => {
+    let partitionStatsCalls = 0;
+    const query = vi.fn(async (_connection: SqlServerConnection, sql: string): Promise<SqlServerQueryResult> => {
+      if (sql.includes('FROM sys.database_files')) return result([{ logical_name: 'ERP', type_desc: 'ROWS', size_mb: 100, used_mb: 80, growth: 12800, is_percent_growth: false }]);
+      if (sql.includes('FROM sys.dm_db_log_space_usage')) return result([]);
+      if (sql.includes('FROM sys.databases')) return result([{ recovery_model_desc: 'SIMPLE', log_reuse_wait_desc: 'NOTHING' }]);
+      if (sql.includes('COUNT_BIG')) return result([{ table_count: 1 }]);
+      if (sql.includes('COS_GROWTH_SCHEMA_FINGERPRINTS')) throw new Error('metadata denied');
+      if (sql.includes('FROM sys.dm_db_partition_stats')) {
+        partitionStatsCalls += 1;
+        return result(partitionStatsCalls === 1 ? [] : [
+          { object_id: 1, schema_name: 'dbo', table_name: 'History', row_count: 100, reserved_mb: 20, used_mb: 18, data_mb: 16, index_mb: 2 }
+        ]);
+      }
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+
+    const capture = await readSqlServerGrowthCapture(connection, {}, query);
+    expect(capture.tables).toHaveLength(1);
+    expect(capture.tableFingerprints).toEqual([]);
+    expect(capture.schemaTruncated).toBe(true);
+    expect(capture.limitations.join(' ')).toMatch(/schema fingerprint.*unavailable/i);
   });
 });

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
-import type { DatabaseSettingsState } from '../src/shared/database.js';
+import type { DatabaseGrowthCompareRequest, DatabaseSettingsState } from '../src/shared/database.js';
 
 let dom: JSDOM;
 let state: DatabaseSettingsState;
@@ -70,11 +70,30 @@ beforeEach(() => {
       files: [],
       tables: [{ objectId: 42, schema: 'dbo', name: 'L00ZONES', rows: 1000, reservedMb: 150, usedMb: 140, dataMb: 130, indexMb: 10 }],
       tablesTruncated: false,
+      tableFingerprints: [{ schema: 'dbo', name: 'L00ZONES', columnCount: 4, indexCount: 2, columnHash: '100', indexHash: '200' }],
+      schemaTruncated: false,
       limitations: []
     })),
-    compareDatabaseGrowth: vi.fn((request: { baselineConnection: string; currentConnection: string; baselineAsOf?: string }) => reply({
-      baseline: { connection: request.baselineConnection, database: 'L80LINKQ_2025', capturedAt: '2026-09-16T01:00:00.000Z', ...(request.baselineAsOf ? { asOf: request.baselineAsOf } : {}), tablesTruncated: false },
-      current: { connection: request.currentConnection, database: 'L80LINKQ.TEST', capturedAt: '2026-09-16T01:00:01.000Z', tablesTruncated: false },
+    compareDatabaseGrowth: vi.fn((request: DatabaseGrowthCompareRequest) => reply({
+      baseline: {
+        connection: request.baseline.connection,
+        database: 'L80LINKQ_2025',
+        capturedAt: '2026-09-16T01:00:00.000Z',
+        ...(request.baselineAsOf ? { asOf: request.baselineAsOf } : {}),
+        source: request.baseline.type,
+        ...(request.baseline.type === 'snapshot' ? { snapshotId: request.baseline.snapshotId } : {}),
+        tablesTruncated: false,
+        schemaTruncated: false
+      },
+      current: {
+        connection: request.current.connection,
+        database: 'L80LINKQ.TEST',
+        capturedAt: '2026-09-16T01:00:01.000Z',
+        source: request.current.type,
+        ...(request.current.type === 'snapshot' ? { snapshotId: request.current.snapshotId } : {}),
+        tablesTruncated: false,
+        schemaTruncated: false
+      },
       summary: {
         totalAllocatedDeltaMb: 20480,
         dataAllocatedDeltaMb: 17408,
@@ -84,7 +103,10 @@ beforeEach(() => {
         tableUsedDeltaMb: 11755,
         unattributedDataUsedDeltaMb: 3045,
         attributionPercent: 79.43,
-        tableCountDelta: 23
+        tableCountDelta: 23,
+        addedTableCount: 23,
+        removedTableCount: 0,
+        schemaChangedTableCount: 1
       },
       fileDeltas: [{ name: 'ERP', type: 'data', state: 'matched', baselineSizeMb: 4096, currentSizeMb: 21504, sizeDeltaMb: 17408, baselineUsedMb: 3800, currentUsedMb: 18600, usedDeltaMb: 14800 }],
       tableDeltas: [{
@@ -98,6 +120,15 @@ beforeEach(() => {
       totalTableDifferenceCount: 1,
       returnedTableDifferenceCount: 1,
       omittedTableDifferenceCount: 0,
+      schemaDeltas: [{
+        schema: 'dbo', name: 'L01BANKHISTORY', baselineObjectId: 10, currentObjectId: 900,
+        columnChanged: true, indexChanged: true,
+        baselineColumnCount: 8, currentColumnCount: 10,
+        baselineIndexCount: 2, currentIndexCount: 4
+      }],
+      totalSchemaDifferenceCount: 1,
+      returnedSchemaDifferenceCount: 1,
+      omittedSchemaDifferenceCount: 0,
       limitations: []
     })),
     readDatabaseGrowthHistory: vi.fn(() => reply({ connection: 'linkq-test', snapshots: [] })),
@@ -250,15 +281,15 @@ it('compares a restored baseline database with the current database and sends me
   const baseline = document.getElementById('databaseGrowthCompareBaseline') as HTMLSelectElement;
   const current = document.getElementById('databaseGrowthCompareCurrent') as HTMLSelectElement;
   const baselineDate = document.getElementById('databaseGrowthCompareBaselineDate') as HTMLInputElement;
-  baseline.value = 'linkq-2025';
-  current.value = 'linkq-test';
+  baseline.value = JSON.stringify({ type: 'live', connection: 'linkq-2025' });
+  current.value = JSON.stringify({ type: 'live', connection: 'linkq-test' });
   baselineDate.value = '2025-09-16';
   document.getElementById('databaseGrowthCompareRun')!.click();
   await tick();
 
   expect(api.compareDatabaseGrowth).toHaveBeenCalledWith({
-    baselineConnection: 'linkq-2025',
-    currentConnection: 'linkq-test',
+    baseline: { type: 'live', connection: 'linkq-2025' },
+    current: { type: 'live', connection: 'linkq-test' },
     baselineAsOf: '2025-09-16'
   });
   const comparison = document.getElementById('databaseGrowthCompareBody')!;
@@ -266,6 +297,8 @@ it('compares a restored baseline database with the current database and sends me
   expect(comparison.textContent).toContain('79.4%');
   expect(comparison.textContent).toContain('dbo.L01BANKHISTORY');
   expect(comparison.textContent).toContain('+39,000,000');
+  expect(comparison.textContent).toContain('Schema & index drift');
+  expect(comparison.textContent).toContain('8 → 10 · changed');
 
   let aiPrompt = '';
   dom.window.addEventListener('cos:database-open-chat', event => {
@@ -275,7 +308,46 @@ it('compares a restored baseline database with the current database and sends me
   expect(aiPrompt).toContain('2025-09-16');
   expect(aiPrompt).toContain('data actually used');
   expect(aiPrompt).toContain('L01BANKHISTORY');
+  expect(aiPrompt).toContain('matching tables with column/index drift: 1');
   expect(aiPrompt).toContain('Do not claim a historical cause');
+});
+
+it('offers saved snapshots as compare sources and can compare a snapshot with the live database', async () => {
+  const snapshotId = '22222222-2222-4222-8222-222222222222';
+  api.readDatabaseGrowthHistory!.mockImplementation((id: string) => reply({
+    connection: id,
+    snapshots: id === 'linkq-test' ? [{
+      id: snapshotId,
+      connection: 'linkq-test',
+      savedAt: '2025-09-16T01:01:00.000Z',
+      captureVersion: 2,
+      database: 'L80LINKQ.TEST',
+      capturedAt: '2025-09-16T01:00:00.000Z',
+      summary: { totalMb: 5000, dataMb: 4000, logMb: 1000, dataUsedMb: 3500, logUsedMb: 100, logUsedPercent: 10, tableCount: 220 },
+      files: [],
+      tables: [],
+      tablesTruncated: false,
+      limitations: []
+    }] : []
+  }));
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+  await tick();
+
+  const baseline = document.getElementById('databaseGrowthCompareBaseline') as HTMLSelectElement;
+  const current = document.getElementById('databaseGrowthCompareCurrent') as HTMLSelectElement;
+  expect([...baseline.options].some(option => option.textContent?.includes('Snapshot · LinkQ Test'))).toBe(true);
+  expect(JSON.parse(baseline.value)).toEqual({ type: 'snapshot', connection: 'linkq-test', snapshotId });
+  expect(JSON.parse(current.value)).toEqual({ type: 'live', connection: 'linkq-test' });
+
+  document.getElementById('databaseGrowthCompareRun')!.click();
+  await tick();
+  expect(api.compareDatabaseGrowth).toHaveBeenCalledWith({
+    baseline: { type: 'snapshot', connection: 'linkq-test', snapshotId },
+    current: { type: 'live', connection: 'linkq-test' }
+  });
 });
 
 it('shows an explicit unsaved connection on first use', async () => {

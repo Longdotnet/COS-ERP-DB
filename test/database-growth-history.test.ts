@@ -7,6 +7,7 @@ import {
   resetDatabaseGrowthHistoryForTests,
   saveDatabaseGrowthSnapshot
 } from '../src/main/database/growth-history.js';
+import { executeDatabaseGrowthComparison } from '../src/main/database/service.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
@@ -62,6 +63,12 @@ describe('database growth history', () => {
         { objectId: 12, schema: 'dbo', name: 'Master', rows: 50, reservedMb: 50, usedMb: 45, dataMb: 40, indexMb: 5 }
       ],
       tablesTruncated: false,
+      tableFingerprints: [
+        { schema: 'dbo', name: 'History', columnCount: 5, indexCount: 2, columnHash: '100', indexHash: '200' },
+        { schema: 'dbo', name: 'Audit', columnCount: 8, indexCount: 3, columnHash: '101', indexHash: '201' },
+        { schema: 'dbo', name: 'Master', columnCount: 3, indexCount: 1, columnHash: '102', indexHash: '202' }
+      ],
+      schemaTruncated: false,
       limitations: []
     };
     await saveDatabaseGrowthSnapshot('customer-a', current);
@@ -70,6 +77,46 @@ describe('database growth history', () => {
     expect(history.snapshots).toHaveLength(2);
     expect(history.snapshots[0]).toMatchObject({ captureVersion: 2, tablesTruncated: false });
     expect(history.snapshots[0]!.tables).toHaveLength(3);
+    expect(history.snapshots[0]!.tableFingerprints).toHaveLength(3);
+    expect(history.snapshots[0]!.schemaTruncated).toBe(false);
     expect(history.snapshots[1]!.largestTables).toHaveLength(1);
+  });
+
+  it('compares two saved snapshots without reconnecting to SQL Server', async () => {
+    const first = await saveDatabaseGrowthSnapshot('customer-a', {
+      captureVersion: 2,
+      database: 'ERP',
+      capturedAt: '2025-09-16T00:00:00.000Z',
+      summary: { totalMb: 5000, dataMb: 4000, logMb: 1000, dataUsedMb: 3500, logUsedMb: 100, logUsedPercent: 10, tableCount: 1 },
+      files: [{ name: 'ERP', type: 'data', sizeMb: 4000, usedMb: 3500, freeMb: 500, growth: 128, percentGrowth: false }],
+      tables: [{ objectId: 1, schema: 'dbo', name: 'History', rows: 1000, reservedMb: 800, usedMb: 700, dataMb: 650, indexMb: 50 }],
+      tablesTruncated: false,
+      tableFingerprints: [{ schema: 'dbo', name: 'History', columnCount: 5, indexCount: 2, columnHash: '100', indexHash: '200' }],
+      schemaTruncated: false,
+      limitations: []
+    });
+    const second = await saveDatabaseGrowthSnapshot('customer-a', {
+      captureVersion: 2,
+      database: 'ERP',
+      capturedAt: '2026-09-16T00:00:00.000Z',
+      summary: { totalMb: 25000, dataMb: 21000, logMb: 4000, dataUsedMb: 18000, logUsedMb: 500, logUsedPercent: 12.5, tableCount: 1 },
+      files: [{ name: 'ERP', type: 'data', sizeMb: 21000, usedMb: 18000, freeMb: 3000, growth: 512, percentGrowth: false }],
+      tables: [{ objectId: 99, schema: 'dbo', name: 'History', rows: 40000000, reservedMb: 8500, usedMb: 8200, dataMb: 7100, indexMb: 1100 }],
+      tablesTruncated: false,
+      tableFingerprints: [{ schema: 'dbo', name: 'History', columnCount: 6, indexCount: 3, columnHash: '101', indexHash: '201' }],
+      schemaTruncated: false,
+      limitations: []
+    });
+
+    const comparison = await executeDatabaseGrowthComparison({
+      baseline: { type: 'snapshot', connection: 'customer-a', snapshotId: first.snapshots[0]!.id },
+      current: { type: 'snapshot', connection: 'customer-a', snapshotId: second.snapshots[0]!.id }
+    });
+
+    expect(comparison.baseline).toMatchObject({ source: 'snapshot', capturedAt: '2025-09-16T00:00:00.000Z' });
+    expect(comparison.current).toMatchObject({ source: 'snapshot', capturedAt: '2026-09-16T00:00:00.000Z' });
+    expect(comparison.summary.totalAllocatedDeltaMb).toBe(20000);
+    expect(comparison.tableDeltas[0]).toMatchObject({ name: 'History', state: 'matched', baselineObjectId: 1, currentObjectId: 99 });
+    expect(comparison.schemaDeltas[0]).toMatchObject({ name: 'History', columnChanged: true, indexChanged: true });
   });
 });

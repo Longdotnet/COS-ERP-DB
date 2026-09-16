@@ -128,20 +128,23 @@ export function registerDatabaseIpc(handle: RegisterHandler): void {
   });
 
   handle<DatabaseGrowthComparisonResult>('database:growthCompare', async payload => {
+    const source = z.discriminatedUnion('type', [
+      z.object({ type: z.literal('live'), connection: profileIdArg.shape.id }).strict(),
+      z.object({
+        type: z.literal('snapshot'),
+        connection: profileIdArg.shape.id,
+        snapshotId: z.string().uuid()
+      }).strict()
+    ]);
     const parsed = z.object({
-      baselineConnection: profileIdArg.shape.id,
-      currentConnection: profileIdArg.shape.id,
+      baseline: source,
+      current: source,
       baselineAsOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
     }).strict().refine(
-      value => value.baselineConnection.toLowerCase() !== value.currentConnection.toLowerCase(),
-      'Baseline and current database connections must be different.'
+      value => JSON.stringify(value.baseline) !== JSON.stringify(value.current),
+      'Baseline and current database sources must be different.'
     ).parse(payload) as DatabaseGrowthCompareRequest;
-    return executeDatabaseGrowthComparison(
-      parsed.baselineConnection,
-      parsed.currentConnection,
-      undefined,
-      parsed.baselineAsOf ? { baselineAsOf: parsed.baselineAsOf } : {}
-    );
+    return executeDatabaseGrowthComparison(parsed);
   });
 
   handle<DatabaseGrowthHistoryResult>('database:growthHistory', async payload => {

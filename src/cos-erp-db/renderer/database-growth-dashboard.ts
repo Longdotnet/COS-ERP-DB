@@ -4,6 +4,7 @@ import type {
   DatabaseGrowthFinding,
   DatabaseGrowthHistoryResult,
   DatabaseGrowthCapture,
+  DatabaseGrowthCompareSource,
   DatabaseGrowthComparisonResult,
   DatabaseGrowthSnapshot,
   DatabaseGrowthSnapshotInput,
@@ -21,6 +22,8 @@ let root: HTMLElement | null = null;
 let selectedConnection = '';
 let generation = 0;
 let comparisonGeneration = 0;
+let comparisonSourcesGeneration = 0;
+let latestSettings: DatabaseSettingsState | null = null;
 const cache = new Map<string, DatabaseGrowthDiagnosticsResult>();
 const historyCache = new Map<string, DatabaseGrowthHistoryResult>();
 let activeComparison: DatabaseGrowthComparisonResult | null = null;
@@ -150,21 +153,51 @@ function signedRows(value: number): string {
   return `${rounded > 0 ? '+' : '−'}${Math.abs(rounded).toLocaleString('en-US')}`;
 }
 
+function encodeCompareSource(source: DatabaseGrowthCompareSource): string {
+  return JSON.stringify(source);
+}
+
+function decodeCompareSource(value: string): DatabaseGrowthCompareSource | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<DatabaseGrowthCompareSource>;
+    if (parsed.type === 'live' && typeof parsed.connection === 'string') {
+      return { type: 'live', connection: parsed.connection };
+    }
+    if (parsed.type === 'snapshot' && typeof parsed.connection === 'string' && typeof parsed.snapshotId === 'string') {
+      return { type: 'snapshot', connection: parsed.connection, snapshotId: parsed.snapshotId };
+    }
+  } catch {
+    // Select values are app-owned; an invalid value is treated as unavailable rather than guessed.
+  }
+  return null;
+}
+
+function compareSourceDescription(source: DatabaseGrowthComparisonResult['baseline'] | DatabaseGrowthComparisonResult['current']): string {
+  return source.source === 'snapshot'
+    ? `saved snapshot captured ${new Date(source.capturedAt).toLocaleString()}`
+    : `live database captured ${new Date(source.capturedAt).toLocaleString()}`;
+}
+
 function comparisonAiPrompt(result: DatabaseGrowthComparisonResult): string {
   const baselineDate = result.baseline.asOf
     ? `The user declared the baseline database represents ${result.baseline.asOf}.`
-    : `No historical as-of date was supplied for the baseline. Both live captures were measured now; do not infer the age of the baseline from its database or connection name.`;
+    : result.baseline.source === 'snapshot'
+      ? `The baseline is a saved measurement captured at ${result.baseline.capturedAt}. If that snapshot came from a restored older backup, its capture timestamp alone does not prove the backup's business as-of date.`
+      : `No historical as-of date was supplied for the live baseline. Do not infer the age of the baseline from its database or connection name.`;
   const tables = result.tableDeltas.slice(0, 12).map(table =>
     `- ${table.schema}.${table.name} [${table.state}]: used ${signedSize(table.usedDeltaMb)}, reserved ${signedSize(table.reservedDeltaMb)}, rows ${signedRows(table.rowDelta)}, indexes ${signedSize(table.indexDeltaMb)}`
   ).join('\n');
   const files = result.fileDeltas.slice(0, 8).map(file =>
     `- ${file.type} ${file.name} [${file.state}]: allocated ${signedSize(file.sizeDeltaMb)}${file.usedDeltaMb === null ? '' : `, used ${signedSize(file.usedDeltaMb)}`}`
   ).join('\n');
+  const schemas = result.schemaDeltas.slice(0, 12).map(delta =>
+    `- ${delta.schema}.${delta.name}: columns ${delta.baselineColumnCount} → ${delta.currentColumnCount}${delta.columnChanged ? ' (changed)' : ''}, indexes ${delta.baselineIndexCount} → ${delta.currentIndexCount}${delta.indexChanged ? ' (changed)' : ''}`
+  ).join('\n');
   const limitations = result.limitations.length ? result.limitations.map(item => `- ${item}`).join('\n') : '- none';
   return [
     `Explain this SQL Server Database Growth Compare in Vietnamese for an ERP developer.`,
-    `Baseline: connection "${result.baseline.connection}" / database "${result.baseline.database}".`,
-    `Current: connection "${result.current.connection}" / database "${result.current.database}".`,
+    `Baseline: ${result.baseline.source} source, connection "${result.baseline.connection}" / database "${result.baseline.database}", captured ${result.baseline.capturedAt}.`,
+    `Current: ${result.current.source} source, connection "${result.current.connection}" / database "${result.current.database}", captured ${result.current.capturedAt}.`,
     baselineDate,
     'Use only measured evidence below. Separate measured facts from hypotheses. Do not claim a historical cause merely because two database states differ.',
     'Give: (1) what changed in plain language, (2) where the measured growth is concentrated, (3) likely causes ranked by confidence, (4) the next 3 checks/actions, and (5) what cannot yet be concluded.',
@@ -179,12 +212,18 @@ function comparisonAiPrompt(result: DatabaseGrowthComparisonResult): string {
     `- unattributed data-used delta: ${signedSize(result.summary.unattributedDataUsedDeltaMb)}`,
     `- attribution coverage: ${result.summary.attributionPercent === null ? 'not applicable' : `${result.summary.attributionPercent.toFixed(1)}%`}`,
     `- user-table count delta: ${signedRows(result.summary.tableCountDelta)}`,
+    `- tables added: ${result.summary.addedTableCount}`,
+    `- tables removed: ${result.summary.removedTableCount}`,
+    `- matching tables with column/index drift: ${result.summary.schemaChangedTableCount}`,
     '',
     `Largest object differences (${result.returnedTableDifferenceCount} shown of ${result.totalTableDifferenceCount}):`,
     tables || '- none',
     '',
     'File differences:',
     files || '- none',
+    '',
+    `Column/index fingerprint differences (${result.returnedSchemaDifferenceCount} shown of ${result.totalSchemaDifferenceCount}):`,
+    schemas || '- none',
     '',
     'Limitations:',
     limitations
@@ -200,7 +239,7 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
   const summary = el('section', 'database-growth-panel database-growth-compare-summary');
   const dateDetail = result.baseline.asOf
     ? `Baseline as of ${result.baseline.asOf}`
-    : 'Live-state comparison · baseline historical date not supplied';
+    : `${compareSourceDescription(result.baseline)} → ${compareSourceDescription(result.current)}`;
   summary.append(sectionHead('Database comparison', `${result.baseline.database} → ${result.current.database}`));
   const metrics = el('div', 'database-growth-metrics');
   metrics.append(
@@ -209,7 +248,11 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
     metric('Log allocation change', signedSize(result.summary.logAllocatedDeltaMb), `${signedSize(result.summary.logUsedDeltaMb)} currently used`, 'is-log'),
     metric('Measured attribution', result.summary.attributionPercent === null ? 'N/A' : `${result.summary.attributionPercent.toFixed(1)}%`, `${signedSize(result.summary.unattributedDataUsedDeltaMb)} data-used delta remains unattributed`)
   );
-  summary.append(metrics, el('p', 'database-growth-baseline-note', () => t('Allocated file growth and actually used data are shown separately so preallocated free space is not mistaken for ERP row growth.')));
+  summary.append(
+    metrics,
+    el('p', 'database-growth-baseline-note', () => t('Allocated file growth and actually used data are shown separately so preallocated free space is not mistaken for ERP row growth.')),
+    el('p', 'database-growth-baseline-note', `Tables: +${result.summary.addedTableCount.toLocaleString('en-US')} added · −${result.summary.removedTableCount.toLocaleString('en-US')} removed · ${result.summary.schemaChangedTableCount.toLocaleString('en-US')} matching table${result.summary.schemaChangedTableCount === 1 ? '' : 's'} changed columns or indexes.`)
+  );
 
   const objects = el('section', 'database-growth-panel database-growth-compare-objects');
   objects.append(sectionHead('Largest object changes', `${result.returnedTableDifferenceCount} of ${result.totalTableDifferenceCount}`));
@@ -226,7 +269,7 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
     for (const item of result.tableDeltas.slice(0, 25)) {
       const row = document.createElement('tr');
       const name = document.createElement('td');
-      if (item.currentObjectId !== null) {
+      if (result.current.source === 'live' && item.currentObjectId !== null) {
         const open = document.createElement('button');
         open.type = 'button';
         open.className = 'database-growth-table-link';
@@ -290,7 +333,54 @@ function renderComparison(result: DatabaseGrowthComparisonResult): void {
     files.append(scroll);
   }
 
-  const panels: HTMLElement[] = [summary, objects, files];
+  const schema = el('section', 'database-growth-panel database-growth-compare-schema');
+  schema.append(sectionHead('Schema & index drift', `${result.returnedSchemaDifferenceCount} of ${result.totalSchemaDifferenceCount}`));
+  if (result.schemaDeltas.length === 0) {
+    schema.append(el('p', 'database-growth-baseline-note', () => t('No column or index fingerprint differences were measured for tables present in both captured sources.')));
+  } else {
+    const table = document.createElement('table');
+    table.className = 'database-growth-table';
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    for (const text of ['Object', 'Columns', 'Indexes']) headRow.append(el('th', '', text));
+    thead.append(headRow);
+    const tbody = document.createElement('tbody');
+    for (const item of result.schemaDeltas.slice(0, 25)) {
+      const row = document.createElement('tr');
+      const name = document.createElement('td');
+      if (result.current.source === 'live' && item.currentObjectId !== null) {
+        const open = document.createElement('button');
+        open.type = 'button';
+        open.className = 'database-growth-table-link';
+        open.textContent = `${item.schema}.${item.name}`;
+        open.addEventListener('click', () => openDatabaseExplorerObject(result.current.connection, {
+          objectId: item.currentObjectId!,
+          schema: item.schema,
+          name: item.name,
+          type: 'table',
+          modifiedAt: null
+        }));
+        name.append(open);
+      } else {
+        name.textContent = `${item.schema}.${item.name}`;
+      }
+      row.append(
+        name,
+        el('td', '', `${item.baselineColumnCount} → ${item.currentColumnCount}${item.columnChanged ? ' · changed' : ''}`),
+        el('td', '', `${item.baselineIndexCount} → ${item.currentIndexCount}${item.indexChanged ? ' · changed' : ''}`)
+      );
+      tbody.append(row);
+    }
+    table.append(thead, tbody);
+    const scroll = el('div', 'database-growth-table-scroll');
+    scroll.append(table);
+    schema.append(scroll);
+    if (result.omittedSchemaDifferenceCount > 0) {
+      schema.append(el('p', 'database-growth-baseline-note', `${result.omittedSchemaDifferenceCount.toLocaleString('en-US')} additional schema/index differences were omitted from this summary.`));
+    }
+  }
+
+  const panels: HTMLElement[] = [summary, objects, schema, files];
   if (result.limitations.length) {
     const limits = el('section', 'database-growth-panel database-growth-limitations');
     limits.append(sectionHead('Comparison limitations'));
@@ -311,6 +401,83 @@ function renderComparisonState(message: string, isError = false): void {
   body.replaceChildren(state);
   activeComparison = null;
   byId<HTMLButtonElement>('databaseGrowthCompareExplain').disabled = true;
+}
+
+async function refreshComparisonSources(next: DatabaseSettingsState): Promise<void> {
+  if (!root) return;
+  const token = ++comparisonSourcesGeneration;
+  const baselineSelect = byId<HTMLSelectElement>('databaseGrowthCompareBaseline');
+  const currentSelect = byId<HTMLSelectElement>('databaseGrowthCompareCurrent');
+  const runCompare = byId<HTMLButtonElement>('databaseGrowthCompareRun');
+  const previousBaseline = baselineSelect.value;
+  const previousCurrent = currentSelect.value;
+  baselineSelect.disabled = true;
+  currentSelect.disabled = true;
+  runCompare.disabled = true;
+
+  const histories = await Promise.all(next.settings.connections.map(async profile => {
+    const reply = await api.readDatabaseGrowthHistory(profile.id);
+    const history = reply.ok ? reply.data : { connection: profile.id, snapshots: [] };
+    if (reply.ok) historyCache.set(profile.id, history);
+    return { profile, history };
+  }));
+  if (!root || token !== comparisonSourcesGeneration) return;
+
+  const choices: Array<{ source: DatabaseGrowthCompareSource; label: string; capturedAt?: string }> = [];
+  for (const { profile, history } of histories) {
+    choices.push({
+      source: { type: 'live', connection: profile.id },
+      label: `Live · ${profile.name} · ${profile.database}`
+    });
+    for (const snapshot of history.snapshots) {
+      choices.push({
+        source: { type: 'snapshot', connection: profile.id, snapshotId: snapshot.id },
+        label: `Snapshot · ${profile.name} · ${new Date(snapshot.capturedAt).toLocaleString()} · ${snapshot.database}`,
+        capturedAt: snapshot.capturedAt
+      });
+    }
+  }
+
+  const makeOptions = () => choices.map(choice => {
+    const option = document.createElement('option');
+    option.value = encodeCompareSource(choice.source);
+    option.textContent = choice.label;
+    return option;
+  });
+  baselineSelect.replaceChildren(...makeOptions());
+  currentSelect.replaceChildren(...makeOptions());
+  const values = new Set(choices.map(choice => encodeCompareSource(choice.source)));
+
+  const defaultCurrent = encodeCompareSource({
+    type: 'live',
+    connection: selectedConnection || next.settings.defaultConnectionId || next.settings.connections[0]?.id || ''
+  });
+  const currentValue = values.has(previousCurrent) ? previousCurrent : values.has(defaultCurrent) ? defaultCurrent : choices[0] ? encodeCompareSource(choices[0].source) : '';
+  const currentSource = decodeCompareSource(currentValue);
+
+  let baselineValue = values.has(previousBaseline) && previousBaseline !== currentValue ? previousBaseline : '';
+  if (!baselineValue && currentSource) {
+    const sameConnectionSnapshots = choices
+      .filter(choice => choice.source.type === 'snapshot' && choice.source.connection === currentSource.connection)
+      .sort((left, right) => (left.capturedAt ?? '').localeCompare(right.capturedAt ?? ''));
+    const oldest = sameConnectionSnapshots.find(choice => encodeCompareSource(choice.source) !== currentValue);
+    if (oldest) baselineValue = encodeCompareSource(oldest.source);
+  }
+  if (!baselineValue) {
+    const alternate = choices.find(choice => encodeCompareSource(choice.source) !== currentValue);
+    baselineValue = alternate ? encodeCompareSource(alternate.source) : '';
+  }
+
+  currentSelect.value = currentValue;
+  baselineSelect.value = baselineValue;
+  const canCompare = Boolean(baselineValue && currentValue && baselineValue !== currentValue);
+  baselineSelect.disabled = choices.length < 2;
+  currentSelect.disabled = choices.length < 2;
+  runCompare.disabled = !canCompare;
+  if (!canCompare) {
+    activeComparison = null;
+    byId<HTMLButtonElement>('databaseGrowthCompareExplain').disabled = true;
+  }
 }
 
 function historyPanel(result: DatabaseGrowthDiagnosticsResult): HTMLElement {
@@ -576,7 +743,7 @@ function build(mount: HTMLElement): void {
   const compareCopy = el('div', 'database-growth-compare-copy');
   compareCopy.append(
     el('strong', '', () => t('Compare databases')),
-    el('span', '', () => t('Use a restored older database as the baseline and the current database as the target.'))
+    el('span', '', () => t('Compare live databases or saved snapshots to explain storage, table, column and index changes over time.'))
   );
   const compareControls = el('div', 'database-growth-compare-controls');
   const baselineConnection = document.createElement('select');
@@ -628,17 +795,19 @@ function build(mount: HTMLElement): void {
       explainCompare.disabled = true;
       runCompare.disabled = baselineConnection.value === ''
         || currentConnection.value === ''
-        || baselineConnection.value.toLowerCase() === currentConnection.value.toLowerCase();
+        || baselineConnection.value === currentConnection.value;
     });
   }
   runCompare.addEventListener('click', async () => {
-    if (!baselineConnection.value || !currentConnection.value || baselineConnection.value.toLowerCase() === currentConnection.value.toLowerCase()) return;
+    const baselineSource = decodeCompareSource(baselineConnection.value);
+    const currentSource = decodeCompareSource(currentConnection.value);
+    if (!baselineSource || !currentSource || baselineConnection.value === currentConnection.value) return;
     const token = ++comparisonGeneration;
     runCompare.disabled = true;
-    renderComparisonState('Capturing both database states and attributing storage differences…');
+    renderComparisonState('Loading both database states and attributing storage differences…');
     const result = await run(api.compareDatabaseGrowth({
-      baselineConnection: baselineConnection.value,
-      currentConnection: currentConnection.value,
+      baseline: baselineSource,
+      current: currentSource,
       ...(baselineAsOf.value ? { baselineAsOf: baselineAsOf.value } : {})
     }));
     if (token !== comparisonGeneration) return;
@@ -669,6 +838,7 @@ function build(mount: HTMLElement): void {
     if (!history) return;
     historyCache.set(selectedConnection, history);
     render(result);
+    if (latestSettings) void refreshComparisonSources(latestSettings);
     toast(t('Growth snapshot saved locally'));
   });
   explain.addEventListener('click', () => {
@@ -688,22 +858,16 @@ export function initDatabaseGrowthDashboard(mount: HTMLElement): void {
 
 export function setDatabaseGrowthDashboardState(next: DatabaseSettingsState): void {
   if (!root) return;
+  latestSettings = next;
   const select = byId<HTMLSelectElement>('databaseGrowthConnection');
-  const baselineSelect = byId<HTMLSelectElement>('databaseGrowthCompareBaseline');
-  const currentSelect = byId<HTMLSelectElement>('databaseGrowthCompareCurrent');
-  const compareRun = byId<HTMLButtonElement>('databaseGrowthCompareRun');
   const previous = selectedConnection;
-  const makeOptions = () => next.settings.connections.map(profile => {
+  const makeConnectionOptions = () => next.settings.connections.map(profile => {
     const option = document.createElement('option');
     option.value = profile.id;
     option.textContent = `${profile.name} · ${profile.database}`;
     return option;
   });
-  select.replaceChildren(...makeOptions());
-  const previousBaseline = baselineSelect.value;
-  const previousCurrent = currentSelect.value;
-  baselineSelect.replaceChildren(...makeOptions());
-  currentSelect.replaceChildren(...makeOptions());
+  select.replaceChildren(...makeConnectionOptions());
   const available = next.settings.connections.some(profile => profile.id === previous);
   const nextConnection = available ? previous : next.settings.defaultConnectionId ?? next.settings.connections[0]?.id ?? '';
   const changed = nextConnection !== selectedConnection;
@@ -711,24 +875,7 @@ export function setDatabaseGrowthDashboardState(next: DatabaseSettingsState): vo
   select.value = selectedConnection;
   select.disabled = selectedConnection === '';
   byId<HTMLButtonElement>('databaseGrowthRefresh').disabled = selectedConnection === '';
-
-  const connectionIds = next.settings.connections.map(profile => profile.id);
-  const compareCurrent = connectionIds.includes(previousCurrent)
-    ? previousCurrent
-    : selectedConnection || connectionIds[0] || '';
-  const compareBaseline = connectionIds.includes(previousBaseline) && previousBaseline.toLowerCase() !== compareCurrent.toLowerCase()
-    ? previousBaseline
-    : connectionIds.find(id => id.toLowerCase() !== compareCurrent.toLowerCase()) ?? connectionIds[0] ?? '';
-  currentSelect.value = compareCurrent;
-  baselineSelect.value = compareBaseline;
-  const canCompare = Boolean(compareBaseline && compareCurrent && compareBaseline.toLowerCase() !== compareCurrent.toLowerCase());
-  baselineSelect.disabled = connectionIds.length < 2;
-  currentSelect.disabled = connectionIds.length < 2;
-  compareRun.disabled = !canCompare;
-  if (!canCompare) {
-    activeComparison = null;
-    byId<HTMLButtonElement>('databaseGrowthCompareExplain').disabled = true;
-  }
+  void refreshComparisonSources(next);
   if (!selectedConnection) {
     generation += 1;
     renderEmpty('Add a SQL Server connection to run growth diagnostics.');

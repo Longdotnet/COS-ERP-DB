@@ -44,6 +44,15 @@ const fileSchema = z.object({
   percentGrowth: z.boolean()
 }).strict();
 
+const tableFingerprintSchema = z.object({
+  schema: z.string().min(1).max(256),
+  name: z.string().min(1).max(256),
+  columnCount: z.number().int().nonnegative(),
+  indexCount: z.number().int().nonnegative(),
+  columnHash: z.string().min(1).max(64),
+  indexHash: z.string().min(1).max(64)
+}).strict();
+
 export const databaseGrowthSnapshotInputSchema = z.object({
   captureVersion: z.literal(2).optional(),
   database: z.string().max(256),
@@ -53,6 +62,8 @@ export const databaseGrowthSnapshotInputSchema = z.object({
   files: z.array(fileSchema).max(64).optional(),
   tables: z.array(tableSchema).max(5000).optional(),
   tablesTruncated: z.boolean().optional(),
+  tableFingerprints: z.array(tableFingerprintSchema).max(5000).optional(),
+  schemaTruncated: z.boolean().optional(),
   limitations: z.array(z.string().max(1000)).max(32).optional()
 }).strict();
 
@@ -118,6 +129,13 @@ export async function readDatabaseGrowthHistory(connection: string): Promise<Dat
       .filter(snapshot => snapshot.connection.toLowerCase() === key)
       .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
   };
+}
+
+export async function readDatabaseGrowthSnapshot(connection: string, snapshotId: string): Promise<DatabaseGrowthSnapshot> {
+  const history = await readDatabaseGrowthHistory(connection);
+  const snapshot = history.snapshots.find(candidate => candidate.id === snapshotId);
+  if (!snapshot) throw new Error(`Database growth snapshot ${snapshotId} was not found for connection ${connection}.`);
+  return snapshot;
 }
 
 export function saveDatabaseGrowthSnapshot(connection: string, input: DatabaseGrowthSnapshotInput): Promise<DatabaseGrowthHistoryResult> {
