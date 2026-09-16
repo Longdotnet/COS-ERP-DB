@@ -1,4 +1,4 @@
-import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER, type ToolInputBatch } from '../session/input.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -34,11 +34,13 @@ import { toolSchema } from './tool-declarations.js';
 import {
   SandboxError,
   isAbsoluteVirtualPath,
+  isContained,
   isNativeWindowsPath,
   resolvePath,
   type Resolved
 } from '../sandbox.js';
 import { currentWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
+import { skillsDirectory } from '../skills.js';
 import { getSessionProject } from '../projects.js';
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
@@ -91,6 +93,7 @@ import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBa
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { unattributedRepairEta } from '../bridge.js';
 import { conversationAttachment, readOverflowText } from '../session/store.js';
+import { sessionFinishDeadline } from '../session/finish.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 
 export interface ToolContext {
@@ -580,16 +583,21 @@ async function dispatchTracked(
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
-  // update_plan always consumes this exact session, even outside a swarm. Resolve it
+  // update_plan and session_finish consume this exact session, even outside a swarm. Resolve it
   // before the shared blocked/superseded checks rather than guessing from selection.
   // Observation and its dependent input must resolve the same caller before either
   // handler runs. Recording a late identity cannot recover a discarded anonymous frame.
   const desktopContext = surface === 'desktop' && (name === 'get_window_state' ||
     (WINDOWS_COMPUTER_STATE_INPUT_METHODS as readonly string[]).includes(name));
-  if (!context.caller.conversationId && (desktopContext || name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())) && requestId) {
+  // Identity and the finish hold share one ingress deadline; late proof must not
+  // add another complete hold interval to an already waiting provider request.
+  const finishDeadline = name === 'session_finish' ? sessionFinishDeadline(startedAt) : null;
+  const identityWindow = (requested: number): number => finishDeadline === null
+    ? requested : Math.min(requested, Math.max(0, finishDeadline - Date.now()));
+  if (!context.caller.conversationId && (desktopContext || name === 'exec' || name === 'update_plan' || name === 'session_finish' || (identitySensitive && swarmRunning())) && requestId) {
     setCallerConversation(
       context,
-      await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
+      await awaitFreshCallOrigin(name, startedAt, identityWindow(name === 'session_finish' ? SPAWN_EVIDENCE_MS : IDENTITY_EVIDENCE_MS), { requestId })
     );
   }
   // A run that ended leaves an explicit short-lived lease tombstone for each open worker
@@ -598,7 +606,7 @@ async function dispatchTracked(
   if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
     setCallerConversation(
       context,
-      await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
+      await awaitFreshCallOrigin(name, startedAt, identityWindow(IDENTITY_EVIDENCE_MS), { requestId })
     );
   }
   // Dormant histories are long-lived identity fences, not active slot claims. An old worker tab
@@ -609,7 +617,7 @@ async function dispatchTracked(
   if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
     setCallerConversation(
       context,
-      await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
+      await awaitFreshCallOrigin(name, startedAt, identityWindow(IDENTITY_EVIDENCE_MS), { requestId })
     );
   }
   // And the user's own block, which needs identity resolved to the same depth as everything
@@ -634,7 +642,7 @@ async function dispatchTracked(
   if (!context.caller.conversationId && (anyChatBlocked() || anyContinuationOpen()) && requestId) {
     setCallerConversation(
       context,
-      await awaitFreshCallOrigin(name, startedAt, REQUEST_ID_GRACE_MS, { requestId })
+      await awaitFreshCallOrigin(name, startedAt, identityWindow(REQUEST_ID_GRACE_MS), { requestId })
     );
   }
   const supersededConversation = context.caller.conversationId
@@ -846,10 +854,11 @@ async function dispatchTracked(
   );
   // Ordinary tools carry direct user input, but only the explicit finish signal
   // advances a planned stage. Successful work is not evidence that a stage is done.
-  const userInput = nested ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
+  const userInput: ToolInputBatch = nested ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError, true).catch(() => {
     logWarn('User input could not be attached; the completed tool result is preserved');
     return { messages: [], reminder: '' };
   });
+  try {
   if (userInput.messages.length) {
     const attachments: ToolResult['content'] = [];
     for (const [index, message] of userInput.messages.entries()) {
@@ -917,6 +926,9 @@ async function dispatchTracked(
   if (callerRunId) releaseQuiescentRun({}, callerRunId);
   markTiming('recorder', true);
   return delivered;
+  } finally {
+    await userInput.recordHistory?.().catch(() => logWarn('User input history will be retried from its retained delivery receipt'));
+  }
 }
 
 /** Whether this handler must know which chat it is before resolving its paths. */
@@ -1014,7 +1026,10 @@ export async function resolveIn(
   });
   // Absolute only: a workspace learned from a relative path would let one loose resolution
   // decide where the next loose resolution points. See workspace.ts.
-  if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);
+  // Loading shared skill instructions must not move the chat away from its project.
+  const skillDirectory = skillsDirectory();
+  const isSkill = resolved.root.name === 'skills' || (skillDirectory !== null && isContained(skillDirectory, resolved.real));
+  if (!isSkill && (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested))) await learnWorkspace(resolved);
   return resolved;
 }
 

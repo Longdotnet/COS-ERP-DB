@@ -1,4 +1,6 @@
 import type { ChatModelCatalog } from '../shared/chat-models.js';
+import type { SkillLibrary } from '../shared/skills.js';
+import type { ChatgptPermissionNotice } from '../shared/chatgpt-permission-notice.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import type { TaskProgress } from '../shared/task-progress.js';
 import type { TerminalLiveUpdate } from '../shared/terminal-live.js';
@@ -79,6 +81,10 @@ export interface SessionDetail {
 
 const api = {
   ...createDatabaseApi(call),
+  skillsList: () => call<SkillLibrary>('skills:list'),
+  skillsImport: () => call<SkillLibrary | null>('skills:import'),
+  skillsOpenFolder: () => call<void>('skills:openFolder'),
+  skillsRemove: (id: string) => call<SkillLibrary>('skills:remove', { id }),
   openLegalNotices: () => call<void>('plugins:legalNotices'),
   pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
   pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
@@ -156,6 +162,13 @@ const api = {
   releaseSessionFinish: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:releaseFinish', { id, expectedTurnId }),
   generateFinishGoal: (id: string, expectedTurnId: string) => call<string>('sessions:generateFinishGoal', { id, expectedTurnId }),
   getChatModels: () => call<ChatModelCatalog>('chatModels:get'),
+  getChatgptPermissionNotice: () => call<ChatgptPermissionNotice>('chatgptPermissionNotice:get'),
+  acknowledgeChatgptPermissionNotice: () => call<ChatgptPermissionNotice>('chatgptPermissionNotice:ack'),
+  onChatgptPermissionNotice: (listener: (notice: ChatgptPermissionNotice) => void): (() => void) => {
+    const wrapped = (_event: unknown, notice: ChatgptPermissionNotice): void => listener(notice);
+    ipcRenderer.on('chatgptPermissionNotice:changed', wrapped);
+    return () => ipcRenderer.removeListener('chatgptPermissionNotice:changed', wrapped);
+  },
   browserPreferences: (patch: Partial<BrowserPreferences> = {}) => call<BrowserPreferences>('browser:preferences', patch),
   requestChatModels: () => call<ChatModelCatalog>('chatModels:request'),
   onChatModelsChanged: (listener: (catalog: ChatModelCatalog) => void): (() => void) => {

@@ -44,6 +44,52 @@ afterEach(async () => {
   await removeTempDir(dir);
 });
 describe('external plugin authority', () => {
+  it('identifies a stale Core name on Plugins without dispatching or changing any permissions', async () => {
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const outcome = vi.fn();
+    const result = JSON.stringify(await manager.call('read', { paths: ['/project'] }, outcome));
+    expect(result).toContain('PLUGIN_TOOL_UNAVAILABLE');
+    expect(result).toContain('wrong connector');
+    expect(result).toContain('Chat On Steroids Core');
+    expect(result).toContain('This call was not dispatched');
+    expect(result).not.toContain('PLUGIN_DISABLED');
+    expect(upstream).not.toHaveBeenCalled();
+    expect(outcome).toHaveBeenCalledWith('tool_rejected');
+    expect(manager.tools()).toEqual([]);
+  });
+
+  it('keeps an actual disabled external read tool distinct from a wrong-connector call', async () => {
+    await fs.writeFile(entry, fixture.replaceAll('Echo.Mixed', 'read'));
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    await manager.setEnabled(row.id, false);
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const result = JSON.stringify(await manager.call('read', { value: 'retained tool' }));
+    expect(result).toContain('PLUGIN_DISABLED');
+    expect(result).toContain('Enable this plugin and tool');
+    expect(result).not.toContain('Chat On Steroids Core');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('keeps a server failure distinct from a disabled tool on subsequent cached calls', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const upstream = vi.spyOn(Client.prototype, 'callTool').mockRejectedValueOnce(new Error('private transport details'));
+    expect(JSON.stringify(await manager.call('Echo.Mixed', { value: 'first' }))).toContain('PLUGIN_CALL_FAILED');
+    expect(manager.snapshot().plugins[0]?.status).toBe('error');
+    const outcome = vi.fn();
+    const next = JSON.stringify(await manager.call('Echo.Mixed', { value: 'second' }, outcome));
+    expect(next).toContain('PLUGIN_UNAVAILABLE');
+    expect(next).toContain('Restart this plugin');
+    expect(next).not.toContain('Refresh the Plugins connector');
+    expect(next).not.toContain('private transport details');
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(outcome).toHaveBeenCalledWith('tool_rejected');
+    await manager.setEnabled(row.id, false);
+    const disabled = JSON.stringify(await manager.call('Echo.Mixed', { value: 'third' }));
+    expect(disabled).toContain('PLUGIN_DISABLED');
+    expect(disabled).toContain('Enable');
+    expect(disabled).not.toContain('Restart this plugin');
+  });
+
   it('keeps Windows package data below MAX_PATH across installation and replacement', async () => {
     const directories: string[] = [];
     vi.spyOn(pluginInstaller, 'installSource').mockImplementation(async (_source, directory) => {
@@ -154,6 +200,10 @@ describe('external plugin authority', () => {
     await manager.initialize(dir);
     expect(manager.tools()).toEqual([]);
     await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('needs-auth'));
+    expect(fetcher).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
+    const refused = JSON.stringify(await manager.call('Echo.Mixed', { value: 'unavailable' }));
+    expect(refused).toContain('PLUGIN_NEEDS_AUTH');
+    expect(refused).toContain('Sign in');
     expect(fetcher).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
   });
   it('keeps needs-auth and unpublishes cached tools after an authenticated call retires its expired connection', async () => {

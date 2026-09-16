@@ -36,7 +36,7 @@ import type {
   StoredText
 } from '../../shared/session.js';
 import { CONTINUATION_MARKER, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, storedTextTokens, workSequence } from '../../shared/session.js';
-import { chronological } from '../../shared/chronology.js';
+import { chronological, positionOf } from '../../shared/chronology.js';
 import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { getConfig } from '../config.js';
@@ -1101,6 +1101,7 @@ export function upsertMessageEvent(
                 // provider later observes different native attachment ids for that send.
                 attachments: previous.inputId ? previous.attachments ?? event.attachments : event.attachments ?? previous.attachments,
                 inputDelivery: previous.inputDelivery === 'confirmed' ? 'confirmed' : event.inputDelivery ?? previous.inputDelivery,
+                inputImageCount: event.inputImageCount ?? previous.inputImageCount,
                 model: event.model ?? previous.model,
                 reasoningEffort: event.reasoningEffort ?? previous.reasoningEffort,
                 assets: event.assets ?? previous.assets }
@@ -1138,7 +1139,7 @@ export function upsertMessageEvent(
             previous.goalEligible === nextEvent.goalEligible &&
             previous.providerMessageId === nextEvent.providerMessageId)) &&
         (nextEvent.kind !== 'user_message' || previous.kind !== 'user_message' ||
-          (nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.inputDelivery === previous.inputDelivery && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
+          (nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.inputDelivery === previous.inputDelivery && nextEvent.inputImageCount === previous.inputImageCount && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
         (previous.turnId ?? undefined) === settledTurnId &&
         (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
         (!preferTime || previous.time === nextEvent.time)
@@ -1366,6 +1367,14 @@ export async function readRecentEvents(
   return readRecentEventsFromDisk(sessionId, limit, options);
 }
 
+/** The latest authored question, unaffected by later revisions of older messages. */
+export async function readLatestUserMessage(sessionId: string): Promise<Extract<SessionEvent, { kind: 'user_message' }> | undefined> {
+  assertSessionId(sessionId);
+  await flushSession(sessionId);
+  const [message] = await readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true });
+  return message?.kind === 'user_message' ? message : undefined;
+}
+
 /** Recorded local execution, not a native tool label or a request-id sighting alone. */
 export async function turnHasMcpCall(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
   assertSessionId(sessionId);
@@ -1402,7 +1411,7 @@ async function readRecentEventsFromDisk(
   sessionId: string,
   limit: number,
   options: Pick<ReadOptions, 'kinds' | 'agent'> & {
-    maxBytes?: number; before?: number; acceptEvent?: (event: SessionEvent) => boolean
+    maxBytes?: number; before?: number; acceptEvent?: (event: SessionEvent) => boolean; orderByOrigin?: boolean
   } = {}
 ): Promise<SessionEvent[]> {
   const cap = Math.max(1, Math.min(MAX_EVENT_TAIL, Math.floor(limit)));
@@ -1503,7 +1512,8 @@ async function readRecentEventsFromDisk(
     if (options.acceptEvent && !options.acceptEvent(message)) continue;
     candidates.push(message);
   }
-  candidates.sort((left, right) => workSequence(left) - workSequence(right));
+  const sequence = options.orderByOrigin ? positionOf : workSequence;
+  candidates.sort((left, right) => sequence(left) - sequence(right));
   const selected = candidates.slice(Math.max(0, candidates.length - cap));
   if (damaged > 0) logWarn(`session ${sessionId}: skipped ${damaged} unreadable recent event line(s)`);
   return chronological(selected);

@@ -6702,6 +6702,55 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(emitted(live.sent, 'turn_start')).toHaveLength(2);
   });
 
+  it('keeps final ownership when ChatGPT reuses a page turn id after another question', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    const old = assistantTurn(live.document, 'recycled-provider-turn', []);
+    prose(live.document, old, 'old-provider-final', 'First answer.');
+    live.hook.observe(); await settle();
+    const oldDescriptor = { turnId: 'recycled-provider-turn', endMessageId: 'old-provider-final',
+      messages: [{ role: 'assistant', stable: true, messageId: 'old-provider-final',
+        rawMessageId: 'old-provider-final', rawText: 'First answer.', renderedHtml: '<p>First answer.</p>' }] };
+    await bindFiberTurns([{ section: old, turn: oldDescriptor }]);
+    await live.hook.flush();
+    const first = emitted(live.sent, 'turn_start')[0]!.event.turnId;
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: first, outcome: 'completed' })
+    ]);
+
+    // The same DOM id is reused across an authored question. Fiber still supplies
+    // separate descriptors: merging their section nodes makes the live owner
+    // ambiguous and records the new final without the local turn id.
+    userTurn(live.document, 'next-question', 'Second question.');
+    const current = assistantTurn(live.document, 'recycled-provider-turn', []);
+    live.hook.observe(); await settle();
+    const second = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    expect(second).not.toBe(first);
+    await bindFiberTurns([
+      { section: old, turn: oldDescriptor },
+      { section: current, turn: { turnId: 'recycled-provider-turn' } }
+    ]);
+    await live.hook.flush();
+    // An old final cannot finish the second question while its answer is pending.
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(1);
+
+    prose(live.document, current, 'new-provider-final', 'Second answer.');
+    const bindings = [
+      { section: old, turn: oldDescriptor },
+      { section: current, turn: { turnId: 'recycled-provider-turn', endMessageId: 'new-provider-final',
+        messages: [{ role: 'assistant', stable: true, messageId: 'new-provider-final',
+          rawMessageId: 'new-provider-final', rawText: 'Second answer.', renderedHtml: '<p>Second answer.</p>' }] } }
+    ];
+    await bindFiberTurns(bindings); await live.hook.flush();
+    await bindFiberTurns(bindings); await live.hook.flush();
+    expect(emitted(live.sent, 'assistant_message').filter(row => row.event.messageId === 'new-provider-final').at(-1)?.event)
+      .toMatchObject({ turnId: second, final: true });
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: first, outcome: 'completed' }),
+      expect.objectContaining({ turnId: second, outcome: 'completed' })
+    ]);
+  });
+
   it('closes an image-only answer from exact Fiber terminal evidence without authored text', async () => {
     live = await harness();
     startGenerating(live.document);
@@ -7817,10 +7866,15 @@ describe('how a turn is recorded as having ended', () => {
     const [started] = emitted(live.sent, 'turn_start').map((entry) => entry.event);
     expect(failure.recoverable).toBe(true);
     expect(failure.turnId).toBe(started.turnId);
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+    // Reporting transport trouble does not contradict a native generating
+    // control. Once native work actually stops, the ordinary settle path fails.
+    stopGenerating(live.document);
+    live.hook.observe(); await settle();
+    live.advance(live.hook.TURN_SETTLE_MS + 1);
+    live.hook.observe(); await settle(); await live.hook.flush();
     const terminal = emitted(live.sent, 'turn_end').map(entry => entry.event);
     expect(terminal).toContainEqual(expect.objectContaining({ turnId: started.turnId, outcome: 'failed' }));
-    const events = live.sent.filter(message => message.type === 'events').flatMap(message => message.entries ?? []).map(entry => entry.event);
-    expect(events.findIndex(event => event.kind === 'turn_end')).toBeLessThan(events.findIndex(event => event.kind === 'chat_error'));
   });
 
   /**
@@ -7857,6 +7911,47 @@ describe('how a turn is recorded as having ended', () => {
     });
   });
 
+  it('keeps a generating transport failure open through reload and records the recovered final under its original identity', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'transport-live', []);
+    live.hook.observe(); await settle();
+    const id = emitted(live.sent, 'turn_start').at(-1)!.event.turnId as string;
+    alertBanner(live.document, 'Connection interrupted. Waiting for the complete answer');
+    live.hook.observe(); await settle();
+    live.advance(live.hook.TURN_SETTLE_MS * 2);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+    expect(emitted(live.sent, 'chat_error').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: id, recoverable: true })]);
+
+    // The old document dies, but its durable open generation is the authority
+    // returned by activity. The recovered document must not invent another send.
+    live.dom.window.close();
+    live = await harness('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0,
+        activeTurnId: id, recordedTurnId: id,
+        userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-transport-user' }] } })
+    }, document => {
+      userTurn(document, 'transport-user', 'Finish the task');
+      assistantTurn(document, 'transport-live', []);
+      startGenerating(document, { send: false });
+      alertBanner(document, 'Connection interrupted. Waiting for the complete answer');
+    });
+    live.hook.observe(); await settle();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+    const section = live.document.querySelector('[data-turn-id="transport-live"]') as HTMLElement;
+    await bindFiberTurns([{ section, turn: { turnId: 'transport-live', endMessageId: 'transport-final',
+      messages: [{ messageId: 'transport-final', rawMessageId: 'transport-final', stable: true,
+        rawText: 'The task is complete.', renderedHtml: '<p>The task is complete.</p>' }] } }]);
+    await live.hook.refreshFiber(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: id, outcome: 'completed' })]);
+    expect(emitted(live.sent, 'assistant_message').at(-1)?.event).toMatchObject({ turnId: id, final: true });
+  });
+
   // Native Chrome shape captured 2026-09-12, with private conversation content omitted.
   function thinkingFailed(section: HTMLElement): HTMLButtonElement {
     const button = live!.document.createElement('button');
@@ -7888,6 +7983,18 @@ describe('how a turn is recorded as having ended', () => {
     live!.advance(330_000); live!.hook.observe(); await settle();
     expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
     expect(emitted(live!.sent, 'assistant_message').some(row => row.event.final)).toBe(false);
+  });
+  it('still closes the exact Thinking failed header immediately while native Stop remains visible', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'busy-thinking-failure', []);
+    live.hook.observe(); await settle();
+    const id = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    thinkingFailed(section);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: id, outcome: 'failed', reason: 'thinking_failed' })]);
+    expect(emitted(live.sent, 'assistant_message').some(row => row.event.final)).toBe(false);
   });
   it('does not publish HTML-only interim hydration as fresh work after Thinking failed', async () => {
     live = await harness();
@@ -8314,10 +8421,10 @@ describe('evidence from the page context', () => {
     expect(live.hook.fiberFor(block)).toBeNull();
   });
 
-  it('maps Fiber call evidence onto the local generation id, never ChatGPT’s reused page turn id', async () => {
+  it.each([false, true])('requires the exact section stamp for reused page-id call evidence (stamped: %s)', async stamped => {
     live = await harness();
     startGenerating(live.document);
-    assistantTurn(live.document, 'reused-page-turn', []);
+    const section = assistantTurn(live.document, 'reused-page-turn', []);
     live.hook.observe();
     await settle();
     const local = emitted(live.sent, 'turn_start')[0]!.event.turnId as string;
@@ -8325,8 +8432,9 @@ describe('evidence from the page context', () => {
 
     // Two Fiber turns expose the same page turn id, which is exactly the live renderer
     // failure mode. The older occurrence still proves its conversation issued a connector
-    // request, but only the newest occurrence matching the currently bound assistant turn is
-    // allowed to inherit the local durable generation id.
+    // request. Only the scan-qualified section stamp can choose between them;
+    // a newer array position is not evidence of local generation ownership.
+    if (stamped) section.setAttribute('data-clf-fiber-turn', '1');
     await reply([], [
       {
         turnId: 'reused-page-turn',
@@ -8344,7 +8452,7 @@ describe('evidence from the page context', () => {
     const evidence = emitted(live.sent, 'tool_evidence').map((entry) => entry.event);
     expect(evidence).toHaveLength(2);
     expect(evidence[0]!.turnId).toBeUndefined();
-    expect(evidence[1]!.turnId).toBe(local);
+    expect(evidence[1]!.turnId).toBe(stamped ? local : undefined);
     expect(evidence.some((entry) => entry.turnId === 'reused-page-turn')).toBe(false);
   });
 
@@ -8590,6 +8698,37 @@ describe('evidence from the page context', () => {
         calls: [{ requestId, messageId: null, createTime: 1_700_000_001 }]
       })
     ]);
+  });
+
+  it('retains one-shot stream proof through a failed ACK without overlapping or repeating a confirmed request', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', requestId = 'wfr_retry_once';
+    live.reply.set('correlate', () => ({ ok: false }));
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId] }
+    }));
+    await settle();
+    live.hook.observe(); await settle();
+    expect(live.sent.filter(m => m.type === 'correlate')).toHaveLength(1);
+    live.reply.set('correlate', () => ({ ok: true, data: { conversationId, confirmed: [requestId] } }));
+    live.advance(35_000); live.hook.observe(); await settle();
+    expect(live.sent.filter(m => m.type === 'correlate')).toHaveLength(2);
+    live.advance(65_000); live.hook.observe(); await settle();
+    expect(live.sent.filter(m => m.type === 'correlate')).toHaveLength(2);
+  });
+
+  it('shows only exact IDs of the newest native turn and does not call an owner ACK tool activity', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', requestId = 'wfr_popup_current';
+    live.reply.set('correlate', () => ({ ok: true, data: { conversationId, confirmed: [requestId] } }));
+    const section = assistantTurn(live.document, 'current-native-turn', ['Called tool']);
+    await bindFiberRequest(section, requestId);
+    const status = await live.runtimeMessage({ type: 'clf-page-status' }) as any;
+    expect(status.requestId).toBe(requestId);
+    expect(status.trace).toEqual([expect.objectContaining({ requestId, confirmed: true, app: null })]);
+    userTurn(live.document, 'next-question', 'Next question');
+    expect(await live.runtimeMessage({ type: 'clf-page-status' })).toMatchObject({ requestId: null, trace: [] });
   });
 
   it('keeps a fresh-chat stream identity until the address bar publishes its exact route', async () => {
@@ -13888,6 +14027,45 @@ describe('the goal loop', () => {
     expect(drafts(live)).toHaveLength(2);
   });
 
+  it.each(['native', 'compaction'] as const)('recollects the same recovery ticket after a delayed retry meets temporary %s work', async busyKind => {
+    const pending = { replyId: 'silence:retry-busy', turnId: 'g-silence-retry-busy',
+      silenceSourceTurnId: 'g-original', eventSeq: 12, acceptedAt: 1000, listenUntil: 0 };
+    let offered = false, busy = false, requests = 0;
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      ...goalReplies(),
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0,
+        job: busy && busyKind === 'compaction' ? { busy: true, state: 'awaiting-summary' } : null,
+        goal: { enabled: true, own: true, hasKey: true, model: MODEL, pending: offered ? pending : null, draft: null } } }),
+      goal_draft: () => ++requests === 1
+        ? { ok: false, status: 409, data: { error: 'chat_still_working', retryable: true } }
+        : goalReplies().goal_draft()
+    });
+    (live.window as any).CLF_DOM.generating = () => busy && busyKind === 'native';
+    const timer = live.window.setTimeout;
+    const wakes: Array<() => void> = [];
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === live!.hook.GOAL_RETRY_MS) { wakes.push(fn); return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    offered = true;
+    await live.hook.pullActivity(); await settle();
+    expect(requests).toBe(1);
+    expect(wakes).toHaveLength(1);
+    busy = true;
+    await live.hook.pullActivity();
+    wakes[0]!(); await settle();
+    for (let n = 0; n < 3; n++) { await live.hook.pullActivity(); await settle(); }
+    expect(requests).toBe(1);
+    expect(acks(live)).toHaveLength(0);
+    busy = false;
+    await live.hook.pullActivity(); await settle();
+    expect(requests).toBe(2);
+    expect(drafts(live).at(-1)).toMatchObject({ turnId: pending.turnId, terminalRequired: true });
+    for (let n = 0; n < 3; n++) { await live.hook.pullActivity(); await settle(); }
+    expect(requests).toBe(2);
+    expect(acks(live)).toHaveLength(0);
+  });
+
   it('continues the first resumed answer that finished while the replacement tab was hidden', async () => {
     const commandId = 'cmd-hidden-goal-resume';
     const objective = 'finish the overnight release';
@@ -16927,12 +17105,19 @@ describe('stable final eligibility during compaction custody', () => {
       } }),
       compact: () => ({ ok: false, error: 'stale_document' })
     });
+    const old = assistantTurn(live.document, 'ordinary-or-handoff', []);
+    prose(live.document, old, 'prior-final', 'The previous answer.');
+    live.hook.observe(); await settle();
     startGenerating(live.document);
     live.hook.observe(); await settle();
     const section = assistantTurn(live.document, 'ordinary-or-handoff', []);
     prose(live.document, section, 'terminal-answer', 'B_DONE 552');
     live.hook.observe(); await settle();
-    await bindFiberTurns([{ section, turn: {
+    await bindFiberTurns([{ section: old, turn: {
+      turnId: 'ordinary-or-handoff', endMessageId: 'prior-final',
+      messages: [{ messageId: 'prior-final', rawMessageId: 'prior-final', role: 'assistant', stable: true,
+        rawText: 'The previous answer.', renderedHtml: '<p>The previous answer.</p>' }]
+    } }, { section, turn: {
       turnId: 'ordinary-or-handoff', endMessageId: 'terminal-answer', calls: [],
       messages: [
         ...(handoff ? [{ messageId: 'handoff-user', rawMessageId: 'handoff-user', role: 'user', stable: true,

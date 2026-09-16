@@ -6,6 +6,7 @@ import { initPlugins, applyPluginsState } from './plugins.js';
 import { initBrowserPreferences } from './browser-preferences.js';
 import { initSetupGuide } from './setup-guide.js';
 import { initDatabaseSettings } from '../cos-erp-db/renderer/database-settings.js';
+import { initChatgptPermissionNotice } from './chatgpt-permission-notice.js';
 /**
  * Renderer. No Node, no filesystem, no network — everything goes through window.api.
  *
@@ -47,6 +48,7 @@ const api = window.api;
 initLanguage();
 initSetupGuide();
 initDatabaseSettings();
+initChatgptPermissionNotice(api);
 
 /** Same shape the platform uses; mirrored here only to grey out step 2 until it is valid. */
 const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;

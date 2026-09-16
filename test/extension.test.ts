@@ -866,8 +866,9 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     expect(worker.tabsReload).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['unresolved', 'resolved-during-scan', 'claim-unavailable'] as const)(
-    'claims attribution recovery after the tab scan: %s', async (mode) => {
+  it.each(['unattributed', 'assistant-error'].flatMap(reason =>
+    ['unresolved', 'resolved-during-scan', 'claim-unavailable'].map(mode => ({ reason, mode }))))(
+    'claims $reason recovery after the tab scan: $mode', async ({ reason, mode }) => {
       let armed = false;
       let handed = false;
       let resolved = false;
@@ -886,7 +887,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
           if (armed && !handed) {
             handed = true;
             trace.push('handout');
-            return response(200, { repairs: [{ conversationId: CHAT, token: 'attribution-attempt', requiresClaim: true }] });
+            return response(200, { repairs: [{ conversationId: CHAT, token: 'attribution-attempt', reason, requiresClaim: true }] });
           }
           return response(200, { repairs: [] });
         }

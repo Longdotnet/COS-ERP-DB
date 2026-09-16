@@ -2418,8 +2418,8 @@ async function performBrowserRepairs(repairs, policy) {
       if (target && focus) {
         await chrome.tabs.update(target.id, { active: true });
       }
-      // The tab scan can yield while exact MCP evidence clears an attribution
-      // incident. Claim this server-held attempt only at the browser action boundary.
+      // The tab scan can yield while attribution recovers or a final/new question
+      // retires an interrupted-response repair. Claim only at the action boundary.
       if (requiresClaim) {
         const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
         if (!claim.ok || claim.data?.allowed !== true) continue;

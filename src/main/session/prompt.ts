@@ -5,20 +5,18 @@ import { currentCoreInstructions } from '../mcp/instructions.js';
 import { getSessionProject, projectWorkspace } from '../projects.js';
 import { resolvePath } from '../sandbox.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt } from '../../shared/user-prompt.js';
+import { selectedSkillInstructions } from './skill-prompt.js';
 
-type PromptScope = { sessionId?: string | null; projectId?: string | null };
+type PromptScope = { sessionId?: string | null; projectId?: string | null; skillCommands?: readonly string[] };
 export type PromptLimits = { maxChars: number; maxBytes: number };
 type ProjectInstructions = { directory: string; text: string; truncated: boolean };
+type ProjectFolder = { virtual: string; real: string };
 const limits: PromptLimits = { maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: Infinity };
 const cutNotice = '\n\n[Cut off because of the message limit. Read AGENTS.md yourself for the remaining instructions.]';
 
 /** One selected folder, never cwd inference, global discovery or a recursive document scan. */
-async function projectInstructions(scope: PromptScope): Promise<ProjectInstructions | null> {
-  if ((!scope.sessionId && !scope.projectId) || !effectiveCapabilities(getConfig()).read) return null;
-  // Existing sessions own their project; a caller-provided project cannot replace that binding.
-  const folder = scope.sessionId ? await getSessionProject(scope.sessionId)
-    : await projectWorkspace(scope.projectId!);
-  if (!folder) return null;
+async function projectInstructions(scope: PromptScope, folder: ProjectFolder | null): Promise<ProjectInstructions | null> {
+  if (!folder || !effectiveCapabilities(getConfig()).read) return null;
   const filename = path.join(folder.real, 'AGENTS.md');
   try {
     const resolved = await resolvePath(getConfig().roots, filename, { allowMissing: true });
@@ -50,12 +48,12 @@ async function projectInstructions(scope: PromptScope): Promise<ProjectInstructi
   }
 }
 
-/** User text and the complete Core prompt are mandatory; only project instructions spend slack. */
+/** User text, Core and selected skills are mandatory; only project instructions spend slack. */
 export function fitSessionPrompt(text: string, core: string, agents: ProjectInstructions | null = null, budget = limits): string {
   const fits = (value: string): boolean => value.length <= Math.min(MAX_CHATGPT_MESSAGE_CHARS, budget.maxChars) &&
     Buffer.byteLength(value, 'utf8') <= budget.maxBytes;
   const base = prependUserPrompt(text, core);
-  if (!fits(base)) throw new Error('The message and main instructions exceed the delivery limit (maximum 96,000 characters). Shorten the message or standing instructions.');
+  if (!fits(base)) throw new Error('The message, main instructions and selected skills exceed the delivery limit (maximum 96,000 characters). Shorten the message or standing instructions, or select fewer skills.');
   if (!agents) return base;
   const content = agents.text.replace(/\r\n?/g, '\n');
   const render = (length: number, shortened: boolean): string => {
@@ -79,7 +77,18 @@ export function fitSessionPrompt(text: string, core: string, agents: ProjectInst
 /** Opening normal/worker messages only. Callers own first-message eligibility;
  * follow-ups, helpers, handoff requests and resumed bootstraps never call this. */
 export async function prepareSessionPrompt(text: string, scope: PromptScope = {}, budget = limits): Promise<string> {
-  const core = await currentCoreInstructions();
+  // The durable session binding wins over a caller's currently selected folder.
+  // Include its virtual path even when AGENTS.md is absent or cannot spend any space.
+  const [main, skills, folder] = await Promise.all([currentCoreInstructions(), selectedSkillInstructions(scope.skillCommands ?? [text]),
+    scope.sessionId ? getSessionProject(scope.sessionId) : scope.projectId ? projectWorkspace(scope.projectId) : null]);
+  const project = folder ? `\n\n# Selected project\n\nPrimary working folder: ${JSON.stringify(folder.virtual)}. Use this folder as the default workdir and place the task's files here. Work outside it when the task needs it or the user directs you there, while respecting current tool permissions.` : '';
+  const core = `${main}${project}${skills ? `\n\n${skills}` : ''}`;
   fitSessionPrompt(text, core, null, budget); // Reject mandatory overflow before reading optional files.
-  return fitSessionPrompt(text, core, await projectInstructions(scope), budget);
+  return fitSessionPrompt(text, core, await projectInstructions(scope, folder), budget);
+}
+
+/** Explicitly selected follow-up skills use the same hidden frame without repeating setup. */
+export async function prepareFollowupPrompt(text: string, commands: readonly string[] = [text], budget = limits): Promise<string> {
+  const skills = await selectedSkillInstructions(commands);
+  return skills ? fitSessionPrompt(text, skills, null, budget) : text;
 }

@@ -11,11 +11,12 @@ import { renderGoalReasoning } from './goal-reasoning.js';
 import { preserveTimelineViewport } from './timeline-scroll.js';
 import { createSidebarOrder } from './sidebar-order.js';
 import { toolResultText } from './tool-result.js';
-import { chatErrorPresentation } from './chat-error.js';
+import { chatErrorPresentation, duplicateChatErrors } from './chat-error.js';
 import { renderRecoveryCountdowns } from './recovery.js';
 import type { RecoveryCountdown } from '../shared/recovery.js';
 import { communicationTitle, foldAgentCommunication } from './agent-communication.js';
 import { initContextMeter, paintContextMeter } from './context-meter.js';
+import { createSkills, type SkillsController } from './skills.js';
 import { isAstraModel, isProModel } from '../shared/chat-models.js';
 import type { InputImage, InputAttachment, InputAutomation } from '../shared/input.js';
 import { injectableAttachments } from '../shared/input.js';
@@ -116,6 +117,7 @@ interface Deps {
 
 let deps: Deps;
 let visible = false;
+let skillsController: SkillsController | null = null;
 
 let sessions: SessionSummary[] = [];
 let pressure = new Map<string, TokenPressure>();
@@ -167,6 +169,7 @@ function restoreDraft(): void {
   cancelGoalRequest();
   $('activeGoalRow').hidden = true; $('recoveryStatus').hidden = true;
   $<HTMLTextAreaElement>('chatInput').value = inputDrafts.get(draftKey()) ?? '';
+  skillsController?.syncDraft();
   const automation = $<HTMLSelectElement>('chatAutomation'); automation.value = 'off'; delete automation.dataset.edited;
   $<HTMLSelectElement>('loopDelivery').value = 'finish';
   $<HTMLTextAreaElement>('sessionObjective').value = ''; delete $('sessionObjective').dataset.edited; delete $('sessionObjective').dataset.sessionId;
@@ -1614,6 +1617,14 @@ function paintInputReceipt(row: HTMLElement, item: ReturnType<typeof timelineIte
   receipt.parentElement?.classList.toggle('has-input-receipt', !receipt.hidden);
 }
 
+function retainedInputImages(event: Extract<SessionEvent, { kind: 'user_message' }>, sessionId = selectedId): InputImage[] {
+  if (!sessionId || !event.inputId || event.assets?.length) return [];
+  const entry = pendingComposerInputs.find(row => row.id === event.inputId &&
+    (row.deliveredSessionId ?? row.sessionId) === sessionId);
+  return entry ? [...(entry.images ?? []), ...(entry.toolImages ?? [])]
+    .filter(image => /^data:image\/webp;base64,/.test(image.dataUrl)).slice(0, 4) : [];
+}
+
 function eventBody(event: SessionEvent, context?: { id: string; current: () => boolean; history: readonly SessionEvent[] }): HTMLElement {
   switch (event.kind) {
     case 'session_start':
@@ -1624,7 +1635,18 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
       const attachments = el('div', 'message-attachments');
       if (event.attachments?.length) attachments.append(...event.attachments.map(file => attachmentCard(file)));
       const assets = event.assets?.filter(asset => asset.mimeType === 'image/webp').slice(0, 4) ?? [];
-      if (event.attachments?.length || assets.length) box.append(attachments);
+      const retained = retainedInputImages(event, context?.id ?? selectedId);
+      if (event.attachments?.length || assets.length || retained.length) box.append(attachments);
+      for (const attachment of retained) {
+        const image = document.createElement('img');
+        image.src = attachment.dataUrl; image.alt = t("User attachment"); image.loading = 'lazy';
+        attachments.append(image);
+      }
+      if ((event.inputImageCount ?? 0) > 0 && !assets.length) {
+        box.append(el('p', 'meta', () => retained.length
+          ? t("Image preview retained with this delivery; not yet saved to history.")
+          : t("Image preview unavailable in this recording.")));
+      }
       // Native ChatGPT can prepend a blank paragraph. Ignore it only when a
       // complete instruction frame validates; keep the authored suffix exact.
       const userText = event.authoredText ?? userPromptText(event.message.text.trimStart()) ?? event.message.text;
@@ -2153,7 +2175,8 @@ function itemSignature(item: TimelineItem): string {
   const parts: Array<string | number> = [event.seq, event.time, event.kind, event.agent ?? ''];
   switch (event.kind) {
     case 'user_message':
-      parts.push(event.message.chars, event.authoredText ?? '', event.inputDelivery ?? '');
+      parts.push(event.message.chars, event.authoredText ?? '', event.inputDelivery ?? '', event.inputImageCount ?? 0,
+        JSON.stringify(event.assets ?? []), JSON.stringify(event.attachments ?? []), retainedInputImages(event).length);
       break;
     case 'progress':
     case 'chat_error':
@@ -2303,7 +2326,9 @@ function paintDetail(followBottom = historyBefore === null): void {
       activityBoundary = key;
     }
   };
+  const duplicateErrors = duplicateChatErrors(events);
   for (const item of timelineItems(shown)) {
+    if (item.kind === 'event' && duplicateErrors.has(item.event.seq)) continue;
     appendRetiredInputs(item.kind === 'event' ? item.event.time : item.block.time);
     if (item.kind === 'compaction' || !['tool_call', 'page_tool', 'agent_message'].includes(item.event.kind)) activityBoundary = itemKey(item);
     if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && item.event.source === 'app' && item.event.kind === 'progress' && item.event.progressId?.startsWith('browser-repair:')) continue;
@@ -3328,7 +3353,9 @@ async function refreshInputQueue(): Promise<void> {
   const unbound = (entry: InputEntry) => selectedId === null && !entry.sessionId && !entry.deliveredSessionId && entry.purpose !== 'decision' && ['queued', 'browser'].includes(entry.state);
   const notice = (entry: InputEntry) => (belongsToSelection(entry) || (selectedId === null && !entry.sessionId && !entry.deliveredSessionId)) && entry.purpose !== 'decision' &&
     ['failed', 'cancelled'].includes(entry.state) && !!entry.error && !dismissedInputNotices.has(entry.id);
-  const rows = all.filter((entry) => !dismissedInputNotices.has(entry.id) && !(entry.state === 'tool' && entry.historyRecorded) && !(queuedFollowup(entry) && ['queued', 'tool', 'browser'].includes(entry.state)) && (belongsToSelection(entry) || unbound(entry) || notice(entry)) &&
+  const hasDeliveryAnchor = (entry: InputEntry) => events.some(event => event.kind === 'user_message' &&
+    (event.inputId === entry.id || (!!entry.messageId && event.messageId === entry.messageId)));
+  const rows = all.filter((entry) => !dismissedInputNotices.has(entry.id) && !(['tool', 'sent'].includes(entry.state) && hasDeliveryAnchor(entry)) && !(entry.state === 'tool' && entry.historyRecorded) && !(queuedFollowup(entry) && ['queued', 'tool', 'browser'].includes(entry.state)) && (belongsToSelection(entry) || unbound(entry) || notice(entry)) &&
     (notice(entry) || unbound(entry) || selectedId !== null || projectGroup(entry.projectId) === selectedProjectId) &&
     (notice(entry) || !['sent', 'cancelled'].includes(entry.state) || (entry.state === 'sent' && entry.messageId && !entry.historyRecorded)));
   for (const entry of startingInputs.values()) if (belongsToSelection(entry) && !all.some(row => row.id === entry.id)) rows.push(entry);
@@ -3566,6 +3593,11 @@ export function initChat(next: Deps): void {
     .filter(entry => entry.conversationId && entry.origin?.kind !== 'worker')
     .map(entry => ({ id: entry.id, scope: projectGroup(entry.projectId) ?? '' })), paintSessions);
   deps = next;
+  skillsController = createSkills({
+    api,
+    input: $<HTMLTextAreaElement>('chatInput'),
+    getDraftIdentity: () => `${selectionGeneration}:${draftKey()}`
+  });
   const agentToggle = el('button', 'btn btn-icon', '◫') as HTMLButtonElement;
   agentToggle.id = 'agentPanelToggle'; agentToggle.type = 'button'; agentToggle.hidden = true;
   ui(agentToggle, 'aria-label', () => t("Toggle sub-agent side panel")); agentToggle.setAttribute('aria-expanded', 'false');
@@ -3789,6 +3821,7 @@ export function initChat(next: Deps): void {
   });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') for (const menu of composerMenus) menu.open = false; });
   $('chatInput').addEventListener('input', () => {
+    skillsController?.onInput();
     const hasText = !!$<HTMLTextAreaElement>('chatInput').value.trim();
     const plan = taskPlans.get(draftKey());
     if (plan && !plan.stages && (plan.requestId || !hasText)) {
@@ -3798,6 +3831,7 @@ export function initChat(next: Deps): void {
     paintDeliveryControls(); paintTaskActions();
   });
   $('chatInput').addEventListener('keydown', (event) => {
+    if (skillsController?.onKeydown(event)) return;
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (currentPreparedPlan() || $<HTMLTextAreaElement>('chatInput').value.trim() || imageDrafts.get(draftKey())?.length) $<HTMLFormElement>('composer').requestSubmit(); }
   });
   $('composerSettings').addEventListener('toggle', paintTaskActions);
