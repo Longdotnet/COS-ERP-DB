@@ -9,6 +9,8 @@ import { resolveSqlServerProfile, type ResolvedSqlServerProfile } from './profil
 import { searchSqlServerObjects } from './metadata.js';
 import type {
   DatabaseAccessMode,
+  DatabaseGrowthCapture,
+  DatabaseGrowthComparisonResult,
   DatabaseGrowthDiagnosticsResult,
   DatabaseObjectDetailRequest,
   DatabaseObjectDetailsResult,
@@ -25,6 +27,8 @@ import { readSqlServerTablePage } from './table-data.js';
 import { updateSqlServerTableCell } from './table-write.js';
 import { readSqlServerObjectDetails } from './object-details.js';
 import { readSqlServerGrowthDiagnostics } from './growth-diagnostics.js';
+import { readSqlServerGrowthCapture } from './growth-capture.js';
+import { compareDatabaseGrowthCaptures } from './growth-compare.js';
 import { getDatabaseWorkspaceContext } from './workspace-context.js';
 import { readDatabaseSettings } from './store.js';
 
@@ -602,6 +606,53 @@ export async function executeDatabaseTableCellUpdate(
   } finally {
     release();
   }
+}
+
+/** Renderer-owned full growth capture. Kept out of DatabaseActionInput so the MCP surface stays small. */
+export async function executeDatabaseGrowthCapture(
+  connectionId: string,
+  runtime: DatabaseRuntime = DEFAULT_RUNTIME,
+  options: { signal?: AbortSignal } = {}
+): Promise<{ connection: string; capture: DatabaseGrowthCapture }> {
+  let profile: ResolvedSqlServerProfile;
+  try {
+    profile = await runtime.resolve(connectionId);
+  } catch (error) {
+    throw new DatabaseServiceError(error instanceof Error ? error.message : String(error));
+  }
+  const password = profile.connection.authentication.password;
+  const release = await acquireQuerySlot(profile.id, options.signal);
+  try {
+    const capture = runtime === DEFAULT_RUNTIME
+      ? await readSqlServerGrowthCapture(profile.connection, options)
+      : await readSqlServerGrowthCapture(profile.connection, options, (connection, sql, queryOptions) => runtime.query(connection, sql, queryOptions));
+    return { connection: profile.id, capture };
+  } catch (error) {
+    if (error instanceof DatabaseServiceError) throw error;
+    throw redactError(error, password);
+  } finally {
+    release();
+  }
+}
+
+/** Live database-to-database comparison. Full attribution is computed in main before renderer truncation. */
+export async function executeDatabaseGrowthComparison(
+  baselineConnection: string,
+  currentConnection: string,
+  runtime: DatabaseRuntime = DEFAULT_RUNTIME,
+  options: { signal?: AbortSignal; baselineAsOf?: string } = {}
+): Promise<DatabaseGrowthComparisonResult> {
+  const [baseline, current] = await Promise.all([
+    executeDatabaseGrowthCapture(baselineConnection, runtime, options),
+    executeDatabaseGrowthCapture(currentConnection, runtime, options)
+  ]);
+  return compareDatabaseGrowthCaptures(
+    baseline.connection,
+    baseline.capture,
+    current.connection,
+    current.capture,
+    options.baselineAsOf ? { baselineAsOf: options.baselineAsOf } : {}
+  );
 }
 
 export type { DatabaseRuntime };

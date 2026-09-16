@@ -99,11 +99,28 @@ export interface DatabaseGrowthDiagnosticsResult {
   elapsedMs: number;
 }
 
-export interface DatabaseGrowthSnapshotInput {
+export interface DatabaseGrowthCapture {
+  captureVersion: 2;
   database: string;
   capturedAt: string;
   summary: DatabaseGrowthDiagnosticsResult['summary'];
-  largestTables: DatabaseGrowthTableSummary[];
+  files: DatabaseGrowthFileSummary[];
+  tables: DatabaseGrowthTableSummary[];
+  tablesTruncated: boolean;
+  limitations: string[];
+}
+
+export interface DatabaseGrowthSnapshotInput {
+  captureVersion?: 2;
+  database: string;
+  capturedAt: string;
+  summary: DatabaseGrowthDiagnosticsResult['summary'];
+  /** Legacy V1 bounded table list retained for backward-compatible local history reads. */
+  largestTables?: DatabaseGrowthTableSummary[];
+  files?: DatabaseGrowthFileSummary[];
+  tables?: DatabaseGrowthTableSummary[];
+  tablesTruncated?: boolean;
+  limitations?: string[];
 }
 
 export interface DatabaseGrowthSnapshot extends DatabaseGrowthSnapshotInput {
@@ -115,6 +132,81 @@ export interface DatabaseGrowthSnapshot extends DatabaseGrowthSnapshotInput {
 export interface DatabaseGrowthHistoryResult {
   connection: string;
   snapshots: DatabaseGrowthSnapshot[];
+}
+
+export interface DatabaseGrowthCompareRequest {
+  baselineConnection: string;
+  currentConnection: string;
+  /** Optional business date of a restored backup; capture time alone cannot prove backup age. */
+  baselineAsOf?: string;
+}
+
+export interface DatabaseGrowthTableDelta {
+  schema: string;
+  name: string;
+  state: 'matched' | 'added' | 'removed';
+  baselineObjectId: number | null;
+  currentObjectId: number | null;
+  baselineRows: number;
+  currentRows: number;
+  rowDelta: number;
+  baselineReservedMb: number;
+  currentReservedMb: number;
+  reservedDeltaMb: number;
+  baselineUsedMb: number;
+  currentUsedMb: number;
+  usedDeltaMb: number;
+  baselineDataMb: number;
+  currentDataMb: number;
+  dataDeltaMb: number;
+  baselineIndexMb: number;
+  currentIndexMb: number;
+  indexDeltaMb: number;
+}
+
+export interface DatabaseGrowthFileDelta {
+  name: string;
+  type: 'data' | 'log';
+  state: 'matched' | 'added' | 'removed';
+  baselineSizeMb: number;
+  currentSizeMb: number;
+  sizeDeltaMb: number;
+  baselineUsedMb: number | null;
+  currentUsedMb: number | null;
+  usedDeltaMb: number | null;
+}
+
+export interface DatabaseGrowthComparisonResult {
+  baseline: {
+    connection: string;
+    database: string;
+    capturedAt: string;
+    asOf?: string;
+    tablesTruncated: boolean;
+  };
+  current: {
+    connection: string;
+    database: string;
+    capturedAt: string;
+    tablesTruncated: boolean;
+  };
+  summary: {
+    totalAllocatedDeltaMb: number;
+    dataAllocatedDeltaMb: number;
+    dataUsedDeltaMb: number;
+    logAllocatedDeltaMb: number;
+    logUsedDeltaMb: number;
+    tableUsedDeltaMb: number;
+    unattributedDataUsedDeltaMb: number;
+    attributionPercent: number | null;
+    tableCountDelta: number;
+  };
+  fileDeltas: DatabaseGrowthFileDelta[];
+  tableDeltas: DatabaseGrowthTableDelta[];
+  totalTableDifferenceCount: number;
+  returnedTableDifferenceCount: number;
+  omittedTableDifferenceCount: number;
+  limitations: string[];
 }
 
 export interface DatabaseObjectSearchRequest extends DatabaseObjectSearchInput {

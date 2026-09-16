@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import type {
   DatabaseConnectionTestResult,
+  DatabaseGrowthCapture,
+  DatabaseGrowthComparisonResult,
+  DatabaseGrowthCompareRequest,
   DatabaseGrowthHistoryResult,
   DatabaseGrowthDiagnosticsResult,
   DatabaseGrowthSnapshotInput,
@@ -19,7 +22,12 @@ import type {
 } from '../../shared/database.js';
 import { logInfo } from '../logger.js';
 import { secureStorageStatus } from '../secrets.js';
-import { executeDatabaseAction, executeDatabaseTableCellUpdate } from './service.js';
+import {
+  executeDatabaseAction,
+  executeDatabaseGrowthCapture,
+  executeDatabaseGrowthComparison,
+  executeDatabaseTableCellUpdate
+} from './service.js';
 import { MAX_DATABASE_OBJECT_PAGE_SIZE, MAX_DATABASE_OBJECT_SEARCH_CHARS } from './metadata.js';
 import { MAX_DATABASE_TABLE_FILTERS, MAX_DATABASE_TABLE_PAGE_SIZE } from './table-data.js';
 import { setDatabaseWorkspaceContext } from './workspace-context.js';
@@ -112,6 +120,28 @@ export function registerDatabaseIpc(handle: RegisterHandler): void {
     if (result.action !== 'growth_diagnostics') throw new Error('Unexpected database growth diagnostics result');
     const { action: _action, connection: _connection, ...diagnostics } = result;
     return diagnostics;
+  });
+
+  handle<DatabaseGrowthCapture>('database:growthCapture', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return (await executeDatabaseGrowthCapture(id)).capture;
+  });
+
+  handle<DatabaseGrowthComparisonResult>('database:growthCompare', async payload => {
+    const parsed = z.object({
+      baselineConnection: profileIdArg.shape.id,
+      currentConnection: profileIdArg.shape.id,
+      baselineAsOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+    }).strict().refine(
+      value => value.baselineConnection.toLowerCase() !== value.currentConnection.toLowerCase(),
+      'Baseline and current database connections must be different.'
+    ).parse(payload) as DatabaseGrowthCompareRequest;
+    return executeDatabaseGrowthComparison(
+      parsed.baselineConnection,
+      parsed.currentConnection,
+      undefined,
+      parsed.baselineAsOf ? { baselineAsOf: parsed.baselineAsOf } : {}
+    );
   });
 
   handle<DatabaseGrowthHistoryResult>('database:growthHistory', async payload => {

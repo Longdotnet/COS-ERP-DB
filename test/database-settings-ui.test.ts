@@ -62,6 +62,44 @@ beforeEach(() => {
       historicalBaselineAvailable: false,
       elapsedMs: 7
     })),
+    readDatabaseGrowthCapture: vi.fn(() => reply({
+      captureVersion: 2,
+      database: 'L80LINKQ.TEST',
+      capturedAt: '2026-09-15T17:00:00.000Z',
+      summary: { totalMb: 2038.75, dataMb: 238.75, logMb: 1800, dataUsedMb: 173.13, logUsedMb: 1783.98, logUsedPercent: 99.11, tableCount: 250 },
+      files: [],
+      tables: [{ objectId: 42, schema: 'dbo', name: 'L00ZONES', rows: 1000, reservedMb: 150, usedMb: 140, dataMb: 130, indexMb: 10 }],
+      tablesTruncated: false,
+      limitations: []
+    })),
+    compareDatabaseGrowth: vi.fn((request: { baselineConnection: string; currentConnection: string; baselineAsOf?: string }) => reply({
+      baseline: { connection: request.baselineConnection, database: 'L80LINKQ_2025', capturedAt: '2026-09-16T01:00:00.000Z', ...(request.baselineAsOf ? { asOf: request.baselineAsOf } : {}), tablesTruncated: false },
+      current: { connection: request.currentConnection, database: 'L80LINKQ.TEST', capturedAt: '2026-09-16T01:00:01.000Z', tablesTruncated: false },
+      summary: {
+        totalAllocatedDeltaMb: 20480,
+        dataAllocatedDeltaMb: 17408,
+        dataUsedDeltaMb: 14800,
+        logAllocatedDeltaMb: 3072,
+        logUsedDeltaMb: 400,
+        tableUsedDeltaMb: 11755,
+        unattributedDataUsedDeltaMb: 3045,
+        attributionPercent: 79.43,
+        tableCountDelta: 23
+      },
+      fileDeltas: [{ name: 'ERP', type: 'data', state: 'matched', baselineSizeMb: 4096, currentSizeMb: 21504, sizeDeltaMb: 17408, baselineUsedMb: 3800, currentUsedMb: 18600, usedDeltaMb: 14800 }],
+      tableDeltas: [{
+        schema: 'dbo', name: 'L01BANKHISTORY', state: 'matched', baselineObjectId: 10, currentObjectId: 900,
+        baselineRows: 1000000, currentRows: 40000000, rowDelta: 39000000,
+        baselineReservedMb: 800, currentReservedMb: 8500, reservedDeltaMb: 7700,
+        baselineUsedMb: 750, currentUsedMb: 8200, usedDeltaMb: 7450,
+        baselineDataMb: 700, currentDataMb: 7100, dataDeltaMb: 6400,
+        baselineIndexMb: 50, currentIndexMb: 1100, indexDeltaMb: 1050
+      }],
+      totalTableDifferenceCount: 1,
+      returnedTableDifferenceCount: 1,
+      omittedTableDifferenceCount: 0,
+      limitations: []
+    })),
     readDatabaseGrowthHistory: vi.fn(() => reply({ connection: 'linkq-test', snapshots: [] })),
     saveDatabaseGrowthSnapshot: vi.fn((_id: string, snapshot: unknown) => reply({
       connection: 'linkq-test',
@@ -174,7 +212,9 @@ it('renders growth investigation as a readable dashboard and drills a table into
 
   document.getElementById('databaseGrowthSaveSnapshot')!.click();
   await tick();
+  expect(api.readDatabaseGrowthCapture).toHaveBeenCalledWith('linkq-test');
   expect(api.saveDatabaseGrowthSnapshot).toHaveBeenCalledWith('linkq-test', expect.objectContaining({
+    captureVersion: 2,
     database: 'L80LINKQ.TEST',
     capturedAt: '2026-09-15T17:00:00.000Z'
   }));
@@ -187,6 +227,55 @@ it('renders growth investigation as a readable dashboard and drills a table into
 
   expect(document.querySelector('.database-object-workspace-identity')!.textContent).toContain('dbo.L00ZONES');
   expect(api.readDatabaseTablePage).toHaveBeenLastCalledWith({ connection: 'linkq-test', objectId: 42, limit: 100 });
+});
+
+it('compares a restored baseline database with the current database and sends measured evidence to AI', async () => {
+  state.settings.connections.unshift({
+    id: 'linkq-2025',
+    name: 'LinkQ Backup 2025',
+    provider: 'sqlserver',
+    accessMode: 'read-only',
+    server: 'localhost',
+    database: 'L80LINKQ_2025',
+    encrypt: false,
+    trustServerCertificate: true,
+    authentication: { type: 'sql', user: 'long' }
+  });
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+  await tick();
+
+  const baseline = document.getElementById('databaseGrowthCompareBaseline') as HTMLSelectElement;
+  const current = document.getElementById('databaseGrowthCompareCurrent') as HTMLSelectElement;
+  const baselineDate = document.getElementById('databaseGrowthCompareBaselineDate') as HTMLInputElement;
+  baseline.value = 'linkq-2025';
+  current.value = 'linkq-test';
+  baselineDate.value = '2025-09-16';
+  document.getElementById('databaseGrowthCompareRun')!.click();
+  await tick();
+
+  expect(api.compareDatabaseGrowth).toHaveBeenCalledWith({
+    baselineConnection: 'linkq-2025',
+    currentConnection: 'linkq-test',
+    baselineAsOf: '2025-09-16'
+  });
+  const comparison = document.getElementById('databaseGrowthCompareBody')!;
+  expect(comparison.textContent).toContain('+20.0 GB');
+  expect(comparison.textContent).toContain('79.4%');
+  expect(comparison.textContent).toContain('dbo.L01BANKHISTORY');
+  expect(comparison.textContent).toContain('+39,000,000');
+
+  let aiPrompt = '';
+  dom.window.addEventListener('cos:database-open-chat', event => {
+    aiPrompt = (event as CustomEvent<{ suggestedText?: string }>).detail?.suggestedText ?? '';
+  });
+  document.getElementById('databaseGrowthCompareExplain')!.click();
+  expect(aiPrompt).toContain('2025-09-16');
+  expect(aiPrompt).toContain('data actually used');
+  expect(aiPrompt).toContain('L01BANKHISTORY');
+  expect(aiPrompt).toContain('Do not claim a historical cause');
 });
 
 it('shows an explicit unsaved connection on first use', async () => {

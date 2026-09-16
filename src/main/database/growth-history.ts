@@ -34,11 +34,26 @@ const tableSchema = z.object({
   indexMb: z.number().finite().nonnegative()
 }).strict();
 
+const fileSchema = z.object({
+  name: z.string().min(1).max(256),
+  type: z.enum(['data', 'log']),
+  sizeMb: z.number().finite().nonnegative(),
+  usedMb: z.number().finite().nonnegative().nullable(),
+  freeMb: z.number().finite().nonnegative().nullable(),
+  growth: z.number().finite().nonnegative(),
+  percentGrowth: z.boolean()
+}).strict();
+
 export const databaseGrowthSnapshotInputSchema = z.object({
+  captureVersion: z.literal(2).optional(),
   database: z.string().max(256),
   capturedAt: z.string().datetime(),
   summary: summarySchema,
-  largestTables: z.array(tableSchema).max(25)
+  largestTables: z.array(tableSchema).max(25).optional(),
+  files: z.array(fileSchema).max(64).optional(),
+  tables: z.array(tableSchema).max(5000).optional(),
+  tablesTruncated: z.boolean().optional(),
+  limitations: z.array(z.string().max(1000)).max(32).optional()
 }).strict();
 
 const snapshotSchema = databaseGrowthSnapshotInputSchema.extend({

@@ -1,5 +1,8 @@
 import type {
   DatabaseConnectionTestResult,
+  DatabaseGrowthCapture,
+  DatabaseGrowthComparisonResult,
+  DatabaseGrowthCompareRequest,
   DatabaseGrowthHistoryResult,
   DatabaseGrowthDiagnosticsResult,
   DatabaseGrowthSnapshotInput,
@@ -33,6 +36,8 @@ export function createDatabaseApi(call: Call) {
     setDatabasePassword: (id: string, value: string) => call<DatabaseSettingsState>('database:passwordSet', { id, value }),
     testDatabaseConnection: (id: string) => call<DatabaseConnectionTestResult>('database:test', { id }),
     readDatabaseGrowthDiagnostics: (id: string) => call<DatabaseGrowthDiagnosticsResult>('database:growthDiagnostics', { id }),
+    readDatabaseGrowthCapture: (id: string) => call<DatabaseGrowthCapture>('database:growthCapture', { id }),
+    compareDatabaseGrowth: (request: DatabaseGrowthCompareRequest) => call<DatabaseGrowthComparisonResult>('database:growthCompare', request),
     readDatabaseGrowthHistory: (id: string) => call<DatabaseGrowthHistoryResult>('database:growthHistory', { id }),
     saveDatabaseGrowthSnapshot: (id: string, snapshot: DatabaseGrowthSnapshotInput) => call<DatabaseGrowthHistoryResult>('database:growthSnapshotSave', { id, snapshot }),
     searchDatabaseObjects: (request: DatabaseObjectSearchRequest) => call<DatabaseObjectSearchResult>('database:objectsSearch', request),
