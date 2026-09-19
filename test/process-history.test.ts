@@ -1,11 +1,12 @@
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { emptyEvidence } from '../src/main/mcp/call-context.js';
 import { flushRecorder, recordToolCall, resetRecorderForTests } from '../src/main/session/recorder.js';
 import { appendEvent, completeProcessCall, createSession, flushSessions, getSession, initSessionStore,
-  readActivityEvents, readEvents, readRecentEvents, recordProcessCall, resetSessionStoreForTests, turnHasMcpCall } from '../src/main/session/store.js';
+  readActivityEvents, readEvents, readHydratedActivityCall, readRecentEvents, recordProcessCall,
+  rebindSession, resetSessionStoreForTests, turnHasMcpCall } from '../src/main/session/store.js';
 import { foldProgress, toolCallSummary, workSequence, type SessionEvent } from '../src/shared/session.js';
 import { UnifiedExecProcessManager, type ProcessCompletion } from '../src/main/codex/unified-exec.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -55,6 +56,16 @@ it('revises the exact launch once, preserves chronology and survives a cold hist
   expect((await getSession(session.id))!.toolCalls).toBe(count);
 });
 
+it('keeps a proven benign non-zero completion green without changing its raw exit code', async () => {
+  const session = await createSession({ conversationId: 'benign-owner', title: 'process' });
+  await recordProcessCall(session.id, launch('benign-call', 'benign-owner'));
+  await completeProcessCall(session.id, 'benign-call', { completedAt: 200, durationMs: 100,
+    exitCode: 4294967295, benignExit: true });
+  const row = (await readEvents(session.id)).find(event => event.kind === 'tool_call');
+  expect(row).toMatchObject({ call: { process: { exitCode: 4294967295 },
+    summary: { title: 'Completed fixture', tone: 'good', metric: '✓ finished' } } });
+});
+
 it('does not cross sessions or reused numeric process ids', async () => {
   const a = await createSession({ conversationId: 'a', title: 'a' });
   const b = await createSession({ conversationId: 'b', title: 'b' });
@@ -67,6 +78,63 @@ it('does not cross sessions or reused numeric process ids', async () => {
   expect(calls.map(e => [e.call.callId, e.call.process?.exitCode])).toEqual([
     ['old-call', 0], ['new-call', undefined], ['foreign-call', undefined]
   ]);
+});
+
+it('reads only an exact already-hydrated call revision without opening or scanning history', async () => {
+  const a = await createSession({ conversationId: 'owner-a', title: 'a' });
+  const b = await createSession({ conversationId: 'owner-b', title: 'b' });
+  await appendEvent(a.id, launch('ordinary-a', 'owner-a'));
+  await recordProcessCall(a.id, launch('process-a', 'owner-a'));
+  await recordProcessCall(b.id, launch('foreign-b', 'owner-b'));
+  const projected = await readActivityEvents(a.id, 0);
+  const ordinary = projected.events.find(event => event.kind === 'tool_call' && event.call.callId === 'ordinary-a')!;
+  const processLaunch = projected.events.find(event => event.kind === 'tool_call' && event.call.callId === 'process-a')!;
+  // Presentation adds a derived turn position; details return the unchanged stored record.
+  const ordinaryRecord = { ...ordinary };
+  delete ordinaryRecord.turnOrigin;
+
+  const openFile = vi.spyOn(fs, 'open');
+  const readFile = vi.spyOn(fs, 'readFile');
+  try {
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'ordinary-a', ordinary.seq)).resolves.toEqual(ordinaryRecord);
+    await expect(readHydratedActivityCall(a.id, 'owner-b', 'ordinary-a', ordinary.seq)).resolves.toBeNull();
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'missing', ordinary.seq)).resolves.toBeNull();
+
+    await completeProcessCall(a.id, 'process-a', { completedAt: 200, durationMs: 100, exitCode: 9 });
+    const completed = (await readActivityEvents(a.id, processLaunch.seq + 1)).events
+      .find(event => event.kind === 'tool_call' && event.call.callId === 'process-a')!;
+    const completedRecord = { ...completed };
+    delete completedRecord.turnOrigin;
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'process-a', processLaunch.seq)).resolves.toBeNull();
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'process-a', completed.seq)).resolves.toEqual(completedRecord);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(readFile).not.toHaveBeenCalled();
+
+    // The initial ownership check can pass while an accepted A→B rebind is already queued.
+    // Its in-queue recheck must refuse A after the move commits.
+    const moving = rebindSession(a.id, 'owner-a', 'owner-next');
+    await Promise.resolve();
+    const waitingRead = readHydratedActivityCall(a.id, 'owner-a', 'ordinary-a', ordinary.seq);
+    await expect(moving).resolves.toBe(true);
+    await expect(waitingRead).resolves.toBeNull();
+  } finally {
+    openFile.mockRestore();
+    readFile.mockRestore();
+  }
+
+  await flushSessions();
+  resetSessionStoreForTests();
+  initSessionStore(dir);
+  const coldOpen = vi.spyOn(fs, 'open');
+  const coldRead = vi.spyOn(fs, 'readFile');
+  try {
+    await expect(readHydratedActivityCall(a.id, 'owner-a', 'ordinary-a', ordinary.seq)).resolves.toBeNull();
+    expect(coldOpen).not.toHaveBeenCalled();
+    expect(coldRead).not.toHaveBeenCalled();
+  } finally {
+    coldOpen.mockRestore();
+    coldRead.mockRestore();
+  }
 });
 
 it('keeps a late exit out of work boundaries, pagination and cold finish replay', async () => {

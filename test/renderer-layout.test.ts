@@ -46,7 +46,7 @@ it('searches whole settings sections without empty headings, orphaned controls o
   filterSettingsSections(view, '  SESSION FINISH  ');
   expect(sections.filter(section => !section.hidden).map(section => section.textContent)).toEqual(['Keep the turn open']);
   for (const section of sections) expect((section.nextElementSibling as HTMLElement).hidden).toBe(section.hidden);
-  expect(document.getElementById('finishAction')!.closest('.pane')!.hasAttribute('hidden')).toBe(false);
+  expect(document.getElementById('finishTool')!.closest('.pane')!.hasAttribute('hidden')).toBe(false);
   expect(document.getElementById('goalKey')!.closest('.pane')!.hasAttribute('hidden')).toBe(true);
   filterSettingsSections(view, 'no-such-setting-123');
   expect(sections.every(section => section.hidden)).toBe(true);
@@ -97,9 +97,24 @@ describe('the session card header', () => {
    * because the chat is what writes the brief — a button here would be a second way to
    * start the one thing that must happen exactly once.
    */
-  it('keeps the title beside connection status and chat controls in the composer', () => {
+  it('keeps global connection status out of the chat header and in the sidebar footer', () => {
     const header = document.querySelector('#chatTitle')!.closest('header')!;
-    expect(header.contains(document.getElementById('live'))).toBe(true);
+    const connection = document.getElementById('sidebarConnection')!;
+    const footer = connection.closest('.sidebar-bottom')!;
+    expect(header.contains(connection)).toBe(false);
+    expect(footer).not.toBeNull();
+    expect([...footer.children].map((node) => (node as HTMLElement).id || (node as HTMLElement).className)).toEqual([
+      'workspaceSettings',
+      'connection-anchor'
+    ]);
+    expect(document.getElementById('connectionPopover')!.closest('.connection-anchor')).not.toBeNull();
+    expect(rule('.connection-popover')).toContain('position: fixed');
+    expect(rule('.connection-popover')).toContain('max-height: min(580px, calc(100vh - 70px))');
+    expect(rule('.connection-popover::-webkit-scrollbar-track')).toContain('margin-block: 10px');
+    expect(rule('#workspaceSettings')).toContain('height: 36px');
+    expect(rule('.sidebar-connection')).toContain('width: 36px; height: 36px');
+    expect(document.getElementById('connectionAdvanced')).not.toBeNull();
+    expect(document.getElementById('connectionAdvancedGrid')).not.toBeNull();
     expect(document.getElementById('sessionControls')!.closest('#composerSettings')).not.toBeNull();
     expect(header.querySelector('.session-controls')).toBeNull();
   });
@@ -375,7 +390,7 @@ describe('the settings sheet', () => {
     expect(select).toContain('width: auto');
     expect(select).toContain('flex: 0 0 auto');
     // Same specificity trap as input.num: the shared rule has to come first to lose.
-    expect(css.indexOf('.setting select {')).toBeGreaterThan(css.indexOf("input[type='number'],"));
+    expect(css.indexOf('\n.setting select {')).toBeGreaterThan(css.indexOf("input[type='number'],"));
   });
 
   /** The row's action never shrinks; its explanation is the thing that ellipsizes. */
@@ -423,10 +438,12 @@ describe('the settings sheet', () => {
   it('asks for a single compaction threshold', () => {
     const pane = document.querySelector('.view[data-view="settings"]')!;
     const numbers = [...pane.querySelectorAll('input[type="number"]')].map((input) => input.id);
-    expect(numbers).toEqual(['maWorkers', 'sessRetain', 'autoCompactTokens']);
-    for (const id of ['sessAdvisory', 'sessLimit']) {
+    expect(numbers).toEqual(['maWorkers', 'autoCompactTokens']);
+    for (const id of ['sessRecord', 'sessRetain', 'sessAdvisory', 'sessLimit']) {
       expect(document.getElementById(id), `#${id} is back`).toBeNull();
     }
+    expect(document.querySelector('[data-group="recording"]')).toBeNull();
+    expect(pane.textContent).not.toContain('Keep recordings');
   });
 
   /**
@@ -500,9 +517,16 @@ describe('the window as a whole', () => {
   });
 
   it('never scrolls sideways', () => {
-    // Wide authored tables and the bounded database tab strip may scroll locally; the surrounding app must not.
+    // Wide authored tables/code and the bounded database tab strip may scroll locally; the surrounding app must not.
     const horizontal = [...css.matchAll(/([^{}]+)\{[^{}]*overflow-x:\s*(?:auto|scroll)[^{}]*\}/g)];
-    expect(horizontal.map(match => match[1]!.trim())).toEqual(['.msg.rich .markdown-table', '.database-object-tabs']);
+    expect(horizontal.map(match => match[1]!.trim())).toEqual([
+      '.msg.rich .markdown-table',
+      '.file-preview-markdown pre',
+      '.file-preview-markdown-table',
+      '.file-pdf-viewport',
+      '.database-object-tabs',
+      '.terminal-tabs'
+    ]);
     expect(css).not.toMatch(/overflow:\s*(auto|scroll)\s+/);
     // The one scrolling surface in the app is vertical only.
     expect(rule('.scroll')).toContain('overflow: hidden auto');

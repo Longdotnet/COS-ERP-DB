@@ -22,6 +22,9 @@ import { publishPluginSurface, unpublishPluginSurface, pluginRefreshPublications
 import { pluginManager } from './plugins/manager.js';
 
 let endpoint: McpEndpoint | null = null;
+/** Retain custody while draining so final shutdown can bound that same stop. */
+let drainingEndpoint: McpEndpoint | null = null;
+let pendingDisconnect: Promise<void> | null = null;
 /** The Core tunnel. Also the only tunnel on the cloudflared and manual paths. */
 let tunnel: TunnelHandle | null = null;
 /** Independent optional tunnel lifetimes on the OpenAI path. */
@@ -134,7 +137,7 @@ function describeSurfaces(): SurfaceStatus[] {
 
 function desktopUnavailableDetail(id: SurfaceId): string {
   if (id === 'desktop' && !desktopAutomationSupported()) {
-    return 'Desktop automation requires Windows or macOS; Linux is not yet supported. Core files, terminal, sessions and sub-agents remain available.';
+    return 'Enable screen or input access for browser control through the companion extension. Native desktop input requires Windows or supported macOS.';
   }
   return id === 'desktop'
     ? 'Turn on "See the screen", "Control mouse and keyboard" or a clipboard permission to use this connector.'
@@ -155,8 +158,7 @@ function toolsFor(id: SurfaceId): string[] {
   if (!caps.command && caps.search) tools.push('find');
   if (caps.create || caps.edit || caps.move || caps.deleteFile) tools.push('apply_patch');
   if (caps.command) tools.push('exec_command', 'write_stdin');
-  if (caps.saveArtifact) tools.push('download_artifact');
-  if (config.sessions.record) tools.push('session');
+  if (config.sessions.record) tools.push('update_plan');
   if (config.multiAgent.enabled) tools.push('agents');
   return tools;
 }
@@ -228,7 +230,7 @@ function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): st
 }
 
 async function connectImpl(): Promise<void> {
-  if (shutdownRequested) return;
+  if (shutdownRequested || pendingDisconnect) return;
   // Offline counts as running: the tunnel is alive and retrying on its own.
   if (
     status.state === 'connected' ||
@@ -242,7 +244,7 @@ async function connectImpl(): Promise<void> {
   // disconnectImpl can itself await a live endpoint/tunnel. Final shutdown may be requested
   // while that stop is in progress; never mint a fresh generation afterwards and thereby undo
   // the synchronous invalidation performed by shutdownConnection().
-  if (shutdownRequested) return;
+  if (shutdownRequested || pendingDisconnect) return;
   const generation = ++connectionGeneration;
 
   const config = getConfig();
@@ -266,18 +268,18 @@ async function connectImpl(): Promise<void> {
         privacyScreenshots: live.ui.privacyScreenshots
       };
     });
+    endpoint = startedEndpoint;
     if (shutdownRequested || generation !== connectionGeneration) {
-      await startedEndpoint.stop({ forceAfterMs: 30_000 }).catch(() => {});
+      await disconnectImpl();
       return;
     }
-    endpoint = startedEndpoint;
     setStatus({ localUrl: endpoint.url, surfaces: describeSurfaces() });
     if (desktopAutomationSupported() && (caps.screen || caps.control)) void prewarmComputerHelper();
     updateSurface('core', { state: 'starting', detail: 'Connecting…' });
 
     const apiKey = await getSecret(setupApiKeySlot(config.tunnel.profileId));
     if (shutdownRequested || generation !== connectionGeneration) {
-      await disconnectImpl(30_000);
+      await disconnectImpl();
       return;
     }
     activeCoreTransport = coreTransport(config.tunnel);
@@ -317,17 +319,16 @@ async function connectImpl(): Promise<void> {
         }
       }
     });
+    tunnel = startedTunnel;
     if (shutdownRequested || generation !== connectionGeneration) {
-      await startedTunnel.stop().catch(() => {});
-      await disconnectImpl(30_000);
+      await disconnectImpl();
       return;
     }
-    tunnel = startedTunnel;
 
     for (const id of optionalSurfaces) await startOptionalTunnel(id, generation, config.tunnel, apiKey);
   } catch (err) {
     if (shutdownRequested || generation !== connectionGeneration) {
-      await disconnectImpl(30_000);
+      await disconnectImpl();
       return;
     }
     const message = err instanceof TunnelError ? err.message : (err as Error).message;
@@ -349,6 +350,7 @@ async function startOptionalTunnel(
   settings: TunnelSettings,
   apiKey: string | null
 ): Promise<void> {
+  if (shutdownRequested || pendingDisconnect || generation !== connectionGeneration) return;
   if (settings.kind !== 'openai') return;
   const surface = status.surfaces.find((entry) => entry.id === id);
   if (!surface?.available || !endpoint) return;
@@ -380,10 +382,8 @@ async function startOptionalTunnel(
         });
       }
     });
-    if (shutdownRequested || generation !== connectionGeneration) {
-      await started.stop().catch(() => {});
-      return;
-    }
+    // The serialized teardown owns retirement, including when Disconnect arrived
+    // during startup. Keep the transport until its accepted responses drain.
     lifetime.handle = started;
   } catch (err) {
     if (optionalTunnels.get(id) === lifetime) optionalTunnels.delete(id);
@@ -416,7 +416,7 @@ async function stopOptionalTunnel(id: OptionalSurface, detail: string): Promise<
  * serialized lifecycle here; unrelated settings saves do not.
  */
 async function applySettingsImpl(): Promise<void> {
-  if (shutdownRequested) return;
+  if (shutdownRequested || pendingDisconnect) return;
   if (!endpoint) return;
   const config = getConfig();
   const desiredCoreTransport = coreTransport(config.tunnel);
@@ -465,6 +465,9 @@ async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
   for (const surface of SURFACE_LIST) unpublishPluginSurface(surface.id);
   // Invalidate callbacks first; stopping a child can itself cause exit/health events.
   connectionGeneration += 1;
+  if (status.state !== 'disconnected') {
+    setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
+  }
   // Stop local admission first and let accepted MCP calls finish recording before any
   // command process or durable writer is retired by the app-wide shutdown sequence.
   // The public tunnel may briefly see the now-closed loopback endpoint, which is preferable
@@ -472,8 +475,14 @@ async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
   if (endpoint) {
     const stopping = endpoint;
     endpoint = null;
-    if (endpointForceAfterMs === undefined) await stopping.stop().catch(() => {});
-    else await stopping.stop({ forceAfterMs: endpointForceAfterMs }).catch(() => {});
+    drainingEndpoint = stopping;
+    try {
+      const forceAfterMs = endpointForceAfterMs ?? (shutdownRequested ? 30_000 : undefined);
+      if (forceAfterMs === undefined) await stopping.stop().catch(() => {});
+      else await stopping.stop({ forceAfterMs }).catch(() => {});
+    } finally {
+      drainingEndpoint = null;
+    }
   }
   for (const { handle } of optionalTunnels.values()) await handle?.stop().catch(() => {});
   optionalTunnels.clear();
@@ -500,7 +509,12 @@ export function connect(): Promise<void> {
 }
 
 export function disconnect(): Promise<void> {
-  return enqueueLifecycle(disconnectImpl);
+  if (pendingDisconnect) return pendingDisconnect;
+  connectionGeneration += 1;
+  logInfo('disconnect requested');
+  setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
+  pendingDisconnect = enqueueLifecycle(disconnectImpl).finally(() => { pendingDisconnect = null; });
+  return pendingDisconnect;
 }
 
 /**
@@ -513,6 +527,8 @@ export function shutdownConnection(): Promise<void> {
   // Ordinary disconnect does not set this flag, so Settings can still disconnect/reconnect.
   shutdownRequested = true;
   connectionGeneration += 1;
+  // Do not enqueue the force deadline behind the ordinary drain it must bound.
+  void drainingEndpoint?.stop({ forceAfterMs: 30_000 }).catch(() => {});
   return enqueueLifecycle(() => disconnectImpl(30_000));
 }
 

@@ -19,21 +19,26 @@ import { trackInFlight, emptyEvidence, type CallContext } from '../src/main/mcp/
 const offerToolInput = async (...args: Parameters<typeof offerToolInputBatch>) => (await offerToolInputBatch(...args)).messages;
 vi.mock('../src/main/session/recorder.js', () => ({ noteChatOrigin: vi.fn(async () => undefined) }));
 
-const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, finishReleased: false, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
+const openings = vi.hoisted(() => new Map<string, { id: string; conversationId: string | null; origin: { kind: string } }>());
+const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
 vi.mock('../src/main/session/store.js', () => ({
   sessionsRoot: () => path.join(directory, 'sessions'),
   listUsageSessions: vi.fn(async () => []),
   sessionDirectoryMissing: vi.fn(async () => false),
+  deleteSession: vi.fn(async (id: string) => { openings.delete(id); }),
+  readCompletedFinal: vi.fn(async () => null),
   conversationWasSuperseded: vi.fn(async () => false),
   readRecentEvents: vi.fn(async () => binding.end ? [binding.end] : []),
   turnHasMcpCall: vi.fn(async () => true),
-  getSession: vi.fn(async (id: string) => ({ id, conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, activeTurnId: binding.activeTurnId,
+  createSession: vi.fn(async (options: { reservedId: string; origin: { kind: string } }) => { const row = openings.get(options.reservedId) ?? { id: options.reservedId, conversationId: null, origin: options.origin, chatIds: [], events: 0 }; openings.set(row.id, row); return row; }),
+  rebindSession: vi.fn(async (id: string, from: string | null, to: string) => { const row = openings.get(id); if (!row || row.conversationId !== from) return false; row.conversationId = to; return true; }),
+  getSession: vi.fn(async (id: string) => openings.get(id) ?? ({ id, conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, activeTurnId: binding.activeTurnId,
     origin: { kind: binding.origin }, lastToolCallAt: binding.lastToolCallAt,
     finishTurn: { turnId: binding.activeTurnId, released: binding.finishReleased },
     selectedModel: { conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, model: binding.model } })),
-  findSessionByConversation: vi.fn(async (id: string) => binding.recorded && id === binding.conversationId ? { id: 'session-one', conversationId: id } : null)
+  findSessionByConversation: vi.fn(async (id: string) => [...openings.values()].find(row => row.conversationId === id) ?? (binding.recorded && id === binding.conversationId ? { id: 'session-one', conversationId: id } : null))
 }));
-vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes }, goal: { impulseMinutes: binding.impulseMinutes } }) }));
+vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes }, goal: { enabled: binding.goalEnabled, mode: 'goal', impulseMinutes: binding.impulseMinutes } }) }));
 vi.mock('../src/main/session/blocked-chats.js', () => ({ isChatBlocked: () => binding.blocked }));
 let directory: string;
 let now: number;
@@ -51,6 +56,7 @@ async function seedLegacyInput(args: InputArgs): Promise<InputEntry> {
   return row;
 }
 beforeEach(async () => {
+  openings.clear();
   vi.mocked(noteChatOrigin).mockClear();
   resetInputForTests();
   automate.mockReset();
@@ -65,7 +71,7 @@ beforeEach(async () => {
   binding.recorded = true;
   binding.activeTurnId = null;
   binding.lastToolCallAt = null;
-  binding.finishEnabled = true; binding.finishReleased = false; binding.model = 'gpt-6-astra'; binding.leadMinutes = 5; binding.impulseMinutes = 0;
+  binding.finishEnabled = true; binding.goalEnabled = false; binding.finishReleased = false; binding.model = 'gpt-6-astra'; binding.leadMinutes = 5; binding.impulseMinutes = 0;
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 0 };
   now = 1000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -112,6 +118,49 @@ describe('durable user input ownership', () => {
     expect(await authorizeBrowserInput(direct.id, 'native-page', binding.conversationId)).toBe(false);
     expect(await acknowledgeBrowserInput(direct.id, 'native-page', binding.conversationId, 'native-message')).toBe(true);
     expect((await listInputs())[0]).toMatchObject({ state: 'sent', messageId: 'native-message' });
+  });
+
+  it('queues an explicit injection before the first tool for that exact turn without browser fallback', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    binding.lastToolCallAt = 800;
+    const row = await enqueueInput(input({ delivery: 'tool' }));
+    expect(row).toMatchObject({ state: 'queued', delivery: 'tool', transportIntent: 'tool', toolTurnId: 'plain-turn' });
+    expect(row.directTurn).toBeUndefined();
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect(await claimBrowserInput(row.id, 'native-page', binding.conversationId, true)).toBeNull();
+    expect(await offerToolInput(sessionId, 'foreign-conversation', 'foreign-call', now)).toEqual([]);
+    expect(await offerToolInput(sessionId, binding.conversationId, 'first-exact-call', now)).toEqual([
+      { text: row.text, images: [] }
+    ]);
+  });
+
+  it('fails an explicit injection visibly when its exact turn ends without a tool', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const row = await enqueueInput(input({ delivery: 'tool' }));
+    resetInputForTests();
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'plain-turn', time: 1001 };
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+      state: 'failed',
+      error: 'Not injected: the selected turn ended before an eligible tool call.'
+    });
+    binding.activeTurnId = 'next-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'next-turn', time: 1002 };
+    expect(await offerToolInput(sessionId, binding.conversationId, 'next-turn-call', now + 2)).toEqual([]);
+  });
+
+  it('does not leak a restarted explicit injection into a newer inactive turn', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'original-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'original-turn', time: 900 };
+    const row = await enqueueInput(input({ delivery: 'tool' }));
+    resetInputForTests();
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'newer-turn', time: 1001 };
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed' });
+    expect(await offerToolInput(sessionId, binding.conversationId, 'newer-call', now + 1)).toEqual([]);
   });
 
   it.each(['gpt-5-pro', 'gpt-5.6-pro', 'gpt-6-astra', 'gpt-6-pro'])('keeps %s on MCP injection before its first call', async model => {
@@ -206,6 +255,7 @@ describe('durable user input ownership', () => {
   });
 
   it('supersedes only the receiving session Goal and preserves another session queued Goal across restart', async () => {
+    binding.goalEnabled = true;
     binding.activeTurnId = 'turn-one';
     const otherGoal = await enqueueInput(input({ text: 'Goal A' }), { turnId: 'turn-one', periodic: false });
     const ownGoal = await enqueueInput(input({ sessionId: 'session-two', text: 'Goal B' }), { turnId: 'turn-one', periodic: false });
@@ -247,6 +297,7 @@ describe('durable user input ownership', () => {
     expect(last[0]?.text).toContain('Stage two');
   });
   it('keeps an automatic Goal for a call started after its enqueue', async () => {
+    binding.goalEnabled = true;
     binding.activeTurnId = 'turn-one';
     await enqueueInput(input(), { turnId: 'turn-one', periodic: false });
     expect(await offerToolInput(sessionId, binding.conversationId, 'running-call', now, true)).toEqual([]);
@@ -255,6 +306,7 @@ describe('durable user input ownership', () => {
   });
 
   it.each([false, true])('prioritizes new user input while preserving generated post-wire receipts: offered=%s', async offered => {
+    binding.goalEnabled = true;
     binding.activeTurnId = 'turn-one'; binding.impulseMinutes = 3;
     const generated = await enqueueInput(input({ text: 'Generated instruction' }), { turnId: 'turn-one', periodic: false });
     if (offered) now += 1;
@@ -270,6 +322,7 @@ describe('durable user input ownership', () => {
     expect(result[0]!.text).not.toContain('Generated instruction');
   });
   it.each(['queued', 'tool'] as const)('cancels persisted obsolete periodic %s rows even with the old setting enabled', async state => {
+    binding.goalEnabled = true;
     binding.activeTurnId = 'turn-one'; binding.impulseMinutes = 3;
     const row: InputEntry = { ...input(), state, owner: state === 'tool' ? 'old-request' : null,
       createdAt: now, conversationId: binding.conversationId,
@@ -283,6 +336,7 @@ describe('durable user input ownership', () => {
     await expect(enqueueInput(input(), { turnId: 'turn-one', periodic: true })).rejects.toThrow('no longer belongs');
   });
   it.each(['end', 'next-turn', 'hold-off'] as const)('does not deliver a queued finish instruction after %s, including restart', async change => {
+    binding.goalEnabled = true;
     binding.activeTurnId = 'turn-one';
     const row = await enqueueInput(input({ text: 'Check the remaining issue' }), { turnId: 'turn-one', periodic: false });
     if (change === 'end') binding.finishReleased = true;
@@ -293,6 +347,7 @@ describe('durable user input ownership', () => {
     expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
     expect(await pendingBrowserInputs()).toEqual([]);
   });  it('delivers a generated finish instruction through the existing exact tool receipt once', async () => {
+    binding.goalEnabled = true;
     binding.activeTurnId = 'turn-one';
     const row = await enqueueInput(input({ text: 'Finish the validation' }), { turnId: 'turn-one', periodic: false });
     expect(await offerToolInput(sessionId, binding.conversationId, 'first-request', now + 1, true)).toHaveLength(1);
@@ -338,10 +393,11 @@ describe('durable user input ownership', () => {
     await claimBrowserInput(row.id, 'page', null);
     expect(noteChatOrigin).not.toHaveBeenCalled();
     await acknowledgeBrowserInput(row.id, 'page', binding.conversationId, 'native-user');
-    expect(noteChatOrigin).toHaveBeenCalledWith(binding.conversationId, { kind: 'desktop', fromSessionId: null, agentId: null, task: '' });
+    expect(openings.get(row.sessionId!)?.origin.kind).toBe('desktop');
     vi.mocked(noteChatOrigin).mockClear();
     resetInputForTests(); await listInputs();
-    expect(noteChatOrigin).toHaveBeenCalledWith(binding.conversationId, expect.objectContaining({ kind: 'desktop' }));
+    expect(openings.get(row.sessionId!)?.origin.kind).toBe('desktop');
+    expect(noteChatOrigin).not.toHaveBeenCalled();
     vi.mocked(noteChatOrigin).mockClear();
     const existing = await enqueueInput(input());
     await claimBrowserInput(existing.id, 'existing', binding.conversationId);
@@ -359,23 +415,25 @@ describe('durable user input ownership', () => {
     expect(await pendingBrowserInputs()).toEqual([]);
     expect(await claimBrowserInput(row.id, 'late-page', null, true)).toBeNull();
     now += 45000;
-    expect((await listInputs())[0]).toMatchObject({ state: 'cancelled', error: expect.stringContaining('may already') });
+    // An authorized Send retains exact custody while native identity is still pending.
+    expect((await listInputs())[0]).toMatchObject({ state: 'browser', owner: 'replacement-page' });
+    expect(await claimBrowserInput(row.id, 'late-page', null, true)).toBeNull();
     await expect(enqueueInput(input())).resolves.toMatchObject({ state: 'queued' });
     expect(await acknowledgeBrowserInput(row.id, 'replacement-page', binding.conversationId, 'late-native')).toBe(true);
-    expect((await listInputs())[0]).toMatchObject({ state: 'cancelled', messageId: 'late-native' });
+    expect((await listInputs())[0]).toMatchObject({ state: 'sent', messageId: 'late-native' });
   });
-  it('does not replay a retained transcript just to restore an origin already present in the catalog', async () => {
-    const row = await enqueueInput(input({ sessionId: null }));
+  it('does not replay a retained transcript after a migrated opening owns its exact session', async () => {
+    const row = await seedLegacyInput(input({ sessionId: null }));
     await claimBrowserInput(row.id, 'page', null);
     await acknowledgeBrowserInput(row.id, 'page', binding.conversationId, 'native-user');
     vi.mocked(noteChatOrigin).mockClear();
     vi.mocked(listUsageSessions).mockResolvedValueOnce([{ id: sessionId, conversationId: binding.conversationId, origin: { kind: 'desktop' } }] as never);
     resetInputForTests(); await listInputs();
     expect(noteChatOrigin).not.toHaveBeenCalled();
-    // Two current records are not one proven stamped origin; preserve ordinary repair.
+    // A later catalog conflict cannot detach or replay the outbox's exact migrated owner.
     vi.mocked(listUsageSessions).mockResolvedValueOnce([{ id: sessionId, conversationId: binding.conversationId, origin: { kind: 'desktop' } }, { id: 'session-two', conversationId: binding.conversationId, origin: null }] as never);
     resetInputForTests(); await listInputs();
-    expect(noteChatOrigin).toHaveBeenCalledWith(binding.conversationId, expect.objectContaining({ kind: 'desktop' }));
+    expect(noteChatOrigin).not.toHaveBeenCalled();
   });
   it('expires pre-send preparation without images within one minute and revokes a late document', async () => {
     const row = await enqueueInput(input({ sessionId: null }));
@@ -436,15 +494,15 @@ describe('durable user input ownership', () => {
     await acknowledgeBrowserInput(second.id, 'second-owner', binding.conversationId);
     expect(automate.mock.calls.at(-1)?.[1]).toBe('off');
   });
-  it('expires a legacy initial browser attempt while retaining an intentional after-turn wait', async () => {
+  it('migrates a legacy initial browser attempt while retaining an intentional after-turn wait', async () => {
     const stale = await seedLegacyInput(input({ sessionId: null }));
     const after = await seedLegacyInput(input({ mode: 'after-turn' }));
     now += 600001;
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'fresh-end', time: now };
     expect(await pendingBrowserInputs()).toContainEqual({ id: after.id, conversationId: binding.conversationId });
-    expect((await listInputs()).find(row => row.id === stale.id)).toMatchObject({ state: 'failed' });
+    expect((await listInputs()).find(row => row.id === stale.id)).toMatchObject({ state: 'queued', opening: true, sessionId: stale.id });
     resetInputForTests();
-    expect(await claimBrowserInput(stale.id, 'after-restart', null)).toBeNull();
+    expect(await claimBrowserInput(stale.id, 'after-restart', null)).toMatchObject({ id: stale.id, state: 'browser' });
   });
   it('waits indefinitely for tool injection after restart', async () => {
     binding.activeTurnId = 'active';
@@ -464,12 +522,14 @@ describe('durable user input ownership', () => {
     resetInputForTests();
     expect(await offerToolInput(sessionId, binding.conversationId, 'next-tool', now + 1)).toEqual([]);
   });
-  it('bounds pending user messages across chats while allowing an exact UUID retry', async () => {
+  it('admits independent chats while preserving same-session admission and exact UUID retry', async () => {
     const first = input({ sessionId: null });
     await enqueueInput(first);
     expect(await enqueueInput(first)).toMatchObject({ id: first.id });
+    const second = await enqueueInput(input());
     await expect(enqueueInput(input())).rejects.toThrow('One message');
     expect(await cancelInput(first.id)).toBe(true);
+    expect(await cancelInput(second.id)).toBe(true);
     await expect(enqueueInput(input())).resolves.toMatchObject({ state: 'queued' });
   });
   it.each(['tool', 'browser'] as const)('retains the %s delivery receipt when recording fails and never resends it', async (transport) => {
@@ -495,6 +555,48 @@ describe('durable user input ownership', () => {
     await listInputs();
     expect(record).toHaveBeenCalledTimes(calls);
   });
+  it.each([false, true])('retains canonical commitment independently of optional image failure (committed=%s)', async committed => {
+    const record = vi.fn(async (_entry: Readonly<InputEntry>, anchor: (seq: number) => void) => {
+      if (committed) anchor(1);
+      throw new Error(committed ? 'asset quota' : 'message write failed');
+      return true;
+    });
+    configureInputDelivery({ applyAutomation: automate, changed, recordDelivered: record });
+    const row = await enqueueInput(input());
+    await claimBrowserInput(row.id, 'page', binding.conversationId);
+    await acknowledgeBrowserInput(row.id, 'page', binding.conversationId, 'native-message');
+    const persisted = (await readDurable<InputEntry[]>('session-input'))![0]!;
+    expect(persisted.historyAnchored === true).toBe(committed);
+    expect(persisted.historyRecorded).not.toBe(true);
+    resetInputForTests();
+    const retained = (await listInputs())[0]!;
+    expect(retained.historyAnchored === true).toBe(committed);
+    expect(await claimBrowserInput(row.id, 'other-page', binding.conversationId)).toBeNull();
+    expect(await offerToolInput(sessionId, binding.conversationId, 'later', ++now)).toEqual([]);
+    record.mockImplementation(async (_entry, anchor) => { anchor(1); return true; });
+    expect((await listInputs())[0]).toMatchObject({ historyAnchored: true, historyRecorded: true, historySeq: 1 });
+  });
+  it('anchors both companion receipts through their one combined canonical message', async () => {
+    const root: InputEntry = { ...input(), state: 'sent', owner: 'page', createdAt: now, deliveredAt: now,
+      conversationId: binding.conversationId, messageId: 'shared-native' };
+    const companion: InputEntry = { ...root, id: '20000000-0000-4000-8000-000000000002', text: 'Companion' };
+    root.companionInputId = companion.id;
+    await writeDurableNow('session-input', [root, companion]);
+    resetInputForTests();
+    const record = vi.fn(async (entry: Readonly<InputEntry>, anchor: (seq: number) => void) => {
+      expect(entry.id).toBe(root.id);
+      expect(entry.text).toContain('Companion');
+      anchor(1);
+      throw new Error('optional asset failed');
+      return true;
+    });
+    configureInputDelivery({ applyAutomation: automate, changed, recordDelivered: record });
+    const rows = await listInputs();
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(rows).toHaveLength(2);
+    for (const row of rows) expect(row).toMatchObject({ historyAnchored: true, historySeq: 1 });
+    for (const row of (await readDurable<InputEntry[]>('session-input'))!) expect(row.historyRecorded).not.toBe(true);
+  });
   it('reprojects a wrapped recorded receipt after restart without reopening delivery', async () => {
     const record = vi.fn(async (_entry: InputEntry) => true);
     configureInputDelivery({ applyAutomation: automate, changed, recordDelivered: record });
@@ -512,9 +614,10 @@ describe('durable user input ownership', () => {
     await listInputs();
     expect(record).toHaveBeenCalledTimes(1);
   });
-  it('legacy queue: offers images in the held turn, bounds each offer to four, and preserves the receipt boundary', async () => {
+  it('legacy queue: offers images in the held turn, bounds each offer to ten, and preserves the receipt boundary', async () => {
     binding.activeTurnId = 'held-turn';
-    const images = Array.from({ length: 4 }, (_, index) => ({ name: `${index}.webp`, dataUrl: 'data:image/webp;base64,YQ==' }));
+    const images = Array.from({ length: 10 }, (_, index) => ({ name: `${index}.webp`, dataUrl: 'data:image/webp;base64,YQ==' }));
+    expect(inputArgs.safeParse(input({ images: [...images, images[0]!] })).success).toBe(false);
     const first = await seedLegacyInput(input({ images }));
     await seedLegacyInput(input({ images: images.slice(0, 1) }));
     expect(await hasEligibleToolInput(sessionId)).toBe(true);
@@ -528,6 +631,13 @@ describe('durable user input ownership', () => {
     expect(next).toHaveLength(1);
     expect(next[0]?.images).toHaveLength(1);
     expect((await listInputs()).find(row => row.id === first.id)?.state).toBe('sent');
+  });
+  it('retains the image byte budget when ten individually bounded images exceed it', async () => {
+    binding.activeTurnId = 'held-turn';
+    const images = Array.from({ length: 10 }, (_, index) => ({ name: `${index}.webp`, dataUrl: 'data:image/webp;base64,' + 'A'.repeat(512000) }));
+    expect(inputArgs.safeParse(input({ images })).success).toBe(true);
+    await expect(enqueueInput(input({ images, delivery: 'tool' }))).rejects.toThrow('The image queue is full');
+    expect(await listInputs()).toEqual([]);
   });
   it('keeps input in tool delivery during a proven active turn even when the browser looks idle', async () => {
     binding.activeTurnId = 'real-turn';
@@ -596,24 +706,24 @@ describe('durable user input ownership', () => {
     expect(await acknowledgeBrowserInput(row.id, 'other', binding.conversationId)).toBe(false);
     expect(await acknowledgeBrowserInput(row.id, 'owner', binding.conversationId)).toBe(true);
     expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'goal', 'after-send', 'Build the requested project and test it', undefined);
-    expect((await listInputs())[0]).toMatchObject({ sessionId: null, deliveredSessionId: sessionId, conversationId: binding.conversationId, state: 'sent' });
+    expect((await listInputs())[0]).toMatchObject({ sessionId: row.sessionId, deliveredSessionId: row.sessionId, conversationId: binding.conversationId, state: 'sent' });
     expect(await enqueueInput(args)).toMatchObject({ state: 'sent', automation: 'goal' });
     expect(await acknowledgeBrowserInput(row.id, 'owner', 'conversation-other')).toBe(false);
     expect(automate).toHaveBeenCalledTimes(1);
     resetInputForTests();
-    expect((await listInputs())[0]).toMatchObject({ deliveredSessionId: sessionId, objective: 'Build the requested project and test it' });
+    expect((await listInputs())[0]).toMatchObject({ deliveredSessionId: row.sessionId, objective: 'Build the requested project and test it' });
   });
-  it('waits for exact recording evidence when a new send ACK precedes recorder creation', async () => {
+  it('retains its reserved session when a new send ACK precedes recorder creation', async () => {
     binding.recorded = false;
     const row = await enqueueInput(input({ sessionId: null, automation: 'loop' }));
     await claimBrowserInput(row.id, 'owner', null);
     expect(await acknowledgeBrowserInput(row.id, 'owner', binding.conversationId)).toBe(true);
-    expect((await listInputs())[0]?.deliveredSessionId).toBeNull();
+    expect((await listInputs())[0]?.deliveredSessionId).toBe(row.sessionId);
     binding.recorded = true;
   binding.activeTurnId = null;
-    expect((await listInputs())[0]?.deliveredSessionId).toBe(sessionId);
+    expect((await listInputs())[0]?.deliveredSessionId).toBe(row.sessionId);
     binding.conversationId = 'conversation-resumed';
-    expect((await listInputs())[0]?.deliveredSessionId).toBe(sessionId);
+    expect((await listInputs())[0]?.deliveredSessionId).toBe(row.sessionId);
   });
   it('deduplicates exact ids, rejects changed input, and returns detached rows', async () => {
     const args = input();
@@ -738,7 +848,8 @@ describe('durable user input ownership', () => {
       rows.push(row);
     }
     resetInputForTests();
-    await expect(enqueueInput(input({ sessionId: null }))).rejects.toThrow('One message');
+    const independent = await enqueueInput(input({ sessionId: null }));
+    await cancelInput(independent.id);
     for (const row of rows) expect(await cancelInput(row.id)).toBe(true);
     resetInputForTests();
     expect(await pendingBrowserInputs()).toEqual([]);
@@ -773,8 +884,10 @@ describe('durable user input ownership', () => {
     const rows = await listInputs();
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ state: 'cancelled', messageId: 'native-id', error: expect.stringContaining('later confirmed') });
-    expect(await enqueueInput(input({ ...row }))).toMatchObject({ state: 'cancelled' });
-    expect(await cancelInput(row.id)).toBe(false);
+    expect(await enqueueInput(input({ ...row, sessionId: null }))).toMatchObject({ state: 'cancelled' });
+    // Explicit notice dismissal is idempotent and cannot erase a late receipt.
+    expect(await cancelInput(row.id)).toBe(true);
+    expect((await listInputs())[0]).toMatchObject({ state: 'cancelled', messageId: 'native-id', error: expect.stringContaining('later confirmed') });
   });
   it('does not publish a rejected enqueue through a background durable retry', async () => {
     vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('disk busy'));
@@ -1152,7 +1265,7 @@ it('materializes remaining plan stages once after exact delivery, across restart
   resetInputForTests();
   const initial = (await listInputs()).filter(row => row.mode === 'finish');
   expect(initial.map(row => row.text)).toEqual(first.stages);
-  expect(initial.every(row => row.sessionId === 'session-one')).toBe(true);
+  expect(initial.every(row => row.sessionId === first.id)).toBe(true);
   expect(initial.every(row => row.model === null && row.reasoningEffort === null)).toBe(true);
   resetInputForTests();
   expect((await listInputs()).filter(row => row.mode === 'finish').map(row => row.id)).toEqual(initial.map(row => row.id));
@@ -1304,15 +1417,14 @@ it('admits active direct injections independently across chats and preserves all
   expect(await offerToolInput(sessionId, 'conversation-a', 'tool-a', now)).toHaveLength(2);
   expect(await offerToolInput('session-two', 'conversation-b', 'tool-b', now)).toHaveLength(1);
 });
-it('expires an unclaimed ordinary initial browser attempt 60 seconds after its due time', async () => {
-  const row = await enqueueInput(input({ sessionId: null, dueAt: now + 120000 }));
-  expect(row.transportIntent).toBe('browser');
+it('keeps a migrated legacy initial browser attempt queued past its old startup deadline', async () => {
+  const row = await seedLegacyInput(input({ sessionId: null, dueAt: now + 120000 }));
   now += 179999;
   resetInputForTests();
   expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
   now++;
-  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', error: expect.stringContaining('60 seconds') });
-  expect(await claimBrowserInput(row.id, 'late', null)).toBeNull();
+  expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued', opening: true, sessionId: row.id });
+  expect(await claimBrowserInput(row.id, 'late', null)).toMatchObject({ id: row.id, state: 'browser' });
 });
 it('never times out an intentional after-turn wait or a finish stage', async () => {
   binding.activeTurnId = 'active';
@@ -1332,7 +1444,8 @@ it('allows one browser send alongside other-chat tool input but prevents same-ch
   const browser = await enqueueInput(input({ sessionId: null }));
   expect(browser.transportIntent).toBe('browser');
   expect(await pendingBrowserInputs()).toEqual([{ id: browser.id, conversationId: null }]);
-  await expect(enqueueInput(input({ sessionId: null }))).rejects.toThrow('One message');
+  const independent = await enqueueInput(input({ sessionId: null }));
+  await cancelInput(independent.id);
   await cancelInput(browser.id);
   await expect(enqueueInput(input())).rejects.toThrow('One message');
   expect((await listInputs()).find(row => row.id === tool.id)?.state).toBe('queued');
@@ -1497,7 +1610,7 @@ describe('one silence delivery for a correction and its next checkpoint', () => 
       activity: () => ({ possible: true, exact: true, turnId: 'retained-mcp-turn', model: 'pro' }) });
     expect(await sessionInputPolicy(sessionId)).toMatchObject({ canInject: true, injectionTurnId: 'retained-mcp-turn', settled: false, browserAllowed: false });
     const image = kind === 'image' ? await stagedImage() : null;
-    const correction = await enqueueInput(input({ ...(image ? { attachments: [image], attachmentDelivery: 'tool' } : {}) }));
+    const correction = await enqueueInput(input({ delivery: 'tool', ...(image ? { attachments: [image] } : {}) }));
     expect(correction.transportIntent).toBe('tool');
     expect(await pendingBrowserInputs()).toEqual([]);
     expect(await offerToolInput(sessionId, binding.conversationId, 'continued-exact-call', now)).toEqual([
@@ -1549,7 +1662,7 @@ describe('one silence delivery for a correction and its next checkpoint', () => 
     expect(await authorizeBrowserInput(correction.id, 'replacement-page', binding.conversationId)).toBe(true);
     expect(await acknowledgeBrowserInput(head.id, 'replacement-page', binding.conversationId, 'native-id')).toBe(false);
     expect(await acknowledgeBrowserInput(correction.id, 'replacement-page', binding.conversationId, 'native-id')).toBe(true);
-    expect(history).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: correction.id, text: claim?.text, messageId: 'native-id' }));
+    expect(history).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: correction.id, text: claim?.text, messageId: 'native-id' }), expect.any(Function));
     const rows = await listInputs();
     for (const id of [head.id, correction.id]) expect(rows.find(row => row.id === id)).toMatchObject({ state: 'sent', messageId: 'native-id', historyRecorded: true });
     expect(rows.find(row => row.id === later.id)).toMatchObject({ state: 'queued' });
@@ -1568,18 +1681,19 @@ describe('one silence delivery for a correction and its next checkpoint', () => 
     expect(await offerToolInput(sessionId, binding.conversationId, 'resumed-call', now)).toEqual([expect.objectContaining({ text: 'Use real 3D shapes' })]);
   });
 
-  it.each(['cancel', 'failure', 'timeout'] as const)('keeps both originals under one late receipt after %s', async outcome => {
+  it.each(['cancel', 'failure', 'delay'] as const)('keeps both originals under one late receipt after %s', async outcome => {
     const { head, correction } = await bundle();
     await claimBrowserInput(correction.id, 'page', binding.conversationId, true);
     await authorizeBrowserInput(correction.id, 'page', binding.conversationId);
     if (outcome === 'cancel') expect(await cancelInput(head.id)).toBe(true);
     if (outcome === 'failure') expect(await failBrowserInput(correction.id, 'page', 'Lost response after Send')).toBe(true);
-    if (outcome === 'timeout') now += 45_001;
+    if (outcome === 'delay') now += 45_001;
     resetInputForTests();
-    for (const id of [head.id, correction.id]) expect((await listInputs()).find(row => row.id === id)).toMatchObject({ state: 'cancelled' });
+    for (const id of [head.id, correction.id]) expect((await listInputs()).find(row => row.id === id)).toMatchObject({ state: outcome === 'delay' ? 'browser' : 'cancelled' });
     expect(await pendingBrowserInputs()).toEqual([]);
+    expect(await claimBrowserInput(correction.id, 'replacement-page', binding.conversationId, true)).toBeNull();
     expect(await acknowledgeBrowserInput(correction.id, 'page', binding.conversationId, 'late-native-id')).toBe(true);
-    for (const id of [head.id, correction.id]) expect((await listInputs()).find(row => row.id === id)).toMatchObject({ state: 'cancelled', messageId: 'late-native-id' });
+    for (const id of [head.id, correction.id]) expect((await listInputs()).find(row => row.id === id)).toMatchObject({ state: outcome === 'delay' ? 'sent' : 'cancelled', messageId: 'late-native-id' });
   });
 
   it('preserves authorized bundle custody against a fresh-work revocation and false safe-withdrawal report', async () => {
@@ -1618,7 +1732,7 @@ describe('one silence delivery for a correction and its next checkpoint', () => 
     const image = { name: 'shape.webp', dataUrl: 'data:image/webp;base64,AAAA' };
     const { head, correction } = kind === 'text'
       ? await bundle({ text: 'x'.repeat(90_000) }, { text: 'y'.repeat(10_000) })
-      : await bundle({ images: [image, image, image, image] }, { images: [image] });
+      : await bundle({ images: Array(10).fill(image) }, { images: [image] });
     const claim = await claimBrowserInput(correction.id, 'page', binding.conversationId, true);
     expect(claim?.text).toBe(correction.text);
     expect(claim?.companionInputId).toBeUndefined();

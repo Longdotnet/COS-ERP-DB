@@ -2,20 +2,21 @@ import { GOAL_MARKER_INSTRUCTION } from '../src/shared/goal-templates.js';
 import { currentCoreInstructions } from '../src/main/mcp/instructions.js';
 import { prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js';
 import { finishInstruction } from '../src/shared/finish.js';
+import { initSkillsPath } from '../src/main/skills.js';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { addProject, assignSessionProject } from '../src/main/projects.js';
-import { initSkills, removeSkill } from '../src/main/skills.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
 import * as browserWake from '../src/main/browser-wake.js';
+import * as browserStartup from '../src/main/browser-startup.js';
 type Handler = (event: unknown, payload: unknown) => Promise<any>;
 const handlers = new Map<string, Handler>();
 vi.mock('electron', () => ({
   ipcMain: { handle: (name: string, handler: Handler) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) },
   BrowserWindow: class {}, clipboard: {}, dialog: {}, shell: {}, nativeTheme: { themeSource: 'system' },
-  app: { getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
+  app: { on: vi.fn(), getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
   safeStorage: {
     isAsyncEncryptionAvailable: async () => true, getSelectedStorageBackend: () => 'gnome_libsecret',
     encryptStringAsync: async (text: string) => Buffer.from(text),
@@ -31,7 +32,7 @@ vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => '
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
-const { createSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
+const { createSession, getSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { registerIpc } = await import('../src/main/ipc.js');
 const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
 const input = await import('../src/main/session/input.js');
@@ -50,7 +51,6 @@ async function post(route: string, body: unknown) {
 beforeAll(async () => {
   directory = await makeTempDir('clf-input-integration-');
   initConfigPath(directory); initSecretsPath(directory); initDurableStore(directory); initSessionStore(directory);
-  await initSkills(directory);
   await saveConfig(defaultConfig());
   registerIpc(() => ({ isDestroyed: () => false, webContents: { send: pushed } }) as never, () => undefined);
   await startBridge();
@@ -62,8 +62,72 @@ beforeEach(async () => {
   await writeDurableNow('session-input', []);
   await writeDurableNow('plugin-refresh', []);
   goal.resetGoalStateForTests(); input.resetInputForTests(); pushed.mockClear();
-  await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false }, goal: { ...defaultConfig().goal, enabled: false } });
 });
+
+it.each([false, true])('pauses completed queued input at manual close through the final Send fence (claimed: %s)', async claimed => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), turnId = randomUUID();
+    const session = await createSession({ title: 'Closed queued delivery', conversationId });
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: ++now },
+      { kind: 'turn_start', turnId, time: now },
+      { kind: 'assistant_message', messageId: randomUUID(), turnId, text: 'Done.', state: 'final', final: true, time: ++now },
+      { kind: 'turn_end', turnId, outcome: 'completed', time: ++now }
+    ] });
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(true);
+    if (claimed) expect(await input.claimBrowserInput(row.id, 'closing-document', conversationId, true)).not.toBeNull();
+    now++;
+    await post('/closed', { conversationId, manual: true });
+    expect((await post('/status', { openConversations: [] })).body.inputs.some((item: any) => item.id === row.id)).toBe(false);
+    expect(await input.claimBrowserInput(row.id, 'late-document', conversationId, true)).toBeNull();
+    expect(await input.authorizeBrowserInput(row.id, 'closing-document', conversationId)).toBe(false);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued', text: row.text });
+    now++;
+    const returned = await fetch(`http://127.0.0.1:${bridgePort()}/activity?conversationId=${conversationId}`, {
+      headers: { authorization: `Bearer ${bearer}`, 'x-extension-version': APP_VERSION, 'x-extension-protocol': String(BRIDGE_PROTOCOL) }
+    });
+    expect(returned.status).toBe(200);
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(true);
+  } finally { clock.mockRestore(); }
+});
+
+it('keeps automatic Continue attached to the native question after injected corrections', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const store = await import('../src/main/session/store.js');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Native recovery question', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the task', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 10_000;
+    for (let index = 0; index < 3; index++) await store.appendEvent(session.id, {
+      kind: 'user_message', source: 'app', time: now, turnId,
+      inputId: `inline-correction-${index}`, messageId: `input:inline-correction-${index}`,
+      message: { text: 'Keep this detail.', truncated: false, chars: 17 }
+    });
+    await attributedMcp(conversationId);
+    now += 120_000;
+    await bridge.sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs.find((item: any) => item.conversationId === conversationId);
+    expect(repair?.reason).toBe('silence');
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+    expect(row.recovery?.questionId).toBe(questionId);
+    expect((await input.pendingBrowserInputs()).find(item => item.id === row.id)?.recovery?.questionId).toBe(questionId);
+    expect(await input.claimBrowserInput(row.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
 it.each([false, true])('retires Goal only when queued input commits its exact source, including restored aliases (%s)', async alias => {
   const store = await import('../src/main/session/store.js');
   const durable = await import('../src/main/durable.js');
@@ -132,8 +196,39 @@ it('refreshes account models after an owned picker failure without authorizing a
   expect((await post('/input/fail', { ...failure, owner: 'picker-page' })).body.ok).toBe(true);
   expect(catalog.pendingChatModelRequest()).toMatchObject({ allowOpen: false });
   expect(pushed).toHaveBeenCalledWith('chatModels:changed', expect.objectContaining({ state: 'pending' }));
+  expect(pushed.mock.calls.some(([channel]) => channel === 'setup:toolApprovalNotice')).toBe(false);
   expect((await input.listInputs()).find(input => input.id === row.id)?.state).toBe('failed');
   catalog.resetChatModelsForTests();
+});
+
+it('exposes bounded image-storage accounting and rejects an unknown cleanup mode', async () => {
+  const storage = await handlers.get('sessions:imageStorage')!(null, undefined);
+  expect(storage).toMatchObject({ ok: true, data: { usedBytes: expect.any(Number), limitBytes: 2 * 1024 * 1024 * 1024 } });
+  expect(await handlers.get('sessions:clearImageStorage')!(null, { mode: 'automatic' })).toMatchObject({ ok: false });
+});
+
+it('shows the approval reminder only after an authorized discovery handoff succeeds', async () => {
+  const catalog = await import('../src/main/chat-models.js');
+  const wake = vi.spyOn(browserStartup, 'wakeBrowserUrl').mockResolvedValue(undefined);
+  const notices = () => pushed.mock.calls.filter(([channel]) => channel === 'setup:toolApprovalNotice');
+  try {
+    catalog.resetChatModelsForTests();
+    await catalog.startChatModelDiscovery(false);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(wake).not.toHaveBeenCalled();
+    expect(notices()).toHaveLength(0);
+
+    catalog.resetChatModelsForTests();
+    wake.mockRejectedValueOnce(new Error('test handoff failed'));
+    await catalog.startChatModelDiscovery(true);
+    await vi.waitFor(() => expect(catalog.getChatModels().state).toBe('unavailable'));
+    expect(notices()).toHaveLength(0);
+
+    catalog.resetChatModelsForTests();
+    await catalog.startChatModelDiscovery(true);
+    await vi.waitFor(() => expect(notices()).toHaveLength(1));
+    expect(wake).toHaveBeenLastCalledWith(expect.stringContaining('https://chatgpt.com/?cos-model-catalog='), true, true);
+  } finally { wake.mockRestore(); catalog.resetChatModelsForTests(); }
 });
 
 it.each([false, true])('collects an exact recorded helper final across document loss (final before ACK: %s)', async finalBeforeAck => {
@@ -249,8 +344,12 @@ it.each(['interim', 'native-tool', 'mcp', 'final', 'replay'] as const)('releases
     now += 29_000;
     await bridge.sweepStaleSwarm(now);
     const repairs = (await post('/status', {openConversations: [conversationId]})).body.repairs;
-    expect(repairs.some((row: any) => row.conversationId === conversationId)).toBe(activity === 'replay');
+    expect(repairs.some((row: any) => row.conversationId === conversationId)).toBe(false);
     expect((await input.pendingBrowserInputs()).some(row => row.id === queued.id)).toBe(activity === 'final');
+    now += 270_000;
+    await bridge.sweepStaleSwarm(now);
+    expect((await post('/status', {openConversations: [conversationId]})).body.repairs
+      .some((row: any) => row.conversationId === conversationId && row.reason === 'silence')).toBe(activity === 'replay');
   } finally { clock.mockRestore(); }
 });
 
@@ -373,17 +472,21 @@ it.each(['app', 'browser'] as const)('files a missing failed-turn Loop ticket on
   } finally { clock.mockRestore(); }
 });
 
-async function refreshFailedView(conversationId: string, advance: (ms: number) => void, delay = 0) {
+async function refreshFailedView(conversationId: string, advance: (ms: number) => void) {
   const bridge = await import('../src/main/bridge.js');
-  if (delay) expect((await post('/status', { openConversations: [conversationId] })).body.repairs.some((r: any) => r.conversationId === conversationId)).toBe(false);
-  advance(delay);
+  const { findSessionByConversation } = await import('../src/main/session/store.js');
+  const session = (await findSessionByConversation(conversationId))!;
+  const deadline = (await bridge.sessionControlsFor(session.id)).recovery?.find(row => row.kind === 'silence')?.deadline;
+  expect(deadline).toBeDefined();
+  advance(Math.max(0, deadline! - Date.now()));
   await bridge.sweepStaleSwarm(Date.now());
   const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs.find((r: any) => r.conversationId === conversationId);
   expect(repair).toMatchObject({ reason: 'silence' });
   await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
-  advance(5 * 60_000 - 1);
+  const listenMs = session.selectedModel?.model === 'gpt-6-pro' ? 300_000 : 60_000;
+  advance(listenMs - 1);
   const pending = await input.pendingBrowserInputs();
-  expect(pending.some(row => row.conversationId === conversationId)).toBe(false);
+  expect(pending.some(row => row.conversationId === conversationId && !row.recovery)).toBe(false);
   advance(1);
 }
 
@@ -403,6 +506,8 @@ it.each(['auto', 'after-turn'] as const)('reserves the failed-view five-minute w
     const row = await input.enqueueInput({ ...message(session.id, 'off'), automation: undefined, mode });
     now++;
     await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId: 'failure-priority', outcome: 'failed', reason: 'thinking_failed', time: now }] });
+    expect((await input.pendingBrowserInputs()).some(r => r.id === row.id)).toBe(mode === 'auto');
+    now += 300_000;
     await bridge.sweepStaleSwarm(now);
     const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs.find((r: any) => r.conversationId === conversationId);
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
@@ -542,14 +647,16 @@ describe.each(['input', 'loop'] as const)('MCP admission for %s recovery', desti
           now += bridge.PRO_SILENCE_MS + 1;
           await bridge.sweepStaleSwarm(now);
           const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs.find((item: any) => item.conversationId === conversationId);
-          expect(repair).toBeDefined(); // Reload remains allowed even without MCP.
-          await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+          expect(!!repair).toBe(evidence === 'current-turn');
+          if (repair) await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
         } else {
           now += 330_000;
           await post('/events', { conversationId, events: [
             { kind: 'turn_end', turnId: 'current-turn', outcome: 'failed', reason: 'thinking_failed', time: now }
           ] });
-          await refreshFailedView(conversationId, ms => { now += ms; });
+          if (evidence === 'current-turn') await refreshFailedView(conversationId, ms => { now += ms; });
+          else expect((await post('/status', { openConversations: [conversationId] })).body.repairs
+            .some((repair: any) => repair.conversationId === conversationId)).toBe(false);
         }
         const eligible = evidence === 'current-turn';
         if (row) {
@@ -559,7 +666,8 @@ describe.each(['input', 'loop'] as const)('MCP admission for %s recovery', desti
           expect(!!(await post('/input/claim', { id: row.id, owner: 'page', conversationId, requiresAuthorization: true })).body.input).toBe(eligible);
         } else {
           goal.restoreGoalReplies(goal.snapshotGoalReplies());
-          expect(goal.goalPendingReplyFor(conversationId) !== null).toBe(eligible);
+          expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+          expect((await input.listInputs()).some(item => item.sessionId === session.id && item.recovery && item.state === 'queued')).toBe(eligible);
         }
       } finally { clock.mockRestore(); }
     });
@@ -598,10 +706,11 @@ it.each(['gpt-6-pro', 'gpt-5.6-sol'])('carries settled Thinking failed through H
       clock.mockReturnValue(busyAt);
       expect((await post('/input/claim', { id: first.id, owner: 'failed-turn-page', conversationId, silenceBusyTurnId: 'native-failed-turn' })).body.ok).toBe(true);
       input.resetInputForTests();
-      clock.mockReturnValue(busyAt + 5 * 60_000 - 1);
+      const extraWait = model === 'gpt-6-pro' ? 300_000 : 60_000;
+      clock.mockReturnValue(busyAt + extraWait - 1);
       expect(await input.pendingBrowserInputs()).toEqual([]);
       expect((await post('/input/claim', { id: first.id, owner: 'failed-turn-page', conversationId, requiresAuthorization: true })).body.input).toBeNull();
-      clock.mockReturnValue(busyAt + 5 * 60_000);
+      clock.mockReturnValue(busyAt + extraWait);
       expect(await input.pendingBrowserInputs()).toHaveLength(1);
     }
     const claim = await post('/input/claim', { id: first.id, owner: 'failed-turn-page', conversationId, requiresAuthorization: true });
@@ -641,20 +750,17 @@ it.each(['gpt-6-pro', 'gpt-5.6-sol'])('preserves failed prime recovery while ano
       { kind: 'turn_end', turnId: 'prime-failed-view', outcome: 'failed', reason: 'thinking_failed', time: now }
     ] });
     await refreshFailedView(conversationId, ms => { now += ms; });
-    const pending = goal.goalPendingReplyFor(conversationId)!;
-    expect(pending).toMatchObject({ silenceSourceTurnId: 'prime-failed-view' });
+    const pending = (await input.listInputs()).find(row => row.conversationId === conversationId && row.recovery)!;
+    expect(pending).toMatchObject({ state: 'queued', silenceBoundary: { turnId: 'prime-failed-view' } });
+    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
     expect(calls.runningToolCalls(worker)).toBe(1);
     expect(calls.runningToolCalls(conversationId)).toBe(0);
     now += 2 * 60_000;
     await bridge.sweepStaleSwarm(now);
-    goal.restoreGoalReplies(goal.snapshotGoalReplies());
-    expect(goal.goalPendingReplyFor(conversationId)).toEqual(pending);
-    const drafted = await post('/goal/draft', { conversationId, turnId: pending.turnId, terminalRequired: true, clientId: 'prime-page' });
-    expect(drafted.status, JSON.stringify(drafted.body)).toBe(200);
-    expect(goal.goalPendingReplyFor(conversationId)).toEqual(pending);
+    expect((await input.claimBrowserInput(pending.id, 'prime-page', conversationId, true))?.id).toBe(pending.id);
+    expect(await input.authorizeBrowserInput(pending.id, 'prime-page', conversationId)).toBe(true);
     release(); await running;
-    await bridge.sweepStaleSwarm(now);
-    expect(goal.goalPendingReplyFor(conversationId)).toEqual(pending);
+    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
   } finally { release(); await running; clock.mockRestore(); }
 });
 
@@ -678,7 +784,10 @@ it('refuses restored recovery tickets without MCP proof but still delivers a rea
   expect(await input.pendingBrowserInputs()).toEqual([]);
   expect((await post('/input/claim', { id: row.id, owner: 'page', conversationId, requiresAuthorization: true })).body.input).toBeNull();
   expect((await post('/goal/draft', { conversationId, turnId: 'g-silence-restored', terminalRequired: true })).status).toBe(409);
-  await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId: 'restored-turn', outcome: 'completed', time: Date.now() + 1 }] });
+  await post('/events', { conversationId, events: [
+    { kind: 'assistant_message', turnId: 'restored-turn', messageId: 'restored-final', text: 'Finished', state: 'final', final: true, time: Date.now() },
+    { kind: 'turn_end', turnId: 'restored-turn', outcome: 'completed', time: Date.now() + 1 }
+  ] });
   expect((await post('/input/claim', { id: row.id, owner: 'page', conversationId, requiresAuthorization: true })).body.input?.id).toBe(row.id);
 });
 
@@ -695,7 +804,9 @@ it('does not turn generic failed/error prose or an unknown wire reason into queu
   expect(await input.pendingBrowserInputs()).toEqual([]);
 });
 
-it.each([false, true])('normal queued recovery uses two minutes plus one minute after ACK and spends its source before Goal (Goal enabled: %s)', async enabled => {
+it.each([
+  [false, 'same-batch'], [true, 'same-batch'], [true, 'before-start'], [true, 'after-start'], [true, 'after-refresh'], [false, 'unknown'], [true, 'unknown']
+] as const)('normal/unknown queued recovery uses two minutes plus one minute after ACK (Goal enabled: %s, selection: %s)', async (enabled, selection) => {
   const bridge = await import('../src/main/bridge.js');
   let now = Date.now();
   const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -704,10 +815,14 @@ it.each([false, true])('normal queued recovery uses two minutes plus one minute 
     const session = await createSession({ title: 'Normal queued recovery', conversationId });
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled } });
     if (enabled) await goal.setGoalSwitchNow(conversationId, 'goal', true);
+    const observed = { kind: 'model_selection', model: 'gpt-5-6-thinking', reasoningEffort: 'high', time: now };
+    if (selection === 'before-start') await post('/events', { conversationId, events: [observed] });
     await post('/events', { conversationId, events: [
-      { kind: 'model_selection', model: 'gpt-5.6-sol', reasoningEffort: 'high', time: now },
+      ...(selection === 'same-batch' ? [observed] : []),
       { kind: 'turn_start', turnId: 'normal-silence', time: now }
     ] });
+    if (selection === 'after-start') await post('/events', { conversationId, events: [observed] });
+    expect(bridge.sessionInputActivity((await getSession(session.id))!).model).toBe(['unknown', 'after-refresh'].includes(selection) ? 'unknown' : 'other');
     const first = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
     const second = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
     await attributedMcp(conversationId);
@@ -721,10 +836,18 @@ it.each([false, true])('normal queued recovery uses two minutes plus one minute 
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
     const boundary = (await input.listInputs()).find(row => row.id === first.id)!.silenceBoundary!;
     expect(boundary.listenUntil).toBe(now + 60_000);
-    expect((await bridge.sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'post-reload', next: 'queue', deadline: boundary.listenUntil }]);
+    expect((await bridge.sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'post-reload', next: 'queue', deadline: boundary.listenUntil, generating: true }]);
+    if (selection === 'after-refresh') {
+      now += 10_000;
+      await post('/events', { conversationId, events: [{ ...observed, time: now }] });
+      expect(bridge.sessionInputActivity((await getSession(session.id))!).model).toBe('other');
+      expect((await bridge.sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'post-reload', next: 'queue', deadline: boundary.listenUntil, generating: true }]);
+      await bridge.sweepStaleSwarm(now);
+      expect((await post('/status', { openConversations: [conversationId] })).body.repairs.some((row: any) => row.conversationId === conversationId)).toBe(false);
+    }
     input.resetInputForTests();
     expect(await input.pendingBrowserInputs()).toEqual([]);
-    now += 59_999;
+    now = boundary.listenUntil! - 1;
     expect((await post('/input/claim', { id: first.id, owner: 'normal-page', conversationId, requiresAuthorization: true })).body.input).toBeNull();
     now++;
     await bridge.sweepStaleSwarm(now);
@@ -956,10 +1079,10 @@ it('freezes image injection from staged originals with replay, receipt, and brow
     { kind: 'model_selection', model: 'gpt-6-astra', time: Date.now() },
     { kind: 'turn_start', turnId: 'image-turn', time: Date.now() }
   ] });
-  const authored = { ...message(session.id, 'off'), mode: 'auto' as const, attachments: [attachment], attachmentDelivery: 'tool' as const };
+  const authored = { ...message(session.id, 'off'), mode: 'auto' as const, attachments: [attachment], delivery: 'tool' as const };
   const result = await handlers.get('sessions:send')!(null, authored);
   expect(result.ok).toBe(true);
-  expect(result.data).toMatchObject({ attachments: [attachment], attachmentDelivery: 'tool', transportIntent: 'tool' });
+  expect(result.data).toMatchObject({ attachments: [attachment], delivery: 'tool', transportIntent: 'tool', toolTurnId: 'image-turn' });
   const dataUrl = result.data.toolImages[0].dataUrl;
   expect(await sharp(Buffer.from(dataUrl.split(',')[1], 'base64')).metadata()).toMatchObject({ width: 1600, height: 800 });
   input.resetInputForTests();
@@ -1001,7 +1124,7 @@ it('rejects image admission when the session changes during normalization', asyn
   const normalize = attachments.normalizeInputAttachments;
   const held = vi.spyOn(attachments, 'normalizeInputAttachments').mockImplementation(async files => { await gate; return normalize(files); });
   try {
-    const pending = input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', attachments: [file], attachmentDelivery: 'tool' });
+    const pending = input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', attachments: [file], delivery: 'tool' });
     const rejected = expect(pending).rejects.toThrow('active chat changed');
     await vi.waitFor(() => expect(held).toHaveBeenCalled());
     await rebindSession(session.id, conversationId, randomUUID());
@@ -1032,7 +1155,6 @@ it('revokes a claimed send via IPC, fences pre-send authorization and records a 
   expect((await handlers.get('sessions:cancelInput')!(null, { id: row.id })).ok).toBe(true);
   expect((await post('/input/claim', { id: row.id, owner: 'page', conversationId: null, authorize: true })).body.ok).toBe(false);
   const conversationId = randomUUID();
-  await createSession({ title: 'Late receipt', conversationId });
   expect((await post('/input/ack', { id: row.id, owner: 'page', conversationId, messageId: 'native-late' })).body.ok).toBe(true);
   expect((await input.listInputs())[0]).toMatchObject({ state: 'cancelled', historyRecorded: true, messageId: 'native-late' });
 });
@@ -1055,6 +1177,78 @@ afterAll(async () => {
 });
 const message = (sessionId: string | null, automation: 'off' | 'goal' | 'loop') => ({
   id: randomUUID(), sessionId, automation, text: 'Complete this request', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null
+});
+
+it('bounds an explicit next-tool delivery to four recorded images', async () => {
+  const { default: sharp } = await import('sharp');
+  const conversationId = randomUUID();
+  const session = await createSession({ title: 'Four-image injection', conversationId });
+  await post('/events', { conversationId, events: [
+    { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+    { kind: 'turn_start', turnId: 'tool-free-turn', time: Date.now() }
+  ] });
+  const dataUrl = `data:image/webp;base64,${(await sharp({ create: { width: 2, height: 2, channels: 3, background: '#abcdef' } }).webp().toBuffer()).toString('base64')}`;
+  const images = Array.from({ length: 4 }, (_, index) => ({ name: `image-${index}.webp`, dataUrl }));
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', delivery: 'tool', images });
+  expect(row).toMatchObject({ state: 'queued', transportIntent: 'tool', toolTurnId: 'tool-free-turn' });
+  expect(await input.pendingBrowserInputs()).toEqual([]);
+  expect((await input.offerToolInput(session.id, conversationId, 'first-tool', Date.now())).messages[0]?.images).toHaveLength(4);
+  await expect(input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', delivery: 'tool', images: [...images, images[0]!] }))
+    .rejects.toThrow();
+});
+it('freezes selected skills before workflow wrapping and reuses exact delivery after the file is removed', async () => {
+  const userData = path.join(directory, 'skill-delivery');
+  await initSkillsPath(userData);
+  const skillFolder = path.join(userData, 'skills', 'audit');
+  await fs.mkdir(skillFolder);
+  const skillFile = path.join(skillFolder, 'SKILL.md');
+  await fs.writeFile(skillFile, '# Audit\n\nCOMPLETE_SELECTED_SKILL');
+  const objective = '/prompt audit\nImplement every original requirement';
+  const row = await input.enqueueInput({ ...message(null, 'off'), mode: 'auto', objective, authoredSource: 'objective',
+    text: 'Start implementation', stages: ['Verify every requirement'] });
+  const first = await input.claimBrowserInput(row.id, 'skill-owner', null, true);
+  expect(first?.text).toContain('COMPLETE_SELECTED_SKILL');
+  expect(first?.text).toContain(objective);
+  expect(first?.text).toContain('Verify every requirement');
+  expect(first!.text.indexOf('# Selected skill')).toBeLessThan(first!.text.indexOf('Original user request:'));
+  await fs.unlink(skillFile);
+  input.resetInputForTests();
+  expect((await input.claimBrowserInput(row.id, 'skill-owner', null, true))?.text).toBe(first?.text);
+  expect((await input.listInputs()).find(item => item.id === row.id)?.text).toBe('Start implementation');
+  await input.cancelInput(row.id);
+  // A new selection must fail explicitly; the old frozen claim alone owns the old bytes.
+  const next = await input.enqueueInput({ ...message(null, 'off'), mode: 'auto', text: '/audit New request' });
+  await expect(input.claimBrowserInput(next.id, 'new-skill-owner', null, true)).rejects.toThrow('Skill "audit" is unavailable');
+});
+it.each([false, true])('selects skills from the current composer, never an unrelated saved objective (existing=%s)', async existing => {
+  const userData = path.join(directory, 'skill-provenance');
+  await initSkillsPath(userData);
+  await fs.mkdir(path.join(userData, 'skills/review'), { recursive: true });
+  await fs.writeFile(path.join(userData, 'skills/review/SKILL.md'), '# Review\n\nCURRENT_SELECTION');
+  const session = existing ? await createSession({ title: 'Skill source', conversationId: randomUUID() }) : null;
+  const selected = await input.enqueueInput({ ...message(session?.id ?? null, 'off'), mode: 'auto', text: '/review Current correction', objective: 'Unrelated saved objective' });
+  const first = await input.claimBrowserInput(selected.id, 'selection-owner', session?.conversationId ?? null, true);
+  expect(first?.text).toContain('CURRENT_SELECTION');
+  await input.cancelInput(selected.id);
+  const plain = await input.enqueueInput({ ...message(session?.id ?? null, 'off'), mode: 'auto', text: 'Plain correction', objective: '/missing Old objective' });
+  const next = await input.claimBrowserInput(plain.id, 'plain-owner', session?.conversationId ?? null, true);
+  expect(next?.text).not.toContain('# Selected skill');
+  expect(next?.text).toContain('Plain correction');
+  await input.cancelInput(plain.id);
+});
+it('keeps generated slash-leading checkpoints literal until the user explicitly edits one', async () => {
+  const config = defaultConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
+  const session = await createSession({ title: 'Generated checkpoint', conversationId: randomUUID() });
+  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'finish', text: 'First check', stages: ['/missing Generated check'] });
+  const checkpoint = (await input.listInputs()).find(item => item.id !== row.id && item.sessionId === session.id)!;
+  expect(checkpoint.authoredSource).toBe('none');
+  await input.cancelInput(row.id);
+  const offered = await input.offerToolInput(session.id, session.conversationId, 'checkpoint-tool', Date.now(), true);
+  expect(offered.messages.map(item => item.text).join('\n')).toContain('/missing Generated check');
+  const editable = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'finish', text: '/missing Generated check', authoredSource: 'none' });
+  expect(await input.editQueuedInput(editable.id, '/missing Human-selected correction')).toBe(true);
+  expect((await input.listInputs()).find(item => item.id === editable.id)?.authoredSource).toBe('text');
 });
 it('freezes the complete current prompt for each new chat and leaves the authored input intact', async () => {
   const config = defaultConfig();
@@ -1083,50 +1277,6 @@ it.each(['off', 'goal', 'loop'] as const)('does not repeat setup in an existing 
   expect(claim?.text).toBe('Continue the original work');
   input.resetInputForTests();
   expect((await input.claimBrowserInput(row.id, 'followup-page', conversationId, true))?.text).toBe(claim?.text);
-});
-
-it('freezes selected skills from a planned original request through browser claim and restart', async () => {
-  const id = `review-${randomUUID()}`;
-  const skillDirectory = path.join(directory, 'skills', id);
-  await fs.mkdir(skillDirectory);
-  await fs.writeFile(path.join(skillDirectory, 'SKILL.md'), `---\nname: Review\ndescription: Review code changes\n---\nSKILL_FROZEN_BODY 🐱`);
-  const objective = `/${id}\nOriginal constraints must survive.`;
-  const row = await input.enqueueInput({ ...message(null, 'off'), mode: 'auto',
-    text: `/${id}\nImplement the whole task.`, objective, stages: ['Verify all behavior.'] });
-  const claim = await input.claimBrowserInput(row.id, 'skills-browser-page', null, true);
-  expect(claim).not.toBeNull();
-  expect(claim!.text.match(/SKILL_FROZEN_BODY/g)).toHaveLength(1);
-  expect(claim!.text.indexOf('# Selected skills')).toBeGreaterThan(claim!.text.indexOf('# Local tools'));
-  expect(userPromptText(claim!.text)).toContain(objective);
-  expect(userPromptText(claim!.text)).toContain('Verify all behavior.');
-  expect(userPromptText(claim!.text)).not.toContain('SKILL_FROZEN_BODY');
-  expect(claim!.text.length).toBeLessThanOrEqual(96000);
-  await removeSkill(id);
-  input.resetInputForTests();
-  expect((await input.claimBrowserInput(row.id, 'skills-browser-page', null, true))!.text).toBe(claim!.text);
-  expect((await input.listInputs()).find(entry => entry.id === row.id)!.text).toBe(row.text);
-});
-
-it('freezes explicit follow-up skills for MCP delivery while preserving authored text and avoiding repeated setup', async () => {
-  const id = `followup-${randomUUID()}`;
-  const skillDirectory = path.join(directory, 'skills', id);
-  await fs.mkdir(skillDirectory);
-  await fs.writeFile(path.join(skillDirectory, 'SKILL.md'), `---\nname: Follow-up\ndescription: Explain an implementation\n---\nFOLLOWUP_SKILL_ORIGINAL`);
-  const session = await createSession({ title: 'Skill follow-up', conversationId: randomUUID() });
-  const text = `/prompt ${id}\nExplain the current changes.`;
-  const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text });
-  const offered = await input.offerToolInput(session.id, session.conversationId, 'skill-offer', 0);
-  expect(offered.messages).toHaveLength(1);
-  const prepared = offered.messages[0]!.text;
-  expect(prepared).toContain('FOLLOWUP_SKILL_ORIGINAL');
-  expect(prepared).not.toContain('# Local tools');
-  expect(userPromptText(prepared)).toBe(text);
-  await fs.writeFile(path.join(skillDirectory, 'SKILL.md'), '# Changed\nFOLLOWUP_SKILL_CHANGED');
-  input.resetInputForTests();
-  const retry = await input.offerToolInput(session.id, session.conversationId, 'skill-offer-retry', 0);
-  expect(retry.messages[0]!.text).toBe(prepared);
-  expect((await input.listInputs()).find(entry => entry.id === row.id)!.text).toBe(text);
-  await removeSkill(id);
 });
 
 it('delivers only the selected project AGENTS.md, freezes claims across restart, and budgets the Astra appendix before cutting', async () => {
@@ -1453,13 +1603,45 @@ describe('IPC input delivery and Goal control integration', () => {
     await input.offerToolInput(session.id, conversationId, 'overlapping-request', 0);
     expect(goal.goalSwitchFor(conversationId).enabled).toBe(false);
   });
+  it.each([2700, 24000])('keeps one reserved session per intentional send even when opening text is identical (%s chars)', async size => {
+    const store = await import('../src/main/session/store.js');
+    const before = new Set((await store.listAllSessions()).map(session => session.id));
+    const requests = [message(null, 'off'), message(null, 'off')].map(request => ({ ...request,
+      text: 'Keep the literal `code`, $variables and multilingual text: Grüße 世界.\n'.repeat(400).slice(0, size) }));
+    for (const request of requests) {
+      expect((await handlers.get('sessions:send')!(null, request)).ok).toBe(true);
+      const owner = `document-${request.id}`, conversationId = randomUUID(), messageId = randomUUID();
+      const claim = await post('/input/claim', { id: request.id, owner, conversationId: null, requiresAuthorization: true });
+      expect(claim.body.input).toMatchObject({ id: request.id, sessionId: request.id, opening: true });
+      expect((await post('/input/claim', { id: request.id, owner, conversationId: null, authorize: true })).body.ok).toBe(true);
+      const receipt = { id: request.id, owner, conversationId, messageId };
+      expect((await post('/input/bind', receipt)).body.ok).toBe(true);
+      const evidence = await post('/events', { conversationId, events: [
+        { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
+        { kind: 'user_message', messageId, text: claim.body.input.text, time: Date.now() }
+      ] });
+      expect(evidence.status).toBe(200);
+      expect((await post('/input/ack', receipt)).body.ok).toBe(true);
+      // An acknowledgement or route-binding replay must never mint a second owner.
+      expect((await post('/input/bind', receipt)).body.ok).toBe(true);
+      expect((await post('/input/ack', receipt)).body.ok).toBe(true);
+      expect((await store.findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(request.id);
+      expect((await input.listInputs()).find(row => row.id === request.id)).toMatchObject({
+        state: 'sent', sessionId: request.id, deliveredSessionId: request.id, conversationId, messageId
+      });
+      const users = await store.readRecentEvents(request.id, 10, { kinds: ['user_message'] });
+      expect(users).toHaveLength(1);
+    }
+    expect((await store.listAllSessions()).filter(session => !before.has(session.id)).map(session => session.id).sort())
+      .toEqual(requests.map(request => request.id).sort());
+  });
   it('binds a new chat through HTTP ACK, applies its choice once, and pushes session change', async () => {
     const request = message(null, 'goal');
     await handlers.get('sessions:send')!(null, request);
     const claim = await post('/input/claim', { id: request.id, owner: 'document-owner', conversationId: null });
     expect(claim.body.input.automation).toBe('goal');
     const conversationId = randomUUID();
-    const session = await createSession({ title: 'New input', conversationId });
+    const session = { id: request.id }; // admission reserved this exact local owner
     pushed.mockClear();
     const payload = { id: request.id, owner: 'document-owner', conversationId };
     expect((await post('/input/ack', payload)).body.ok).toBe(true);
@@ -1480,7 +1662,6 @@ describe('IPC input delivery and Goal control integration', () => {
     await post('/input/claim', { id: request.id, owner: 'off-before-ack', conversationId: null });
     expect(await input.setInputAutomation(request.id, 'off')).toBe(true);
     const conversationId = randomUUID();
-    await createSession({ title: 'Off before first receipt', conversationId });
     const ack = { id: request.id, owner: 'off-before-ack', conversationId };
     expect((await post('/input/ack', ack)).body.ok).toBe(true);
     expect(goal.goalObjectiveFor(conversationId)).toBe(objective);
@@ -1505,6 +1686,7 @@ it.each(['auto', 'finish'] as const)('adds one short reminder to every later Ast
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-6-pro', reasoningEffort: 'pro', time: t },
     { kind: 'turn_start', turnId: 'previous-astra', time: t },
+    { kind: 'assistant_message', turnId: 'previous-astra', messageId: 'previous-astra-final', text: 'The previous request is complete.', state: 'final', final: true, time: t + 999 },
     { kind: 'turn_end', turnId: 'previous-astra', outcome: 'completed', time: t + 1000 }
   ] });
   const request = { ...message(chat.id, 'off'), mode, afterTurn: true } as Parameters<typeof input.enqueueInput>[0];
@@ -1538,13 +1720,723 @@ it('retires a late-confirmed cancelled desktop send after two minutes even as th
     const after = (await post('/status', { openConversations: [conversationId] })).body;
     expect(after.retiredConversations).toContain(conversationId);
     expect(after.closableConversations).toContain(conversationId);
-    const session = await createSession({ conversationId, title: 'Resumed conversation' });
+    const session = { id: row.sessionId! };
     const previous = (await input.listInputs()).find(item => item.id === row.id)!;
     await writeDurableNow('session-input', [previous, { ...previous, id: randomUUID(), sessionId: session.id,
-      state: 'sent', createdAt: now + 121_000, deliveredAt: now + 121_000, historyRecorded: true }]);
+      opening: undefined, state: 'sent', createdAt: now + 121_000, deliveredAt: now + 121_000, historyRecorded: true }]);
     input.resetInputForTests(); clock.mockReturnValue(now + 242_001);
     const resumed = (await post('/status', { openConversations: [conversationId] })).body;
     expect(resumed.retiredConversations).not.toContain(conversationId);
     expect(resumed.closableConversations).not.toContain(conversationId);
   } finally { clock.mockRestore(); }
+});
+
+describe('native progress silence authority', () => {
+  const bridge = async () => import('../src/main/bridge.js');
+  async function open(model: string, proof: 'none' | 'previous' | 'request' | 'current' = 'current') {
+    await saveConfig(defaultConfig());
+    const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    const session = await createSession({ title: 'Native progress regression', conversationId });
+    if (proof === 'previous') {
+      await post('/events', { conversationId, events: [{ kind: 'turn_start', turnId: 'previous', time: Date.now() - 2 }] });
+      await attributedMcp(conversationId);
+      await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId: 'previous', outcome: 'completed', time: Date.now() - 1 }] });
+    }
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model, time: Date.now() },
+      { kind: 'user_message', messageId: questionId, text: 'Prepare the PDF', time: Date.now(), authoredNow: true },
+      { kind: 'turn_start', turnId, time: Date.now() }
+    ] });
+    if (proof === 'current') await attributedMcp(conversationId);
+    if (proof === 'request') await post('/events', { conversationId, events: [{ kind: 'tool_evidence', turnId, time: Date.now(),
+      calls: [{ messageId: randomUUID(), tool: 'read', order: 0, answered: false, requestId: randomUUID() }] }] });
+    return { conversationId, turnId, questionId, session, window: model === 'gpt-5.6-pro' ? 600_000 : 120_000 };
+  }
+  async function repairFor(conversationId: string) {
+    await (await bridge()).sweepStaleSwarm(Date.now());
+    return (await post('/status', { openConversations: [conversationId] })).body.repairs.find((row: any) => row.conversationId === conversationId);
+  }
+  async function confirm(conversationId: string, repair: any) {
+    expect(repair?.reason).toBe('silence');
+    if (repair.requiresClaim) expect((await post('/repairs/claim', { conversationId, token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+  }
+
+  it('keeps authored queued work ahead of automatic Continue after a committed handoff', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+      const recovery = (await input.listInputs()).find(row => row.recovery)!;
+      expect(await input.claimBrowserInput(recovery.id, 'old-document', source.conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(recovery.id, 'old-document', source.conversationId)).toBe(true);
+      const queued = await input.enqueueInput({ ...message(source.session.id, 'off'), mode: 'after-turn', text: 'Check the original requirement next.' });
+      const destination = randomUUID(), nextTurn = randomUUID();
+      expect(await rebindSession(source.session.id, source.conversationId, destination)).toBe(true);
+      input.resetInputForTests();
+      await post('/events', { conversationId: destination, events: [
+        { kind: 'model_selection', model: 'gpt-5.6-sol', time: ++now },
+        { kind: 'user_message', messageId: randomUUID(), text: 'Continue the original task', time: now, authoredNow: true },
+        { kind: 'turn_start', turnId: nextTurn, time: now }
+      ] });
+      await attributedMcp(destination);
+      expect(await input.fileRecoveryInput(source.session.id, destination, nextTurn, false, () => true)).toBe(false);
+      expect((await input.listInputs()).find(row => row.id === queued.id)).toEqual(queued);
+      expect((await input.listInputs()).find(row => row.id === recovery.id)?.state).toBe('cancelled');
+      await post('/events', { conversationId: destination, events: [
+        { kind: 'assistant_message', turnId: nextTurn, messageId: randomUUID(), text: 'The current task is done.', state: 'final', final: true, time: ++now },
+        { kind: 'turn_end', turnId: nextTurn, outcome: 'completed', time: ++now }
+      ] });
+      expect((await input.pendingBrowserInputs()).find(row => row.id === queued.id)).toMatchObject({ conversationId: destination, supersededConversationId: source.conversationId });
+      expect(await input.claimBrowserInput(queued.id, 'next-document', destination, true)).toMatchObject({ text: queued.text });
+      expect(await input.authorizeBrowserInput(queued.id, 'next-document', destination)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['authored', 'foreign', 'unnamed', 'missing-session', 'companion'] as const)(
+    'keeps an uncertain %s browser claim through a handoff and restart', async kind => {
+      const source = await open('gpt-5.6-sol');
+      expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+      const pending = (await input.listInputs()).find(row => row.recovery)!;
+      expect(await input.claimBrowserInput(pending.id, 'retained-owner', source.conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(pending.id, 'retained-owner', source.conversationId)).toBe(true);
+      const claimed = (await input.listInputs()).find(row => row.id === pending.id)!;
+      if (kind === 'authored') { delete claimed.recovery; delete claimed.silenceBoundary; claimed.text = 'An authored browser message'; }
+      if (kind === 'foreign') { claimed.conversationId = randomUUID(); claimed.silenceBoundary!.conversationId = claimed.conversationId; }
+      if (kind === 'unnamed') claimed.conversationId = null;
+      if (kind === 'missing-session') claimed.sessionId = randomUUID();
+      if (kind === 'companion') claimed.companionInputId = randomUUID();
+      const rows = claimed.companionInputId ? [claimed, { ...claimed, id: claimed.companionInputId,
+        companionInputId: undefined, recovery: undefined, silenceBoundary: undefined, text: 'An authored companion' }] : [claimed];
+      await writeDurableNow('session-input', rows);
+      expect(await rebindSession(source.session.id, source.conversationId, randomUUID())).toBe(true);
+      input.resetInputForTests();
+      const restored = await input.listInputs();
+      expect(restored).toEqual(rows);
+      expect(await input.claimBrowserInput(claimed.id, 'replacement-owner', source.conversationId, true)).toBeNull();
+    });
+
+  for (const model of ['gpt-5.6-sol', 'gpt-5.6-pro']) {
+    it.each([false, true])(`releases only a departed automatic Continue and preserves its exact late receipt (${model}, restored: %s)`, async restored => {
+      let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const source = await open(model);
+        expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, model.endsWith('pro'), () => true)).toBe(true);
+        const pending = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+        expect(await input.claimBrowserInput(pending.id, 'departed-document', source.conversationId, true)).not.toBeNull();
+        expect(await input.authorizeBrowserInput(pending.id, 'departed-document', source.conversationId)).toBe(true);
+        const authorized = (await input.listInputs()).find(row => row.id === pending.id)!;
+
+        now += 16 * 60_000;
+        expect((await input.listInputs()).find(row => row.id === pending.id)).toEqual(authorized);
+        expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, model.endsWith('pro'), () => true)).toBe(false);
+        const destination = randomUUID(), nextTurn = randomUUID();
+        expect(await rebindSession(source.session.id, source.conversationId, destination)).toBe(true);
+        if (restored) input.resetInputForTests();
+        await post('/events', { conversationId: destination, events: [
+          { kind: 'model_selection', model, time: ++now },
+          { kind: 'user_message', messageId: randomUUID(), text: 'Finish the original task in this chat', time: now, authoredNow: true },
+          { kind: 'turn_start', turnId: nextTurn, time: now }
+        ] });
+        await attributedMcp(destination);
+        expect(await input.fileRecoveryInput(source.session.id, destination, nextTurn, model.endsWith('pro'), () => true)).toBe(true);
+        const rows = await input.listInputs();
+        expect(rows.find(row => row.id === pending.id)).toEqual({ ...authorized, state: 'cancelled' });
+        const successor = rows.find(row => row.sessionId === source.session.id && row.state === 'queued')!;
+        expect(successor.conversationId).toBe(destination);
+        expect(await input.claimBrowserInput(successor.id, 'successor-document', destination, true)).not.toBeNull();
+        expect(await input.claimBrowserInput(pending.id, 'new-document', destination, true)).toBeNull();
+        expect(await input.acknowledgeBrowserInput(pending.id, 'wrong-document', source.conversationId, 'late-confirmation')).toBe(false);
+        expect(await input.acknowledgeBrowserInput(pending.id, 'departed-document', destination, 'late-confirmation')).toBe(false);
+        expect(await input.acknowledgeBrowserInput(pending.id, 'departed-document', source.conversationId, 'late-confirmation')).toBe(true);
+        expect((await input.listInputs()).find(row => row.id === pending.id)).toMatchObject({
+          state: 'cancelled', conversationId: source.conversationId, owner: authorized.owner,
+          sendAuthorizedAt: authorized.sendAuthorizedAt, messageId: 'late-confirmation', deliveredSessionId: source.session.id
+        });
+        expect((await getSession(source.session.id))?.conversationId).toBe(destination);
+      } finally { clock.mockRestore(); }
+    });
+
+    it.each(['none', 'previous', 'request'] as const)(`never intervenes in ${model} without current-turn MCP (%s)`, async proof => {
+      let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const source = await open(model, proof);
+        await post('/events', { conversationId: source.conversationId, events: [
+          { kind: 'page_tool', turnId: source.turnId, messageId: 'native-search', text: 'Searched 10 websites', time: ++now }
+        ] });
+        now += source.window + 60_000;
+        expect(await repairFor(source.conversationId)).toBeUndefined();
+        expect((await input.listInputs()).filter(row => row.sessionId === source.session.id && row.recovery)).toEqual([]);
+        expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, model.endsWith('pro'), () => true)).toBe(false);
+      } finally { clock.mockRestore(); }
+    });
+
+    it.each(['page_tool', 'assistant_message'] as const)(`renews ${model} silence from fresh %s but not its replay`, async kind => {
+      let now = Date.now(); const began = now, clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const source = await open(model);
+        now += source.window - 20_000;
+        const activity = { kind, turnId: source.turnId, messageId: 'native-progress', text: 'Prepared PDF',
+          state: 'streaming', activeNow: true, time: now };
+        await post('/events', { conversationId: source.conversationId, events: [activity] });
+        const due = now + source.window;
+        const controls = await (await bridge()).sessionControlsFor(source.session.id);
+        expect(controls.recovery).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'silence', deadline: due })]));
+        now = began + source.window + 1;
+        expect(await repairFor(source.conversationId)).toBeUndefined();
+        // Reload/DOM remount can change labels and markup but preserves native row identity.
+        await post('/events', { conversationId: source.conversationId, events: [{ ...activity, time: now,
+          ...(kind === 'page_tool' ? { text: 'Inspected PDF' } : { renderedHtml: '<p>Prepared PDF</p>' }) }] });
+        now = due - 1;
+        expect(await repairFor(source.conversationId)).toBeUndefined();
+        now++;
+        expect((await repairFor(source.conversationId))?.reason).toBe('silence');
+      } finally { clock.mockRestore(); }
+    });
+  }
+
+  it('keeps a single ticket through canonical user/prose and native-label revisions', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      const progress = { kind: 'page_tool', turnId: source.turnId, messageId: 'stable-native', text: 'Preparing PDF', time: ++now };
+      const prose = { kind: 'assistant_message', turnId: source.turnId, messageId: 'interim', text: 'Working on the PDF', state: 'streaming', activeNow: true, time: now };
+      await post('/events', { conversationId: source.conversationId, events: [progress, prose] });
+      now += source.window + 1;
+      await confirm(source.conversationId, await repairFor(source.conversationId));
+      const ticket = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+      expect(ticket).toBeDefined();
+      await post('/events', { conversationId: source.conversationId, events: [
+        { kind: 'user_message', messageId: source.questionId, turnId: source.questionId, text: 'Prepare the PDF', authoredTime: true, time: now - source.window },
+        { ...progress, text: 'Prepared PDF', time: now },
+        { ...prose, providerMessageId: randomUUID(), renderedHtml: '<p>Working on the PDF</p>', time: now }
+      ] });
+      input.resetInputForTests();
+      expect((await input.listInputs()).find(row => row.id === ticket.id)?.state).toBe('queued');
+      now += 60_001;
+      await repairFor(source.conversationId);
+      expect((await input.listInputs()).filter(row => row.sessionId === source.session.id && row.recovery)).toHaveLength(1);
+      expect((await input.claimBrowserInput(ticket.id, 'same-episode', source.conversationId, true))?.id).toBe(ticket.id);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['page_tool', 'assistant_message'] as const)('keeps the ticket when a previously unseen historical %s is backfilled', async kind => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      now += source.window + 1;
+      await confirm(source.conversationId, await repairFor(source.conversationId));
+      const ticket = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+      await post('/events', { conversationId: source.conversationId, events: [{ kind, turnId: source.turnId,
+        messageId: 'late-history', text: 'Historical PDF step', state: 'streaming', activeNow: false, time: ++now }] });
+      input.resetInputForTests();
+      expect((await input.listInputs()).find(row => row.id === ticket.id)?.state).toBe('queued');
+      expect((await input.claimBrowserInput(ticket.id, 'unchanged-page', source.conversationId, true))?.id).toBe(ticket.id);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['queued', 'claimed', 'stop-claimed'] as const)('new native work revokes %s recovery and requires a fresh full window', async phase => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      now += source.window + 1;
+      await confirm(source.conversationId, await repairFor(source.conversationId));
+      const ticket = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+      await input.deferSilenceInput(ticket.id, source.conversationId, source.turnId);
+      now = ticket.recovery!.busyUntil;
+      if (phase !== 'queued') expect(await input.claimBrowserInput(ticket.id, 'resuming-page', source.conversationId, true)).not.toBeNull();
+      if (phase === 'stop-claimed') expect(await input.advanceRecoveryInput(ticket.id, 'resuming-page', source.conversationId, 'stop')).toBe(true);
+      await post('/events', { conversationId: source.conversationId, events: [{ kind: 'page_tool', turnId: source.turnId,
+        messageId: 'new-native-work', text: 'Searched three more websites', activeNow: true, time: ++now }] });
+      expect(await input.advanceRecoveryInput(ticket.id, 'resuming-page', source.conversationId, phase === 'stop-claimed' ? 'stopped' : 'stop')).toBe(false);
+      expect(await input.authorizeBrowserInput(ticket.id, 'resuming-page', source.conversationId)).toBe(false);
+      expect((await input.listInputs()).find(row => row.id === ticket.id)?.state).toBe('cancelled');
+      now += source.window - 1;
+      expect(await repairFor(source.conversationId)).toBeUndefined();
+      now++;
+      await confirm(source.conversationId, await repairFor(source.conversationId));
+      const episodes = (await input.listInputs()).filter(row => row.sessionId === source.session.id && row.recovery);
+      expect(episodes).toHaveLength(2);
+      expect(episodes[0]!.recovery!.episode).not.toBe(episodes[1]!.recovery!.episode);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['stop', 'send'] as const)('withholds %s permission when native work commits during its durable claim write', async action => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let rename: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      const source = await open('gpt-5.6-sol');
+      now += source.window + 1;
+      await confirm(source.conversationId, await repairFor(source.conversationId));
+      const ticket = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+      if (action === 'stop') { await input.deferSilenceInput(ticket.id, source.conversationId, source.turnId); now = ticket.recovery!.busyUntil; }
+      expect(await input.claimBrowserInput(ticket.id, 'writing-page', source.conversationId, true)).not.toBeNull();
+      const original = fs.rename;
+      const { recordChatObservations } = await import('../src/main/session/recorder.js');
+      let injected = false;
+      rename = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (!injected && String(to).endsWith('session-input.json')) {
+          injected = true;
+          // Simulate the recorder committing while its bridge callback waits on
+          // this outbox operation. The final claim check must read durable work.
+          await recordChatObservations(source.conversationId, [{ kind: 'page_tool', turnId: source.turnId,
+            messageId: 'work-during-write', text: 'Native PDF preparation resumed', activeNow: true, time: ++now }]);
+        }
+        return original(from, to);
+      });
+      const attempt = () => action === 'stop'
+        ? input.advanceRecoveryInput(ticket.id, 'writing-page', source.conversationId, 'stop')
+        : input.authorizeBrowserInput(ticket.id, 'writing-page', source.conversationId);
+      expect(await attempt()).toBe(false);
+      expect(injected).toBe(true);
+      expect(await attempt()).toBe(false);
+      const saved = (await input.listInputs()).find(row => row.id === ticket.id)!;
+      expect(saved.deliveredAt).toBeUndefined();
+      expect(saved.messageId).toBeUndefined();
+      if (action === 'send') expect(saved.sendAuthorizedAt).toBeDefined(); // Spent, never reissued.
+      else expect(saved.recovery?.phase).toBe('stopping');
+    } finally { rename?.mockRestore(); clock.mockRestore(); }
+  });
+
+  it('manual Stop supersedes automation interruption and vetoes continuation and reopening after restore', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      await saveConfig({ ...defaultConfig(), multiAgent: { ...defaultConfig().multiAgent, recoverAgentTabs: true } });
+      now += source.window + 1;
+      await confirm(source.conversationId, await repairFor(source.conversationId));
+      const ticket = (await input.listInputs()).find(row => row.sessionId === source.session.id && row.recovery)!;
+      await input.deferSilenceInput(ticket.id, source.conversationId, source.turnId); now = ticket.recovery!.busyUntil;
+      await input.claimBrowserInput(ticket.id, 'stop-race', source.conversationId, true);
+      const claims = await Promise.all([1, 2].map(() => input.advanceRecoveryInput(ticket.id, 'stop-race', source.conversationId, 'stop')));
+      expect(claims).toEqual([true, false]);
+      await post('/events', { conversationId: source.conversationId, events: [
+        { kind: 'turn_end', turnId: source.turnId, outcome: 'interrupted', time: ++now },
+        { kind: 'turn_end', turnId: source.turnId, outcome: 'stopped', detail: 'The user pressed native Stop.', time: ++now }
+      ] });
+      input.resetInputForTests();
+      expect((await getSession(source.session.id))?.lastTurnOutcome).toBe('stopped');
+      expect(await input.advanceRecoveryInput(ticket.id, 'stop-race', source.conversationId, 'stopped')).toBe(false);
+      expect(await input.authorizeBrowserInput(ticket.id, 'stop-race', source.conversationId)).toBe(false);
+      await post('/closed', { conversationId: source.conversationId });
+      now += 20 * 60_000;
+      expect(await repairFor(source.conversationId)).toBeUndefined();
+      expect((await input.listInputs()).filter(row => row.sessionId === source.session.id && row.recovery)).toHaveLength(1);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('does not renew a silence deadline from an error notification', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      now += source.window - 1000;
+      await post('/events', { conversationId: source.conversationId, events: [{ kind: 'chat_error', turnId: source.turnId,
+        text: 'An informational notification', recoverable: false, time: now }] });
+      now += 1000;
+      expect((await repairFor(source.conversationId))?.reason).toBe('silence');
+    } finally { clock.mockRestore(); }
+  });
+
+  it('revokes a handed reload before browser execution when native work resumes', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      now += source.window + 1;
+      const repair = await repairFor(source.conversationId);
+      expect(repair).toMatchObject({ reason: 'silence', requiresClaim: true });
+      await post('/events', { conversationId: source.conversationId, events: [
+        { kind: 'page_tool', turnId: source.turnId, messageId: 'late-native', text: 'Inspected PDF rendering', time: ++now }
+      ] });
+      expect((await post('/repairs/claim', { conversationId: source.conversationId, token: repair.token })).body.allowed).toBe(false);
+      await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [source.conversationId] });
+      expect((await input.listInputs()).filter(row => row.sessionId === source.session.id && row.recovery)).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+});
+
+describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)', mode => {
+  beforeEach(async () => { await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } }); });
+  async function silent(model: string, advance: (ms: number) => void, reloadDelay = 0, sourceEnd?: 'completed' | 'interrupted' | 'unknown', mcp = true, manualClose = false) {
+    const bridge = await import('../src/main/bridge.js');
+    const conversationId = randomUUID();
+    const session = await createSession({ title: 'Automatic Continue fixture', conversationId });
+    if (mode !== 'off') await goal.setGoalSwitchNow(conversationId, mode, true);
+    const questionId = randomUUID(), turnId = randomUUID();
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model, reasoningEffort: 'high', time: Date.now() },
+      { kind: 'user_message', messageId: questionId, text: 'Finish the requested task', time: Date.now() },
+      { kind: 'turn_start', turnId, time: Date.now() }
+    ] });
+    if (mcp) await attributedMcp(conversationId);
+    if (sourceEnd) await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId, outcome: sourceEnd, time: Date.now() }] });
+    const openConversations = manualClose ? [] : [conversationId];
+    if (manualClose) {
+      await post('/closed', { conversationId, manual: true });
+      expect((await getSession(session.id))?.browserRecoveryDismissedAt).toBe(Date.now());
+      expect((await post('/status', { openConversations })).body.repairs.some((row: any) => row.conversationId === conversationId)).toBe(false);
+    }
+    const window = model === 'gpt-5.6-pro' ? 600_000 : 120_000;
+    advance(window - 1);
+    await bridge.sweepStaleSwarm(Date.now());
+    expect((await input.pendingBrowserInputs()).filter(row => row.conversationId === conversationId)).toEqual([]);
+    advance(2);
+    await bridge.sweepStaleSwarm(Date.now());
+    if (manualClose) {
+      expect((await post('/status', { openConversations })).body.repairs.some((row: any) => row.conversationId === conversationId)).toBe(false);
+      expect((await input.listInputs()).filter(row => row.sessionId === session.id && row.recovery)).toEqual([]);
+      // Explicitly returning to this page releases the dismissal. Existing work
+      // is still overdue, so recovery resumes without another start/tool call.
+      const returned = await fetch(`http://127.0.0.1:${bridgePort()}/activity?conversationId=${conversationId}`, {
+        headers: { authorization: `Bearer ${bearer}`, 'x-extension-version': APP_VERSION, 'x-extension-protocol': String(BRIDGE_PROTOCOL) }
+      });
+      expect(returned.status).toBe(200);
+      expect((await getSession(session.id))?.browserRecoveryDismissedAt).toBeUndefined();
+      openConversations.push(conversationId);
+      await bridge.sweepStaleSwarm(Date.now());
+    }
+    const repair = (await post('/status', { openConversations })).body.repairs.find((row: any) => row.conversationId === conversationId);
+    expect(repair?.reason).toBe('silence');
+    if (repair.requiresClaim) expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    advance(reloadDelay);
+    await post(`/status?repaired=${repair.token}&repairAction=${manualClose ? 'reopened' : 'reloaded'}`, { openConversations });
+    const row = (await input.listInputs()).find(row => row.sessionId === session.id && row.recovery)!;
+    expect(row).toMatchObject({ state: 'queued', recovery: { questionId, phase: 'ready' } });
+    return { row, conversationId, session, turnId };
+  }
+
+  it.each(['gpt-5.6-sol', 'gpt-5.6-pro'])('continues an idle unfinished %s immediately after its initial reload', async model => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId } = await silent(model, ms => { now += ms; });
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === row.id)?.recovery?.stop).toBe(false);
+      const claim = await input.claimBrowserInput(row.id, 'idle-doc', conversationId, true);
+      expect(claim?.text).toBe(row.text);
+      expect(await input.advanceRecoveryInput(row.id, 'idle-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, 'idle-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'idle-doc', conversationId)).toBe(false);
+      expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+    } finally { clock.mockRestore(); }
+  });
+
+  it('gives Pro five full minutes after a delayed reload acknowledgement', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, turnId } = await silent('gpt-5.6-pro', ms => { now += ms; }, 60_000);
+      const deadline = now + 5 * 60_000;
+      expect(row.recovery?.busyUntil).toBe(deadline);
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      expect((await input.listInputs()).find(entry => entry.id === row.id)?.silenceBoundary?.listenUntil).toBe(deadline);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['completed', 'interrupted', 'unknown'] as const)('does not mistake a native %s boundary for a canonical final answer', async outcome => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId } = await silent('gpt-5.6-sol', ms => { now += ms; }, 0, outcome);
+      expect(await input.claimBrowserInput(row.id, 'unfinished-doc', conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'unfinished-doc', conversationId)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('holds Continue during a local tool and cancels it when that source records new work', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const calls = await import('../src/main/mcp/call-context.js');
+    let release: (() => void) | undefined;
+    let running: Promise<void> | undefined;
+    try {
+      const { row, conversationId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      running = calls.trackInFlight({ startedAt: now, transportKey: null, agent: null, outcome: null,
+        evidence: calls.emptyEvidence(), caller: { conversationId, requestId: randomUUID(), transportKey: null } },
+        () => new Promise<void>(resolve => { release = resolve; }));
+      expect(await input.claimBrowserInput(row.id, 'busy-tool-doc', conversationId, true)).toBeNull();
+      expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
+      await attributedMcp(conversationId);
+      expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
+    } finally { release?.(); await running; clock.mockRestore(); }
+  });
+
+  it.each(['gpt-5.6-sol', 'gpt-5.6-pro'])('gives busy %s one half-window and fences Stop/reload/Send custody', async model => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, turnId } = await silent(model, ms => { now += ms; });
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      now = row.recovery!.busyUntil - 1;
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      now++;
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(false);
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === row.id)?.recovery?.stop).toBe(true);
+      expect(await input.claimBrowserInput(row.id, 'old-doc', conversationId, true)).not.toBeNull();
+      expect(await input.advanceRecoveryInput(row.id, 'other-doc', conversationId, 'stop')).toBe(false);
+      expect((await post('/input/claim', { id: row.id, owner: 'old-doc', conversationId, recoveryAction: 'stop' })).body.ok).toBe(true);
+      expect(await input.advanceRecoveryInput(row.id, 'old-doc', conversationId, 'stop')).toBe(false);
+      await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId, outcome: 'interrupted', time: now }] });
+      expect(await input.authorizeBrowserInput(row.id, 'old-doc', conversationId)).toBe(false);
+      expect(await input.advanceRecoveryInput(row.id, 'old-doc', conversationId, 'stopped')).toBe(true);
+      expect(await input.advanceRecoveryInput(row.id, 'old-doc', conversationId, 'stopped')).toBe(false);
+      expect(await input.advanceRecoveryInput(row.id, 'old-doc', conversationId, 'reloaded')).toBe(false);
+      expect(await input.claimBrowserInput(row.id, 'other-doc', conversationId, true)).toBeNull();
+      expect((await input.claimBrowserInput(row.id, 'old-doc', conversationId, true))?.text).toBe(row.text);
+      expect(await input.authorizeBrowserInput(row.id, 'old-doc', conversationId)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each([
+    { kind: 'text', manualClose: false }, { kind: 'image', manualClose: false },
+    { kind: 'text', manualClose: true }, { kind: 'image', manualClose: true }
+  ])('hands a recovered $kind final to Goal/Loop and cancels Continue before Stop (manual close and return: $manualClose)', async ({ kind, manualClose }) => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; }, 0, undefined, true, manualClose);
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      const messageId = randomUUID();
+      await post('/events', { conversationId, events: [{ kind: 'assistant_message', messageId,
+        providerMessageId: messageId, turnId, text: kind === 'image' ? '' : 'Finished.',
+        state: 'final', final: true, goalEligible: true, activeNow: true, time: ++now }] });
+      expect(await input.claimBrowserInput(row.id, 'late-doc', conversationId, true)).toBeNull();
+      expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
+      expect(goal.goalPendingReplyFor(conversationId)?.replyId ?? null).toBe(mode === 'off' ? null : messageId);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['running', 'settling'] as const)('keeps the same Continue ticket while an unrelated tool is still unassigned (%s)', async phase => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const calls = await import('../src/main/mcp/call-context.js');
+    let release!: () => void;
+    let work: Promise<void> | undefined;
+    try {
+      const { row, conversationId } = await silent('gpt-5.6-pro', ms => { now += ms; });
+      const context = { startedAt: now, transportKey: null, agent: null, outcome: null,
+        evidence: calls.emptyEvidence(), caller: { conversationId: null as string | null, requestId: randomUUID(), transportKey: null } };
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      if (phase === 'running') work = calls.trackInFlight(context, () => pending);
+      else { calls.holdWhileSettling(context, pending); work = pending; }
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      expect(await input.claimBrowserInput(row.id, 'held-doc', conversationId, true)).toBeNull();
+      input.resetInputForTests();
+      expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+        state: 'queued', owner: null, recovery: row.recovery, silenceBoundary: row.silenceBoundary
+      });
+      // Exact evidence assigns the tool to a different chat while the call is still live.
+      context.caller.conversationId = randomUUID();
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === row.id)).toBeDefined();
+      expect(await input.claimBrowserInput(row.id, 'held-doc', conversationId, true)).not.toBeNull();
+      expect(await input.authorizeBrowserInput(row.id, 'held-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'held-doc', conversationId)).toBe(false);
+    } finally { release?.(); await work; clock.mockRestore(); }
+  });
+
+  it('retains a claimed Continue across unrelated activity without granting Stop or Send', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const calls = await import('../src/main/mcp/call-context.js');
+    let release!: () => void;
+    let work: Promise<void> | undefined;
+    try {
+      const { row, conversationId, turnId } = await silent('gpt-5.6-pro', ms => { now += ms; });
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      now = row.recovery!.busyUntil;
+      expect(await input.claimBrowserInput(row.id, 'claimed-doc', conversationId, true)).not.toBeNull();
+      work = calls.trackInFlight({ startedAt: now, transportKey: null, agent: null, outcome: null,
+        evidence: calls.emptyEvidence(), caller: { conversationId: null, requestId: randomUUID(), transportKey: null } },
+        () => new Promise<void>(resolve => { release = resolve; }));
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, 'claimed-doc', conversationId)).toBe(false);
+      expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'browser', owner: 'claimed-doc' });
+      release(); await work;
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stop')).toBe(true);
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.advanceRecoveryInput(row.id, 'claimed-doc', conversationId, 'stopped')).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'claimed-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'claimed-doc', conversationId)).toBe(false);
+    } finally { release?.(); await work; clock.mockRestore(); }
+  });
+
+  it.each(['gpt-5.6-sol', 'gpt-5.6-pro'])('keeps Continue and its Stop deadline when reload re-observes the same question with different text (%s)', async model => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, turnId, session } = await silent(model, ms => { now += ms; });
+      const store = await import('../src/main/session/store.js');
+      for (const [index, text] of ['Finish the requested task…', 'Finish the requested task\nwith the existing results.'].entries()) {
+        await post('/events', { conversationId, events: [{ kind: 'user_message',
+          messageId: row.recovery!.questionId, text, ...(index === 0 ? { authoredNow: false } : {}), time: ++now }] });
+        expect((await input.listInputs()).find(entry => entry.id === row.id)).toMatchObject({
+          state: 'queued', silenceBoundary: { workSeq: row.silenceBoundary!.workSeq },
+          recovery: { busyUntil: row.recovery!.busyUntil }
+        });
+        expect((await store.readLatestUserMessage(session.id))?.message.text).toBe(text);
+      }
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      now = row.recovery!.busyUntil - 1;
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === row.id)).toBe(false);
+      now++;
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === row.id)?.recovery?.stop).toBe(true);
+      expect(await input.claimBrowserInput(row.id, 'reloaded-question-doc', conversationId, true)).not.toBeNull();
+      expect(await input.advanceRecoveryInput(row.id, 'reloaded-question-doc', conversationId, 'stop')).toBe(true);
+      expect(await input.advanceRecoveryInput(row.id, 'reloaded-question-doc', conversationId, 'stop')).toBe(false);
+      expect(await input.authorizeBrowserInput(row.id, 'reloaded-question-doc', conversationId)).toBe(false);
+      expect(await input.advanceRecoveryInput(row.id, 'reloaded-question-doc', conversationId, 'stopped')).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'reloaded-question-doc', conversationId)).toBe(true);
+      expect(await input.authorizeBrowserInput(row.id, 'reloaded-question-doc', conversationId)).toBe(false);
+      const nextQuestion = randomUUID(), nextTurn = randomUUID();
+      expect(await input.acknowledgeBrowserInput(row.id, 'reloaded-question-doc', conversationId, nextQuestion)).toBe(true);
+      expect(await input.acknowledgeBrowserInput(row.id, 'reloaded-question-doc', conversationId, nextQuestion)).toBe(true);
+      expect((await input.listInputs()).filter(entry => entry.id === row.id && entry.state === 'sent')).toHaveLength(1);
+      await post('/events', { conversationId, events: [
+        { kind: 'turn_end', turnId, outcome: 'interrupted', reason: 'automation_silence', time: ++now },
+        { kind: 'user_message', messageId: nextQuestion, text: row.text, authoredNow: true, time: ++now },
+        { kind: 'turn_start', turnId: nextTurn, time: now }
+      ] });
+      await attributedMcp(conversationId);
+      const bridge = await import('../src/main/bridge.js');
+      now += (model === 'gpt-5.6-pro' ? 600_000 : 120_000) - 1;
+      await bridge.sweepStaleSwarm(now);
+      const pending = () => post('/status', { openConversations: [conversationId] });
+      expect((await pending()).body.repairs.some((repair: any) => repair.conversationId === conversationId)).toBe(false);
+      now += 2;
+      await bridge.sweepStaleSwarm(now);
+      const repair = (await pending()).body.repairs.find((repair: any) => repair.conversationId === conversationId);
+      expect(repair?.reason).toBe('silence');
+      expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+      await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+      const next = (await input.listInputs()).find(entry => entry.sessionId === session.id && entry.state === 'queued' && entry.recovery)!;
+      expect(next.id).not.toBe(row.id);
+      expect(next.recovery?.questionId).toBe(nextQuestion);
+      expect(next.silenceBoundary?.turnId).toBe(nextTurn);
+      expect(await input.deferSilenceInput(next.id, conversationId, nextTurn)).toBe(true);
+      now = next.recovery!.busyUntil;
+      expect((await input.pendingBrowserInputs()).find(entry => entry.id === next.id)?.recovery?.stop).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('keeps the recovery message and source immutable under user queue operations', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, session } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      expect(await input.editQueuedInput(row.id, 'Replace the automatic recovery with a different task')).toBe(false);
+      expect(await input.reorderQueuedInputs(session.id, [row.id])).toBe(false);
+      const stored = (await input.listInputs()).find(entry => entry.id === row.id)!;
+      expect(stored.text).toBe(row.text);
+      expect(stored.silenceBoundary).toEqual(row.silenceBoundary);
+      expect(stored.recovery).toEqual(row.recovery);
+      expect((await input.claimBrowserInput(row.id, 'unchanged-recovery-doc', conversationId, true))?.text).toBe(row.text);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['gpt-5.6-sol', 'gpt-5.6-pro', null])('keeps the activity-based Thinking failed deadline and conditional busy wait for %s', async model => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const bridge = await import('../src/main/bridge.js');
+      const conversationId = randomUUID(), turnId = randomUUID();
+      const session = await createSession({ title: 'Failed response recovery', conversationId });
+      if (mode !== 'off') {
+        await goal.setGoalSwitchNow(conversationId, mode, true);
+        await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false } });
+      }
+      await post('/events', { conversationId, events: [
+        ...(model ? [{ kind: 'model_selection', model, reasoningEffort: 'high', time: now }] : []),
+        { kind: 'user_message', messageId: randomUUID(), text: 'Complete the task', time: now },
+        { kind: 'turn_start', turnId, time: now }
+      ] });
+      await attributedMcp(conversationId);
+      const lastWork = now, pro = model === 'gpt-5.6-pro';
+      const deadline = lastWork + (pro ? 300_000 : 120_000);
+      now += 30_000;
+      const failure = { kind: 'turn_end', turnId, outcome: 'failed', reason: 'thinking_failed', time: now };
+      await post('/events', { conversationId, events: [failure] });
+      const repairFor = async () => (await post('/status', { openConversations: [conversationId] })).body.repairs.find((item: any) => item.conversationId === conversationId);
+      expect(await repairFor()).toBeUndefined();
+      expect((await bridge.sessionControlsFor(session.id)).recovery).toContainEqual({
+        kind: 'silence', deadline, visibleAt: deadline - (pro ? 300_000 : 30_000)
+      });
+      now = deadline - 1;
+      await post('/events', { conversationId, events: [failure] }); // Replayed failure cannot renew or spend silence.
+      await bridge.sweepStaleSwarm(now);
+      expect(await repairFor()).toBeUndefined();
+      now++;
+      await bridge.sweepStaleSwarm(now);
+      const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs.find((item: any) => item.conversationId === conversationId);
+      expect(repair?.reason).toBe('silence');
+      expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+      await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+      const row = (await input.listInputs()).find(item => item.sessionId === session.id && item.recovery)!;
+      expect(row.recovery!.busyUntil).toBe(now + (pro ? 300_000 : 60_000));
+      expect(await input.deferSilenceInput(row.id, conversationId, turnId)).toBe(true);
+      expect((await bridge.sessionControlsFor(session.id)).recovery).toContainEqual({
+        kind: 'native-busy', deadline: row.recovery!.busyUntil, next: 'continue'
+      });
+      now = row.recovery!.busyUntil - 1;
+      expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+      now = row.recovery!.busyUntil;
+      expect((await input.pendingBrowserInputs()).find(item => item.id === row.id)?.recovery?.stop).toBe(true);
+      expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+    } finally { clock.mockRestore(); }
+  });
+
+  it('retains the same frozen ticket across restore and the shared 2/5/10/15 pickup schedule', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const bridge = await import('../src/main/bridge.js');
+    try {
+      const { row, conversationId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      for (const minutes of [2, 5, 10, 15]) {
+        input.resetInputForTests();
+        now += minutes * 60_000;
+        expect(await input.pendingQueuedPickups()).toEqual(expect.arrayContaining([expect.objectContaining({ conversationId })]));
+        await bridge.sweepStaleSwarm(now);
+        const status = (await post('/status', { openConversations: [conversationId] })).body;
+        const repair = status.repairs.find((item: any) => item.conversationId === conversationId);
+        expect(repair?.reason).toBe('goal'); // Existing shared pickup wire reason.
+        await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+        expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued', text: row.text });
+        expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+      }
+      expect((await input.claimBrowserInput(row.id, 'restored-doc', conversationId, true))?.text).toBe(row.text);
+      expect(await input.authorizeBrowserInput(row.id, 'restored-doc', conversationId)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['timeout', 'failure'])('releases a pre-send browser %s to the same ticket without replaying Stop', async failure => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const { row, conversationId, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+      await input.deferSilenceInput(row.id, conversationId, turnId);
+      now = row.recovery!.busyUntil;
+      await input.claimBrowserInput(row.id, 'lost-doc', conversationId, true);
+      expect(await input.advanceRecoveryInput(row.id, 'lost-doc', conversationId, 'stop')).toBe(true);
+      if (failure === 'failure') expect(await input.failBrowserInput(row.id, 'lost-doc', 'Page preparation was interrupted')).toBe(true);
+      else now += 60_001;
+      input.resetInputForTests();
+      expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued', recovery: { phase: 'resumed' } });
+      expect(await input.authorizeBrowserInput(row.id, 'lost-doc', conversationId)).toBe(false);
+      expect((await input.pendingBrowserInputs()).find(item => item.id === row.id)?.recovery?.stop).toBe(false);
+      expect((await input.claimBrowserInput(row.id, 'replacement-doc', conversationId, true))?.text).toBe(row.text);
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['final', 'stop', 'question', 'edited-question', 'activity', 'setting', 'block', 'rebind', 'input'] as const)(
+    'cancels a pending recovery on %s before any send or stop', async change => {
+      let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const { row, conversationId, session, turnId } = await silent('gpt-5.6-sol', ms => { now += ms; });
+        now++;
+        if (change === 'final') await post('/events', { conversationId, events: [
+          { kind: 'assistant_message', messageId: randomUUID(), turnId, text: 'Finished.', state: 'final', final: true, time: now }
+        ] });
+        if (change === 'stop') await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId, outcome: 'stopped', time: now }] });
+        if (change === 'question') await post('/events', { conversationId, events: [{ kind: 'user_message', messageId: randomUUID(), text: 'A newer instruction', time: now }] });
+        if (change === 'edited-question') await post('/events', { conversationId, events: [{ kind: 'user_message',
+          messageId: row.recovery!.questionId, text: 'An explicitly authored change', authoredNow: true, time: now }] });
+        if (change === 'activity') await attributedMcp(conversationId);
+        if (change === 'setting') {
+          await goal.setGoalSwitchNow(conversationId, mode === 'off' ? 'goal' : mode, false);
+          await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false } });
+        }
+        if (change === 'block') (await import('../src/main/session/blocked-chats.js')).setChatBlocked(conversationId, true);
+        if (change === 'rebind') await rebindSession(session.id, conversationId, randomUUID());
+        if (change === 'input') await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
+        expect(await input.claimBrowserInput(row.id, 'late-doc', conversationId, true)).toBeNull();
+        const cancelled = (await input.listInputs()).find(entry => entry.id === row.id)!;
+        expect(cancelled.state).toBe('cancelled');
+        if (change === 'block') expect(cancelled.error).toBe('Automatic Continue cancelled: this chat is blocked.');
+        if (change === 'question') expect(cancelled.error).toBe('Automatic Continue cancelled: another user message arrived.');
+      } finally { clock.mockRestore(); }
+    });
 });

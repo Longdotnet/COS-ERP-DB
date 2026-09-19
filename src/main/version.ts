@@ -12,7 +12,7 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '2.1.13';
+export const APP_VERSION = '2.1.14';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving
@@ -66,4 +66,6 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  */
 // 13 — native file attachments require exact claimed-input chunk delivery and final
 // draft ownership. A 12 companion would silently send text without these files.
-export const BRIDGE_PROTOCOL = 13;
+// 14 — exact native generated-image metadata and bounded preview observations. A 13 app
+// would ACK the journal while silently discarding that new event kind.
+export const BRIDGE_PROTOCOL = 14;

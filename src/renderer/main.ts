@@ -4,9 +4,12 @@ import { initUsage, refreshUsage } from './usage.js';
 import { initSidebarResize } from './sidebar-resize.js';
 import { initPlugins, applyPluginsState } from './plugins.js';
 import { initBrowserPreferences } from './browser-preferences.js';
+import { initConnectionAdvanced } from './connection-popover.js';
 import { initSetupGuide } from './setup-guide.js';
 import { initDatabaseSettings } from '../cos-erp-db/renderer/database-settings.js';
-import { initChatgptPermissionNotice } from './chatgpt-permission-notice.js';
+import { initAppearance } from './appearance.js';
+import { initPet } from './pet.js';
+import type { AppearanceSettings } from '../shared/appearance.js';
 /**
  * Renderer. No Node, no filesystem, no network — everything goes through window.api.
  *
@@ -46,9 +49,13 @@ declare global {
 
 const api = window.api;
 initLanguage();
+initPet();
 initSetupGuide();
 initDatabaseSettings();
-initChatgptPermissionNotice(api);
+// Escape the translucent sidebar's backdrop-filter containing block.
+document.body.append($('connectionPopover'));
+const connectionAdvanced = initConnectionAdvanced();
+const appearance = initAppearance(patch => { void save(patch); });
 
 /** Same shape the platform uses; mirrored here only to grey out step 2 until it is valid. */
 const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;
@@ -75,13 +82,13 @@ const GROUPS: Group[] = [
     title: "Change files",
     icon: 'i-pencil',
     blurb: "Create, edit, move, delete and save ChatGPT files, inside those folders only.",
-    caps: ['create', 'edit', 'move', 'deleteFile', 'saveArtifact']
+    caps: ['create', 'edit', 'move', 'deleteFile']
   },
   {
     id: 'desktop',
-    title: "See and use the desktop",
+    title: "Browser and desktop control",
     icon: 'i-monitor',
-    blurb: "Screenshots, the list of open windows, and the mouse and keyboard.",
+    blurb: "Background browser tabs, DOM, console and network; native windows and input where supported.",
     caps: ['screen', 'control', 'clipboardRead', 'clipboardWrite']
   },
   {
@@ -124,10 +131,12 @@ let setupKeySave: Promise<boolean> = Promise.resolve(true);
 // ------------------------------------------------------------------- tabs
 
 function showTab(name: string): void {
-  const settings = name !== 'chat';
-  document.querySelector<HTMLElement>('.app')!.dataset.screen = settings ? 'settings' : 'chat';
+  const settings = name !== 'chat' && name !== 'plugins';
+  document.querySelector<HTMLElement>('.app')!.dataset.screen = name === 'plugins' ? 'library' : settings ? 'settings' : 'chat';
   document.querySelector<HTMLElement>('.sidebar-brand')!.hidden = settings;
-  $('workspaceSettings').hidden = settings;
+  $('sidebarPrimary').hidden = settings;
+  $('workspaceSettings').hidden = false;
+  $('workspaceSettings').classList.toggle('is-sel', settings);
   if (name === 'usage') void refreshUsage();
   $('tabs').hidden = !settings;
   $('backToChat').hidden = !settings;
@@ -139,6 +148,7 @@ function showTab(name: string): void {
   for (const tab of document.querySelectorAll<HTMLElement>('nav button')) {
     tab.classList.toggle('is-sel', tab.dataset.tab === name);
   }
+  for (const item of document.querySelectorAll<HTMLElement>('[data-sidebar-page]')) item.classList.toggle('is-sel', item.dataset.sidebarPage === name);
   for (const panel of document.querySelectorAll<HTMLElement>('.panel')) {
     panel.classList.toggle('is-active', panel.dataset.panel === (name === 'settings' ? 'chat' : name));
   }
@@ -150,6 +160,35 @@ function showTab(name: string): void {
   // opens on the newest line rather than on whatever was oldest in the buffer.
   for (const id of FEEDS) stickToNewest(id);
 }
+
+function setConnectionPopover(open: boolean): void {
+  const popover = $('connectionPopover');
+  const trigger = $('sidebarConnection');
+  popover.hidden = !open;
+  trigger.setAttribute('aria-expanded', String(open));
+  if (open) {
+    $<HTMLDetailsElement>('connectionAdvanced').open = false;
+    $<HTMLDetailsElement>('connectionRuntime').open = false;
+    positionConnectionPopover();
+    paintClock();
+    connectionAdvanced.refreshIfOpen();
+  }
+}
+
+/** Keep this diagnostic surface anchored to the status button and inside the viewport. */
+function positionConnectionPopover(): void {
+  const popover = $('connectionPopover');
+  if (popover.hidden) return;
+  const trigger = $('sidebarConnection').getBoundingClientRect();
+  const margin = 12;
+  const width = popover.getBoundingClientRect().width;
+  const preferredLeft = trigger.left + trigger.width / 2 - width / 2;
+  const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+  popover.style.left = `${Math.min(Math.max(margin, preferredLeft), maxLeft)}px`;
+  popover.style.bottom = `${Math.max(margin, window.innerHeight - trigger.top + 8)}px`;
+}
+
+window.addEventListener('resize', () => positionConnectionPopover());
 
 $('backToChat').addEventListener('click', () => showTab('chat'));
 window.addEventListener('cos:database-open-chat', (event) => {
@@ -168,9 +207,16 @@ window.addEventListener('cos:database-open-chat', (event) => {
   }
 });
 $('workspaceSettings').addEventListener('click', () => showTab('home'));
+$('sidebarConnection').addEventListener('click', () => {
+  setConnectionPopover(Boolean($('connectionPopover').hidden));
+});
 $('chatSettingsBtn').addEventListener('click', () => showTab('settings'));
-$('sessionList').addEventListener('click', () => showTab('chat'));
+$('sessionList').addEventListener('click', event => {
+  if ((event.target as HTMLElement).closest('[data-id], [data-new-project]')) showTab('chat');
+}, { capture: true });
 $('newChat').addEventListener('click', () => showTab('chat'));
+$('sidebarPlugins').addEventListener('click', () => showTab('plugins'));
+$('addProject').addEventListener('click', () => showTab('chat'));
 $('composerFolder').addEventListener('click', () => $('addProject').click());
 let zoomFactor = 1;
 let zoomEdited = false;
@@ -276,31 +322,6 @@ function buildGroups(): void {
     return root;
   });
 
-  // Recording and sub-agents are tool surfaces exactly like the file and desktop
-  // permissions — `session` and `agents` are two of the nine tools ChatGPT can discover —
-  // and they used to be checkboxes buried in a settings pane behind a gear. Every switch
-  // that decides what ChatGPT can reach now lives in this one list. Chat settings keeps
-  // only the numbers that tune them.
-  const record = document.createElement('input');
-  record.type = 'checkbox';
-  record.id = 'sessRecord';
-  ui(record, 'title', () => t("Record this chat locally, and expose the session tool in ChatGPT"));
-  record.addEventListener('change', () => void save());
-  const recording = groupShell('recording', 'Session recording', 'i-steps', record);
-  const recordTools = el('div', 'tools');
-  for (const [name, detail] of [
-    ['search', 'List recent recordings or find past and concurrent work by text.'],
-    ['read', 'Read one explicit recording, continue it, or expand one short T… tool reference.']
-  ] as Array<[string, string]>) {
-    const row = el('div', 'tool is-static');
-    const body = el('span');
-    body.append(el('strong', '', name), el('em', '', () => t(detail)));
-    row.append(body);
-    recordTools.append(row);
-  }
-  recordTools.append(toolNames(['session']));
-  recording.append(recordTools);
-
   const enabled = document.createElement('input');
   enabled.type = 'checkbox';
   enabled.id = 'homeMaEnabled';
@@ -327,7 +348,7 @@ function buildGroups(): void {
   tools.append(toolNames(['agents']));
   agents.append(tools);
 
-  $('groups').replaceChildren(...permissionGroups, recording, agents);
+  $('groups').replaceChildren(...permissionGroups, agents);
 }
 
 function capInput(cap: Capability): HTMLInputElement {
@@ -342,12 +363,7 @@ function paintGroups(): void {
 
   for (const group of GROUPS) {
     const root = document.querySelector<HTMLElement>(`[data-group="${group.id}"]`)!;
-    const supported = group.id !== 'desktop' || desktopSupported;
-    root.hidden = !supported;
-    if (!supported) {
-      for (const cap of group.caps) capInput(cap).disabled = true;
-      continue;
-    }
+    root.hidden = false;
     root.classList.toggle('is-open', openGroup === group.id);
 
     const names = [...new Set(group.caps.flatMap((cap) => capabilityTools(cap, state!.platform?.family)))];
@@ -357,7 +373,8 @@ function paintGroups(): void {
       namesRow.replaceChildren(...names.map(name => el('code', '', name)));
     }
 
-    const usable = group.caps.filter((cap) => !(readOnly && WRITE_CAPABILITIES.includes(cap)));
+    const usable = group.caps.filter((cap) => !(readOnly && WRITE_CAPABILITIES.includes(cap)) &&
+      (desktopSupported || cap !== 'clipboardRead' && cap !== 'clipboardWrite'));
     const on = group.caps.filter((cap) => capInput(cap).checked);
 
     const box = root.querySelector<HTMLInputElement>('.group-box')!;
@@ -378,15 +395,15 @@ function paintGroups(): void {
   }
 
   for (const cap of WRITE_CAPABILITIES) capInput(cap).disabled = readOnly;
+  for (const cap of ['clipboardRead', 'clipboardWrite'] as const) {
+    capInput(cap).disabled = !desktopSupported || (readOnly && WRITE_CAPABILITIES.includes(cap));
+  }
 
-  // The two feature groups. apply() already passed both switches through the
+  // The feature group. apply() already passed its switch through the
   // focused/dirty-field guard. Recopying state here undid that protection and visibly
   // flipped a user's just-clicked toggle back when an unsolicited stale state push
   // arrived before save completed, so this only reads them.
-  for (const [id, onText] of [
-    ['recording', 'session tool exposed'],
-    ['agents', 'agents tool exposed']
-  ] as Array<[string, string]>) {
+  for (const [id, onText] of [['agents', 'agents tool exposed']] as Array<[string, string]>) {
     const root = document.querySelector<HTMLElement>(`[data-group="${id}"]`);
     if (!root) continue;
     const box = root.querySelector<HTMLInputElement>('.sw input')!;
@@ -447,7 +464,7 @@ function toolsOn(next: AppState): number {
 let settingsSaveQueue: Promise<void> = Promise.resolve();
 let requestedSettings: SettingsPatch | null = null;
 
-function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Promise<void> {
+function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?: AppearanceSettings } = {}): Promise<void> {
   if (applying || !state) return Promise.resolve();
 
   const previous: AppState['config'] = requestedSettings
@@ -460,7 +477,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
     // config. A hidden disabled checkbox is presentation,
     // not a user edit: copying its forced-false value into every unrelated settings save
     // would erase those choices merely because the config was opened on another OS.
-    if (!(state.platform?.desktopAutomation ?? true) && DESKTOP_CAPABILITIES.includes(capability)) continue;
+    if (!(state.platform?.desktopAutomation ?? true) && DESKTOP_CAPABILITIES.includes(capability) && capability !== 'screen' && capability !== 'control') continue;
     capabilities[capability] = input.checked;
   }
   const readOnly = over.readOnly ?? previous.readOnly;
@@ -478,12 +495,13 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       binaryPath: $<HTMLInputElement>('binaryPath').value.trim()
     },
     ui: {
+      ...previous.ui,
       chatBrowser: $<HTMLSelectElement>('chatBrowser').value as ChatBrowser,
       finishTool: $<HTMLInputElement>('finishTool').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
-      finishAction: $<HTMLSelectElement>('finishAction').value as 'notify' | 'goal',
       finishLeadMinutes: Number($<HTMLSelectElement>('finishLeadMinutes').value),
       backgroundChats: $<HTMLInputElement>('backgroundChats').checked,
+      autoContinue: $<HTMLInputElement>('autoContinue').checked,
       browserOnly: $<HTMLInputElement>('browserOnly').checked,
       autoRefreshPlugins: $<HTMLInputElement>('autoRefreshPlugins').checked,
       autoConnect: $<HTMLInputElement>('autoConnect').checked,
@@ -491,7 +509,8 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       minimizeToTray: $<HTMLInputElement>('minimizeToTray').checked,
       developerMode: $<HTMLInputElement>('developerMode').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
-      theme: over.theme ?? previous.ui.theme
+      theme: over.theme ?? previous.ui.theme,
+      appearance: over.appearance ?? previous.ui.appearance
     },
     ...chatPatch
   };
@@ -510,7 +529,6 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
 
 async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']): Promise<void> {
   const toolSurfaceChanged =
-    previous.sessions.record !== patch.sessions.record ||
     previous.multiAgent.enabled !== patch.multiAgent.enabled ||
     (Object.keys(patch.capabilities) as Capability[]).some((cap) => {
       const before = previous.capabilities[cap] && !(previous.readOnly && WRITE_CAPABILITIES.includes(cap));
@@ -529,6 +547,8 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     goal: previous.goal
   };
   const next = await run(api.saveSettings(patch, base));
+  // Retire this request before repaint, while a newer queued preference still wins.
+  if (requestedSettings === patch) requestedSettings = null;
   if (next) {
     apply(next);
     if (previous.multiAgent.enabled && !patch.multiAgent.enabled) {
@@ -539,14 +559,13 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
       toast(t("Tools changed. Start a new ChatGPT conversation to guarantee the new tool list is loaded."));
     }
   } else await refresh();
-  // Do not erase the desired state of a newer queued save when an older one completes.
-  if (requestedSettings === patch) requestedSettings = null;
 }
 
 // ---------------------------------------------------------------- helpers
 
 const STATUS_TEXT: Record<AppState['status']['state'], string> = {
   disconnected: "Not connected",
+  disconnecting: "Disconnecting",
   'starting-server': "Starting",
   'connecting-tunnel': "Connecting",
   connected: "Connected",
@@ -969,23 +988,32 @@ function apply(next: AppState): void {
 
   const connected = status.state === 'connected';
   const offline = status.state === 'offline';
-  const busy = status.state === 'starting-server' || status.state === 'connecting-tunnel';
+  const disconnecting = status.state === 'disconnecting';
+  const busy = disconnecting || status.state === 'starting-server' || status.state === 'connecting-tunnel';
   const failed = status.state === 'auth-failed' || status.state === 'tunnel-unavailable';
   const running = isRunning(status.state);
   const missing = missingStep(next);
 
   // ---- theme
-  const dark = config.ui.theme === 'dark';
-  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-  $('themeIcon').setAttribute('href', dark ? '#i-sun' : '#i-moon');
-  ui($('themeBtn'), 'title', () => dark ? t("Switch to light mode") : t("Switch to dark mode"));
+  const appearanceUi = requestedSettings?.ui ?? config.ui;
+  appearance.apply(appearanceUi);
 
-  // ---- header
-  const live = $('live');
-  live.className = `live${
-    connected ? ' is-connected' : offline ? ' is-offline' : busy ? ' is-busy' : failed ? ' is-error' : ''
-  }`;
-  ui($('liveState'), 'textContent', () => t(STATUS_TEXT[status.state]));
+  const headerConnect = $<HTMLButtonElement>('headerConnect');
+  const wasVisible = !headerConnect.hidden;
+  headerConnect.hidden = connected;
+  headerConnect.disabled = busy;
+  ui(headerConnect, 'textContent', () => disconnecting ? t('Disconnecting…') : busy ? t('Connecting…') : t('Connect'));
+  if (connected && wasVisible && !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) $('sidebarConnection').animate([
+    { boxShadow: '0 0 0 0 var(--green)' }, { boxShadow: '0 0 0 12px transparent' }
+  ], { duration: 850, iterations: 2 });
+
+  // ---- global connection surface
+  const connectionTone = connected ? 'is-connected' : offline ? 'is-offline' : busy ? 'is-busy' : failed ? 'is-error' : '';
+  const sidebarConnection = $('sidebarConnection');
+  sidebarConnection.className = `sidebar-connection${connectionTone ? ` ${connectionTone}` : ''}`;
+  const connectionPopover = $('connectionPopover');
+  connectionPopover.className = `connection-popover scroll${connectionTone ? ` ${connectionTone}` : ''}`;
+  ui($('connectionPopoverTitle'), 'textContent', () => t(STATUS_TEXT[status.state]));
 
   const id = config.tunnel.tunnelId;
   ui($('headerSub'), 'textContent', () => config.tunnel.kind === 'openai'
@@ -994,11 +1022,14 @@ function apply(next: AppState): void {
         : t("No tunnel yet")
       : (status.publicUrl ?? status.localUrl ?? config.tunnel.kind));
 
-  const connectBtn = $<HTMLButtonElement>('connectBtn');
-  connectBtn.classList.toggle('is-running', running);
-  ui($('connectLabel'), 'textContent', () => running ? t("Disconnect") : t("Connect"));
-  connectBtn.disabled = !running && missing !== null;
+  const connectBtn = $<HTMLButtonElement>('connectionPopoverToggle');
+  ui(connectBtn, 'textContent', () => disconnecting ? t('Disconnecting…') : running ? t("Disconnect") : t("Connect"));
+  connectBtn.disabled = disconnecting || (!running && missing !== null);
   connectBtn.title = !running && missing ? missing.text : '';
+
+  ui($('connectionPopoverExtension'), 'textContent', () => next.bridge.extensionVersion
+    ? `v${next.bridge.extensionVersion}`
+    : t("Not reported"));
 
   // ---- out of date, app or extension
   paintUpdate(next);
@@ -1012,20 +1043,13 @@ function apply(next: AppState): void {
   $('readOnlyBtn').classList.toggle('is-on', config.readOnly);
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-cap]')) {
     const cap = input.dataset.cap as Capability;
-    const supported = (next.platform?.desktopAutomation ?? true) || !DESKTOP_CAPABILITIES.includes(cap);
+    const supported = (next.platform?.desktopAutomation ?? true) || !DESKTOP_CAPABILITIES.includes(cap) || cap === 'screen' || cap === 'control';
     applyChecked(input, supported && config.capabilities[cap], previousState?.config.capabilities[cap]);
   }
   applyChecked(
     $<HTMLInputElement>('homeMaEnabled'),
     config.multiAgent.enabled,
     previousState?.config.multiAgent.enabled
-  );
-  // Recording is a tool switch like the rest of this list, so it goes through the same
-  // dirty-field guard rather than being assigned outright from the Chat panel.
-  applyChecked(
-    $<HTMLInputElement>('sessRecord'),
-    config.sessions.record,
-    previousState?.config.sessions.record
   );
   paintGroups();
   paintDesktopAccess(next);
@@ -1054,9 +1078,9 @@ function apply(next: AppState): void {
   applyValue($<HTMLSelectElement>('chatBrowser'), config.ui.chatBrowser ?? 'chrome', previousState?.config.ui.chatBrowser ?? 'chrome');
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
   applyChecked($<HTMLInputElement>('finishTool'), config.ui.finishTool === true, previousState?.config.ui.finishTool);
-  applyValue($<HTMLSelectElement>('finishAction'), config.ui.finishAction ?? 'notify', previousState?.config.ui.finishAction);
   applyValue($<HTMLSelectElement>('finishLeadMinutes'), String(config.ui.finishLeadMinutes ?? 5), String(previousState?.config.ui.finishLeadMinutes ?? 5));
   applyChecked($<HTMLInputElement>('backgroundChats'), config.ui.backgroundChats === true, previousState?.config.ui.backgroundChats);
+  applyChecked($<HTMLInputElement>('autoContinue'), config.ui.autoContinue !== false, previousState?.config.ui.autoContinue);
   applyChecked($<HTMLInputElement>('browserOnly'), config.ui.browserOnly === true, previousState?.config.ui.browserOnly);
   applyChecked($<HTMLInputElement>('autoRefreshPlugins'), config.ui.autoRefreshPlugins === true, previousState?.config.ui.autoRefreshPlugins);
   $('startAtLoginRow').hidden = next.loginStartupAvailable !== true;
@@ -1109,9 +1133,9 @@ function apply(next: AppState): void {
   $<HTMLButtonElement>('removeApiKey').disabled = !next.hasApiKey || !secureStorageAvailable;
 
   const wizConnect = $<HTMLButtonElement>('wizConnect');
-  ui(wizConnect, 'textContent', () => running ? t("Disconnect") : t("Connect"));
+  ui(wizConnect, 'textContent', () => disconnecting ? t('Disconnecting…') : running ? t("Disconnect") : t("Connect"));
   wizConnect.disabled = connectBtn.disabled;
-  ui($('wizStatus'), 'textContent', () => running || failed ? status.detail || t(STATUS_TEXT[status.state]) : '');
+  ui($('wizStatus'), 'textContent', () => running || failed || disconnecting ? status.detail || t(STATUS_TEXT[status.state]) : '');
 
   $('chatgptConn').replaceChildren(
     openai
@@ -1245,7 +1269,7 @@ function copyRow(label: string | (() => string), value: string, what: string): H
 function connectorCards(next: AppState, desktopExpanded: boolean): HTMLElement[] {
   const { status, config } = next;
   return status.surfaces
-    .filter((surface) => surface.id !== 'plugins' && (surface.id !== 'desktop' || (next.platform?.desktopAutomation ?? true)))
+    .filter((surface) => surface.id !== 'plugins')
     .map((surface) => {
     const optional = surface.id === 'desktop';
     const card = optional ? document.createElement('details') : el('div');
@@ -1378,9 +1402,10 @@ function facts(next: AppState): HTMLElement[] {
  */
 function paintClock(): void {
   if (!state) return;
-  const { status } = state;
+  const { status, bridge } = state;
   const running = isRunning(status.state);
   const connected = status.state === 'connected';
+  const disconnecting = status.state === 'disconnecting';
 
   const handshake = $('bigHandshake');
   handshake.textContent = shortAgo(status.handshakeAt);
@@ -1390,11 +1415,37 @@ function paintClock(): void {
   request.textContent = shortAgo(status.lastRequestAt);
   request.className = status.lastRequestAt === null ? 'is-cold' : '';
 
-  ui($('liveNote'), 'textContent', () => running
+  const core = status.surfaces.find((surface) => surface.id === 'core');
+  ui($('connectionPopoverConnector'), 'textContent', () => disconnecting ? t('Disconnecting…') : !running
+    ? t("Not connected")
+    : core?.lastRequestAt
+      ? t("Reached")
+      : connected
+        ? t("waiting")
+        : t(STATUS_TEXT[status.state]));
+  ui($('connectionPopoverBrowser'), 'textContent', () => bridge.present
+    ? t("Connected")
+    : bridge.paired ? t("Paired · not active") : t("Not connected"));
+
+  const connectorRow = $('connectionPopoverConnector').parentElement!;
+  const browserRow = $('connectionPopoverBrowser').parentElement!;
+  connectorRow.dataset.tone = connected ? 'ok' : disconnecting || status.state === 'starting-server' || status.state === 'connecting-tunnel' ? 'wait' : 'bad';
+  browserRow.dataset.tone = bridge.present ? 'ok' : bridge.paired ? 'wait' : 'bad';
+  ui(connectorRow, 'title', () => core?.lastRequestAt ? t("Reached {0}", [ago(core.lastRequestAt)]) : $('connectionPopoverConnector').textContent ?? '');
+  ui(browserRow, 'title', () => bridge.lastSeenAt ? t("Seen {0}", [ago(bridge.lastSeenAt)]) : $('connectionPopoverBrowser').textContent ?? '');
+  $('connectionPopoverVerified').hidden = connected;
+  ui($('connectionPopoverTitle'), 'title', () => disconnecting ? t('Closing connection…') : status.handshakeAt !== null ? t("verified {0}", [ago(status.handshakeAt)]) : t("no handshake yet"));
+  ui($('connectionPopoverVerified'), 'textContent', () => disconnecting ? t('Closing connection…') : running
     ? status.handshakeAt === null
       ? t("no handshake yet")
       : t("verified {0}", [ago(status.handshakeAt)])
-    : '');
+    : t("Connection is off"));
+
+  const triggerText = status.handshakeAt !== null && running
+    ? `${t(STATUS_TEXT[status.state])} · ${t("verified {0}", [ago(status.handshakeAt)])}`
+    : t(STATUS_TEXT[status.state]);
+  ui($('sidebarConnection'), 'aria-label', () => triggerText);
+  ui($('sidebarConnection'), 'title', () => triggerText);
 }
 
 window.setInterval(paintClock, 1000);
@@ -1591,7 +1642,7 @@ async function dropFolders(event: DragEvent): Promise<void> {
 }
 
 async function toggleConnection(): Promise<void> {
-  if (!state) return;
+  if (!state || state.status.state === 'disconnecting') return;
   // Mirrors the button label exactly, so a click always does what it says.
   const next = await run(isRunning(state.status.state) ? api.disconnect() : api.connect());
   if (next) apply(next);
@@ -1650,18 +1701,6 @@ $('closeChecks').addEventListener('click', () => {
   $('checksBox').hidden = true;
 });
 
-$('themeBtn').addEventListener('click', () => {
-  if (!state) return;
-  // A save can still be waiting on main-process lifecycle work. Toggle from the latest
-  // requested value, not merely the last acknowledged state, or two quick clicks both choose
-  // the same target and behave like one click.
-  const current = requestedSettings?.ui.theme ?? state.config.ui.theme;
-  const next = current === 'dark' ? 'light' : 'dark';
-  // Applied immediately so the click feels instant; the save confirms it.
-  document.documentElement.dataset.theme = next;
-  void save({ theme: next });
-});
-
 $('readOnlyBtn').addEventListener('click', () => {
   if (!state) return;
   const current = requestedSettings?.readOnly ?? state.config.readOnly;
@@ -1677,7 +1716,8 @@ $('wizManageFolders').addEventListener('click', () => {
 });
 
 // Dropping a file anywhere on an Electron window otherwise navigates the whole window to
-// it. Only the Folders card accepts drops, and everything else swallows them.
+// it. The Folders card and chat attachment owner handle their own file drops; this fence
+// prevents navigation for every remaining target.
 window.addEventListener('dragover', (event) => event.preventDefault());
 window.addEventListener('drop', (event) => event.preventDefault());
 {
@@ -1718,7 +1758,15 @@ function installUpdate(): void {
 
 $('updateInstall').addEventListener('click', installUpdate);
 $('installUpdate').addEventListener('click', installUpdate);
-$('connectBtn').addEventListener('click', () => void toggleConnection());
+$('headerConnect').addEventListener('click', async () => {
+  if (!state) return;
+  if (missingStep(state)) { showTab('setup'); return; }
+  if (isRunning(state.status.state)) {
+    const disconnected = await run(api.disconnect()); if (!disconnected) return; apply(disconnected);
+  }
+  const connected = await run(api.connect()); if (connected) apply(connected);
+});
+$('connectionPopoverToggle').addEventListener('click', () => void toggleConnection());
 $('wizConnect').addEventListener('click', () => void toggleConnection());
 
 $('pickBinary').addEventListener('click', async () => {
@@ -1787,8 +1835,15 @@ for (const id of [
 }
 
 document.addEventListener('click', (event) => {
-  const link = (event.target as HTMLElement).closest<HTMLElement>('[data-link]');
+  const target = event.target as HTMLElement;
+  if (!target.closest('.connection-anchor') && !$('connectionPopover').contains(target) && !$('connectionPopover').hidden) setConnectionPopover(false);
+  const link = target.closest<HTMLElement>('[data-link]');
   if (link?.dataset.link) void run(api.openLink(link.dataset.link));
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || $('connectionPopover').hidden) return;
+  setConnectionPopover(false);
+  $('sidebarConnection').focus();
 });
 
 $('bridgeDownload').addEventListener('click', () => void run(api.downloadExtension()));

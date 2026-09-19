@@ -10,6 +10,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { positionOf } from '../src/shared/chronology.js';
+import sharp from 'sharp';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { lineDelta, formatDelta } from '../src/main/diffstat.js';
@@ -44,6 +46,7 @@ import {
   pruneSessions,
   readAsset,
   readEvents,
+  readActivityEvents,
   readRecentEvents,
   readLatestUserMessage,
   turnHasMcpCall,
@@ -264,6 +267,42 @@ describe('session store', () => {
     }
     expect(seen.size).toBeGreaterThanOrEqual(12);
   });
+  it('pages revised long answers by origin in both directions while live deltas still use revision sequence', async () => {
+    const session = await createSession({ title: 'Origin paging' });
+    const body = { text: 'Detailed review. '.repeat(1200), truncated: false, chars: 19200 };
+    const answer = { kind: 'assistant_message' as const, source: 'extension' as const,
+      time: 100, messageId: 'long-review', message: body, final: true };
+    const first = await upsertMessageEvent(session.id, answer);
+    for (let i = 0; i < 12; i++) await appendEvent(session.id, {
+      time: 200 + i, source: 'app', kind: 'note', message: { text: `later ${i}`, truncated: false, chars: 8 }
+    });
+    const revised = await upsertMessageEvent(session.id, { ...answer, renderedHtml: { text: '<p>Detailed review.</p>', truncated: false, chars: 23 } });
+    expect(revised.event.seq).toBeGreaterThan(first.event.seq);
+    const all = await readEvents(session.id);
+    const expected = all.map(positionOf).sort((a, b) => a - b);
+    const backwards: number[] = [];
+    let before: number | undefined;
+    for (;;) {
+      const page = await readRecentEvents(session.id, 3, { before, orderByOrigin: true });
+      if (!page.length) break;
+      backwards.push(...page.map(positionOf));
+      before = Math.min(...page.map(positionOf));
+    }
+    expect(backwards.sort((a, b) => a - b)).toEqual(expected);
+    const forwards: number[] = [];
+    let after = 0;
+    for (;;) {
+      const page = await readRecentEvents(session.id, 3, { after, orderByOrigin: true });
+      if (!page.length) break;
+      forwards.push(...page.map(positionOf));
+      after = Math.max(...page.map(positionOf));
+    }
+    expect(forwards).toEqual(expected);
+    expect((await readEvents(session.id, { from: revised.event.seq })).find(e => e.kind === 'assistant_message')).toMatchObject({
+      seq: revised.event.seq, origin: first.event.seq, message: body
+    });
+  });
+
   it('counts stable legacy message revisions once when building a recent presentation window', async () => {
     const summary = await createSession({ title: 'legacy recent dedupe' });
     await appendEvent(summary.id, {
@@ -365,8 +404,11 @@ describe('session store', () => {
 
   it('finds an attachment beyond the 5,000-session maintenance scan cap', async () => {
     const seed = await createSession({ title: 'catalog seed', conversationId: null });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    // Clone an actual persisted checkpoint, including its private version/watermark
+    // fields. A public summary is a legacy fixture and causes 5,001 real migrations.
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     // Force the next lookup to rebuild from the durable catalog rather than the live seed.
     resetSessionStoreForTests();
 
@@ -375,7 +417,23 @@ describe('session store', () => {
     const targetId = names[names.length - 1] as string;
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -385,8 +443,8 @@ describe('session store', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('catalog-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -401,9 +459,13 @@ describe('session store', () => {
 
     try {
       expect((await findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(targetId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readSpy.mockRestore();
       readdirSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
+      await deleteSession(seed.id);
     }
   }, 90_000);
 
@@ -457,6 +519,108 @@ describe('session store', () => {
     const events = await readEvents(summary.id);
     expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
     expect(events.map((event) => event.kind)).toEqual(kinds);
+  });
+
+  it.each([false, true])('keeps recovered replies in their original turn across bounded reads and legacy restart (%s)', async restart => {
+    const session = await createSession({ title: 'paged turn boundaries', conversationId: 'timeline-boundaries' });
+    const text = (value: string) => ({ text: value, chars: value.length, truncated: false });
+    await upsertMessageEvent(session.id, { kind: 'user_message', messageId: 'first-question', time: 90, source: 'extension', message: text('First question') });
+    const start = await appendEvent(session.id, { kind: 'turn_start', turnId: 'first', time: 100, source: 'extension' });
+    await appendEvent(session.id, { kind: 'progress', turnId: 'first', time: 120, source: 'app', message: text('First work') });
+    await appendEvent(session.id, { kind: 'turn_end', turnId: 'first', time: 180, source: 'extension', outcome: 'completed' });
+    await upsertMessageEvent(session.id, { kind: 'user_message', messageId: 'second-question', time: 200, source: 'extension', message: text('Second question') });
+    await appendEvent(session.id, { kind: 'turn_start', turnId: 'second', time: 210, source: 'extension' });
+    const work = await appendEvent(session.id, { kind: 'progress', turnId: 'second', time: 230, source: 'app', message: text('Second work') });
+    const recovered = await upsertMessageEvent(session.id, { kind: 'assistant_message', turnId: 'first', time: 290,
+      authoredAt: 150, messageId: 'first-reply', source: 'extension', message: text('Recovered first answer'), final: true });
+    await upsertMessageEvent(session.id, { kind: 'assistant_message', turnId: 'second', time: 280,
+      messageId: 'second-reply', source: 'extension', message: text('Second answer'), final: true });
+    await appendEvent(session.id, { kind: 'turn_end', turnId: 'second', time: 300, source: 'extension', outcome: 'completed' });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const journal = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    const before = await readEvents(session.id);
+    const coordinates = (event: SessionEvent) => ({ seq: event.seq, position: positionOf(event), time: event.time, turnId: event.turnId });
+    const original = before.map(coordinates);
+    if (restart) {
+      resetRecorderForTests(); resetSessionStoreForTests();
+      for (const name of ['meta.json', 'meta.backup.json']) {
+        const file = path.join(folder, name);
+        const metadata = JSON.parse(await fs.readFile(file, 'utf8'));
+        delete metadata.timelineTurns;
+        await fs.writeFile(file, JSON.stringify(metadata));
+      }
+    }
+    const page = await readRecentEvents(session.id, 4, { orderByOrigin: true });
+    expect(page[0]).toMatchObject({ kind: 'assistant_message', messageId: 'first-reply',
+      seq: recovered.event.seq, origin: recovered.event.origin, time: 290, authoredAt: 150, turnId: 'first', turnOrigin: start.seq });
+    expect(page[1]?.seq).toBe(work.seq);
+    const full = await readEvents(session.id);
+    expect(full.map(coordinates)).toEqual(original);
+    for (const row of full) {
+      const older = await readRecentEvents(session.id, 3, { before: positionOf(row) + 1, orderByOrigin: true });
+      const keys = new Set(older.map(event => event.seq));
+      expect(older.map(event => event.seq)).toEqual(full.filter(event => keys.has(event.seq)).map(event => event.seq));
+    }
+    expect((await getSession(session.id))?.activeTurnId).toBeNull();
+    expect((await getSession(session.id))?.timelineTurns?.first).toEqual({ origin: start.seq, time: 100,
+      endTime: 180, endOrigin: 4, questionId: 'first-question' });
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journal);
+  });
+
+  it.each([false, true])('keeps reloaded interim prose before later tools across every read path and restart (%s)', async restart => {
+    const session = await createSession({ title: 'native interim ordering', conversationId: 'interim-order' });
+    const working = '11111111-1111-4111-8111-111111111111';
+    const exchange = '22222222-2222-4222-8222-222222222222';
+    const parent = '33333333-3333-4333-8333-333333333333';
+    const text = (value: string) => ({ text: value, chars: value.length, truncated: false });
+    const start = await appendEvent(session.id, { kind: 'turn_start', source: 'extension', time: 100, turnId: 'working' });
+    await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: 110,
+      messageId: `assistant:${parent}:${working}:${exchange}`, turnId: 'working', message: text('First update'), final: false });
+    const later = await appendEvent(session.id, { kind: 'tool_call', source: 'mcp', time: 150, turnId: 'working',
+      call: { callId: 'later-tool', tool: 'read', requestId: 'interim-request', conversationId: 'interim-order',
+        attribution: 'request_id', attributionMethod: 'request_id', args: text('{}'), result: text('ok'), outcome: 'ok', durationMs: 1,
+        summary: { kind: 'read', title: 'Later tool', tone: 'neutral' } } });
+    const interim = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: 140,
+      messageId: `assistant:${exchange}:${working}:${exchange}`, message: text('Second update'), final: false });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const journal = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    const shardName = createHash('sha256').update(`assistant_message\u0000${interim.event.messageId}`).digest('hex') + '.json';
+    const shard = await fs.readFile(path.join(folder, 'messages', shardName), 'utf8');
+    if (restart) resetSessionStoreForTests();
+    const full = await readEvents(session.id);
+    expect(full.map(row => row.seq)).toEqual([start.seq, 2, interim.event.seq, later.seq]);
+    for (const page of [
+      await readRecentEvents(session.id, 2, { orderByOrigin: true }),
+      await readRecentEvents(session.id, 2, { after: 2, orderByOrigin: true }),
+      await readEvents(session.id, { from: 3, limit: 2 }),
+      (await readActivityEvents(session.id, 3, 2)).events
+    ]) {
+      expect(page.map(row => row.seq)).toEqual([interim.event.seq, later.seq]);
+      expect(page[0]).toMatchObject({ origin: interim.event.origin, time: 140, turnOrigin: start.seq });
+      expect(page[0]?.turnId).toBeUndefined();
+    }
+    const summary = await getSession(session.id);
+    expect(summary?.activeTurnId).toBe('working');
+    expect(summary?.lastAssistantFinalAt).toBeNull();
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journal);
+    expect(await fs.readFile(path.join(folder, 'messages', shardName), 'utf8')).toBe(shard);
+  });
+
+  it('preserves the legacy authored position when a reload changes the provider timestamp for the same UUID', async () => {
+    const session = await createSession({ title: 'reload authored timestamp' });
+    const owner = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const providerMessageId = '11111111-2222-4333-8444-555555555555';
+    const message = { text: 'The recorded answer', chars: 19, truncated: false };
+    const first = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', final: true,
+      messageId: `assistant:${owner}:${owner}:1789662776481`, providerMessageId, time: 1789662900000, message });
+    const replay = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', final: true,
+      messageId: `assistant:${owner}:${owner}:1789662999999`, providerMessageId, time: 1789663000000,
+      authoredAt: 1789662999999, message }, { preferTime: true });
+    expect(replay.event).toMatchObject({ messageId: first.event.messageId, time: first.event.time,
+      origin: first.event.origin, authoredAt: 1789662776481 });
+    expect(await readEvents(session.id)).toHaveLength(1);
   });
 
   it('reorders late events only inside the durable turn that owns them', async () => {
@@ -1003,7 +1167,7 @@ describe('session store', () => {
   });
 
   it.each(['completed', 'stopped'] as const)('does not restore an abandoned older turn after the latest turn %s', async (outcome) => {
-    const conversationId = 'c-restore-latest-terminal';
+    const conversationId = `c-restore-latest-terminal-${outcome}`;
     const opened = await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: 10, turnId: 'g-abandoned' },
       { kind: 'turn_start', time: 20, turnId: 'g-latest' },
@@ -1720,8 +1884,9 @@ describe('handoff storage', () => {
 
   it('finds the newest handoff even when its session is beyond the 5,000-folder maintenance cap', async () => {
     const seed = await createSession({ title: 'handoff catalog seed' });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     resetSessionStoreForTests();
 
     const names = Array.from({ length: 5001 }, (_, index) => `handoff-${String(index).padStart(5, '0')}`);
@@ -1729,7 +1894,23 @@ describe('handoff storage', () => {
     const handoffId = '2026-08-24-deadbeef';
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -1739,8 +1920,8 @@ describe('handoff storage', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('handoff-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -1750,7 +1931,7 @@ describe('handoff storage', () => {
             lastHandoffAt: id === targetId ? 20_000 : null
           });
         }
-        if (file.endsWith(`${path.sep}handoffs${path.sep}${handoffId}.json`)) {
+        if (file === path.join(rootPath, targetId, 'handoffs', `${handoffId}.json`)) {
           return JSON.stringify(handoff(targetId, handoffId, 20_000));
         }
         return (realReadFile as (...callArgs: unknown[]) => ReturnType<typeof fs.readFile>)(target, ...args);
@@ -1759,14 +1940,17 @@ describe('handoff storage', () => {
 
     try {
       expect((await latestHandoff())?.id).toBe(handoffId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readdirSpy.mockRestore();
       readSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
       await deleteSession(seed.id);
     }
   }, 90_000);
 
-  it('never prunes the session holding the newest handoff', async () => {
+  it('never age-prunes closed recordings, including sessions without a handoff', async () => {
     const stale = await createSession({ title: 'stale' });
     const kept = await createSession({ title: 'kept' });
     await saveHandoff(handoff(kept.id, '2026-01-03-cccccccc', Date.now()));
@@ -1791,16 +1975,14 @@ describe('handoff storage', () => {
     }
 
     const removed = await pruneSessions(30);
-    expect(removed).toBeGreaterThanOrEqual(1);
-    // Retention is not the UI's first 200 rows. Check durable existence directly so this
-    // invariant stays valid even when the retained handoff is intentionally old in a large
-    // test history.
+    expect(removed).toBe(0);
     expect(await getSession(kept.id)).not.toBeNull();
-    expect(await getSession(stale.id)).toBeNull();
+    expect(await getSession(stale.id)).not.toBeNull();
+    await deleteSession(stale.id);
     await deleteSession(kept.id);
   }, 90_000);
 
-  it('prunes an expired session beyond the old 5,000-folder maintenance prefix', async () => {
+  it('does not scan or remove even an expired recording when asked through the legacy prune seam', async () => {
     const seed = await createSession({ title: 'retention catalog seed' });
     const seedSummary = await getSession(seed.id);
     expect(seedSummary).not.toBeNull();
@@ -1869,8 +2051,8 @@ describe('handoff storage', () => {
     );
 
     try {
-      expect(await pruneSessions(30)).toBe(1);
-      expect(removed).toEqual([targetId]);
+      expect(await pruneSessions(30)).toBe(0);
+      expect(removed).toEqual([]);
     } finally {
       rmSpy.mockRestore();
       statSpy.mockRestore();
@@ -1879,8 +2061,8 @@ describe('handoff storage', () => {
       resetSessionStoreForTests();
       await deleteSession(seed.id);
     }
-  // Match the adjacent full-catalog tests: Windows metadata I/O under the parallel
-  // suite can exceed the ordinary 30-second budget. Keep all 5,001 entries exercised.
+  // Keep the former pathological catalogue shape: the invariant is that no reader or remover
+  // is touched at all, regardless of how much expired history exists.
   }, 90_000);
 
   it('splits a long brief on blank lines and keeps every character', () => {
@@ -1970,6 +2152,44 @@ describe('canonical recorder 1.8', () => {
     await upsertMessageEvent(opened.id, revision(60000));
     await upsertMessageEvent(opened.id, revision(60000));
     expect(await getSession(opened.id)).toMatchObject({ estimatedTokens: 15000, contextTokens: 15000 });
+  });
+
+  it('refuses rejected native-image owners before writing preview assets', async () => {
+    const conversationId = `conv-native-image-owner-${Date.now()}`;
+    const messageId = '5150f756-bf2d-45fa-ac0f-45010b2239fb';
+    const providerAssetId = 'file_00000000000000000000000000000071';
+    const preview = async (color: string) => {
+      const bytes = await sharp({ create: { width: 12, height: 8, channels: 3, background: color } }).webp().toBuffer();
+      return `data:image/webp;base64,${bytes.toString('base64')}`;
+    };
+    const first = await recordChatObservations(conversationId, [{
+      kind: 'native_image', time: 100, messageId, providerAssetId, providerRole: 'tool',
+      providerChannel: 'final', providerStatus: 'in_progress', width: 1254, height: 1254,
+      previewStatus: 'pending'
+    }], 'worker-a');
+    const sessionId = first.sessionId!;
+
+    const roleConflict = await recordChatObservations(conversationId, [{
+      kind: 'native_image', time: 200, messageId, providerAssetId, providerRole: 'assistant',
+      providerChannel: 'final', providerStatus: 'finished_successfully', width: 1254, height: 1254,
+      previewStatus: 'available', previewWidth: 12, previewHeight: 8, previewDataUrl: await preview('#0044ff')
+    }], 'worker-a');
+    const agentConflict = await recordChatObservations(conversationId, [{
+      kind: 'native_image', time: 300, messageId, providerAssetId, providerRole: 'tool',
+      providerChannel: 'final', providerStatus: 'finished_successfully', width: 1254, height: 1254,
+      previewStatus: 'available', previewWidth: 12, previewHeight: 8, previewDataUrl: await preview('#ff6600')
+    }], 'worker-b');
+
+    expect(roleConflict.stored).toBe(0);
+    expect(agentConflict.stored).toBe(0);
+    const rows = await readEvents(sessionId, { kinds: ['native_image'] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ providerRole: 'tool', agent: 'worker-a', providerStatus: 'in_progress', previewStatus: 'pending' });
+    const assets = await fs.readdir(path.join(sessionsRoot(), sessionId, 'assets')).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    });
+    expect(assets).toEqual([]);
   });
 
   it('lets the store deduplicate repeated recorder assets instead of shadow-counting the same bytes toward quota', async () => {
@@ -2082,6 +2302,21 @@ describe('canonical recorder 1.8', () => {
     const retry = await recordChatObservations(conversationId, [error]);
     expect(retry.stored).toBe(1);
     expect(await readEvents(retry.sessionId!, { kinds: ['chat_error'] })).toHaveLength(1);
+  });
+
+  it('coalesces the same transport notice with Retry button text across document turns', async () => {
+    const conversationId = 'conv-error-retry-label';
+    const error = { kind: 'chat_error' as const, time: 100_000,
+      text: 'Message delivery timed out. Please try again.', recoverable: true, turnId: 'original' };
+    const first = await recordChatObservations(conversationId, [
+      { kind: 'user_message', messageId: 'question', text: 'Build', time: 90_000, authoredNow: true },
+      { ...error, text: `${error.text} Retry` }, { ...error, time: 100_100, turnId: undefined }
+    ]);
+    await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+    await recordChatObservations(conversationId, [{ ...error, time: 200_000, turnId: 'replacement' }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toHaveLength(1);
+    await recordChatObservations(conversationId, [{ ...error, time: 201_000, text: 'Connection interrupted' }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toHaveLength(2);
   });
 
   it('keeps one exact Thinking failed notice across reload/restart beyond the burst window', async () => {

@@ -4,14 +4,15 @@ import path from 'node:path';
 import { beforeAll, afterAll, afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
-import { initSessionStore, createSession, readEvents, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { initSessionStore, createSession, getSession, readSessionPlan, readEvents, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
-import { flushRecorder } from '../src/main/session/recorder.js';
+import { flushRecorder, recordChatObservations } from '../src/main/session/recorder.js';
 import { cancelInput, enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
 import { setChatBlocked, resetBlockedChatsForTests } from '../src/main/session/blocked-chats.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import type { ToolContext } from '../src/main/mcp/kernel.js';
 import { currentCall } from '../src/main/mcp/call-context.js';
+import { eventTokens } from '../src/shared/session.js';
 import * as backend from '../src/main/codex/read-backend.js';
 import * as desktopBackend from '../src/main/computer/index.js';
 import sharp from 'sharp';
@@ -39,6 +40,7 @@ async function identity() {
 }
 const call = (requestId: string | undefined, code: string) => rpc('tools/call', { name: 'exec', arguments: { code } }, requestId);
 const text = (response: any) => response.result.content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('\n');
+const emittedText = (response: any): string => response.result.content.find((item: any) => item.type === 'text')?.text ?? '';
 
 it.each(['current', 'superseded'] as const)('resolves late session_finish identity before enforcing its %s owner', async state => {
   const conversationId = randomUUID(), requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
@@ -68,10 +70,12 @@ it.each(['current', 'superseded'] as const)('resolves late session_finish identi
 });
 
 it('delivers one recovered-identity notice on the real structured MCP wire after a refused plan update', async () => {
+  const config = getConfig();
+  await saveConfig({ ...config, multiAgent: { ...config.multiAgent, allowUnattributedCalls: false } });
   const requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
   const rejected = await rpc('tools/call', { name: 'update_plan', arguments: { plan: [{ step: 'Verify recovery', status: 'in_progress' }] } }, requestId);
   expect(rejected.result.isError).toBe(true);
-  expect(text(rejected)).toContain('Exact chat identity is required');
+  expect(text(rejected)).toContain('Exact chat identity');
   const conversationId = randomUUID();
   const session = await createSession({ conversationId, title: 'Identity recovery wire' });
   observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, messageId: randomUUID(), tool: 'update_plan', observedAt: Date.now() });
@@ -190,6 +194,37 @@ afterAll(async () => {
   await endpoint.stop(); await unifiedExecManager.terminateAllProcesses(); await flushRecorder(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
 });
 
+it('retires session lookup while recording messages, tools and the exact caller plan', async () => {
+  const who = await identity();
+  const names = (await rpc('tools/list', {})).result.tools.map((tool: any) => tool.name);
+  expect(names).not.toContain('session');
+  expect(names).toContain('update_plan');
+  const observed = await recordChatObservations(who.conversationId, [
+    { kind: 'user_message', time: Date.now(), messageId: randomUUID(), text: 'LOCAL_REQUEST' },
+    { kind: 'assistant_message', time: Date.now(), messageId: randomUUID(), text: 'LOCAL_ANSWER' }
+  ]);
+  expect(observed.sessionId).toBe(who.session.id);
+  expect(text(await call(who.requestId, 'text(ALL_TOOLS.map(tool => tool.name));'))).not.toContain('"session"');
+  const stale = await rpc('tools/call', { name: 'session', arguments: { action: 'search' } }, who.requestId);
+  expect(Boolean(stale.error || stale.result?.isError)).toBe(true);
+  const nested = await call(who.requestId, 'text(await tools.session({action:"search"}));');
+  expect(nested.result.isError).toBe(true);
+  expect(text(nested)).not.toContain('LOCAL_REQUEST');
+  const read = await rpc('tools/call', { name: 'read', arguments: { paths: ['/workspace/alpha.txt'] } }, who.requestId);
+  expect(read.result.isError, text(read)).not.toBe(true);
+  const plan = [{ step: 'Keep recording', status: 'completed' }];
+  const updated = await rpc('tools/call', { name: 'update_plan', arguments: { plan } }, who.requestId);
+  expect(updated.result.isError, text(updated)).not.toBe(true);
+  expect((await readSessionPlan(who.session.id))?.plan).toEqual(plan);
+  await flushRecorder();
+  const events = await readEvents(who.session.id);
+  expect(events.filter(event => event.kind === 'user_message').map(event => event.message.text)).toContain('LOCAL_REQUEST');
+  expect(events.filter(event => event.kind === 'assistant_message').map(event => event.message.text)).toContain('LOCAL_ANSWER');
+  const reads = events.filter(event => event.kind === 'tool_call' && event.call.tool === 'read');
+  expect(reads).toHaveLength(1);
+  expect(JSON.stringify(reads)).toContain('PRIVATE_ALPHA');
+});
+
 it('initializes, discovers and executes the actual model-facing MCP contract with parallel filtering and separate recorded children', async () => {
   const initialize = await rpc('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'code-mode-contract-test', version: '1' } });
   expect(initialize.result.instructions).toContain('Code mode:');
@@ -220,6 +255,15 @@ it('initializes, discovers and executes the actual model-facing MCP contract wit
   const events = (await readEvents(who.session.id)).filter(event => event.kind === 'tool_call');
   expect(events.map(event => event.call.tool).sort()).toEqual(['exec', 'read', 'read']);
   expect(new Set(events.map(event => event.call.callId)).size).toBe(3);
+  const children = events.filter(event => event.call.tool === 'read');
+  expect(children.every(event => event.call.nested === true)).toBe(true);
+  expect(children.map(eventTokens)).toEqual([0, 0]);
+  const outer = events.find(event => event.call.tool === 'exec')!;
+  expect(outer.call.nested).toBeUndefined();
+  expect(eventTokens(outer)).toBeGreaterThan(0);
+  expect(await getSession(who.session.id)).toMatchObject({
+    estimatedTokens: eventTokens(outer), contextTokens: eventTokens(outer), toolCalls: 3
+  });
   expect(JSON.stringify(events.filter(event => event.call.tool === 'read'))).toContain('PRIVATE_ALPHA');
   expect(JSON.stringify(events.filter(event => event.call.tool === 'exec'))).not.toContain('PRIVATE_ALPHA');
 });
@@ -233,8 +277,8 @@ it.runIf(process.platform === 'win32').each([true, false])('routes sky through D
     callers.push(currentCall()!.caller.sessionId!);
     return { windows: [window], screen: { x: 0, y: 0, width: 2, height: 2 } } as never;
   });
-  vi.spyOn(desktopBackend, 'getWindowState').mockResolvedValue({ window, elements: [{ ref: 'fixture-ref', role: 'Button', name: 'Owned button', actions: ['invoke'] }],
-    screenshot: { frameId: 1, data, windowId: 77, region: { x: 0, y: 0, width: 2, height: 2 }, scale: 1 }, related: []
+  vi.spyOn(desktopBackend, 'getWindowState').mockResolvedValue({ window, elements: [{ ref: 'fixture-ref', role: 'Button', name: 'Owned button', actions: ['invoke'], bounds: { x: 0, y: 0, width: 2, height: 2 } }],
+    screenshot: { frameId: 1, data, width: 2, height: 2, windowId: 77, region: { x: 0, y: 0, width: 2, height: 2 }, scale: 1 }, related: []
   } as never);
   const action = vi.spyOn(desktopBackend, 'act').mockImplementation(async () => {
     callers.push(currentCall()!.caller.sessionId!);
@@ -246,7 +290,8 @@ it.runIf(process.platform === 'win32').each([true, false])('routes sky through D
   expect(text(observed)).toContain('0: Button');
   const publicWindow = { app: window.app, id: window.id, title: window.title };
   const clicked = await rpc('tools/call', { name: 'exec', arguments: { code: `await sky.click({window:${JSON.stringify(publicWindow)},element_index:0}); text("accepted");` } }, who.requestId, 'desktop');
-  expect(text(clicked)).toBe('accepted');
+  expect(emittedText(clicked)).toBe('accepted');
+  if (!attributed) expect(text(clicked)).toContain('does not switch on Read-only mode or disable tools');
   expect(action).toHaveBeenCalledExactlyOnceWith([{ type: 'click_ref', ref: 'fixture-ref', button: 'left', count: 1 }], { window: 77, app: 'fixture.exe' });
   expect(callers).toEqual([who.session.id, who.session.id]);
   ctx.caps = { ...ctx.caps, control: false };
@@ -312,8 +357,6 @@ it('rejects missing proof, foreign tools, invalid child arguments and nested lif
   const who = await identity();
   expect(text(await call(who.requestId, 'text([typeof tools.computer,typeof tools.exec])'))).toBe('["undefined","undefined"]');
   expect(text(await call(who.requestId, 'text(await tools.read({paths:1}))'))).toContain('INVALID_ARGUMENTS');
-  const invalidCursor = await call(who.requestId, `text(await tools.session({action:'read', session_id:${JSON.stringify(who.session.id)}, cursor:'opaque', include:['user']}));`);
-  expect(text(invalidCursor)).toContain('do not combine it with include or tool_call');
   for (const code of ['text(await tools.session_finish({summary:"done"}))', 'text(await tools.agents({action:"finish",summary:"done"}))']) {
     expect(text(await call(who.requestId, code))).toContain('DIRECT_CALL_REQUIRED');
   }
@@ -323,21 +366,29 @@ it('allows unattributed file edits through code mode while preserving permission
   const patch = '*** Begin Patch\n*** Add File: /workspace/unattributed.txt\n+created anonymously\n*** End Patch';
   const response = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(patch)}}));`);
   expect(response.result.isError, text(response)).not.toBe(true);
-  expect(JSON.parse(text(response)).isError).not.toBe(true);
+  expect(JSON.parse(emittedText(response)).isError).not.toBe(true);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('created anonymously\n');
   const read = await call(`wfr_${randomUUID().replaceAll('-', '')}`, 'text(await tools.read({paths:["/workspace/unattributed.txt"]}));');
   expect(text(read)).toContain('created anonymously');
   const edit = '*** Begin Patch\n*** Update File: /workspace/unattributed.txt\n@@\n-created anonymously\n+edited anonymously\n*** End Patch';
   const edited = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(edit)}}));`);
-  expect(JSON.parse(text(edited)).isError).not.toBe(true);
+  expect(JSON.parse(emittedText(edited)).isError).not.toBe(true);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
   ctx.caps = { ...ctx.caps, edit: false };
   const deniedPatch = edit.replace('-created anonymously', '-edited anonymously').replace('+edited anonymously', '+must not change');
   const denied = await call(undefined, `text(await tools.apply_patch({patch:${JSON.stringify(deniedPatch)}}));`);
-  expect(JSON.parse(text(denied)).isError).toBe(true);
+  expect(JSON.parse(emittedText(denied)).isError).toBe(true);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
-  const plan = await call(undefined, 'text(await tools.update_plan({plan:[{step:"Anonymous plan",status:"in_progress"}]}));');
-  expect(JSON.parse(text(plan)).isError).toBe(true);
+  const planRequest = `wfr_${randomUUID().replaceAll('-', '')}`;
+  const plan = await call(planRequest, 'text(await tools.update_plan({plan:[{step:"Anonymous plan",status:"in_progress"}]}));');
+  expect(JSON.parse(emittedText(plan)).isError).not.toBe(true);
+  expect(text(plan)).toContain('will attach when its chat identity arrives');
+  const planConversation = randomUUID();
+  const planSession = await createSession({ conversationId: planConversation, title: 'Request plan owner' });
+  expect(observeRequestCorrelation({ requestId: planRequest, conversationId: planConversation, sessionId: planSession.id,
+    messageId: randomUUID(), tool: 'update_plan', observedAt: Date.now() })).toBe('stored');
+  await vi.waitFor(async () => expect((await readSessionPlan(planSession.id))?.plan)
+    .toEqual([{ step: 'Anonymous plan', status: 'in_progress' }]), { timeout: 2_000 });
   const finish = await rpc('tools/call', { name: 'session_finish', arguments: { summary: 'done' } });
   expect(finish.result.isError).toBe(true);
   expect(text(finish)).toContain('Exact session identity');
@@ -345,7 +396,7 @@ it('allows unattributed file edits through code mode while preserving permission
   try {
     await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: true } });
     const spawn = await call(undefined, 'text(await tools.agents({action:"spawn",workers:[{task:"Must never start"}]}));');
-    expect(JSON.parse(text(spawn)).isError).toBe(true);
+    expect(JSON.parse(emittedText(spawn)).isError).toBe(true);
     expect(text(spawn)).toContain('UNIDENTIFIED_CALLER');
   } finally {
     await saveConfig(config);

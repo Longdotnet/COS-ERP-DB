@@ -1,8 +1,12 @@
+vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({ update: vi.fn() }) }));
+// Native animation/media APIs are covered by pet DOM and real Electron tests.
+vi.mock('../src/renderer/pet.js', () => ({ initPet: () => () => {} }));
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_MODEL, DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
+import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../src/shared/browser-control.js';
 
 let dom: JSDOM | null = null;
 afterEach(() => {
@@ -15,6 +19,7 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
+  w.HTMLElement.prototype.animate = vi.fn() as any;
   Object.assign(globalThis, {
     window: w,
     document: w.document,
@@ -171,6 +176,7 @@ it('serializes settings intent so rapid toggles and later UI changes cannot undo
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
+  w.HTMLElement.prototype.animate = vi.fn() as any;
   Object.assign(globalThis, {
     window: w,
     document: w.document,
@@ -274,13 +280,13 @@ it('serializes settings intent so rapid toggles and later UI changes cannot undo
   pending.shift()!({ ok: true, data: current });
   await new Promise((resolve) => setTimeout(resolve, 0));
 
-  // Theme has the same no-form-control shape. Two rapid clicks must request dark then light,
+  // Appearance changes must request dark then light in order,
   // even though the first dark save has not answered yet.
-  const theme = w.document.getElementById('themeBtn') as HTMLButtonElement;
-  theme.click();
+  const theme = w.document.getElementById('appearanceTheme') as HTMLSelectElement;
+  theme.value = 'dark'; theme.dispatchEvent(new w.Event('change', { bubbles: true }));
   await vi.waitFor(() => expect(calls).toHaveLength(4));
   expect(calls[3].ui.theme).toBe('dark');
-  theme.click();
+  theme.value = 'light'; theme.dispatchEvent(new w.Event('change', { bubbles: true }));
   expect(calls).toHaveLength(4);
 
   current = appState({ ...baseConfig, readOnly: false, ui: { ...baseConfig.ui, autoConnect: true, theme: 'dark' } });
@@ -319,6 +325,7 @@ async function mountChat(
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
+  w.HTMLElement.prototype.animate = vi.fn() as any;
   Object.assign(globalThis, { Event: w.Event });
   Object.assign(globalThis, {
     window: w,
@@ -422,6 +429,231 @@ async function mountChat(
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+const projectSidebarFixture = () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Collapsed project', path: 'C:\\repo', createdAt: 1 };
+  const session = { id: 'project-session', title: 'Project task', conversationId: 'chat-project', chatIds: ['chat-project'],
+    startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastHandoffId: null, lastHandoffAt: null,
+    lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null, projectId: project.id };
+  return { project, session };
+};
+
+it('starts project groups collapsed and deliberately expands the project selected for a new chat', async () => {
+  const { project, session } = projectSidebarFixture();
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [project] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } })
+  });
+  const group = () => mounted.window.document.querySelector<HTMLDetailsElement>(`[data-project-id="${project.id}"]`)!;
+  await vi.waitFor(() => expect(group()).not.toBeNull());
+  expect(group().open).toBe(false);
+  (group().querySelector('.project-new') as HTMLButtonElement).click();
+  expect(group().open).toBe(true);
+});
+
+it('commits a project summary click before an immediate state repaint replaces its details node', async () => {
+  const { project, session } = projectSidebarFixture();
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [project] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } })
+  });
+  const group = () => mounted.window.document.querySelector<HTMLDetailsElement>(`[data-project-id="${project.id}"]`)!;
+  await vi.waitFor(() => expect(group()).not.toBeNull());
+  (group().querySelector(`[data-id="${session.id}"]`) as HTMLButtonElement).click();
+  expect(group().open).toBe(true);
+  const clicked = group();
+  clicked.querySelector('summary')!.click();
+  expect(clicked.open).toBe(false);
+  mounted.push(structuredClone(mounted.state));
+  expect(group()).not.toBe(clicked);
+  expect(group().open).toBe(false);
+  await settle();
+  expect(group().open).toBe(false);
+
+  // Native keyboard activation dispatches the same cancelable click with detail 0.
+  group().querySelector('summary')!.dispatchEvent(new mounted.window.MouseEvent('click', {
+    bubbles: true, cancelable: true, detail: 0
+  }));
+  expect(group().open).toBe(true);
+  mounted.push(structuredClone(mounted.state));
+  expect(group().open).toBe(true);
+});
+
+it('keeps project keyboard focus across activity repaint without taking composer focus or reloading on disclosure', async () => {
+  const { project, session } = projectSidebarFixture();
+  const listSessions = vi.fn(async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [project] }), listSessions
+  });
+  const doc = mounted.window.document;
+  const heading = () => doc.querySelector<HTMLElement>(`[data-project-id="${project.id}"] > summary`)!;
+  await vi.waitFor(() => expect(heading()).not.toBeNull());
+  await settle();
+  const reads = listSessions.mock.calls.length;
+  heading().focus(); heading().click();
+  await settle();
+  expect(listSessions).toHaveBeenCalledTimes(reads);
+  expect(doc.activeElement).toBe(heading());
+  mounted.push(structuredClone(mounted.state));
+  expect(doc.activeElement).toBe(heading());
+  const input = doc.getElementById('chatInput') as HTMLTextAreaElement;
+  input.focus(); input.value = 'Keep typing here';
+  mounted.push(structuredClone(mounted.state));
+  expect(doc.activeElement).toBe(input);
+  expect(input.value).toBe('Keep typing here');
+  const { chatVisible } = await import('../src/renderer/chat.js');
+  chatVisible(false); chatVisible(true);
+  await settle();
+  expect(listSessions).toHaveBeenCalledTimes(reads + 1);
+});
+
+it('keeps global connection controls in a compact sidebar popover', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  const now = Date.now();
+  const connected = structuredClone(mounted.state) as any;
+  connected.status = {
+    state: 'connected', detail: 'Connected.', publicUrl: null, localUrl: 'http://127.0.0.1:1234',
+    handshakeAt: now - 5_000, lastRequestAt: now - 3_000, lastToolCallAt: now - 2_000, health: null,
+    surfaces: [{ id: 'core', connectorName: 'Core', description: '', cardSummary: '', optional: false,
+      available: true, localUrl: 'http://127.0.0.1:1234', publicUrl: null, tools: ['read'], state: 'live',
+      detail: '', lastRequestAt: now - 3_000, lastToolCallAt: now - 2_000 }]
+  };
+  connected.bridge = { running: true, port: 8765, paired: true, present: true,
+    lastSeenAt: now - 1_000, extensionVersion: '2.1.13' };
+  mounted.push(connected);
+
+  const trigger = doc.getElementById('sidebarConnection') as HTMLButtonElement;
+  const popover = doc.getElementById('connectionPopover') as HTMLElement;
+  expect(doc.querySelector('#chatTitle')!.closest('header')!.querySelector('#connectBtn')).toBeNull();
+  expect(trigger.closest('.sidebar-bottom')).not.toBeNull();
+  expect(trigger.textContent?.trim()).toBe('');
+  expect(trigger.getAttribute('aria-label')).toMatch(/Connected.*verified/i);
+  expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+  Object.defineProperty(mounted.window, 'innerWidth', { configurable: true, value: 800 });
+  Object.defineProperty(mounted.window, 'innerHeight', { configurable: true, value: 760 });
+  vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue({
+    x: 200, y: 700, left: 200, top: 700, right: 236, bottom: 736, width: 36, height: 36,
+    toJSON: () => ({})
+  } as DOMRect);
+  vi.spyOn(popover, 'getBoundingClientRect').mockReturnValue({ width: 160 } as DOMRect);
+  trigger.click();
+  expect(popover.hidden).toBe(false);
+  expect(trigger.getAttribute('aria-expanded')).toBe('true');
+  expect(popover.style.left).toBe('138px');
+  expect(popover.parentElement).toBe(doc.body);
+  expect(doc.getElementById('connectionPopoverSettings')).toBeNull();
+  const advanced = doc.getElementById('connectionAdvanced') as HTMLDetailsElement;
+  const runtime = doc.getElementById('connectionRuntime') as HTMLDetailsElement;
+  advanced.open = runtime.open = true;
+  trigger.click(); trigger.click();
+  expect(advanced.open).toBe(false);
+  expect(runtime.open).toBe(false);
+  expect(doc.getElementById('connectionPopoverConnector')!.textContent).toMatch(/Reached/i);
+  expect(doc.getElementById('connectionPopoverBrowser')!.textContent).toBe('Connected');
+  expect(doc.getElementById('connectionPopoverBrowser')!.parentElement!.title).toMatch(/Seen/i);
+  expect(doc.getElementById('connectionPopoverBrowser')!.classList.contains('sr-only')).toBe(true);
+  expect(doc.getElementById('connectionPopoverBrowser')!.parentElement!.dataset.tone).toBe('ok');
+  expect(doc.getElementById('connectionPopoverVerified')!.hidden).toBe(true);
+  expect(doc.getElementById('connectionPopoverTitle')!.title).toMatch(/verified/i);
+  expect(doc.getElementById('connectionPipeline')!.closest('details')).toBe(runtime);
+  expect(doc.getElementById('connectionPopoverExtension')!.textContent).toBe('v2.1.13');
+  expect((doc.getElementById('connectionPopoverToggle') as HTMLButtonElement).textContent).toBe('Disconnect');
+
+  doc.body.dispatchEvent(new mounted.window.MouseEvent('click', { bubbles: true }));
+  expect(popover.hidden).toBe(true);
+});
+
+it('keeps the Settings footer action visible while settings are open', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  const settings = doc.getElementById('workspaceSettings') as HTMLButtonElement;
+
+  expect(settings.hidden).toBe(false);
+  settings.click();
+  expect(settings.hidden).toBe(false);
+  expect(settings.classList.contains('is-sel')).toBe(true);
+  (doc.getElementById('backToChat') as HTMLButtonElement).click();
+  expect(settings.hidden).toBe(false);
+  expect(settings.classList.contains('is-sel')).toBe(false);
+});
+
+it('renders companion diagnostics in the native Advanced connection drawer', async () => {
+  const now = Date.now();
+  const diagnostics = {
+    capturedAt: now - 2_000,
+    status: {
+      connected: true, port: 8765, paired: true, disconnected: false,
+      pending: 0, pendingCommandAcks: 0, compatible: true,
+      appVersion: '2.1.13', appProtocol: 14, extensionVersion: '2.1.13', extensionProtocol: 14,
+      pairError: null
+    },
+    preferences: { overwrite: true, durations: false },
+    tab: {
+      tab: 17, isChat: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      bound: true, epoch: 4, terminal: false, recorder: true,
+      page: {
+        recorderVersion: 13, runId: 'run-live', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        generating: true, turnId: 'turn-current-long-id', generations: 2, queued: 0, queueBytes: 0,
+        requestId: 'wfr_1234567890abcdef',
+        trace: [{ requestId: 'wfr_1234567890abcdef', read: true, sent: true, confirmed: true, app: 'request_id', tool: 'read' }],
+        overwrite: true, painted: true, events: 21, calls: 3, sends: 8, failures: 1,
+        session: 'session-live', lastError: null, blocked: null
+      },
+      chatTabs: 2, pending: 0, pendingAll: 0, pendingCloses: 0, pendingCommandAcks: 0,
+      delivery: { at: now - 1_000, ok: true, events: 4, total: 42, status: 200, error: null }
+    }
+  };
+  const mounted = await mountChat({}, [], {
+    companionDiagnostics: () => Promise.resolve({ ok: true, data: diagnostics }),
+    browserPreferences: () => Promise.resolve({ ok: true, data: { overwrite: true, durations: false } })
+  });
+  const doc = mounted.window.document;
+  const details = doc.getElementById('connectionAdvanced') as HTMLDetailsElement;
+  details.open = true;
+  details.dispatchEvent(new mounted.window.Event('toggle'));
+
+  await vi.waitFor(() => expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('session-live'));
+  expect(doc.getElementById('connectionAdvancedTab')!.classList.contains('is-ok')).toBe(true);
+  expect(doc.getElementById('connectionAdvancedRequest')!.textContent).toContain('wfr_12345…cdef');
+  expect(doc.getElementById('connectionAdvancedApp')!.textContent).toContain('tool matched');
+  expect(doc.getElementById('connectionPipelineOwner')!.classList.contains('is-done')).toBe(true);
+  expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('companion browser');
+  expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('fiber v13 · run run-live');
+});
+
+it('uses Internal Chromium as the host source when the optional #237 API is present', async () => {
+  const mounted = await mountChat({}, [], {
+    internalBrowser: () => Promise.resolve({
+      ok: true,
+      data: {
+        open: false,
+        ready: true,
+        tabId: 3,
+        tabs: [
+          { id: 1, active: false, status: 'complete', title: 'ChatGPT', url: 'https://chatgpt.com/' },
+          { id: 3, active: true, status: 'complete', title: 'Current chat · ChatGPT',
+            url: 'https://chatgpt.com/c/6aaa1c34-6bd0-83e9-9677-183c1030b86f' }
+        ]
+      }
+    }),
+    companionDiagnostics: () => Promise.resolve({ ok: true, data: null }),
+    browserPreferences: () => Promise.resolve({ ok: true, data: { overwrite: true, durations: false } })
+  });
+  const doc = mounted.window.document;
+  const details = doc.getElementById('connectionAdvanced') as HTMLDetailsElement;
+  details.open = true;
+  details.dispatchEvent(new mounted.window.Event('toggle'));
+
+  await vi.waitFor(() => expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('Internal Chromium · ready'));
+  expect(doc.getElementById('connectionAdvancedTab')!.textContent).toContain('#3 · complete');
+  expect(doc.getElementById('connectionAdvancedRecording')!.textContent).toContain('companion pending');
+  expect(doc.getElementById('connectionAdvancedChat')!.textContent).toContain('6aaa1c34…b86f');
+  expect(doc.getElementById('connectionPipelineWhy')!.textContent).toContain('Internal Chromium is live');
+});
+
 it('always offers setup collapse and preserves the choice across incomplete status updates', async () => {
   const mounted = await mountChat();
   const doc = mounted.window.document;
@@ -468,7 +700,8 @@ it('adds and selects setup profiles and rejects an older profile status response
 it('attaches pasted screenshot files with previews while preserving ordinary text paste', async () => {
   const dropFiles = vi.fn(async () => ({ ok: true, data: [{ id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'screenshot.png', size: 4, mimeType: 'image/png', preview: 'data:image/webp;base64,AAAA' }] }));
   const mounted = await mountChat({}, [], { dropFiles });
-  const w = mounted.window, input = w.document.getElementById('chatInput')!;
+  const w = mounted.window, input = w.document.getElementById('settingsSearch') as HTMLInputElement;
+  input.focus();
   const file = new w.File(['image'], 'screenshot.png', { type: 'image/png' });
   const paste = new w.Event('paste', { bubbles: true, cancelable: true });
   Object.defineProperty(paste, 'clipboardData', { value: { files: [file] } });
@@ -480,6 +713,7 @@ it('attaches pasted screenshot files with previews while preserving ordinary tex
   Object.defineProperty(text, 'clipboardData', { value: { files: [] } });
   input.dispatchEvent(text);
   expect(text.defaultPrevented).toBe(false);
+  expect(w.document.activeElement).toBe(input);
   const overflow = new w.Event('paste', { bubbles: true, cancelable: true });
   Object.defineProperty(overflow, 'clipboardData', { value: { files: Array(20).fill(file) } });
   input.dispatchEvent(overflow);
@@ -554,12 +788,12 @@ it('shows the current host Desktop tools without rebuilding permission controls 
   const doc = mounted.window.document;
   const names = () => Array.from(doc.querySelectorAll('[data-group="desktop"] .tool-names code'), node => node.textContent);
   const control = doc.querySelector<HTMLInputElement>('[data-cap="control"]')!;
-  const windowsNames = ['list_windows', 'get_window', 'list_apps', 'get_window_state',
+  const windowsNames = [...BROWSER_READ_TOOLS, 'list_windows', 'get_window', 'list_apps', 'get_window_state', ...BROWSER_WRITE_TOOLS,
     'launch_app', 'click', 'press_key', 'type_text', 'scroll', 'set_value', 'drag',
     'perform_secondary_action', 'activate_window', 'read_clipboard', 'write_clipboard', 'exec'];
   expect(names()).toEqual(windowsNames);
   mounted.push({ ...mounted.state, platform: { family: 'macos', name: 'macOS', desktopAutomation: true } });
-  expect(names()).toEqual(['observe', 'computer', 'exec']);
+  expect(names()).toEqual([...BROWSER_READ_TOOLS, 'observe', ...BROWSER_WRITE_TOOLS, 'computer', 'exec']);
   expect(doc.querySelector('[data-cap="control"]')).toBe(control);
   mounted.push(mounted.state);
   expect(names()).toEqual(windowsNames);
@@ -573,7 +807,9 @@ it('preserves native Desktop permissions when saving unrelated settings on Linux
   const w = mounted.window;
 
   const desktopGroup = w.document.querySelector<HTMLElement>('[data-group="desktop"]')!;
-  expect(desktopGroup.hidden).toBe(true);
+  expect(desktopGroup.hidden).toBe(false);
+  expect(w.document.querySelector<HTMLInputElement>('[data-cap="control"]')!.disabled).toBe(false);
+  expect(w.document.querySelector<HTMLInputElement>('[data-cap="clipboardWrite"]')!.disabled).toBe(true);
 
   const autoConnect = w.document.getElementById('autoConnect') as HTMLInputElement;
   autoConnect.checked = true;
@@ -703,7 +939,7 @@ it('guides rootless setup from the capabilities that actually need a filesystem 
   ];
 
   mounted.push(mixed);
-  const connect = mounted.window.document.getElementById('connectBtn') as HTMLButtonElement;
+  const connect = mounted.window.document.getElementById('connectionPopoverToggle') as HTMLButtonElement;
   expect(connect.disabled).toBe(true);
   expect(connect.title).toContain('Choose a folder');
   expect(mounted.window.document.querySelector('[data-step="folder"]')?.classList.contains('is-current')).toBe(true);
@@ -824,7 +1060,7 @@ it('keeps folder access discoverable after setup and navigates without granting 
   expect(mounted.calls).toEqual([]);
 });
 
-it('requires a live browser only when a browser-backed feature is actually enabled', async () => {
+it('always requires the live browser because recording is an invariant', async () => {
   const mounted = await mountChat({
     hasApiKey: true,
     status: {
@@ -839,7 +1075,7 @@ it('requires a live browser only when a browser-backed feature is actually enabl
       surfaces: [
         {
           id: 'core', connectorName: 'Core', description: '', cardSummary: '', optional: false,
-          available: true, localUrl: 'http://127.0.0.1:1234', publicUrl: null, tools: ['read', 'session'],
+          available: true, localUrl: 'http://127.0.0.1:1234', publicUrl: null, tools: ['read', 'update_plan'],
           state: 'live', detail: '', lastRequestAt: Date.now(), lastToolCallAt: Date.now()
         }
       ]
@@ -866,20 +1102,22 @@ it('requires a live browser only when a browser-backed feature is actually enabl
   expect(browserStep.classList.contains('is-done')).toBe(true);
   expect(doc.getElementById('bridgeState')!.textContent).toContain('Connected.');
 
-  // Recording and multi-agent are the two independently viable bridge features. Goal is
-  // browser-driven too, but it requires a recorded session and cannot run by itself when
-  // recording is off, so goal.enabled alone must not keep setup blocked on an inert bridge.
+  // Even a legacy/hand-built renderer snapshot cannot turn recording off. Main normalizes this
+  // shape before publication; the renderer's setup predicate still fails closed if it sees one.
   const browserFree = structuredClone(live) as any;
   browserFree.config.sessions.record = false;
   browserFree.config.multiAgent.enabled = false;
+  browserFree.config.capabilities.screen = false;
+  browserFree.config.capabilities.control = false;
   browserFree.config.goal.enabled = true;
   browserFree.bridge = { running: false, port: null, paired: true, present: false, lastSeenAt: Date.now() };
   mounted.push(browserFree);
-  expect(browserStep.hidden).toBe(true);
-  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(true);
-  expect(doc.getElementById('bridgeState')!.textContent).toContain('not needed');
-  expect((doc.getElementById('chatAutomation') as HTMLSelectElement).disabled).toBe(true);
-  expect(doc.getElementById('chatAutomation')!.title).toMatch(/recording/i);
+  expect(browserStep.hidden).toBe(false);
+  expect(browserStep.classList.contains('is-current')).toBe(true);
+  expect(doc.getElementById('wizard')!.classList.contains('is-tidy')).toBe(false);
+  expect(doc.getElementById('bridgeState')!.textContent).not.toContain('not needed');
+  expect((doc.getElementById('chatAutomation') as HTMLSelectElement).disabled).toBe(false);
+  expect(doc.getElementById('chatAutomation')!.title).toContain('Continue');
 });
 
 /**
@@ -1297,7 +1535,7 @@ it('keeps the model in use when OpenRouter cannot be reached', async () => {
   expect(doc.getElementById('goalModelName')!.textContent).toBe('deepseek/deepseek-v4-flash');
 });
 
-it('edits a fresh Goal before first send and clears it on an independent New Chat', async () => {
+it('retains a fresh Goal and first message when rejected sends return to New Chat', async () => {
   const sendInput = vi.fn(async () => ({ ok: false, error: 'test delivery stopped' }));
   const mounted = await mountChat({}, [], { sendInput,
     getChatModels: async () => ({ ok: true, data: { state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['none', 'high'] }] } }),
@@ -1321,5 +1559,74 @@ it('edits a fresh Goal before first send and clears it on an independent New Cha
   expect(sendInput).toHaveBeenCalledWith(expect.objectContaining({ sessionId: null, automation: 'goal', objective: 'Build and verify the requested feature' }));
   (doc.getElementById('newChat') as HTMLButtonElement).click();
   await settle();
-  expect(objective.value).toBe('');
+  expect(objective.value).toBe('Build and verify the requested feature');
+  expect(input.value).toBe('Start with the existing code');
+  expect((doc.getElementById('chatAutomation') as HTMLSelectElement).value).toBe('goal');
+});
+
+
+it('gives twenty rapid New Chat sends independent visible local chats before any provider receipt', async () => {
+  const rows: any[] = [], summaries: any[] = [];
+  const ok = (data: any) => ({ ok: true, data });
+  const sendInput = vi.fn(async (request: any) => {
+    const row = { ...request, sessionId: request.id, opening: true, state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+    rows.push(row);
+    summaries.push({ id: row.sessionId, title: row.text, conversationId: null, origin: { kind: 'desktop' }, createdAt: row.createdAt, updatedAt: row.createdAt, eventCount: 0, projectId: null, selectedModel: null, usage: {} });
+    return ok(row);
+  });
+  const setInputAutomation = vi.fn(async (id: string, automation: string, loopAfterTurn?: boolean) => {
+    const row = rows.find(row => row.id === id); row.automation = automation; if (loopAfterTurn !== undefined) row.loopAfterTurn = loopAfterTurn; return ok(true);
+  });
+  const setSessionAutomation = vi.fn();
+  const mounted = await mountChat({}, [], { sendInput, setInputAutomation, setSessionAutomation,
+    getChatModels: async () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] }),
+    listInputs: async () => ok([...rows]), listPausedHelpers: async () => ok([]),
+    listSessions: async () => ok({ sessions: [...summaries], activeId: null, pressure: [] }),
+    getSession: async (id: string) => ok({ summary: summaries.find(row => row.id === id), events: [], nextCursor: null })
+  });
+  const w = mounted.window, doc = w.document, field = doc.getElementById('chatInput') as HTMLTextAreaElement;
+  for (let index = 0; index < 20; index++) {
+    (doc.getElementById('newChat') as HTMLButtonElement).click(); await settle();
+    field.value = `Independent opening ${index}`;
+    doc.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(sendInput).toHaveBeenCalledTimes(index + 1));
+    await vi.waitFor(() => expect(doc.querySelector(`.sess.is-sel[data-id="${rows[index]!.sessionId}"]`)).not.toBeNull());
+    expect(doc.querySelector(`[data-input-id="${rows[index]!.id}"]`)?.textContent).toContain(rows[index]!.text);
+    expect((doc.getElementById('composerModel') as HTMLSelectElement).value).toBe('gpt-5.6-sol');
+  }
+  (doc.querySelector('[data-mode=loop]') as HTMLButtonElement).click(); await settle();
+  const loop = doc.getElementById('loopDelivery') as HTMLSelectElement; loop.value = 'after-turn'; loop.dispatchEvent(new w.Event('change')); await settle();
+  expect(setInputAutomation).toHaveBeenLastCalledWith(rows[19]!.id, 'loop', true);
+  expect(setSessionAutomation).not.toHaveBeenCalled();
+  expect(rows[19]).toMatchObject({ automation: 'loop', loopAfterTurn: true });
+  expect(rows.slice(0, 19).every(row => row.automation !== 'loop')).toBe(true);
+  expect(new Set(rows.map(row => row.sessionId)).size).toBe(20);
+  expect(rows.every(row => row.state === 'queued' && row.deliveredAt === undefined)).toBe(true);
+  expect(sendInput.mock.calls.every(([request]) => request.sessionId === null)).toBe(true);
+});
+
+it('does not steal a newer New Chat draft when an older admission response arrives', async () => {
+  let release!: (value: any) => void;
+  const rows: any[] = [], summaries: any[] = [];
+  const ok = (data: any) => ({ ok: true, data });
+  const sendInput = vi.fn((request: any) => new Promise(resolve => { release = () => {
+    const row = { ...request, sessionId: request.id, opening: true, state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+    rows.push(row); summaries.push({ id: row.sessionId, title: row.text, conversationId: null, origin: { kind: 'desktop' }, createdAt: row.createdAt, updatedAt: row.createdAt, eventCount: 0, projectId: null, usage: {} });
+    resolve(ok(row));
+  }; }));
+  const mounted = await mountChat({}, [], { sendInput,
+    getChatModels: async () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] }),
+    listInputs: async () => ok([...rows]), listPausedHelpers: async () => ok([]),
+    listSessions: async () => ok({ sessions: [...summaries], activeId: null, pressure: [] }),
+    getSession: async (id: string) => ok({ summary: summaries.find(row => row.id === id), events: [], nextCursor: null })
+  });
+  const w = mounted.window, doc = w.document, field = doc.getElementById('chatInput') as HTMLTextAreaElement;
+  (doc.getElementById('newChat') as HTMLButtonElement).click(); await settle();
+  field.value = 'Old admission'; doc.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(sendInput).toHaveBeenCalledTimes(1));
+  (doc.getElementById('newChat') as HTMLButtonElement).click(); field.value = 'Keep this newer draft';
+  field.dispatchEvent(new w.Event('input', { bubbles: true })); release(undefined); await settle(); await settle();
+  expect(field.value).toBe('Keep this newer draft');
+  expect(doc.querySelector('.sess.is-sel')).toBeNull();
+  expect(doc.getElementById('chatTitle')!.textContent).toBe('New chat');
 });

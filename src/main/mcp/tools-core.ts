@@ -29,7 +29,7 @@ import {
   viewImage
 } from '../codex/view-image.js';
 import { logInfo, logWarn } from '../logger.js';
-import { SandboxError, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
+import { SandboxError, isAbsoluteVirtualPath, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
 import { currentWorkspace } from '../workspace.js';
 import type { Capabilities, Root } from '../../shared/types.js';
 import type { FileChange } from '../../shared/session.js';
@@ -54,12 +54,11 @@ import { appendTerminalLive, finishTerminalLive, startTerminalLive } from '../co
 import {
   backgroundExecObligations,
   execOwnershipFailure,
+  executionPrincipal,
   forgetExecOwner,
   MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecAttended,
-  noteExecOwner,
-  provenConversation,
-  provenSession
+  noteExecOwner
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
@@ -107,7 +106,8 @@ import { locateRipgrep } from '../ripgrep.js';
 import { ensureDevToolchain } from '../toolchain.js';
 import {
   agentForCaller,
-  currentRunId,
+  agentFamiliesForCaller,
+  reconcileAgentRequestOwners,
   noteAgentContextTokens,
   persistCriticalSwarmNow,
   PRIME_ID,
@@ -125,7 +125,6 @@ import { repairPrimeFromResumeShadow } from '../session/continuation.js';
 import {
   currentCall,
   currentCaller,
-  noteChange,
   noteChanges,
   noteCount,
   noteDetail,
@@ -136,6 +135,7 @@ import {
   recordAgentMessage
 } from '../session/recorder.js';
 import { findSessionByConversation } from '../session/store.js';
+import { requestCorrelation } from '../session/correlation.js';
 import {
   adoptAgent,
   fail,
@@ -154,10 +154,6 @@ import {
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
-import { registerSessionTool as registerSessionSearchReadTool } from './session-tool.js';
-import { ArtifactFetchError } from './artifact-fetch.js';
-import { ArtifactTargetError } from './artifact-target.js';
-import { downloadArtifactFile } from './artifact-download.js';
 import { registerDatabaseTool } from './database-tool.js';
 import { configuredDatabaseShellPolicyViolation } from '../database/exec-policy.js';
 
@@ -200,7 +196,10 @@ const unifiedExecOutputSchema = z
     session_id: z
       .number()
       .optional()
-      .describe('Session identifier to pass to write_stdin when the process is still running.'),
+      .describe('Session ID while running.'),
+    completed_session_id: z.number().optional().describe('Use as write_stdin session_id to reread completed output.'),
+    benign_exit: z.boolean().optional().describe('Non-zero exit is an expected result, not a failure.'),
+    output_replayed: z.boolean().optional().describe('Retained output; command was not run again.'),
     original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
     output: z.string().describe('Command output text, possibly truncated.'),
     supplemental_context: z.string().optional().describe('App context, not process output.')
@@ -236,19 +235,14 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
   return applyUnifiedExecEnv(env);
 }
 
-/** Resolve the stable local session once so exec admission and later ownership cannot disagree. */
-async function execSession(tool: 'exec_command' | 'write_stdin'): Promise<string | null> {
-  let conversationId = provenConversation(currentCaller().requestId, currentCaller().conversationId);
-  const call = currentCall();
-  if (!conversationId && call?.caller.requestId) {
-    conversationId = await awaitFreshCallOrigin(tool, call.startedAt, IDENTITY_EVIDENCE_MS, {
-      requestId: call.caller.requestId
-    });
-    if (conversationId) call.caller.conversationId = conversationId;
-  }
-  const sessionId = provenSession(currentCaller().requestId, currentCaller().sessionId ?? null);
-  if (call) call.caller.sessionId = sessionId;
-  return sessionId;
+/** One stable owner for the running model turn, upgraded lazily when page proof arrives. */
+function execPrincipal(): string | null {
+  const caller = currentCaller();
+  return executionPrincipal(
+    caller.requestId,
+    caller.sessionId ?? null,
+    currentCall()?.allowUnattributed ?? getConfig().multiAgent.allowUnattributedCalls
+  );
 }
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
@@ -641,12 +635,19 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             return fail('apply_patch environment selection is unavailable for this turn');
           }
           const workspace = currentWorkspace();
-          if (!workspace && swarmRunning()) {
+          const hasRelativePath = args.hunks.some(hunk => {
+            const paths = hunk.kind === 'update_file' && hunk.movePath !== null
+              ? [hunk.path, hunk.movePath]
+              : [hunk.path];
+            return paths.some(path => !isAbsoluteVirtualPath(path) && !isNativeWindowsPath(path));
+          });
+          if (!workspace && swarmRunning() && hasRelativePath) {
             return fail(
-              'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Use an absolute path in another tool first so the approved project can be learned.'
+              'WORKSPACE_REQUIRED: this request has no workspace yet. Use an absolute approved path in this patch or another file tool first so the project can be learned.'
             );
           }
-          const baseVirtual = workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : null);
+          const fallback = firstTaskRoot(ctx.roots);
+          const baseVirtual = workspace?.virtual ?? (fallback ? `/${fallback.name}` : null);
           if (baseVirtual === null) {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
@@ -800,7 +801,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               }
             }
 
-            const owner = await execSession('exec_command');
+            const owner = execPrincipal();
             const unread = backgroundExecObligations(owner).exitedUnread;
             if (unread.length >= MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION) {
               const sessionIds = unread.map((session) => session.processId).join(', ');
@@ -824,6 +825,13 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             });
 
             const output = await unifiedExecManager.execCommand({
+              classifyExit: (exitCode, rawOutput) => {
+                if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
+                const sections = parseCommandBatchSections(rawOutput, batch.marker);
+                const nonzero = sections.filter(section => section.exitCode !== 0);
+                return exitCode !== null && exitCode !== 0 && sections.length === rawCommands.length && nonzero.length > 0 &&
+                  nonzero.every(section => nonZeroExitIsBenign(boundCommands[section.index - 1] ?? '', section.exitCode, section.text));
+              },
               batchMarker: batch?.marker,
               command,
               shellType: shell.shellType,
@@ -842,13 +850,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               if (output.processId === null) finishTerminalLive(processId, output.exitCode);
               else void output.completion?.then(completion => finishTerminalLive(processId, completion.exitCode));
             }
-            // Which durable local session may later write to this process id. The frontend
-            // conversation is replaceable during Compact & Resume; the local session is not.
-            if (output.processId === null) {
-              forgetExecOwner(processId);
-            } else {
-              noteExecOwner(output.processId, owner);
-            }
+            // Which exact session or temporary request principal may later write to this
+            // process id. Request custody upgrades lazily when exact correlation arrives.
+            noteExecOwner(output.processId ?? output.completedSessionId ?? null, owner);
             const responseText = execCommandResponseText(output);
             // A search that found nothing exits 1 and has not failed. Recording it as an
             // error made a session's error count meaningless; see exec-hints.ts for why this
@@ -863,13 +867,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // cannot let an unseen real failure pass as benign.
             const batchSections = batch ? parseCommandBatchSections(output.rawOutput.toString('utf8'), batch.marker) : [];
             const nonZeroSections = batchSections.filter((section) => section.exitCode !== 0);
-            const benign = isBatch
-              ? batchSections.length === rawCommands.length &&
-                nonZeroSections.length > 0 &&
-                nonZeroSections.every((section) =>
-                  nonZeroExitIsBenign(boundCommands[section.index - 1] ?? '', section.exitCode, section.text)
-                )
-              : nonZeroExitIsBenign(boundCommand, output.exitCode, responseText);
+            const benign = output.benignExit === true;
             noteExec({
               completion: output.completion,
               ...(output.processId === null ? {} : { id: String(output.processId) }),
@@ -958,14 +956,15 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
           // The ownership registry decides both admission and the reason for refusal.
-          // Missing caller proof is retryable; anonymous custody and a different owner are not.
-          const asking = await execSession('write_stdin');
+          // A request-scoped caller can continue a process it opened before proof. Another
+          // request must wait for exact correlation; a numeric process id is not custody.
+          const asking = execPrincipal();
           const denied = execOwnershipFailure(input.session_id, asking);
           if (denied) {
             const reason = {
               unavailable: 'EXEC_SESSION_UNAVAILABLE: This process id is not available to this call in the running app. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable.',
               anonymous: 'EXEC_SESSION_ANONYMOUS: This process was launched without proven chat identity. An identified chat cannot adopt it. Check the original command and its saved output; retrying from this identified chat cannot change its ownership.',
-              unidentified: 'EXEC_CALLER_UNIDENTIFIED: The current call has no proven chat identity, so it cannot access this owned process. After exact identity recovers, retry this same session_id once; do not launch a replacement command.',
+              unidentified: 'EXEC_CALLER_UNIDENTIFIED: The current request has not been proven to own this process, so it cannot access it yet. After exact identity recovers, retry this same session_id once; do not launch a replacement command.',
               'different-owner': 'EXEC_SESSION_OWNER_MISMATCH: This process belongs to a different local session. Only its owning session can poll it or send input; use a process id returned to this session.'
             }[denied];
             const message = `write_stdin failed for session ${input.session_id}: ${reason} No input was sent and no output was read. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work.`;
@@ -982,16 +981,13 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY
             });
-            if (output.processId === null) forgetExecOwner(input.session_id);
-            else noteExecAttended(input.session_id);
+            noteExecAttended(input.session_id);
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,
               exitCode: output.exitCode,
               timedOut: false,
-              // No `benignExit` here on purpose: a status this drains belongs to the child, is
-              // recorded as `process_exit_nonzero`, and is already outside the reliability
-              // numerator. Exempting it would relabel a failed test run `ok`.
+              benignExit: output.benignExit,
               durationMs: output.wallTimeMs
             });
             logInfo(`tool write_stdin ${input.session_id} (${(input.chars ?? '').length} chars)`);
@@ -1011,81 +1007,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     );
   }
 
-  // ------------------------------------------------------- download_artifact
-
-  // Requests ChatGPT native-file injection. The gateway still validates the reference,
-  // exact host and sandbox destination; metadata alone is not provenance proof.
-  if (exposedCaps.saveArtifact) {
-    reg.register(
-      'download_artifact',
-      toolDeclaration('download_artifact', () => ({
-        title: 'Save ChatGPT file',
-        description:
-          'Save one file ChatGPT generated or attached to a path inside an approved folder. ' +
-          'The file value is supplied by ChatGPT itself — never invent download_url or file_id values. ' +
-          'The destination must not already exist and its parent folder must already exist. ' +
-          'Use for images, PDFs, archives and other files ChatGPT produces; never recreate such files with apply_patch or exec_command.',
-        inputSchema: z
-          .object({
-            file: z
-              .strictObject({
-                download_url: z.string(),
-                file_id: z.string(),
-                mime_type: z.string().nullable().optional(),
-                file_name: z.string().nullable().optional(),
-                name: z.string().nullable().optional(),
-                size: z.number().int().nonnegative().nullable().optional()
-              })
-              .describe('Native file value injected by ChatGPT.'),
-            path: pathArg.describe(
-              'Destination inside an approved folder: a virtual /<root>/... path or an absolute native path. ' +
-                'Relative paths resolve against this chat\'s folder. The destination must name a file that does not already exist.'
-            )
-          })
-          .strict(),
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-        _meta: { 'openai/fileParams': ['file'] }
-      })),
-      async ({ file, path: requestedPath }) =>
-        guard('download_artifact', async () => {
-          if (!caps.saveArtifact) {
-            return fail(
-              'TOOL_DISABLED: download_artifact is disabled by the current Chat On Steroids permissions. Ask the user to enable saving ChatGPT files in the app.'
-            );
-          }
-          try {
-            const saved = await downloadArtifactFile(ctx.roots, requestedPath, file, {
-              maxFileBytes: getConfig().artifacts.maxFileBytes
-            });
-            noteChange({ path: saved.virtual, added: 0, removed: 0, approximate: true });
-            logInfo(`tool download_artifact ${saved.virtual} (${formatBytes(saved.size)}, ${saved.sha256})`);
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `Saved ${saved.virtual} (${formatBytes(saved.size)}, ${saved.sha256}).`
-                }
-              ],
-              structuredContent: { path: saved.virtual, size: saved.size, sha256: saved.sha256 }
-            };
-          } catch (error) {
-            if (
-              error instanceof ArtifactFetchError ||
-              error instanceof ArtifactTargetError ||
-              error instanceof SandboxError
-            ) {
-              return fail(`download_artifact failed: ${error.message}`);
-            }
-            throw error;
-          }
-        })
-    );
-  }
-
-  // ---------------------------------------------------------------- session
+  // ------------------------------------------------------- plan and finish
 
   if (reg.sessionToolsExposed) {
-    registerSessionSearchReadTool(reg);
     registerPlanTool(reg);
   }
   if (reg.ctx.exposedFinishTool ?? getConfig().ui.finishTool === true) {
@@ -1118,18 +1042,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * One tool, four actions, registered only while multi-agent mode is on. Fresh installs enable
  * it; existing configs keep their stored choice, so a user who has it off never sees this schema.
  *
- * The identity model is the whole design, and it is the same one for every role: an agent *is*
- * the ChatGPT conversation it runs in. A chat becomes the prime by spawning from its own proven
- * conversation; a worker is the chat the app opened for its slot, bound and activated by the
- * extension's report before the model there reads its task. Neither is anything the model can
- * assert, so there is no key to carry, no takeover, no promotion and no inference — a call this
- * app cannot place is refused rather than guessed at, and a chat that is not in the run learns
- * only that a run exists.
- *
- * There is no `join`, and no key field anywhere in this schema. There used to be one manual
- * recovery action for the case where the extension's binding report was lost: it was a second
- * way to become a worker, it was the only thing in the app that put a credential into a model's
- * hands, and a run whose binding report never arrived is better restarted than repaired.
+ * Caller identity comes from transport/page evidence, never model arguments. When permitted,
+ * an unresolved request can own a provisional prime family. The same broker later attaches it
+ * to the real session's frontend, preserving every worker and any existing fleets. Workers
+ * retain their app-proven conversation binding. run_id selects an owned family, not a role.
  *
  * Every result here also carries `structuredContent`. The text half is what the model should
  * act on and is kept to a sentence or two; ids, states and counts are machine state and belong
@@ -1175,11 +1091,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
     toolDeclaration('agents', () => ({
       title: 'Multi-agent run',
       description:
-        'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; app settings supply their defaults automatically. Do not ask the user to choose these settings before spawning. Reuse a suitable sleeping worker with message before spawn; spawn creates fresh worker chats for new parallel work. Sleeping/terminal workers stay in this prime conversation’s durable history. ' +
-        'message: prime→worker or worker→prime; messaging a sleeping worker revives that exact existing chat when a slot is free. Replies arrive on later tool results, so never poll. ' +
-        'status shows this prime’s full worker history, including sleeping/revivable and terminal/non-revivable workers, even while no run is active. finish reports a worker result and normally puts it to sleep.',
+        'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; saved app defaults apply. Do not ask the user to choose them. Reuse a suitable sleeping worker with message before spawn. ' +
+        'message: prime→worker or worker→prime; a free slot revives the same sleeping chat. Replies arrive with tool results; never poll. ' +
+        'status: all active, sleeping/revivable and terminal/non-revivable workers in this prime’s durable history, including parked runs. finish: report the result, normally then sleep.',
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
+        run_id: z.string().uuid().optional().describe('Select your returned worker family when status lists several; never grants another caller’s workers.'),
         context: z
           .string()
           .max(4000)
@@ -1203,13 +1120,13 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 .max(80)
                 .optional()
                 .describe(
-                  'Omit unless the user explicitly requests a model override; app settings supply their default. Overrides require an exact account-observed model id or provider alias; never guess spellings. Invalid choices return observed ids before workers open; the browser confirms availability before sending.'
+                  'Omit unless explicitly requested by the user; app settings supply defaults. Use an exact account-observed model id or provider alias. Invalid overrides return observed ids before opening; the browser confirms availability before Send.'
                 ),
               reasoning_effort: z
                 .enum(REASONING_EFFORTS)
                 .optional()
                 .describe(
-                  'Omit unless the user explicitly requests a reasoning override; app settings supply their default automatically. Do not ask for a reasoning level just to spawn a worker. Independent of model: it never selects or changes one.'
+                  'Omit unless explicitly requested by the user; app settings supply defaults. Do not ask just to spawn a worker. This selects reasoning only, never a model.'
                 )
             }).strict()
           )
@@ -1278,18 +1195,13 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
 
         if (input.action === 'spawn') {
           if (!input.workers) return fail('agents action=spawn requires workers.');
-          // One atomic operation: it either claims this exact conversation as prime and
-          // creates the workers, or it creates nothing at all. There is no "create the
-          // workers and find out who the prime was later" — that ordering is what produced a
-          // run whose workers could talk to a prime nobody could authenticate as.
-          //
-          // And the identity behind it is the exact kind: a generic connector row would let
-          // an uninvolved chat that happened to call something else in the same window
-          // become the prime of this run.
+          // Reserve under exact chat proof or the permitted transport request, atomically.
+          // The request remains the reachable prime before browser attachment; later proof
+          // changes its frontend projection without recreating workers or replaying spawn.
           const staged = stageSpawn({
             workers: input.workers,
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true })
+            caller: await callerNow(startedAt, { exact: true, runId: input.run_id })
           });
           let accepted = false;
           try {
@@ -1313,6 +1225,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             throw error;
           }
           const { created, becamePrime, runId } = staged;
+          if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.
           requestWorkerBootstraps(created.map((worker) => worker.id), runId);
@@ -1324,7 +1237,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               {
                 type: 'text' as const,
                 text:
-                  (becamePrime ? `This conversation is now the prime agent of run ${runId}. ` : '') +
+                  (becamePrime ? `This ${currentCaller().conversationId ? 'conversation' : 'request'} is now the prime agent of run ${runId}. ` : '') +
                   `${created.length} worker(s) matched: ${created.map((info) => `${info.id} (${info.label}, ${info.state}${info.model ? `, model ${info.model}` : ''}${info.reasoningEffort ? `, reasoning ${info.reasoningEffort}` : ''})`).join(', ')}. ` +
                   (invited.length > 0 ? 'New worker chats are opening with their briefs already in them. ' : '') +
                   (sleeping.length > 0
@@ -1360,7 +1273,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           if (items.length === 0) return fail('agents action=message requires to and text, or a messages array.');
           // Before any slot is reserved: a sleeping worker whose chat has since crossed the
           // context ceiling is not revivable, and this is the call that would otherwise wake it.
-          const caller = await callerNow(startedAt);
+          const caller = await callerNow(startedAt, { runId: input.run_id, member: true });
           await measureSleepingWorkers(caller);
           // One call, one identity resolution, one all-or-nothing delivery: a prime
           // redirecting its whole run cannot end up with two of its three messages sent.
@@ -1389,7 +1302,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // Reopening a sleeping worker's chat is a browser side effect, so it happens only
           // after the broker revision that reserved its slot is durable — exactly as a spawn's
           // tabs do. Nothing has been typed into that chat yet at this point.
-          const runId = caller.conversationId ? currentRunId(caller.conversationId) : null;
+          const runId = staged.runId;
+          if (currentCall()) currentCall()!.caller.runId = runId;
           if (woken.length > 0 && runId) requestWorkerRevivals(woken, runId);
           for (const message of sent) await recordAgentMessage(message, 'sent', caller.conversationId);
           return {
@@ -1405,6 +1319,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             ],
             structuredContent: {
               action: 'message',
+              run_id: runId,
               queued: sent.map((message) => ({ to: message.to })),
               waking: woken
             }
@@ -1417,7 +1332,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               'agents action=finish requires result: the report the prime reads in your place — what you changed, what you verified and what is left. Send it as result and call finish again.'
             );
           }
-          const staged = stageFinishAgent(await callerNow(startedAt), input.result);
+          const staged = stageFinishAgent(await callerNow(startedAt, { runId: input.run_id, member: true }), input.result);
           let accepted = staged.repeat;
           try {
             if (!staged.repeat) {
@@ -1467,14 +1382,21 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
 
         // Status describes only this exact caller's family. No family is a normal empty
         // result, independent of whether another prime has workers; discovery grants no role.
-        const caller = await callerNow(startedAt);
+        const caller = await callerNow(startedAt, { runId: input.run_id });
         await measureSleepingWorkers(caller);
         const status = statusForCaller(caller);
         const me = status.self;
         const state = status.state;
+        const families = agentFamiliesForCaller(caller);
+        const familyNotice = families.length > 1
+          ? `\n\nYour worker families: ${families.map(family => `${family.run_id} (${family.running ? 'active' : 'retained'})`).join(', ')}. Use run_id to select a family; worker names are local to that family.`
+          : '';
         if (!me) return {
-          content: [{ type: 'text' as const, text: 'No workers or retained worker history belong to this conversation. Use agents action=spawn if the task needs workers.' }],
-          structuredContent: { action: 'status', run_id: null, self: null, agents: [], free_worker_slots: status.freeWorkerSlots }
+          content: [{ type: 'text' as const, text: families.length
+            ? `Select one of your worker families with run_id.${familyNotice}`
+            : 'No workers or retained worker history belong to this caller. Use agents action=spawn if the task needs workers.' }],
+          structuredContent: { action: 'status', run_id: null, self: null, agents: [], free_worker_slots: status.freeWorkerSlots,
+            ...(families.length > 1 ? { available_runs: families } : {}) }
         };
         const failed = state.agents.filter((info) => info.state === 'failed');
         // The word the model reads here is the whole answer to "may I use this worker again".
@@ -1493,15 +1415,6 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
               : info.state;
         const asleep = state.agents.filter((info) => info.state === 'sleeping' && info.revivable);
         const slots = status.freeWorkerSlots;
-        // The recording id is what `session action=read` wants, and a prime that lacks it
-        // searches recordings by the task text instead — a hundred such searches in the 50
-        // most recent recorded sessions, each answering with the prime's own chat as well.
-        const recordings = new Map<string, string>();
-        for (const info of state.agents) {
-          if (info.id === me.id || !info.conversationId) continue;
-          const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
-          if (summary) recordings.set(info.id, summary.id);
-        }
         return {
           content: [
             {
@@ -1514,15 +1427,11 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                       `${info.id}  ${info.role}  ${shown(info)}  waiting ${info.pending}  ${info.label}` +
                       (info.model ? `  model ${info.model}` : '') +
                       (info.reasoningEffort ? `  reasoning ${info.reasoningEffort}` : '') +
-                      (recordings.has(info.id) ? `\n    recording: ${recordings.get(info.id)}` : '') +
                       (info.result
                         ? `\n    ${info.state === 'failed' ? 'failure' : info.state === 'finished' ? 'result' : 'latest result'}: ${info.result.slice(0, 300)}`
                         : '')
                   )
                   .join('\n') +
-                (recordings.size > 0
-                  ? '\n\nTo see what a worker is doing, session action=read with its recording id; pass the update_cursor from that read next time to get only what is new.'
-                  : '') +
                 (me.id === PRIME_ID
                   ? `\n\n${slots} of your worker slots ${slots === 1 ? 'is' : 'are'} free.` +
                     (asleep.length > 0
@@ -1541,7 +1450,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 // A status check is a glance, not a stopping point. Without this the table reads
                 // like an answer to hand back to the user, and a prime that has just looked at its
                 // workers stops mid-run to report what it saw.
-                '\n\nThis is the current stats, keep working.'
+                familyNotice + '\n\nThis is the current stats, keep working.'
             }
           ],
           structuredContent: {
@@ -1549,6 +1458,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             run_id: status.runId,
             self: me.id,
             free_worker_slots: slots,
+            ...(families.length > 1 ? { available_runs: families } : {}),
             agents: state.agents.map((info) => ({
               id: info.id,
               role: info.role,
@@ -1583,15 +1493,18 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
  * The proven identity is then adopted for the rest of the call, so this result is recorded
  * against the right agent and carries the right inbox.
  */
-async function callerNow(startedAt: number, options: { exact?: boolean } = {}): Promise<Caller> {
+async function callerNow(startedAt: number, options: { exact?: boolean; runId?: string; member?: boolean } = {}): Promise<Caller> {
   const base = currentCaller();
   // `exact` marks the one action that binds a run: spawn. It is the call whose refusal the
   // model cannot absorb, so it gets the longer ceiling; every other `agents` action can be
   // declined and asked again on the next tool call.
   const window = base.requestId ? (options.exact ? SPAWN_EVIDENCE_MS : IDENTITY_EVIDENCE_MS) : PRIME_EVIDENCE_MS;
+  const allowRequest = Boolean(base.requestId && (currentCall()?.allowUnattributed ?? getConfig().multiAgent.allowUnattributedCalls));
+  const requestOwnsTarget = !options.member || agentFamiliesForCaller(base).length > 0;
   const resolved =
     base.conversationId ??
-    (await awaitFreshCallOrigin('agents', startedAt, window, {
+    requestCorrelation(base.requestId)?.conversationId ??
+    (allowRequest && requestOwnsTarget ? null : await awaitFreshCallOrigin('agents', startedAt, window, {
       ...options,
       // ChatGPT's own id for this request, when it sent one. It names the conversation
       // outright, so two workers calling at the same moment are no longer a hard case.
@@ -1599,24 +1512,33 @@ async function callerNow(startedAt: number, options: { exact?: boolean } = {}): 
     }));
   const caller: Caller = {
     ...base,
-    conversationId: resolved
+    conversationId: resolved,
+    runId: options.runId
   };
+  const call = currentCall();
+  if (call) call.caller.runId = options.runId;
   if (resolved) {
     const call = currentCall();
     if (call) call.caller.conversationId = resolved;
+    const proof = requestCorrelation(base.requestId);
+    if (proof?.conversationId === resolved) {
+      caller.sessionId = proof.sessionId;
+      if (call) call.caller.sessionId = proof.sessionId;
+    }
     // A pre-fix Compact & Resume can leave this exact app-opened replacement chat with its own
     // shadow session while the reusable-worker run is still bound to the source chat. Repair
     // only that durably-proven historical failure before membership is evaluated; unrelated
     // conversations still hit AGENTS_BUSY exactly as before.
     await repairPrimeFromResumeShadow(resolved);
   }
-  if (!resolved) {
+  if (!resolved && !allowRequest) {
     logWarn(
       base.requestId
         ? `agents caller not identified: no page evidence matched HTTP request ${base.requestId.slice(0, 20)}…`
         : 'agents caller not identified: this MCP request carried no request id and page evidence was insufficient'
     );
   }
+  await reconcileAgentRequestOwners();
   await adoptAgent(agentForCaller(caller));
   return caller;
 }
@@ -1625,7 +1547,10 @@ async function callerNow(startedAt: number, options: { exact?: boolean } = {}): 
 // apply_patch adapter helpers
 // ---------------------------------------------------------------------------
 
-function applyPatchErrorText(error: unknown): string {
+function applyPatchErrorText(error: unknown, includeSourceContext = false): string {
+  if (error instanceof ApplyPatchError && includeSourceContext && error.sourceContext) {
+    return `${error.message}\n\n${error.sourceContext}`;
+  }
   return error instanceof PatchParseError || error instanceof ApplyPatchError ? error.message : friendlyError(error);
 }
 
@@ -1824,7 +1749,7 @@ async function runParsedPatch(
     );
   } catch (error) {
     return {
-      result: fail(`apply_patch verification failed: ${safePatchOutput(applyPatchErrorText(error), resolution)}`),
+      result: fail(`apply_patch verification failed: ${safePatchOutput(applyPatchErrorText(error, caps?.read === true), resolution)}`),
       content: null,
       exitCode: null
     };
@@ -2387,3 +2312,4 @@ function boundedNumberedRead(
 }
 
 export type { ToolResult };
+import { firstTaskRoot } from '../skill-access.js';

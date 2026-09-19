@@ -1,4 +1,5 @@
 import { REASONING_EFFORTS } from '../shared/session.js';
+import { appearanceSchema } from './appearance-schema.js';
 /**
  * Non-secret settings, stored as one small JSON file in the app's userData folder.
  * No database: there are at most a handful of roots and a dozen booleans.
@@ -20,7 +21,6 @@ import {
   WRITE_CAPABILITIES,
   type Capabilities,
   DESKTOP_CAPABILITIES,
-  type ArtifactSettings,
   type CompactionSettings,
   type Config,
   type GoalSettings,
@@ -46,12 +46,10 @@ import { capabilitiesForPlatform } from './platform.js';
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
  * cannot drift apart.
  *
- * Recording starts ON. Everything the app is actually for — the readable timeline, Compact
- * & resume, and agent attribution — reads the recorded history, so an install that starts
- * with it off is an install where the main features silently do nothing. It writes only to
- * this app's own data folder and uploads nothing. Note this changes the default for *new*
- * configs only: an existing config already carries an explicit `record`, and a user who
- * turned it off keeps it off.
+ * Recording is always ON and retained without an age limit. Everything the app is actually
+ * for — the readable timeline, Compact & resume, and agent attribution — reads that durable
+ * history. It writes only to this app's own data folder and uploads nothing. The separate
+ * bounded image store keeps its own quota and explicit cleanup controls.
  *
  * Existing configs still keep every explicit permission choice. Fresh installs are different:
  * the Home screen is meant to start fully usable, so every tool permission and the agents
@@ -86,7 +84,7 @@ import { capabilitiesForPlatform } from './platform.js';
 const DEFAULT_CONTEXT_WINDOW = 400_000;
 const DEFAULT_SESSIONS: SessionSettings = {
   record: true,
-  retainDays: 30,
+  retainDays: 0,
   advisoryTokens: DEFAULT_CONTEXT_WINDOW,
   // Derived, never typed. The Chat panel writes `limit = threshold × 4/3` on every save,
   // so a default that did not already satisfy that relation would be a state the UI cannot
@@ -116,17 +114,6 @@ const DEFAULT_COMPACTION: CompactionSettings = {
   auto: true,
   autoTokens: DEFAULT_SESSIONS.advisoryTokens
 };
-/**
- * Default bound for `download_artifact`.
- *
- * 20 MiB covers generated images, PDFs and small archives without letting one call
- * fill the disk or blow the MCP result budget. Enforced before, during and after
- * the stream (see artifact-fetch/artifact-target), so a lying Content-Length helps nothing.
- */
-const DEFAULT_ARTIFACTS: ArtifactSettings = {
-  maxFileBytes: 20 * 1024 * 1024
-};
-
 /**
  * The goal loop's defaults.
  *
@@ -291,6 +278,8 @@ const configSchema = z.object({
     tunnelId: z.string().max(128), desktopTunnelId: z.string().max(128), pluginsTunnelId: z.string().max(128)
   })).max(11).refine(rows => new Set(rows.map(row => row.id)).size === rows.length, 'Duplicate setup profile').optional(),
   ui: z.object({
+    appearance: appearanceSchema.optional().catch(undefined),
+    autoContinue: z.boolean().optional().default(true),
     chatBrowser: z.enum(CHAT_BROWSERS).optional().default('chrome'),
     developerMode: z.boolean().optional(),
     finishTool: z.boolean().optional(),
@@ -326,6 +315,10 @@ const configSchema = z.object({
         .default(DEFAULT_SESSIONS.advisoryTokens),
       limitTokens: z.number().int().min(10_000).max(4_000_000).optional().default(DEFAULT_SESSIONS.limitTokens)
     })
+    // `record` and `retainDays` remain readable for old configs and wire compatibility, but
+    // they are no longer user choices. Normalizing here covers disk load, renderer saves,
+    // extension/config writers and direct updateConfig callers at one boundary.
+    .transform((sessions) => ({ ...sessions, record: true, retainDays: 0 }))
     .optional()
     .default({ ...DEFAULT_SESSIONS }),
   compaction: z
@@ -354,18 +347,6 @@ const configSchema = z.object({
     })
     .optional()
     .default({ ...DEFAULT_MULTI_AGENT }),
-  artifacts: z
-    .object({
-      maxFileBytes: z
-        .number()
-        .int()
-        .min(1)
-        .max(256 * 1024 * 1024)
-        .optional()
-        .default(DEFAULT_ARTIFACTS.maxFileBytes)
-    })
-    .optional()
-    .default({ ...DEFAULT_ARTIFACTS }),
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
   // every root and permission in it intact.
@@ -480,11 +461,10 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, backgroundChats: true },
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, backgroundChats: true, autoContinue: true },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
-    artifacts: { ...DEFAULT_ARTIFACTS },
     goal: { ...DEFAULT_GOAL },
     mcp: { ...DEFAULT_MCP }
   };
@@ -504,24 +484,11 @@ function conservativeRecoveryConfig(): Config {
     capabilities: { ...DEFAULT_CAPABILITIES },
     readOnly: true,
     multiAgent: { ...DEFAULT_MULTI_AGENT },
+    ui: { ...defaultConfig().ui, autoContinue: false },
     // A config file that could not be trusted is not consent to have a second model typing
     // into the user's chat, whatever the unreadable file said.
     goal: { ...DEFAULT_GOAL }
   };
-}
-
-/**
- * Repairs feature combinations that cannot work, without silently widening privacy settings.
- *
- * Goal Mode reads the local session transcript to decide whether another user turn is needed;
- * `/goal/draft` explicitly refuses a chat with no recorded session. Enabling recording behind
- * the user's back would be a privacy surprise, so the only safe repair is to keep recording off
- * and turn Goal off with it. Keeping this at the config boundary covers renderer, extension and
- * hand-edited/older config writers alike.
- */
-function enforceFeatureDependencies(config: Config): Config {
-  if (config.sessions.record || !config.goal.enabled) return config;
-  return { ...config, goal: { ...config.goal, enabled: false } };
 }
 
 /**
@@ -565,9 +532,7 @@ export async function loadConfig(): Promise<Config> {
       logError('Settings file was invalid and has been reset to defaults');
       current = conservativeRecoveryConfig();
     } else {
-      current = enforceFeatureDependencies(
-        adoptCurrentGoalPrompt(adoptWiderWindow(adoptAutoCompaction(recalibrateTokens(parsed.data))))
-      );
+      current = adoptCurrentGoalPrompt(adoptWiderWindow(adoptAutoCompaction(recalibrateTokens(parsed.data))));
       // Duplicate root names would make a virtual path ambiguous.
       const seen = new Set<string>();
       current.roots = current.roots.filter((r) => {
@@ -676,7 +641,7 @@ export function effectiveCapabilities(
 }
 
 async function persistConfig(next: Config): Promise<Config> {
-  const parsed = enforceFeatureDependencies(configSchema.parse(next));
+  const parsed = configSchema.parse(next);
   const tmp = `${configPath}.tmp`;
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(tmp, JSON.stringify(parsed, null, 2), 'utf8');

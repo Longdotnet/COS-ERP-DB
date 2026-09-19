@@ -65,7 +65,7 @@ const LIVE_DEPTH = 30;
 
 interface Message {
   id: string;
-  author: { role: string };
+  author: { role: string; name?: string };
   recipient: string;
   channel?: string;
   create_time?: number;
@@ -248,6 +248,7 @@ interface TurnEvidence {
   conversationConflict?: boolean;
   endMessageId?: string | null;
   calls: TurnCall[];
+  codeModeCalls?: Array<{ messageId: string; requestId: string | null; answered: boolean }>;
   requests?: Array<{ requestId: string; messageId: string | null; createTime: number | null }>;
   messages: Array<{
     messageId: string;
@@ -260,6 +261,17 @@ interface TurnEvidence {
     renderedHtml: string;
   }>;
   activities?: Array<{ messageId: string; label: string; order: number }>;
+  thoughtNotifications?: Array<{ messageId: string; kind: 'thought_notification' }>;
+  images?: Array<{
+    messageId: string;
+    assetId: string;
+    providerRole: 'tool' | 'assistant';
+    order: number;
+    partOrder: number;
+    createTime?: number | null;
+    width?: number;
+    height?: number;
+  }>;
 }
 
 /** One assistant turn section, carrying its own message model the way the page does. */
@@ -267,20 +279,28 @@ interface TurnFixture {
   id: string;
   messages: Message[];
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
-  rendered?: Array<string | { html: string }>;
+  rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
+  activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string }>;
+  images?: Array<{ assetId: string; clones?: number }>;
   staleStamp?: string;
   conversationProps?: Record<string, unknown>;
+  rect?: { top: number; bottom: number; left: number; right: number } | 'throw';
 }
 
 async function scan(
   fibers: Fiber[],
-  turnSections: TurnFixture[] = []
+  turnSections: TurnFixture[] = [],
+  repeatStableScan = false
 ): Promise<{
   rows: Descriptor[];
   version: number;
   scanToken: string;
   stamps: Array<string | null>;
   turnStamps: Array<string | null>;
+  messageStamps: Array<string | null>;
+  thoughtStamps: Array<string | null>;
+  imageStamps: Array<string | null>;
+  repeatedStampMutations: number;
   turns: TurnEvidence[];
 }> {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
@@ -296,6 +316,10 @@ async function scan(
     section.setAttribute('data-testid', 'conversation-turn-2');
     if (turn.id) section.setAttribute('data-turn-id', turn.id);
     if (turn.staleStamp !== undefined) section.setAttribute('data-clf-fiber-turn', turn.staleStamp);
+    if (turn.rect) section.getBoundingClientRect = () => {
+      if (turn.rect === 'throw') throw new Error('unavailable geometry');
+      return turn.rect as DOMRect;
+    };
     (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(
       turn.messages,
       turn.conversationProps
@@ -304,8 +328,33 @@ async function scan(
       const block = document.createElement('div');
       block.className = 'markdown';
       if (typeof entry === 'string') block.textContent = entry;
-      else block.innerHTML = entry.html;
+      else {
+        block.innerHTML = entry.html;
+        if (entry.nativeId) block.setAttribute('data-message-id', entry.nativeId);
+        if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
+        if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
+        if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
+      }
       section.append(block);
+    }
+    for (const entry of turn.activities ?? []) {
+      const row = document.createElement('span');
+      row.className = 'group/tool-message';
+      row.textContent = entry.label;
+      if (entry.staleThoughtStamp) row.setAttribute('data-clf-fiber-thought', entry.staleThoughtStamp);
+      (row as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
+      section.append(row);
+    }
+    for (const entry of turn.images ?? []) {
+      const add = () => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'group/imagegen-image';
+        const image = document.createElement('img');
+        image.src = `https://chatgpt.com/backend-api/estuary/content?id=${encodeURIComponent(entry.assetId)}&sig=private`;
+        wrapper.append(image);
+        section.append(wrapper);
+      };
+      for (let clone = 0; clone < Math.max(1, entry.clones ?? 1); clone++) add();
     }
     document.body.append(section);
   }
@@ -339,7 +388,22 @@ async function scan(
   );
 
   const data = await reply;
+  let repeatedStampMutations = 0;
+  if (repeatStableScan) {
+    const observer = new window.MutationObserver(() => {});
+    observer.observe(document.body, { subtree: true, attributes: true,
+      attributeFilter: ['data-clf-fiber-turn', 'data-clf-fiber-message', 'data-clf-fiber-thought'] });
+    window.dispatchEvent(new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce }, source: window }));
+    repeatedStampMutations = observer.takeRecords().length;
+    observer.disconnect();
+  }
   const stamps = elements.map((row) => row.getAttribute('data-clf-fiber'));
+  const messageStamps = [...document.querySelectorAll('.markdown')].map(node => node.getAttribute('data-clf-fiber-message'));
+  const thoughtStamps = [...document.querySelectorAll('[data-clf-fiber-thought], .group\\/tool-message')]
+    .filter(node => node.closest('[data-testid^="conversation-turn-"]'))
+    .map(node => node.getAttribute('data-clf-fiber-thought'));
+  const imageStamps = [...document.querySelectorAll('.group\\/imagegen-image img')]
+    .map(node => node.getAttribute('data-clf-fiber-image'));
   const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
     section.getAttribute('data-clf-fiber-turn')
   );
@@ -350,6 +414,10 @@ async function scan(
     scanToken: data.scanToken as string,
     stamps,
     turnStamps,
+    messageStamps,
+    thoughtStamps,
+    imageStamps,
+    repeatedStampMutations,
     turns: (data.turns ?? []) as TurnEvidence[]
   };
 }
@@ -362,6 +430,31 @@ const rowInTurn = (messages: Message[], turnMessages: Message[], collapsed = 0) 
 // --------------------------------------------------------------------- tests
 
 describe('reading a row out of the page', () => {
+  it('recognises a native result-only call without inventing its missing request parent', async () => {
+    // Observed provider shape: tool/api_tool.call_tool with invoked_resource,
+    // but no request message or metadata.parent_id in the rehydrated turn.
+    const result = answer('result-only', 'unused', 'read');
+    result.author.name = 'api_tool.call_tool';
+    delete result.metadata!.parent_id;
+    Object.defineProperty(result.content!, 'text', { get() { throw new Error('Result bytes must remain unread'); } });
+    const { rows, turns } = await scan([rowInTurn([result], [result])], [{ id: 'result-only-turn', messages: [result] }]);
+    expect(rows[0]).toMatchObject({ messageId: 'result-only', tool: 'read', app: APP, path: null, answered: true, localCount: 1 });
+    expect(turns[0]!.calls).toEqual([{ messageId: 'result-only', tool: 'read', order: 0,
+      answered: true, requestId: 'wfr_01a009', createTime: 1786873669.5 }]);
+  });
+
+  it.each(['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins', 'Chat On Steroids Backup', 'Gmail'])(
+    'keeps result-only metadata scoped to the exact supported connector %s', async app => {
+      const result = answer('result-scope', 'unused', 'read', app);
+      result.author.name = 'api_tool.call_tool';
+      delete result.metadata!.parent_id;
+      const { turns } = await scan([], [{ id: 'result-scope-turn', messages: [result, result] }]);
+      // Duplicate provider objects are ambiguous, including result-only shapes.
+      expect(turns[0]!.calls).toEqual([]);
+      const single = await scan([], [{ id: 'result-scope-turn', messages: [result] }]);
+      expect(single.turns[0]!.calls).toHaveLength(['Chat On Steroids Backup', 'Gmail'].includes(app) ? 0 : 1);
+    });
+
   /**
    * The regression the whole batch exists for. The group node is exactly `MAX_CLIMB`
    * levels up, which the old `up < MAX_CLIMB` stopped one short of, so this row — and
@@ -392,8 +485,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(10);
-    expect(rows[0]!.v).toBe(10);
+    expect(version).toBe(15);
+    expect(rows[0]!.v).toBe(15);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -434,6 +527,32 @@ describe('reading a row out of the page', () => {
  * source: a turn that rendered nothing still says exactly what it asked for.
  */
 describe('the calls a turn says it made', () => {
+  it.each(['pending', 'complete', 'wrong-request', 'missing-parent', 'duplicate-result', 'wrong-tool'])(
+    'waits for the exact enclosing native Code Mode result (%s)', async mode => {
+      const root: Message = { id: 'code-root', author: { role: 'assistant' }, recipient: 'functions.exec',
+        status: 'finished_successfully', metadata: { request_id: 'wfr_01a009', turn_exchange_id: 'batch', working_turn_id: 'work' } };
+      const first = request('batch-first', 'read', { parent: root.id });
+      const second = request('batch-second', 'read', { parent: first.id });
+      const firstResult = answer('batch-result-first', second.id, 'read');
+      const secondResult = answer('batch-result-second', firstResult.id, 'read');
+      firstResult.author.name = secondResult.author.name = 'api_tool.call_tool';
+      const result: Message = { id: 'code-result', author: { role: 'tool', name: 'functions.exec' },
+        recipient: 'all', status: 'finished_successfully', metadata: { parent_id: secondResult.id } };
+      for (const message of [first, second, firstResult, secondResult, result]) {
+        message.metadata = { ...message.metadata, request_id: 'wfr_01a009', turn_exchange_id: 'batch', working_turn_id: 'work' };
+      }
+      if (mode === 'wrong-request') result.metadata!.request_id = 'another-request';
+      if (mode === 'missing-parent') result.metadata!.parent_id = 'unseen-parent';
+      if (mode === 'wrong-tool') result.author.name = 'some_other.exec';
+      const following = request('ordinary-after-code', 'read', { parent: result.id });
+      const messages = [root, first, second, firstResult, secondResult,
+        ...(mode === 'pending' ? [] : [result]), ...(mode === 'duplicate-result' ? [result] : []),
+        ...(mode === 'complete' ? [following] : [])];
+      const { turns } = await scan([], [{ id: 'native-code-batch', messages }]);
+      expect(turns[0]!.calls.map(call => call.answered)).toEqual(mode === 'complete' ? [true, true, false] : [false, false]);
+      expect(turns[0]!.codeModeCalls).toEqual([{ messageId: root.id, requestId: 'wfr_01a009', answered: mode === 'complete' }]);
+    });
+
   /**
    * The live regression: 1.7.1 renamed the connector and split it in two, and this test
    * spelled only the old name. Every request on every page stopped being recognised as
@@ -660,6 +779,105 @@ describe('the calls a turn says it made', () => {
         renderedHtml: ''
       }
     ]);
+  });
+
+  it.each(['native', 'scoped', 'foreign', 'unknown', 'text-only', 'duplicate'])('stamps only exact current native message anchors (%s)', async mode => {
+    const message = authored('anchor-message', 'Public prose');
+    const block = { html: 'Public prose', staleMessageStamp: 'old-scan:0:old-message',
+      ...(mode === 'native' || mode === 'duplicate' ? { nativeId: message.id } : {}),
+      ...(mode === 'scoped' || mode === 'foreign' || mode === 'unknown' ? { fiberProps: {
+        messageId: mode === 'unknown' ? 'not-in-this-turn' : message.id,
+        conversation: { id: mode === 'foreign' ? 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' : THREAD }
+      } } : {}) };
+    const result = await scan([], [{ id: 'anchor-turn', messages: [message], conversationProps: { conversationId: THREAD },
+      rendered: mode === 'duplicate' ? [block, block] : [block] }]);
+    const expected = mode === 'native' || mode === 'scoped' ? `${result.scanToken}:0:anchor-message` : null;
+    expect(result.messageStamps).toEqual(mode === 'duplicate' ? [null, null] : [expected]);
+    expect(result.turns[0]!.messages[0]!.rawText).toBe('Public prose');
+  });
+
+  it.each(['exact', 'missing-scope', 'foreign', 'conflicting-scope', 'unknown', 'wrong-type', 'wrong-prefix', 'conflicting-id', 'private', 'tool', 'duplicate'])('joins typed preambles at native Fiber depths (%s)', async mode => {
+    const a = authored('public-a', 'Same public prose');
+    const b = authored('public-b', 'Same public prose');
+    const final = authored('public-final', 'Final');
+    const privateMessage = { ...authored('private', 'Hidden'), channel: 'analysis' };
+    const tool = request('tool', 'read');
+    const messages = [a, tool, privateMessage, b, final];
+    const branch = (id: string, conversationDepth: number) => {
+      let fiber: Fiber | null = null;
+      const key = mode === 'unknown' ? 'unknown' : mode === 'private' ? 'private' : mode === 'tool' ? 'tool' : id;
+      for (let depth = 57; depth >= 0; depth--) {
+        let props: Record<string, unknown> = {};
+        if (depth === 57) props = { turn: { messages } };
+        if (depth === conversationDepth && mode !== 'missing-scope') props = { conversation: { id: mode === 'foreign' ? 'other-chat' : THREAD } };
+        if (depth === 40 && mode === 'conflicting-scope') props = { conversationId: 'other-chat' };
+        if (depth === 11 || depth === 25) props = { item: { type: mode === 'wrong-type' ? 'thought' : 'preamble', key: `${mode === 'wrong-prefix' ? 'other-' : 'preamble-'}${key}` } };
+        if (depth === 4) props = { messageId: undefined, conversation: undefined, ...(mode === 'conflicting-id' ? { message: final } : {}) };
+        fiber = { memoizedProps: props, return: fiber };
+      }
+      return fiber!;
+    };
+    const blocks = [{ html: 'Same public prose', fiber: branch(a.id, 26) }, { html: 'Same public prose', fiber: branch(b.id, 35) }, { html: 'Final', nativeId: final.id }];
+    if (mode === 'duplicate') blocks.splice(1, 0, blocks[0]!);
+    const result = await scan([], [{ id: 'preamble-turn', messages, rendered: blocks }]);
+    const stamp = (id: string) => `${result.scanToken}:0:${id}`;
+    expect(result.messageStamps).toEqual(mode === 'exact' ? [stamp(a.id), stamp(b.id), stamp(final.id)]
+      : mode === 'duplicate' ? [null, null, stamp(b.id), stamp(final.id)] : [null, null, stamp(final.id)]);
+  });
+
+  it.each(['exact', 'empty-label', 'duplicate', 'conflicting-label', 'wrong-type', 'unknown-owner'])('stamps only exact typed thought notifications and retains duplicate DOM copies (%s)', async mode => {
+    const owner = '11111111-2222-4333-8444-555555555555';
+    const key = `thought-${mode === 'unknown-owner' ? 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' : owner}-7`;
+    const fiber = chain({ item: { type: mode === 'wrong-type' ? 'preamble' : 'thought', key } });
+    const activities = [
+      { label: mode === 'empty-label' ? '' : '任意の実行通知', fiber, staleThoughtStamp: 'old-scan:0:stale' },
+      ...(['duplicate', 'conflicting-label'].includes(mode)
+        ? [{ label: mode === 'conflicting-label' ? '別の表示' : '任意の実行通知', fiber }]
+        : [])
+    ];
+    const result = await scan([], [{ id: 'typed-thought-turn', messages: [thought(owner)], activities }], true);
+    const accepted = ['exact', 'empty-label', 'duplicate', 'conflicting-label'].includes(mode);
+    expect(result.turns[0]?.thoughtNotifications).toEqual(accepted
+      ? [{ messageId: `thought-${owner}-7`, kind: 'thought_notification' }]
+      : undefined);
+    expect(result.turns[0]?.activities ?? []).toEqual(mode === 'exact' || mode === 'duplicate'
+      ? [{ messageId: `thought-${owner}-7`, label: '任意の実行通知', order: 0 }]
+      : []);
+    expect(result.thoughtStamps).toEqual(accepted
+      ? activities.map(() => `${result.scanToken}:0:${encodeURIComponent(`thought-${owner}-7`)}`)
+      : activities.map(() => null));
+    expect(result.repeatedStampMutations).toBe(0);
+  });
+
+  it.each(['visible', 'overflow', 'zero', 'nonfinite', 'throw', 'offscreen'])('bounds viewport selection and reserves latest terminal/user boundary (%s)', async mode => {
+    const fixtures: TurnFixture[] = Array.from({ length: 10 }, (_, at) => ({ id: `turn-${at}`, messages: [authored(`message-${at}`, `Prose ${at}`)], staleStamp: 'stale:0' }));
+    fixtures[8]!.messages[0]!.end_turn = true;
+    fixtures[8]!.messages[0]!.status = 'finished_successfully';
+    fixtures[9]!.messages[0]!.author.role = 'user';
+    const visible = { top: 10, bottom: 100, left: 0, right: 300 };
+    for (let at = 0; at < (mode === 'overflow' ? 8 : 4); at++) fixtures[at]!.rect = mode === 'throw' ? 'throw'
+      : mode === 'zero' ? { ...visible, bottom: 10 } : mode === 'nonfinite' ? { ...visible, top: NaN }
+      : mode === 'offscreen' ? { ...visible, bottom: -10, top: -100 } : visible;
+    const result = await scan([], fixtures);
+    const selected = mode === 'visible' ? [0, 1, 2, 3, 8, 9] : [4, 5, 6, 7, 8, 9];
+    expect(result.turns.map(turn => turn.turnId)).toEqual(selected.map(at => `turn-${at}`));
+    expect(result.turns.find(turn => turn.turnId === 'turn-8')!.endMessageId).toBe('message-8');
+    expect(result.turnStamps).toEqual(fixtures.map((_, at) => selected.includes(at) ? `${result.scanToken}:${selected.indexOf(at)}` : null));
+  });
+
+  it('counts split visible groups once, preserves latest text budget and stable stamps', async () => {
+    const visible = { top: 10, bottom: 100, left: 0, right: 300 };
+    const long = 'Public text '.repeat(30_000);
+    const fixtures: TurnFixture[] = Array.from({ length: 8 }, (_, at) => ({ id: `budget-${at}`,
+      messages: [authored(`large-${at}`, long)], rendered: [{ html: 'Public text', nativeId: `large-${at}` }],
+      ...(at < 4 ? { rect: visible } : {}) }));
+    fixtures.splice(1, 0, { ...fixtures[0]!, rendered: [] });
+    const result = await scan([], fixtures, true);
+    expect(result.turns.map(turn => turn.turnId)).toEqual([0, 1, 2, 3, 6, 7].map(at => `budget-${at}`));
+    expect(result.turnStamps[0]).toBe(result.turnStamps[1]);
+    expect(result.turns[5]!.messages[0]!.rawText.length).toBeGreaterThan(200_000);
+    expect(result.turns.reduce((sum, turn) => sum + turn.messages.reduce((n, m) => n + m.rawText.length + m.renderedHtml.length, 0), 0)).toBeLessThanOrEqual(6 * 512 * 1024);
+    expect(result.repeatedStampMutations).toBe(0);
   });
 
   it('attaches rendered HTML only when a public message has one unique exact visible-text match', async () => {
@@ -897,7 +1115,62 @@ describe('the calls a turn says it made', () => {
     image.content = { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer', asset_pointer: 'image-test' }] };
     const { turns } = await scan([], [{ id: 'turn-image', messages: [image] }]);
     expect(turns[0]?.endMessageId).toBe('image-final');
-    expect(turns[0]?.messages).toEqual([]);
+    expect(turns[0]?.messages).toEqual([expect.objectContaining({ rawMessageId: 'image-final', rawText: '', role: 'assistant' })]);
+  });
+
+  it('owns multiple generated images by exact provider message and sediment asset identity', async () => {
+    const generated: Message = {
+      id: '3150f756-bf2d-45fa-ac0f-45010b2239fb',
+      author: { role: 'tool' },
+      recipient: 'all',
+      channel: 'final',
+      create_time: 1789552000.25,
+      status: 'finished_successfully',
+      end_turn: false,
+      content: {
+        content_type: 'multimodal_text',
+        parts: [
+          { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_00000000000000000000000000000001', width: 1254, height: 1254 },
+          { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_00000000000000000000000000000002', width: 1024, height: 768 }
+        ]
+      }
+    };
+    const result = await scan([], [{
+      id: generated.id,
+      messages: [generated],
+      images: [
+        { assetId: 'file_00000000000000000000000000000001', clones: 6 },
+        { assetId: 'file_00000000000000000000000000000002', clones: 3 }
+      ]
+    }]);
+
+    expect(result.turns[0]?.messages).toEqual([]);
+    expect(result.turns[0]?.endMessageId ?? null).toBeNull();
+    expect(result.turns[0]?.images).toEqual([
+      expect.objectContaining({ messageId: generated.id, assetId: 'file_00000000000000000000000000000001', providerRole: 'tool', providerStatus: 'finished_successfully', order: 0, partOrder: 0, width: 1254, height: 1254 }),
+      expect.objectContaining({ messageId: generated.id, assetId: 'file_00000000000000000000000000000002', providerRole: 'tool', providerStatus: 'finished_successfully', order: 0, partOrder: 1, width: 1024, height: 768 })
+    ]);
+    expect(result.imageStamps).toHaveLength(9);
+    expect(result.imageStamps.every(stamp => stamp?.startsWith(`${result.scanToken}:0:`))).toBe(true);
+    expect(result.imageStamps[0]).toContain(encodeURIComponent('file_00000000000000000000000000000001'));
+    expect(result.imageStamps[6]).toContain(encodeURIComponent('file_00000000000000000000000000000002'));
+  });
+
+  it('keeps generated-image metadata but refuses an ambiguous pixel node and private messages', async () => {
+    const visible: Message = {
+      id: '4150f756-bf2d-45fa-ac0f-45010b2239fb', author: { role: 'tool' }, recipient: 'all', channel: 'final',
+      content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_00000000000000000000000000000003' }] }
+    };
+    const conflicting = { ...visible, id: '7150f756-bf2d-45fa-ac0f-45010b2239fb' };
+    const hidden = { ...visible, id: '5150f756-bf2d-45fa-ac0f-45010b2239fb', metadata: { is_visually_hidden_from_conversation: true } };
+    const analysis = { ...visible, id: '6150f756-bf2d-45fa-ac0f-45010b2239fb', author: { role: 'assistant' }, channel: 'analysis' };
+    const result = await scan([], [{ id: visible.id, messages: [visible, conflicting, hidden, analysis], images: [
+      { assetId: 'file_00000000000000000000000000000003', clones: 2 }
+    ] }]);
+
+    expect(result.turns[0]?.images).toHaveLength(2);
+    expect(result.turns[0]?.images?.map(image => image.messageId)).toEqual([visible.id, conflicting.id]);
+    expect(result.imageStamps).toEqual([null, null]);
   });
 
   it('does not reuse an old text completion while a newer image answer is still running', async () => {

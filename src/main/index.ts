@@ -1,3 +1,5 @@
+import { stopInputStartup } from './session/start-input.js';
+import { browserExtensionRequired } from '../shared/types.js';
 import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js';
 /**
  * Main process entry: window, tray, and the security posture for the renderer.
@@ -12,10 +14,10 @@ import { getChatModels, restoreChatModels, startChatModelDiscovery } from './cha
 import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLogOnCrash } from './logger.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
-import { initSkills } from './skills.js';
 import { pluginManager } from './plugins/manager.js';
 import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
-import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
+import { flushSessions, initSessionStore } from './session/store.js';
+import { initSkillsPath } from './skills.js';
 import { usageOverview } from './session/usage.js';
 import {
   flushRecorder,
@@ -32,6 +34,7 @@ import {
   onSwarmPersistNow,
   pauseSwarmForDisable,
   repairPrimeConversationAfterRecovery,
+  reconcileAgentRequestOwners,
   restoreRetiredWorkers,
   restoreSwarm,
   snapshotRetiredWorkers,
@@ -60,10 +63,9 @@ import {
   setContinuationRecoveryHooks,
   type ContinuationSnapshot
 } from './session/continuation.js';
-import { startSessionRetentionMaintenance } from './session/retention.js';
 import { runShutdownSequence } from './shutdown.js';
 import { applyStagedUpdate, startUpdateChecks } from './update.js';
-import { UI_BASE_ZOOM, windowLayoutForWorkArea, titleBarOverlayForTheme } from './window-layout.js';
+import { UI_BASE_ZOOM, windowLayoutForWorkArea, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { openInPreferredBrowser } from './browser.js';
 import {
   applyLoginStartup,
@@ -90,7 +92,6 @@ let tray: Tray | null = null;
 let quitting = false;
 let shutdownStarted = false;
 let shutdownComplete = false;
-let stopSessionRetention: (() => void) | null = null;
 const usageWarmup = new AbortController();
 
 // The fork deliberately runs beside the installed upstream app. Configure Electron identity and
@@ -113,15 +114,16 @@ function createWindow(): void {
   window = new BrowserWindow({
     ...layout,
     ...(icon ? { icon } : {}),
-    fullscreenable: false,
+    // Preserve the native macOS green-button fullscreen action.
+    fullscreenable: process.platform === 'darwin',
     show: false,
     autoHideMenuBar: true,
     ...(process.platform === 'win32' ? {
       titleBarStyle: 'hidden' as const,
-      titleBarOverlay: titleBarOverlayForTheme(getConfig().ui.theme)
+      titleBarOverlay: titleBarOverlayForTheme(getConfig().ui.theme, getConfig().ui.appearance)
     } : {}),
     // Painted before the renderer loads, so a dark window never flashes white.
-    backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
+    backgroundColor: windowBackgroundForTheme(getConfig().ui.theme, getConfig().ui.appearance),
     title: cosErpDbIdentity.displayName,
     webPreferences: {
       zoomFactor: UI_BASE_ZOOM,
@@ -138,9 +140,9 @@ function createWindow(): void {
   if (process.platform === 'win32') window.removeMenu();
 
   // First use discovers the account once. A restored catalog is immediately usable;
-  // showing the window again cannot refresh it or open another browser attempt.
+  // showing the window again may observe an existing page, never open another browser attempt.
   window.on('show', () => {
-    if (!quitting && getChatModels().state === 'unknown') void startChatModelDiscovery(true)
+    if (!quitting && getChatModels().state === 'unknown') void startChatModelDiscovery(false)
       .catch(error => logWarn(`model discovery on window open: ${error.message}`));
   });
   window.once('ready-to-show', () => {
@@ -310,12 +312,12 @@ void app.whenReady().then(async () => {
   initSecretsPath(userData);
   initDatabaseSubsystem(userData);
   initSessionStore(userData);
+  try { await initSkillsPath(userData); }
+  catch (error) { logWarn(`Skills library unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   initDurableStore(userData);
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
-  try { await initSkills(userData); }
-  catch (error) { logWarn(`Skills could not initialize: ${error instanceof Error ? error.message : String(error)}`); }
   await pluginManager.initialize(userData);
   if (windowActivation.isDisabled()) return;
   try { applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
@@ -400,6 +402,8 @@ void app.whenReady().then(async () => {
   if (windowActivation.isDisabled()) return;
   await restoreContinuations(savedContinuations);
   if (windowActivation.isDisabled()) return;
+  await reconcileAgentRequestOwners();
+  if (windowActivation.isDisabled()) return;
 
   // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -407,7 +411,7 @@ void app.whenReady().then(async () => {
       responseHeaders: {
         ...details.responseHeaders,
         'Content-Security-Policy': [
-          "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+          "default-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
         ]
       }
     });
@@ -447,22 +451,11 @@ void app.whenReady().then(async () => {
   // traffic, so never make startup/reload wait behind years of old session history.
   queueDeterministicAttributionRepair();
 
-  // The bridge serves recording and multi-agent mode both: recording needs the
-  // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
-  // Either switch being on starts it. ipc.ts applies the same rule on a settings save.
-  if (getConfig().sessions.record || getConfig().multiAgent.enabled) {
+  // Recording, workers and direct browser tools share one extension transport.
+  // ipc.ts uses the same eligibility rule when settings change.
+  if (browserExtensionRequired(getConfig())) {
     void startBridge();
   }
-  // Retention governs recordings already stored on disk, independent of whether recording is
-  // currently enabled. The tray app can stay alive for days, so run once now and keep a coarse
-  // maintenance timer rather than making expiry depend on the next process restart.
-  stopSessionRetention = startSessionRetentionMaintenance({
-    retainDays: () => getConfig().sessions.retainDays,
-    prune: pruneSessions,
-    onRemoved: (removed) => logInfo(`removed ${removed} session(s) past the retention window`),
-    onError: (err) => logError(`session pruning failed: ${err.message}`)
-  });
-
   if (getConfig().ui.autoConnect) void connect();
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
@@ -503,8 +496,7 @@ app.on('will-quit', (event) => {
   event.preventDefault();
   if (shutdownStarted) return;
   shutdownStarted = true;
-  stopSessionRetention?.();
-  stopSessionRetention = null;
+  stopInputStartup();
   tray?.destroy();
   tray = null;
 

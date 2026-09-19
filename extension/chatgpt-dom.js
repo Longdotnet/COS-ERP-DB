@@ -23,7 +23,12 @@
  */
 
 var CLF_DOM = (() => {
-  const TURN = 'section[data-testid^="conversation-turn"]';
+  // @ehkogh/#318: an alternate exchange contains both roles. Keep the native
+  // structure intact; the MAIN reader supplies exact message ids on its slots.
+  const SHELL_TURN = '[data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key]';
+  const SHELL_UNIT = '[data-content-search-unit-key]';
+  const TURN = `section[data-testid^="conversation-turn"], ${SHELL_TURN}`;
+  const PICKER = '[data-testid="composer-intelligence-picker-content"], [data-model-picker-view]';
   // ChatGPT has used both shapes in the live renderer: the older tool-message span
   // and, as of 2026-08-15, a display-contents row wrapping the visible tool label.
   // Keep both explicit structural anchors; hashed CSS-module names remain off limits.
@@ -35,7 +40,7 @@ var CLF_DOM = (() => {
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"]';
-  const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
+  const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i], form[data-chatgpt-composer] button[type="submit"]';
   /** The composer's own trailing controls, where the send and dictation buttons live. */
   const TRAILING =
     '[data-testid="composer-trailing-actions"], [data-testid="composer-footer-actions"], ' +
@@ -193,7 +198,7 @@ var CLF_DOM = (() => {
         if (parts.length > 0) return parts.join('\n');
       }
       if (role === 'assistant') {
-        const parts = [...node.querySelectorAll('.markdown')]
+        const parts = [...node.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"]')]
           .filter((part) => !(part.closest && part.closest('[data-interrupted]')))
           .filter((part) => !(part.closest && part.closest(TOOL)))
           .map((part) => text(part))
@@ -214,7 +219,7 @@ var CLF_DOM = (() => {
       // every repaint, so the strip has to happen before any fallback, not only in
       // pageText().
       stripOwn(clone);
-      for (const control of clone.querySelectorAll('button, [role="button"], [data-testid*="copy"], [data-testid*="feedback"]')) {
+      for (const control of clone.querySelectorAll('button, [role="button"], [data-testid*="copy"], [data-testid*="feedback"], [data-testid="assistant-message-reaction"]')) {
         control.remove();
       }
       // Everything the preferred path above excludes, excluded here too — otherwise the
@@ -387,7 +392,8 @@ var CLF_DOM = (() => {
     'data-turn',
     'data-turn-id',
     'data-testid',
-    'aria-label'
+    'aria-label', 'data-turn-key', 'data-content-search-turn-key', 'data-content-search-unit-key',
+    'data-clf-fiber-turn', 'data-clf-fiber-message'
   ];
 
   function invalidateFrom(record) {
@@ -396,6 +402,8 @@ var CLF_DOM = (() => {
     const element = target.nodeType === 1 ? target : target.parentElement;
     const section = element && typeof element.closest === 'function' ? element.closest(TURN) : null;
     if (section) sectionCache.delete(section);
+    const slot = element?.closest?.(SHELL_UNIT);
+    if (slot) sectionCache.delete(slot);
   }
 
   function ensureCacheObserver() {
@@ -438,10 +446,10 @@ var CLF_DOM = (() => {
     const memo = memoOf(section);
     if (memo && memo.rows) return memo.rows;
     const rows = [];
-    for (const node of section.querySelectorAll('[data-message-id]')) {
-      const id = node.getAttribute('data-message-id');
+    for (const node of [...(section.matches?.(SHELL_UNIT) ? [section] : []), ...section.querySelectorAll(`[data-message-id], ${SHELL_UNIT}`)]) {
+      const id = messageIdOf(node);
       if (!id) continue;
-      const roleAttr = node.getAttribute('data-message-author-role') || '';
+      const roleAttr = node.getAttribute('data-message-author-role') || shellRole(node);
       const readable = roleAttr === 'user' || roleAttr === 'assistant';
       rows.push({ id, roleAttr, text: readable ? messageText(node, roleAttr) : null, node });
     }
@@ -465,12 +473,35 @@ var CLF_DOM = (() => {
     return parts;
   }
 
+  const shellRole = node => /:(user|assistant)$/.exec(node?.getAttribute?.('data-content-search-unit-key') || '')?.[1] || '';
+  function turnIdOf(section) {
+    return section?.matches?.(SHELL_TURN) ? section.querySelector('[data-content-search-turn-key]')?.getAttribute('data-content-search-turn-key') || null
+      : section?.getAttribute?.('data-turn-id') || null;
+  }
+  function messageIdOf(node) {
+    const explicit = node?.getAttribute?.('data-message-id');
+    if (explicit) return explicit;
+    // The slot's layout key is not a message UUID. Only a current same-exchange
+    // MAIN stamp can join it to the actual typed item; stale stamps fail closed.
+    const section = node?.closest?.(SHELL_TURN), turn = section?.getAttribute('data-clf-fiber-turn');
+    const stamp = node?.getAttribute?.('data-clf-fiber-message');
+    if (!turn || node.getAttribute('data-clf-fiber-turn') !== turn || !stamp?.startsWith(`${turn}:`)) return null;
+    try { return decodeURIComponent(stamp.slice(turn.length + 1)) || null; } catch { return null; }
+  }
   function turns() {
     return safe(() => {
       const out = [];
       let previous = null;
       for (const node of document.querySelectorAll(TURN)) {
-        const id = node.getAttribute('data-turn-id');
+        if (node.closest?.(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`)) continue;
+        const id = turnIdOf(node);
+        if (node.matches?.(SHELL_TURN)) {
+          const users = [...node.querySelectorAll('[data-content-search-unit-key$=":user"]')].filter(slot => slot.closest('[data-turn-key]') === node);
+          if (users.length !== 1 || !id) continue;
+          out.push({ node: users[0], nodes: [users[0]], id, role: 'user' });
+          if (node.querySelector('[data-chatgpt-agent-turn-start], [data-content-search-unit-key$=":assistant"]')) out.push({ node, nodes: [node], id, role: 'assistant' });
+          previous = null; continue;
+        }
         const role = node.getAttribute('data-turn');
         if (previous && id && previous.id === id && previous.role === role) {
           previous.nodes.push(node);
@@ -483,7 +514,9 @@ var CLF_DOM = (() => {
     }, []);
   }
 
-  const presentationTurns = turns;
+  // This compatibility change records the alternate page, it does not replace its
+  // activity/answer UI. Classic Overwrite behavior keeps its own exact anchors.
+  const presentationTurns = () => turns().filter(turn => !turn.node.closest?.(SHELL_TURN));
 
   const turnNodes = (turn) =>
     turn && Array.isArray(turn.nodes) && turn.nodes.length > 0 ? turn.nodes : turn && turn.node ? [turn.node] : [];
@@ -495,6 +528,26 @@ var CLF_DOM = (() => {
    * clamped by ChatGPT, and the clamped part is exactly the part a five-hour session
    * cannot afford to lose.
    */
+  // Read only the native badge beneath its exact stable user-message node. A
+  // neighbouring assistant, quoted markup or recycled turn id cannot own it.
+  const reactionSegments = new Intl.Segmenter('en', { granularity: 'grapheme' });
+  function userMessageReaction(message) {
+    if (message.role !== 'user' || !message.id || !message.node) return undefined;
+    const holders = [...message.node.querySelectorAll('[data-message-author-role="user"][data-message-id]')];
+    if (message.node.matches?.('[data-message-author-role="user"][data-message-id]')) holders.push(message.node);
+    const owned = holders.filter(node => node.getAttribute('data-message-id') === message.id);
+    if (owned.length !== 1) return undefined;
+    const badges = [...owned[0].querySelectorAll('[data-testid="assistant-message-reaction"][role="img"]')]
+      .filter(node => node.closest('[data-message-id]') === owned[0] && !node.closest('.markdown, .whitespace-pre-wrap'));
+    if (!badges.length) return null;
+    if (badges.length !== 1) return undefined;
+    const emoji = badges[0].textContent?.trim() || '';
+    // Keep aligned with shared/message-reaction.ts (extension ships unbundled).
+    return emoji.length <= 32 && /^(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|\p{Emoji_Modifier}|[\u200d\ufe0f\u20e3\u{e0020}-\u{e007f}0-9#*])+$/u.test(emoji) &&
+      /[\p{Extended_Pictographic}\p{Regional_Indicator}\u20e3]/u.test(emoji) &&
+      [...reactionSegments.segment(emoji)].length === 1 ? emoji : undefined;
+  }
+
   function messages() {
     return safe(() => {
       const out = [];
@@ -527,6 +580,7 @@ var CLF_DOM = (() => {
           if (seen.has(row.id)) continue;
           const role = row.roleAttr || turn.role;
           if (role !== 'user' && role !== 'assistant') continue;
+          if (section.closest?.(SHELL_TURN) && role !== turn.role) continue;
           seen.add(row.id);
           explicit++;
           out.push({
@@ -548,7 +602,7 @@ var CLF_DOM = (() => {
       // fallback when there is no explicit assistant message and only collect
       // markdown outside progress/tool containers. content.js itself waits until the
       // turn has stopped generating before recording this as the final answer.
-      if (turn.role === 'assistant' && explicit === 0) {
+      if (turn.role === 'assistant' && explicit === 0 && !nodes[0]?.matches?.(SHELL_TURN)) {
         const parts = [];
         for (const section of nodes) {
           for (const value of sectionParts(section)) {
@@ -644,7 +698,8 @@ var CLF_DOM = (() => {
 
   /** Stop is a busy hint only; the exact provider terminal still owns turn completion. */
   function generating() {
-    return safe(() => nativeComposerControls(STOP).length > 0, false);
+    return safe(() => nativeComposerControls(STOP).length > 0 ||
+      [...document.querySelectorAll(SHELL_TURN)].some(node => !node.closest(`${OWN_SURFACES},.markdown,[contenteditable]`) && node.getAttribute('data-clf-shell-running') === location.pathname), false);
   }
 
   function stopButton() {
@@ -1372,7 +1427,13 @@ var CLF_DOM = (() => {
   }
 
   function composer() {
-    return safe(() => document.querySelector('#prompt-textarea'), null);
+    return safe(() => {
+      const classic = document.querySelector('#prompt-textarea');
+      if (classic) return classic;
+      const candidates = [...document.querySelectorAll('form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]')]
+        .filter(node => !node.closest(`${OWN_SURFACES},[data-turn-key],.markdown,[hidden],[aria-hidden="true"],[inert]`));
+      return candidates.length === 1 ? candidates[0] : null;
+    }, null);
   }
 
   /**
@@ -1493,6 +1554,7 @@ var CLF_DOM = (() => {
     return safe(() => {
       for (const turn of turns()) {
         for (const section of turnNodes(turn)) {
+          if (section.matches?.(SHELL_UNIT) && shellRole(section) === 'user' && messageIdOf(section)) return section;
           for (const node of section.querySelectorAll('[data-message-id]')) {
             const role = node.getAttribute('data-message-author-role') || turn.role;
             if (role === 'assistant') return null;
@@ -1520,103 +1582,257 @@ var CLF_DOM = (() => {
     }, null);
   }
 
-  /**
-   * Stable mount point for the extension-owned activity stream of one assistant turn.
-   * The stream is a sibling of ChatGPT's own activity, so replacing a tool/reasoning
-   * subtree cannot take the local transcript with it.
-   */
-  function turnMount(turn) {
+  const ACTIVITY_CONTROL = 'button, [role="button"], a[href], input, select, textarea';
+  const hiddenActivityBySection = new WeakMap();
+
+  /** Native answer/media and React controls are never represented by local activity.
+   * Re-evaluate on each existing paint: a once-empty container may gain output. */
+  function canHideActivity(node) {
     return safe(() => {
-      const sections = turnNodes(turn);
-      const host = sections[0] || null;
-      if (!host) return null;
-
-      // Where ChatGPT itself put this turn's activity. Anchoring there is the whole point:
-      // the stream stands in for that block, so it has to occupy the same place in the
-      // turn. Mounting at the top of the section instead — which is what this did — lifted
-      // every reconstructed call and caption above the commentary and prose they belong
-      // between, and made a long turn read as if all the work happened first.
-      for (const section of sections) {
-        for (const box of progressRoots(section)) {
-          if (box.closest && box.closest(OWN_SURFACES)) continue;
-          if (box.parentElement) return { host: box.parentElement, before: box };
+      if (!node || node.matches?.('.clf-stream') || node.querySelector?.('.clf-stream')) return false;
+      const protectedOutput = '[class~="group/imagegen-image"], canvas, video, audio, summary, [role="toolbar"], [data-message-author-role], [data-clf-fiber-message]';
+      if (node.matches?.(protectedOutput) || node.querySelector?.(protectedOutput)) return false;
+      // Logos in connector controls are not answer images. Images outside those
+      // controls, native downloads and generated-output actions stay usable.
+      for (const image of node.querySelectorAll('img')) {
+        if (!image.closest('button, [role="button"]') || image.closest('[class~="group/imagegen-image"]')) return false;
+      }
+      if (node.querySelector?.('a[download], button[aria-label="Edit image"], button[aria-label="Share this image"]')) return false;
+      if ([...node.querySelectorAll('.markdown')].some(part =>
+        !part.closest(OWN_SURFACES) && text(part).length > 0)) return false;
+      // The live renderer does not wrap every public/interim line in `.markdown`.
+      // Text belonging to the tool leaf is replaceable; any other text (including
+      // Worked summaries) makes this an answer/progress owner and stops the climb.
+      const pending = [node];
+      while (pending.length) {
+        const current = pending.pop();
+        for (const child of current.childNodes || []) {
+          if (child.nodeType === 3) {
+            const parent = child.parentElement;
+            if (String(child.nodeValue || '').trim() &&
+                !parent?.closest?.(TOOL) && !parent?.closest?.(TOOL_LEGACY) &&
+                !parent?.closest?.(OWN_SURFACES)) return false;
+          } else if (child.nodeType === 1) pending.push(child);
         }
       }
+      return true;
+    }, false);
+  }
 
-      // No activity block yet. The answer is the only other fixed landmark, and the stream
-      // belongs above it: everything in the stream happened before the turn could answer.
-      for (const section of sections) {
-        for (const prose of section.querySelectorAll('.markdown')) {
-          if (prose.closest && (prose.closest(TOOL) || prose.closest(OWN_SURFACES))) continue;
-          if (prose.parentElement) return { host: prose.parentElement, before: prose };
+  /** Noninteractive native status captions have no result or action to preserve.
+   * The caller checks current native response identity and the Overwrite setting. */
+  function activitySummaryRows(turn) {
+    return safe(() => {
+      const interactive = `${ACTIVITY_CONTROL}, [tabindex]:not([tabindex="-1"]), [contenteditable="true"], [aria-expanded], [aria-controls]`;
+      return toolBlocks(turn).filter(row => !row.closest(`${OWN_SURFACES}, ${interactive}, ${CONNECTOR}, [data-clf-fiber-thought]`) &&
+        !row.querySelector('[data-clf-fiber-thought]') &&
+        !row.querySelector(`${interactive}, ${CONNECTOR}, pre, code, table, details`) && canHideActivity(row));
+    }, []);
+  }
+
+  /** Exact current typed-thought rows stamped by the matching MAIN-world scan. */
+  function thoughtActivityRows(turn, scanToken, turnIndex, messageIds) {
+    return safe(() => {
+      if (typeof scanToken !== 'string' || !scanToken || scanToken.length > 64 ||
+          !Number.isInteger(turnIndex) || turnIndex < 0 || !Array.isArray(messageIds) || messageIds.length > 200) return [];
+      const wanted = new Set();
+      for (const messageId of messageIds) {
+        if (typeof messageId !== 'string' || !messageId || messageId.length > 200) return [];
+        wanted.add(`${scanToken}:${turnIndex}:${encodeURIComponent(messageId)}`);
+      }
+      if (!wanted.size) return [];
+      const out = [];
+      for (const section of turnNodes(turn)) {
+        for (const row of section.querySelectorAll('[data-clf-fiber-thought]')) {
+          if (row.closest(OWN_SURFACES)) continue;
+          if (wanted.has(row.getAttribute('data-clf-fiber-thought'))) out.push(row);
         }
       }
+      return out;
+    }, []);
+  }
 
-      // Neither: append, rather than prepend. An assistant section with tool rows and no
-      // reasoning box renders those rows first, and the stream stands after them.
-      return { host, before: null };
-    }, null);
+  /** Controls in the leaf's immediate native branch belong to that tool disclosure. */
+  function activityControls(block) {
+    return new Set(block.parentElement?.querySelectorAll?.(ACTIVITY_CONTROL) || []);
   }
 
   /**
-   * Does this progress box also contain the turn's answer?
-   *
-   * ChatGPT's reasoning container can expand and reparent around content that started
-   * outside it, so a `[data-interrupted]` subtree is not reliably progress-only. Hiding
-   * one that has grown to hold the final prose is what leaves a turn showing "Worked for
-   * 45s" above an empty gap with no answer under it.
+   * Find the layout child whose removal also removes its flex/grid gap. Never cross the
+   * turn section, a native fold/progress owner, an uncovered row, or unrelated controls.
    */
-  function holdsAnswer(box) {
-    return safe(() => {
-      const prose = [...box.querySelectorAll('.markdown')].filter(
-        (node) => !(node.closest && node.closest(TOOL)) && !(node.closest && node.closest(OWN_SURFACES))
-      );
-      return prose.some((node) => text(node).length > 0);
-    }, true);
+  function activityHideTarget(block, section, blocks, covered, allowedControls) {
+    if (!canHideActivity(block)) return null;
+    let target = block;
+    for (let parent = target.parentElement; parent && parent !== section; parent = parent.parentElement) {
+      if (parent.matches?.('[data-interrupted], [data-clf-progress]') || !canHideActivity(parent)) break;
+      if (blocks.some(other => !covered.has(other) && parent.contains(other))) break;
+      if ([...parent.querySelectorAll(ACTIVITY_CONTROL)].some(control => !allowedControls.has(control))) break;
+      target = parent;
+    }
+    return target;
   }
 
-  /** Hides/restores only ChatGPT's own visible progress boxes for this logical turn. */
-  function hideProgress(turn, hidden) {
+  /** Publish one desired marker set without removing/readding unchanged targets every paint. */
+  function syncHiddenActivity(turn, desiredBySection) {
     return safe(() => {
       for (const section of turnNodes(turn)) {
-        const memo = memoOf(section);
-        if (memo && !memo.answers) memo.answers = new Map();
-        const boxes = memo && memo.boxes ? memo.boxes : [...section.querySelectorAll('[data-interrupted]')];
-        if (memo) memo.boxes = boxes;
-        for (const box of boxes) {
-          // Restoring is always safe; hiding is not. A box carrying the answer stays.
-          let holds = memo ? memo.answers.get(box) : undefined;
-          if (holds === undefined) {
-            holds = holdsAnswer(box);
-            if (memo) memo.answers.set(box, holds);
-          }
-          if (hidden && !holds) box.setAttribute('data-clf-native-hidden', '1');
-          else box.removeAttribute('data-clf-native-hidden');
-        }
+        const desired = desiredBySection.get(section) || new Set();
+        const prior = new Set(hiddenActivityBySection.get(section) || []);
+        for (const marked of section.querySelectorAll('[data-clf-native-hidden]')) prior.add(marked);
+        for (const target of prior) if (!desired.has(target)) target.removeAttribute('data-clf-native-hidden');
+        for (const target of desired) if (!prior.has(target)) target.setAttribute('data-clf-native-hidden', '1');
+        hiddenActivityBySection.set(section, desired);
       }
     }, undefined);
   }
 
+  function progressHideTargets(section, blocks) {
+    const targets = [];
+    for (const box of section.querySelectorAll('[data-interrupted], [data-clf-progress]')) {
+      if (!canHideActivity(box)) continue;
+      const localBlocks = blocks.filter(block => box.contains(block));
+      const allowed = new Set(localBlocks.flatMap(block => [...activityControls(block)]));
+      if ([...box.querySelectorAll(ACTIVITY_CONTROL)].some(control => !allowed.has(control))) continue;
+      targets.push(box);
+    }
+    return targets;
+  }
+
+  function hideActivity(turn, coveredBlocks, typedThoughtBlocks = [], summaryBlocks = [], presentation = null) {
+    const sections = turnNodes(turn);
+    const blocks = toolBlocks(turn);
+    const candidates = [...new Set([...blocks, ...(Array.isArray(typedThoughtBlocks) ? typedThoughtBlocks : [])])];
+    const desired = new Map(sections.map(section => [section, new Set()]));
+    const covered = new Set([
+      ...(Array.isArray(coveredBlocks) ? coveredBlocks : []),
+      ...(Array.isArray(typedThoughtBlocks) ? typedThoughtBlocks : []),
+      ...(Array.isArray(summaryBlocks) ? summaryBlocks : [])
+    ]);
+    const summaries = new Set(Array.isArray(summaryBlocks) ? summaryBlocks : []);
+    const allowedControls = new Set(candidates.filter(block => covered.has(block) && !summaries.has(block))
+      .flatMap(block => [...activityControls(block)]));
+    if (covered.size > 0) {
+      for (const block of candidates) {
+        if (!covered.has(block)) continue;
+        const section = sections.find(candidate => candidate.contains(block));
+        const target = section && activityHideTarget(block, section, candidates, covered, allowedControls);
+        if (target) desired.get(section).add(target);
+      }
+    }
+    syncHiddenActivity(turn, desired);
+    syncActivityLayout(turn, presentation);
+  }
+
   /**
-   * Mounts app-owned activity before one assistant turn without replacing ChatGPT's answer.
-   *
-   * The live React subtree remains the one renderer for prose, code/document blocks and action
-   * buttons. Overwrite owns only activity rows, mounted as a sibling so React cannot move them
-   * across a later user message. Turning it off removes only the marker/sibling; ChatGPT never
-   * has to reconstruct anything we destroyed.
+   * The native activity disclosure owns an immediately adjacent clipped height box.
+   * Its translated caption and React's hashed classes are not identity. Public message
+   * anchors or a mounted canonical projection must separately prove the content we reveal.
    */
-  function replaceActivity(turn, root, replaced) {
+  function activityFold(turn) {
+    return safe(() => {
+      const candidates = [];
+      for (const section of turnNodes(turn)) {
+        for (const button of section.querySelectorAll('button[aria-expanded="false"], button[aria-expanded="true"]')) {
+          if (button.closest(`${OWN_SURFACES}, .markdown, ${CONNECTOR}`)) continue;
+          const clip = button.nextElementSibling;
+          if (!clip || !clip.matches('div[data-item-anchor="start"][data-clip="true"][data-dimension="height"]')) continue;
+          candidates.push({ button, clip, section });
+        }
+      }
+      return candidates.length === 1 ? candidates[0] : null;
+    }, null);
+  }
+
+  function collapsedActivityFold(turn) {
+    const fold = activityFold(turn);
+    if (!fold || fold.button.getAttribute('aria-expanded') !== 'false' ||
+        [...fold.clip.childNodes].some(node => node.nodeType === 1 || String(node.nodeValue || '').trim())) return null;
+    return fold;
+  }
+
+  /** Presentation markers are rebuilt with the same paint as native suppression. Nothing
+   * clicks the disclosure, moves React children or changes its remembered open state. */
+  function syncActivityLayout(turn, presentation) {
+    const desired = new Map();
+    if (presentation) {
+      const fold = presentation.fold || activityFold(turn);
+      if (fold && (presentation.fold || (presentation.anchors || []).some(anchor => fold.clip.contains(anchor)))) {
+        desired.set(fold.button, 'header');
+        const hasContent = [...fold.clip.childNodes].some(node => node.nodeType === 1 || String(node.nodeValue || '').trim());
+        desired.set(fold.clip, hasContent ? 'clip' : 'empty-clip');
+      }
+      for (const gap of presentation.chunks || []) {
+        if (!gap.interim || gap.before || !gap.anchor?.isConnected) continue;
+        const section = turnNodes(turn).find(node => node.contains(gap.anchor));
+        if (!section) continue;
+        let step = null;
+        // A tool chunk is a sibling of its exact native interim. That message's trailing
+        // wrappers still carry native spacing after the chunk, producing the reported gap.
+        // Stop before another message, the activity clip or any native action container.
+        for (let parent = gap.anchor.parentElement; parent && parent !== section && parent !== fold?.clip; parent = parent.parentElement) {
+          const messages = [...parent.querySelectorAll('[data-clf-fiber-message]')].filter(node => !node.closest(OWN_SURFACES));
+          if (messages.length !== 1 || messages[0] !== gap.anchor ||
+              [...parent.querySelectorAll('button, summary, [role="toolbar"], [data-message-author-role="user"]')]
+                .some(node => !node.closest(OWN_SURFACES))) break;
+          desired.set(parent, 'step');
+          step = parent;
+        }
+        // Only the native list directly grouping these proven message wrappers loses its
+        // large inter-item gap. Paragraphs, code blocks and the final answer keep their CSS.
+        const stack = step?.parentElement;
+        if (stack && stack !== section && stack !== fold?.clip && !stack.closest('.markdown')) {
+          const style = getComputedStyle(stack);
+          if (style.display === 'flex' && style.flexDirection === 'column') desired.set(stack, 'stack');
+        }
+      }
+    }
+    for (const section of turnNodes(turn)) {
+      for (const node of section.querySelectorAll('[data-clf-activity-part]')) {
+        if (!desired.has(node)) node.removeAttribute('data-clf-activity-part');
+      }
+    }
+    for (const [node, value] of desired) {
+      if (node.getAttribute('data-clf-activity-part') !== value) node.setAttribute('data-clf-activity-part', value);
+    }
+  }
+
+  /** Keep the native folded progress owner whenever it contains prose/media/chunks. */
+  function hideProgress(turn, hidden) {
+    const sections = turnNodes(turn);
+    const blocks = toolBlocks(turn);
+    const desired = new Map(sections.map(section => [section, new Set()]));
+    if (hidden) {
+      for (const section of sections) {
+        for (const target of progressHideTargets(section, blocks)) desired.get(section).add(target);
+      }
+    }
+    syncHiddenActivity(turn, desired);
+  }
+
+  /** Place only our chunk beside its proven native anchor; never reparent React nodes. */
+  function replaceActivity(turn, root, replaced, placement = null) {
     return safe(() => {
       const sections = turnNodes(turn);
-      if (sections.length === 0) return false;
+      if (!sections.length) return false;
       for (const section of sections) {
         if (replaced) section.setAttribute('data-clf-turn-replaced', '1');
         else section.removeAttribute('data-clf-turn-replaced');
       }
-      const embedded = Boolean(root && sections.some((section) => root.parentElement === section));
-      if (replaced && root && (!root.isConnected || embedded)) {
-        const first = sections[0];
-        if (first && first.parentElement) first.parentElement.insertBefore(root, first);
+      if (replaced && root) {
+        const anchor = placement && placement.anchor;
+        if (anchor) {
+          if (!anchor.isConnected || !sections.some(section => section.contains(anchor)) || !anchor.parentElement) return false;
+          if (!placement.before && anchor.nextSibling === root) return true;
+          const before = placement.before ? anchor : anchor.nextSibling;
+          if (root.parentElement !== anchor.parentElement || root.nextSibling !== before) anchor.parentElement.insertBefore(root, before);
+        } else {
+          const first = sections[0];
+          if (!first.parentElement) return false;
+          // A tool-only response has no authored separator. Keep the existing
+          // response sibling stable through React's temporary host moves.
+          if (!root.isConnected || sections.includes(root.parentElement)) first.parentElement.insertBefore(root, first);
+        }
       }
       return true;
     }, false);
@@ -1691,7 +1907,7 @@ var CLF_DOM = (() => {
     }, false);
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null } = {}) {
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null } = {}) {
     try {
       const box = composer();
       if (!box || !box.isConnected || !stillCurrent() || generating() || stopButton()) return false;
@@ -1726,11 +1942,14 @@ var CLF_DOM = (() => {
           const message = visible[at];
           if (message.role !== 'user') continue;
           if (!priorUserNodes.has(message.node) && !priorUserIds.has(message.id) && (matchesUser ? matchesUser(message, submitted) : compact(message.text) === expected)) {
+            if (acceptUserReceipt && !acceptUserReceipt(message, currentConversation)) continue;
             submittedMessageObserved = true;
             return true;
           }
         }
-        if (currentConversation !== beforeConversation) return false;
+        // Receipt-owned delivery must settle on this exact native row. Composer clear
+        // or Stop alone cannot hand off a receipt, and a later DOM read can lose it.
+        if (acceptUserReceipt || currentConversation !== beforeConversation) return false;
         const current = composer();
         if (current === box && box.isConnected && (current.textContent || '').trim() === '') return true;
         if (!beforeGenerating && generating()) return true;
@@ -1783,6 +2002,10 @@ var CLF_DOM = (() => {
                 !sendButtonEnabled(button) || box.getAttribute('aria-disabled') === 'true' ||
                 box.getAttribute('contenteditable') === 'false') return finish(false);
             attempted = true;
+            // The deadline bounds readiness, not an already-dispatched receipt.
+            // Keep this same observer and exact send lifetime until the provider
+            // publishes its identity; never click again because that is delayed.
+            if (acceptUserReceipt && timer !== null) { clearTimeout(timer); timer = null; }
             try { button.click(); } catch { return finish(false); }
             check(); // Synchronous navigation/cancellation during click also re-proves ownership.
           };
@@ -1804,7 +2027,7 @@ var CLF_DOM = (() => {
         if (observeEvidence) unsubscribeEvidence = observeEvidence(check);
         // Readiness and acceptance share one deadline below the app's command lease.
         const timeout = Number.isFinite(acceptanceTimeoutMs) ? Math.max(1, Math.min(30000, acceptanceTimeoutMs)) : 30000;
-        timer = setTimeout(() => { if (attempted) check(); finish(false); }, timeout);
+        timer = setTimeout(() => { if (attempted) check(); if (!attempted || !acceptUserReceipt) finish(false); }, timeout);
         check();
       });
     } catch {
@@ -1926,7 +2149,7 @@ var CLF_DOM = (() => {
     });
   }
 
-  const normalizeModelLabel = value => String(value || '').toLowerCase().replace(/[^a-z0-9.]/g, '');
+  const normalizeModelLabel = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}.]/gu, '');
   /** One bounded read through the existing MAIN-world helper; no provider API or setters. */
   function readPickerState() {
     return new Promise(resolve => {
@@ -1936,7 +2159,7 @@ var CLF_DOM = (() => {
         const data = event.data;
         if (event.source !== window || event.origin !== location.origin || data?.source !== 'clf-picker-reply' || data.nonce !== nonce || data.v !== 1) return;
         const state = data.picker;
-        const groupId = value => typeof value === 'string' && /^[a-zA-Z0-9._ -]{1,80}$/.test(value) && value.trim() === value && value.trim();
+        const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._ -]+$/u.test(value) && value.trim() === value && value.trim();
         const valid = state && typeof state.version === 'string' && Number.isInteger(state.currentBucket) &&
           Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 20 &&
           state.versions.every(v => groupId(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
@@ -1955,30 +2178,37 @@ var CLF_DOM = (() => {
   }
   /** UI only transports a requested selection. Provider state proves identity and availability. */
   function modelPickerTrigger() {
-    const candidates = [...(composer()?.closest('form')?.querySelectorAll('button[aria-haspopup="menu"]') || [])]
-      .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 &&
+    const reported = '[data-codex-intelligence-trigger],[data-composer-navigation-target="reasoning"]';
+    const candidates = [...new Set([...(composer()?.closest('form')?.querySelectorAll('button[aria-haspopup="menu"]') || []),
+      ...document.querySelectorAll(reported)])]
+      .filter(node => node.matches('button,[role="button"]') && !node.closest(`${OWN_SURFACES},[data-testid^="conversation-turn"],[data-message-author-role],.markdown,[contenteditable],[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 &&
         node.id !== 'composer-plus-btn' && node.getAttribute('data-testid') !== 'composer-plus-btn');
-    return candidates.length === 1 ? candidates[0] : null;
+    const observed = candidates.filter(node => node.getAttribute('data-clf-picker-route') === location.pathname);
+    // Alternate native anchors are actionable only after MAIN identified their
+    // model owner. A quoted attribute or an effort value alone cannot authorize it.
+    return observed.length === 1 ? observed[0] : candidates.length === 1 && !candidates[0].matches(reported) ? candidates[0] : null;
   }
-  // Version rows can include a retirement caption below their primary label.
-  // Match the leading label subtree, not the whole row or an arbitrary substring
-  // in its description. Duplicate primary labels still fail closed at the caller.
-  function pickerVersionLabelMatches(row, label) {
-    const text = value => String(value || '').replace(/\s+/g, ' ').trim();
-    const expected = text(label);
-    let node = row;
-    for (let depth = 0; node && depth < 8; depth++) {
-      if (text(node.textContent) === expected) return true;
-      node = [...node.childNodes].find(child => text(child.textContent) &&
-        (child.nodeType === Node.TEXT_NODE || (child.nodeType === Node.ELEMENT_NODE &&
-          !child.matches('svg,[hidden],[aria-hidden="true"],[inert]'))));
+  /** Match the row's leading name, excluding secondary captions and decorations. */
+  function pickerVersionNamed(row, expected) {
+    const text = node => String(node.textContent || '').replace(/\s+/g, ' ').trim();
+    const name = expected.replace(/\s+/g, ' ').trim();
+    for (let node = row, depth = 0; node && depth < 8; depth++) {
+      if (text(node) === name) return true;
+      node = [...node.childNodes].find(child => text(child) &&
+        (child.nodeType === Node.TEXT_NODE || child.nodeType === Node.ELEMENT_NODE &&
+          !child.matches('svg,[hidden],[aria-hidden="true"],[inert]')));
     }
     return false;
   }
   function modelPickerAccess(stillCurrent) {
     const shown = node => node && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
-    const picker = () => document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+    const picker = () => document.querySelector(PICKER);
     const trigger = modelPickerTrigger;
+    let motion = null;
+    const openPicker = () => {
+      const panel = picker();
+      return panel && panel.closest('[role="menu"],[role="dialog"]')?.getAttribute('data-state') !== 'closed' ? panel : null;
+    };
     const wait = (read, timeout = 3000) => new Promise(resolve => {
       let reading = false, dirty = false, done = false;
       const finish = value => { if (done) return; done = true; observer.disconnect(); clearTimeout(timer); resolve(value); };
@@ -2000,15 +2230,43 @@ var CLF_DOM = (() => {
     return {
       state,
       async open() {
+        if (!stillCurrent()) return null;
+        // Native Presence waits for the menu's exit animation. Chrome can suspend
+        // that animation in a hidden window, retaining a closed picker and its
+        // focus scope indefinitely. Suppress only this owned picker animation for
+        // this operation; native state still closes/unmounts it and proves release.
+        motion = document.createElement('style');
+        motion.textContent = '[role="menu"]:has(> [data-testid="composer-intelligence-picker-content"]),[role="dialog"]:has([data-testid="composer-intelligence-picker-content"]),[role="menu"]:has([data-model-picker-view]),[role="menu"][data-model-picker-view]{animation:none!important}';
+        document.head.append(motion);
+        // The read-only helper identifies the exact native owner when another menu
+        // shares the composer. Never select by translated captions or button order.
+        await readPickerState();
         // A cold home editor mounts before its native Chat/Work picker. Workers
         // enter here directly, without the New Chat reuse/catalog preparation.
         // Wait for that surface, then use the same owned Chat transition before
         // interpreting account choices. Work's picker is not a denied Chat model.
         if (!await wait(trigger, 15000) || !await prepareChatModelSurface(stillCurrent)) return null;
-        if (!picker()) { const button = await wait(trigger, 15000); if (!key(button, 'Enter') || !await wait(picker)) return null; }
+        // A retained exit-animation node is not an open native menu.
+        if (!openPicker()) { const button = await wait(trigger, 15000); if (!key(button, 'Enter') || !await wait(openPicker)) return null; }
         return state();
       },
-      close() { key(trigger(), 'Escape'); },
+      async close() {
+        try {
+        if (!stillCurrent()) return false;
+        const panel = picker();
+        if (!panel) return true;
+        const dialog = panel.closest('[role="dialog"]'), active = document.activeElement;
+        if (!shown(panel) && !shown(dialog)) return true;
+        // Escape belongs inside the picker focus trap, not to its outside trigger.
+        // A dispatched key is only an attempt: native unmount/animation owns closure.
+        if (!key(panel.contains(active) || dialog?.contains(active) ? active : panel, 'Escape')) return false;
+        const closed = Boolean(await wait(() => !shown(picker()) && (!dialog?.isConnected || !shown(dialog))));
+        // Rebind passive selection proof to the closed trigger, not the removed
+        // menu node. Reading metadata never reopens or changes the picker.
+        if (closed && stillCurrent()) await readPickerState();
+        return closed && stillCurrent();
+        } finally { motion?.remove(); motion = null; }
+      },
       async version(version) {
         const before = await state(); if (!before) return null;
         const versionRows = () => [...(picker()?.querySelectorAll('[role="menuitemradio"]') || [])].filter(shown);
@@ -2018,12 +2276,12 @@ var CLF_DOM = (() => {
         // The picker may already show the version list (including a checked row).
         // Select that row to return to its effort view; never assume the slider is open.
         if (!versionRows().length) {
-          const toggle = [...picker().querySelectorAll('[role="menuitem"][aria-expanded]')].filter(shown);
+          const toggle = [...picker().querySelectorAll('[role="menuitem"][aria-expanded], [role="menuitem"][data-model-picker-view-toggle]')].filter(shown);
           if (toggle.length !== 1) return null;
           toggle[0].click();
         }
         const option = await wait(() => {
-          const rows = versionRows().filter(node => pickerVersionLabelMatches(node, label) && node.getAttribute('aria-disabled') !== 'true');
+          const rows = versionRows().filter(node => pickerVersionNamed(node, label) && node.getAttribute('aria-disabled') !== 'true');
           return rows.length === 1 ? rows[0] : null;
         });
         if (!key(option, 'Enter')) return null;
@@ -2048,7 +2306,7 @@ var CLF_DOM = (() => {
   // The current native picker or closed trigger carries the MAIN-world snapshot.
   // The route stamp prevents a retained composer from lending another chat proof.
   function visibleModelSelection() {
-    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]') || modelPickerTrigger();
+    const node = document.querySelector(PICKER) || modelPickerTrigger();
     if (node?.getAttribute('data-clf-selected-route') !== location.pathname) return null;
     const model = node?.getAttribute('data-clf-selected-model'), reasoningEffort = node?.getAttribute('data-clf-selected-effort');
     return model && /^[a-zA-Z0-9._-]{1,80}$/.test(model) && ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(reasoningEffort)
@@ -2094,9 +2352,9 @@ var CLF_DOM = (() => {
   }
   async function inspectModelSettings(stillCurrent = () => true, failure = () => {}) {
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
-    if (!original) { ui.close(); failure('picker_unavailable'); return null; }
+    if (!original) { await ui.close(); failure('picker_unavailable'); return null; }
     const result = new Map();
-    let restored = false;
+    let restored = false, closed = false;
     try {
       // One observation per version, not one mutation per effort. Computed choices
       // include account/workspace denials which the raw global preset list does not prove.
@@ -2113,35 +2371,49 @@ var CLF_DOM = (() => {
         const selected = state?.choices.find(c => c.bucket === state.currentBucket);
         restored = selected?.id === previous.id && selected?.effort === previous.effort;
       }
-      ui.close();
+      closed = await ui.close();
     }
     if (!restored) failure('restore_failed');
-    return restored && stillCurrent() && result.size ? [...result.values()] : null;
+    if (!closed) failure('picker_close_failed');
+    return restored && closed && stillCurrent() && result.size ? [...result.values()] : null;
   }
   async function selectModelSettings(model, effort, stillCurrent = () => true) {
     if (!model && !effort) return true;
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
-    if (!original) { ui.close(); return false; }
-    let selected = false;
+    if (!original) { await ui.close(); return false; }
+    let selected = false, closed = false;
     try {
       // Exact provider slug is preferred. Existing saved display slugs may resolve
       // only to an actually observed, available pair; never to an account default.
-      const matches = c => c.available && (!effort || c.effort === effort) && (!model || c.familyId === model || c.id === model || normalizeModelLabel(c.familyLabel) === normalizeModelLabel(model) || normalizeModelLabel(c.label) === normalizeModelLabel(model));
+      const name = normalizeModelLabel(model), candidates = [];
       for (const version of [original.versions.find(v => v.id === original.version), ...original.versions.filter(v => v.id !== original.version)]) {
         const state = await ui.version(version.id); if (!state) return false;
-        const choices = state.choices.filter(matches);
-        if (!choices.length) continue;
-        const choice = choices.find(c => c.bucket === state.currentBucket) || choices[0];
-        const after = await ui.bucket(choice.bucket);
-        const confirmed = after?.choices.find(c => c.bucket === after.currentBucket);
-        selected = stillCurrent() && confirmed?.available === true && confirmed.id === choice.id && confirmed.effort === choice.effort;
-        return selected;
+        for (const choice of state.choices) {
+          if (!choice.available || (effort && choice.effort !== effort)) continue;
+          const rank = !model || choice.familyId === model || choice.id === model ? 2
+            : name && normalizeModelLabel(choice.familyLabel) === name ? 1 : 0;
+          if (rank) candidates.push({ version: version.id, choice, rank });
+        }
       }
-      return false;
+      // An earlier version's display name cannot shadow a later exact execution id.
+      // Captions such as High are effort labels, never model-name aliases. Repeated
+      // Latest/version entries may describe the same pair; distinct families may not.
+      const rank = Math.max(0, ...candidates.map(candidate => candidate.rank));
+      const matches = candidates.filter(candidate => candidate.rank === rank);
+      if (!matches.length || (model && new Set(matches.map(candidate => candidate.choice.familyId)).size !== 1) ||
+          (model && effort && new Set(matches.map(candidate => `${candidate.choice.id}\u0000${candidate.choice.effort}`)).size !== 1)) return false;
+      const wanted = matches.find(candidate => candidate.version === original.version && candidate.choice.bucket === original.currentBucket) || matches[0];
+      const state = await ui.version(wanted.version), choice = wanted.choice;
+      // Versions can change while traversing the UI. Revalidate before moving its slider.
+      if (!state?.choices.some(next => next.bucket === choice.bucket && next.available && next.id === choice.id && next.effort === choice.effort)) return false;
+      const after = await ui.bucket(choice.bucket);
+      const confirmed = after?.choices.find(c => c.bucket === after.currentBucket);
+      selected = stillCurrent() && confirmed?.available === true && confirmed.id === choice.id && confirmed.effort === choice.effort;
     } finally {
       if (!selected && stillCurrent() && await ui.version(original.version)) await ui.bucket(original.currentBucket);
-      ui.close();
+      closed = await ui.close();
     }
+    return selected && closed && stillCurrent();
   }
 
   function projectHomeId(pathname = location.pathname) {
@@ -2225,7 +2497,12 @@ var CLF_DOM = (() => {
     });
   }
   return {
+    TURN_SELECTOR: TURN,
+    AUTHORED_SELECTOR: '[data-message-author-role="assistant"], .markdown, [data-content-search-unit-key], [data-markdown-text-style="assistant-message"]',
+    turnIdOf,
+    messageIdOf,
     userPromptText,
+    userMessageReaction,
     presentUserPrompts,
     composerVisible,
     prepareChatModelSurface,
@@ -2285,6 +2562,8 @@ var CLF_DOM = (() => {
     hasConnectorRow,
     connectorRows,
     fiberRef,
+    activitySummaryRows,
+    thoughtActivityRows,
     toolLabel,
     errors,
     composer,
@@ -2294,8 +2573,11 @@ var CLF_DOM = (() => {
     composerActions,
     composerStack,
     firstUserMessage,
-    turnMount,
     hideProgress,
+    hideActivity,
+    activityFold,
+    collapsedActivityFold,
+    canHideActivity,
     replaceActivity,
     insertPrompt,
     clearPromptExact,

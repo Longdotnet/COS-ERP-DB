@@ -1,5 +1,6 @@
 import type { ReasoningEffort } from './session.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from './windows-computer.js';
+import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from './browser-control.js';
 /** Types shared between the main process and the renderer. No runtime logic here. */
 
 /**
@@ -32,7 +33,6 @@ export const CAPABILITIES = [
   'move',
   'deleteFile',
   'command',
-  'saveArtifact',
   'screen',
   'control',
   'clipboardRead',
@@ -62,7 +62,6 @@ export const WRITE_CAPABILITIES: readonly Capability[] = [
   'move',
   'deleteFile',
   'command',
-  'saveArtifact',
   'control',
   'clipboardWrite'
 ];
@@ -129,6 +128,8 @@ export const CHAT_BROWSERS = ['chrome', 'edge', 'brave'] as const;
 export type ChatBrowser = (typeof CHAT_BROWSERS)[number];
 
 export interface UiPrefs {
+  /** Recover an unfinished silent executor turn only while Goal and Loop are both off. */
+  autoContinue?: boolean;
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
@@ -150,22 +151,17 @@ export interface UiPrefs {
   chatBrowser?: ChatBrowser;
   /** Explicit choice, never inherited from the OS: the window looks how you left it. */
   theme: 'light' | 'dark';
+  appearance?: import('./appearance.js').AppearanceSettings;
 }
 
 /**
- * Session recording. On by default: unlike the diagnostics log this one writes what
- * happened to disk and keeps it, but the timeline, Compact & resume and the agent
- * features are all reads of that record, so an app with it off is an app with its
- * reason for existing switched off. It stays a switch, and an explicit `false` is
- * never overridden.
- *
- * The same switch starts the local bridge the Chrome extension talks to: recording
- * without the extension only sees our own tool calls, and the extension has nothing
- * to report to if nothing is recording.
+ * Session recording is a product invariant. Legacy/wire fields remain so old configs and
+ * clients parse, but the main config boundary always publishes `record: true` and
+ * `retainDays: 0` (no age expiry). Large image bytes retain their separate bounded quota.
  */
 export interface SessionSettings {
   record: boolean;
-  /** Days of history kept. 0 keeps everything. */
+  /** Compatibility projection. Canonical value is 0: recordings do not expire by age. */
   retainDays: number;
   /** Estimated tokens at which the app starts suggesting a compaction. */
   advisoryTokens: number;
@@ -314,15 +310,9 @@ export interface McpSettings {
   instructions: string;
 }
 
-export interface ArtifactSettings {
-  /** Per-file byte ceiling enforced before, during and after the download stream. */
-  maxFileBytes: number;
-}
-
 export interface Config {
   /** Inactive setups only. Keys remain in encrypted secret slots addressed by profile ID. */
   setupProfiles?: Array<{ id: string; name: string; tunnelId: string; desktopTunnelId: string; pluginsTunnelId: string }>;
-  artifacts: ArtifactSettings;
   roots: Root[];
   capabilities: Capabilities;
   readOnly: boolean;
@@ -337,6 +327,7 @@ export interface Config {
 
 export type ConnectionState =
   | 'disconnected'
+  | 'disconnecting'
   | 'starting-server'
   | 'connecting-tunnel'
   | 'connected'
@@ -487,6 +478,92 @@ export interface BridgeStatus {
 }
 
 /**
+ * Read-only companion diagnostics mirrored from the browser extension's own popup.
+ *
+ * This is deliberately diagnostics-only: ids, counters and transport state. It never
+ * carries transcript prose, page text, credentials or file contents. The extension popup
+ * reads the same underlying status/page projections; the desktop popover merely gives that
+ * otherwise-hidden UI a native home inside the app.
+ */
+export interface CompanionDiagnostics {
+  capturedAt: number;
+  status: {
+    connected: boolean;
+    port: number | null;
+    paired: boolean;
+    disconnected: boolean;
+    pending: number;
+    pendingCommandAcks: number;
+    compatible: boolean | null;
+    appVersion: string | null;
+    appProtocol: number | null;
+    extensionVersion: string | null;
+    extensionProtocol: number | null;
+    pairError: { error: string; message: string } | null;
+  };
+  preferences: {
+    overwrite: boolean;
+    durations: boolean;
+  };
+  tab: CompanionTabDiagnostics | null;
+}
+
+export interface CompanionTraceEntry {
+  requestId: string;
+  read: boolean;
+  sent: boolean;
+  confirmed: boolean;
+  app: string | null;
+  tool: string | null;
+}
+
+export interface CompanionPageDiagnostics {
+  recorderVersion: number | null;
+  runId: string | null;
+  conversationId: string | null;
+  generating: boolean;
+  turnId: string | null;
+  generations: number;
+  queued: number;
+  queueBytes: number;
+  requestId: string | null;
+  trace: CompanionTraceEntry[];
+  overwrite: boolean;
+  painted: boolean;
+  events: number;
+  calls: number;
+  sends: number;
+  failures: number;
+  session: string | null;
+  lastError: { at: number; text: string } | null;
+  blocked: string | null;
+}
+
+export interface CompanionTabDiagnostics {
+  tab: number | null;
+  isChat: boolean;
+  conversationId: string | null;
+  bound: boolean;
+  epoch: number | null;
+  terminal: boolean;
+  recorder: boolean;
+  page: CompanionPageDiagnostics | null;
+  chatTabs: number;
+  pending: number;
+  pendingAll: number;
+  pendingCloses: number;
+  pendingCommandAcks: number;
+  delivery: {
+    at: number;
+    ok: boolean | null;
+    events: number;
+    total: number;
+    status: number;
+    error: string | null;
+  };
+}
+
+/**
  * Whether a newer release of this app exists, and what has been done about it.
  *
  * One record for the whole update subsystem — see src/main/update.ts. `latest` is a version
@@ -547,13 +624,12 @@ export interface MacOSDesktopAccessStatus {
 /**
  * Whether the enabled product surface currently needs the companion browser extension.
  *
- * Recording consumes browser observations, and multi-agent uses the browser to open/bind
- * worker chats. Goal and compaction also execute through that bridge, but both depend on a
- * recorded session, so they are not independently viable reasons to require a browser when
- * recording itself is off.
+ * Recording is always on and consumes browser observations, so the extension bridge is an
+ * unconditional product dependency. Keep the parameter for source compatibility with callers
+ * that already pass their config snapshot.
  */
-export function browserExtensionRequired(config: Pick<Config, 'sessions' | 'multiAgent'>): boolean {
-  return config.sessions.record || config.multiAgent.enabled;
+export function browserExtensionRequired(_config: Pick<Config, 'sessions' | 'multiAgent'> & Partial<Pick<Config, 'capabilities'>>): boolean {
+  return true;
 }
 
 export interface AppState {
@@ -589,7 +665,6 @@ export const DEFAULT_CAPABILITIES: Capabilities = {
   move: false,
   deleteFile: false,
   command: false,
-  saveArtifact: false,
   screen: false,
   control: false,
   clipboardRead: false,
@@ -606,7 +681,6 @@ export const CAPABILITY_LABELS: Record<Capability, string> = {
   move: 'Move / rename',
   deleteFile: 'Delete files',
   command: 'Run commands',
-  saveArtifact: 'Save ChatGPT files',
   screen: 'See the screen',
   control: 'Control mouse and keyboard',
   clipboardRead: 'Read clipboard',
@@ -631,9 +705,8 @@ export const CAPABILITY_DETAILS: Record<Capability, string> = {
   move: 'Move or rename, both ends inside approved folders.',
   deleteFile: 'Permanent — there is no Recycle Bin.',
   command: 'Run anything as you. NOT limited to approved folders.',
-  saveArtifact: 'Save images and files ChatGPT generates into an approved folder.',
-  screen: 'Screenshots, open windows, and the controls on them.',
-  control: 'Moves the pointer, clicks, types and presses keys, as you.',
+  screen: 'Browser tabs, DOM, screenshots, console and network; native windows where supported.',
+  control: 'Browser navigation, input and page JavaScript; native mouse and keyboard where supported.',
   clipboardRead: 'Read the current clipboard text.',
   clipboardWrite: 'Replace the clipboard without focus or keystrokes.'
 };
@@ -656,7 +729,6 @@ const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
   move: ['apply_patch'],
   deleteFile: ['apply_patch'],
   command: ['exec_command', 'write_stdin'],
-  saveArtifact: ['download_artifact'],
   screen: ['observe'],
   control: ['computer'],
   clipboardRead: ['computer'],
@@ -665,12 +737,13 @@ const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
 
 /** Settings use the same Windows method lists as registration, with explicit host identity. */
 export function capabilityTools(capability: Capability, platform?: PlatformFamily): readonly string[] {
+  const browser = capability === 'screen' ? BROWSER_READ_TOOLS : capability === 'control' ? BROWSER_WRITE_TOOLS : [];
   if (!DESKTOP_CAPABILITIES.includes(capability)) return CAPABILITY_TOOLS[capability];
-  if (platform === 'macos') return CAPABILITY_TOOLS[capability];
-  if (platform !== 'windows') return [];
+  if (platform === 'macos') return [...browser, ...CAPABILITY_TOOLS[capability]];
+  if (platform !== 'windows') return browser;
   switch (capability) {
-    case 'screen': return WINDOWS_COMPUTER_READ_METHODS;
-    case 'control': return WINDOWS_COMPUTER_INPUT_METHODS;
+    case 'screen': return [...browser, ...WINDOWS_COMPUTER_READ_METHODS];
+    case 'control': return [...browser, ...WINDOWS_COMPUTER_INPUT_METHODS];
     case 'clipboardRead': return ['read_clipboard'];
     case 'clipboardWrite': return ['write_clipboard'];
     default: return [];

@@ -1,11 +1,46 @@
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { closeConversation, liveConversations, recordChatObservations, recordToolCall, resetRecorderForTests } from '../src/main/session/recorder.js';
 import { emptyEvidence, trackInFlight } from '../src/main/mcp/call-context.js';
-import { appendEvent, flushSessions, getSession, initSessionStore, readEvents, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { appendEvent, flushSessions, getSession, initSessionStore, readEvents, readCompletedFinal, upsertMessageEvent, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { sessionInputPolicy } from '../src/main/session/input.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let directory: string;
+
+it.each(['same', 'new-question', 'new-turn'] as const)('accepts a later native Stop only for its still-current source (%s)', async change => {
+  const conversationId = `native-stop-upgrade-${change}`;
+  const opened = await recordChatObservations(conversationId, [
+    { kind: 'user_message', messageId: 'stop-question', text: 'Work', time: 10 },
+    { kind: 'turn_start', turnId: 'stop-source', time: 11 },
+    { kind: 'turn_end', turnId: 'stop-source', outcome: 'interrupted', time: 12 }
+  ]);
+  if (change === 'new-question') await recordChatObservations(conversationId, [{ kind: 'user_message', messageId: 'new-question', text: 'Next', time: 13 }]);
+  if (change === 'new-turn') await recordChatObservations(conversationId, [{ kind: 'turn_start', turnId: 'new-turn', time: 13 }]);
+  await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+  const stop = { kind: 'turn_end' as const, turnId: 'stop-source', outcome: 'stopped' as const, time: 14 };
+  const accepted = await recordChatObservations(conversationId, [stop]);
+  expect(accepted.activity.terminal).toBe(change === 'same');
+  await recordChatObservations(conversationId, [stop]);
+  const ends = await readEvents(opened.sessionId!, { kinds: ['turn_end'] });
+  expect(ends.filter(event => event.kind === 'turn_end' && event.outcome === 'stopped')).toHaveLength(change === 'same' ? 1 : 0);
+  if (change === 'new-turn') expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('new-turn');
+});
+
+it('finds the latest real work behind a later revision of an old native label', async () => {
+  const { readRecentEvents } = await import('../src/main/session/store.js');
+  const { workSequence } = await import('../src/shared/session.js');
+  const opened = await recordChatObservations('native-label-work-order', [
+    { kind: 'turn_start', turnId: 'work-order', time: 10 },
+    { kind: 'page_tool', messageId: 'old-step', turnId: 'work-order', text: 'Preparing', time: 11 },
+    { kind: 'page_tool', messageId: 'new-step', turnId: 'work-order', text: 'Searching', time: 12 }
+  ]);
+  const [before] = await readRecentEvents(opened.sessionId!, 1, { kinds: ['page_tool', 'turn_start'] });
+  await recordChatObservations('native-label-work-order', [{ kind: 'page_tool', messageId: 'old-step', turnId: 'work-order', text: 'Prepared', time: 13 }]);
+  const [after] = await readRecentEvents(opened.sessionId!, 1, { kinds: ['page_tool', 'turn_start'] });
+  expect(workSequence(after!)).toBe(workSequence(before!));
+});
 it('records an empty native image message and keeps its stable origin on replay', async () => {
   const image = { kind: 'user_message' as const, messageId: 'image-only-user', time: 100, text: '',
     attachments: [{ id: 'native-file', name: 'example.png', size: 123, mimeType: 'image/png' }] };
@@ -77,7 +112,7 @@ it.each(['missing', 'replaced', 'matching', 'restart'])('closes the canonical re
   expect(await readEvents(sessionId, { kinds: ['turn_end'] })).toHaveLength(1);
 });
 
-it.each(['missing', 'current-page-id'])('never closes newer work from an old canonical answer with %s identity', async mode => {
+it.each(['missing', 'current-page-id', 'original-page-id'])('never closes newer work from an old canonical answer with %s identity', async mode => {
   const conversationId = `historical-final-${mode}`;
   const opened = await recordChatObservations(conversationId, [
     { kind: 'turn_start', time: 10, turnId: 'old-turn' },
@@ -86,11 +121,12 @@ it.each(['missing', 'current-page-id'])('never closes newer work from an old can
     { kind: 'turn_start', time: 20, turnId: 'new-turn' }
   ]);
   const result = await recordChatObservations(conversationId, [{
-    kind: 'assistant_message', time: 30, messageId: 'old-answer', text: 'Old result', state: 'final', final: true,
-    ...(mode === 'current-page-id' ? { turnId: 'new-turn' } : {})
+    kind: 'assistant_message', time: 30, messageId: 'old-answer', text: 'Old result, revised', state: 'final', final: true,
+    activeNow: true, renderedHtml: '<p>Old result, revised</p>',
+    ...(mode === 'current-page-id' ? { turnId: 'new-turn' } : mode === 'original-page-id' ? { turnId: 'old-turn' } : {})
   }]);
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('new-turn');
-  expect(result.activity.terminal).toBe(false);
+  expect(result.activity).toMatchObject({ meaningful: false, working: false, terminal: false });
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(1);
 });
 
@@ -136,15 +172,16 @@ it('does not close the old turn after a newer user message arrives in the recove
     { kind: 'turn_start', time: 10, turnId: 'turn' },
     { kind: 'assistant_message', time: 11, turnId: 'turn', messageId: 'answer', text: 'Partial', state: 'streaming' }
   ]);
-  await recordChatObservations(conversationId, [
-    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true },
+  const revised = await recordChatObservations(conversationId, [
+    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true, activeNow: true },
     { kind: 'user_message', time: 21, messageId: 'next-user', text: 'New work', authoredNow: true }
   ]);
+  expect(revised.activity).toMatchObject({ working: true, terminal: false });
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('turn');
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(0);
 });
 
-it('waits for a running tool before accepting a recovered final', async () => {
+it('commits a recovered final while its running tool still blocks delivery', async () => {
   const conversationId = 'final-with-running-tool';
   const opened = await recordChatObservations(conversationId, [
     { kind: 'turn_start', time: 10, turnId: 'turn' },
@@ -154,9 +191,9 @@ it('waits for a running tool before accepting a recovered final', async () => {
   await trackInFlight({ startedAt: 12, transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
     caller: { conversationId, requestId: 'running-call', transportKey: null } }, async () => {
     await recordChatObservations(conversationId, [final]);
-    expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('turn');
+    expect((await getSession(opened.sessionId!))?.activeTurnId).toBeNull();
+    expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(1);
   });
-  await recordChatObservations(conversationId, [final]);
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBeNull();
 });
 
@@ -249,10 +286,101 @@ it('does not close an old turn when its revised final follows a newer user messa
     { kind: 'turn_start', time: 10, turnId: 'turn' },
     { kind: 'assistant_message', time: 11, turnId: 'turn', messageId: 'answer', text: 'Partial', state: 'streaming' }
   ]);
-  await recordChatObservations(conversationId, [
+  const revised = await recordChatObservations(conversationId, [
     { kind: 'user_message', time: 21, messageId: 'next-user', text: 'New work', authoredNow: true },
-    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true }
+    { kind: 'assistant_message', time: 20, messageId: 'answer', text: 'Final answer', state: 'final', final: true, activeNow: true }
   ]);
+  expect(revised.activity).toMatchObject({ working: true, terminal: false });
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('turn');
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(0);
+});
+
+
+it.each([false, true])('accepts a textless native final only with exact provider identity (%s)', async native => {
+  const conversationId = `image-final-${native}`;
+  const result = await recordChatObservations(conversationId, [
+    { kind: 'user_message', time: 10, messageId: 'image-question', text: 'Generate two images' },
+    { kind: 'turn_start', time: 11, turnId: 'image-turn' },
+    { kind: 'assistant_message', time: 20, messageId: 'image-final', turnId: 'image-turn', text: '',
+      ...(native ? { providerMessageId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } : {}), state: 'final', final: true, goalEligible: true },
+    { kind: 'turn_end', time: 21, turnId: 'image-turn', outcome: 'completed' }
+  ]);
+  expect(!!await readCompletedFinal(result.sessionId!, conversationId)).toBe(native);
+  await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+  expect(!!await readCompletedFinal(result.sessionId!, conversationId)).toBe(native);
+  await recordChatObservations(conversationId, [{ kind: 'user_message', time: 30,
+    messageId: 'new-image-question', text: 'Generate another image', authoredNow: true }]);
+  expect(await readCompletedFinal(result.sessionId!, conversationId)).toBeNull();
+});
+
+it('uses an unowned canonical final as a settled ordinary input boundary without inventing a turn', async () => {
+  const conversationId = 'unowned-final-current-question';
+  const opened = await recordChatObservations(conversationId, [
+    { kind: 'model_selection', time: 1, model: 'gpt-5-6-pro', reasoningEffort: 'pro' },
+    { kind: 'user_message', time: 10, messageId: 'question', text: 'Report the findings' },
+    { kind: 'assistant_message', time: 20, messageId: 'reply', text: 'Complete report', state: 'final', final: true }
+  ]);
+  const id = opened.sessionId!;
+  expect(await readCompletedFinal(id, conversationId)).toMatchObject({ messageId: 'reply', turnId: null });
+  expect(await sessionInputPolicy(id)).toMatchObject({ browserAllowed: true, settled: true });
+  expect(await readEvents(id, { kinds: ['turn_start', 'turn_end'] })).toEqual([]);
+  await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+  expect(await readCompletedFinal(id, conversationId)).toMatchObject({ messageId: 'reply', turnId: null });
+  await recordChatObservations(conversationId, [{ kind: 'user_message', time: 30, messageId: 'new-question', text: 'New work', authoredNow: true }]);
+  await recordChatObservations(conversationId, [{ kind: 'assistant_message', time: 40, messageId: 'reply', text: 'Complete report plus metadata', state: 'final', final: true }]);
+  expect(await readCompletedFinal(id, conversationId)).toBeNull();
+  expect((await sessionInputPolicy(id)).settled).toBe(false);
+});
+
+it('preserves final acceptance across metadata, late call recording and restart, but rejects fresh work and rebinding', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
+  try {
+    const conversationId = 'completion-observed-time';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: 1, messageId: 'question', text: 'Do work' },
+      { kind: 'assistant_message', time: 10, messageId: 'answer', text: 'Done', state: 'final', final: true }
+    ]);
+    const id = opened.sessionId!;
+    clock.mockReturnValue(2000);
+    await recordChatObservations(conversationId, [{ kind: 'assistant_message', time: 10, messageId: 'answer', text: 'Done', renderedHtml: '<p>Done</p>', state: 'final', final: true }]);
+    expect(await readCompletedFinal(id, conversationId)).toMatchObject({ completedAt: 1000 });
+    const call = (time: number) => appendEvent(id, { kind: 'tool_call', source: 'mcp', time,
+      call: { callId: `call-${time}`, tool: 'read', attribution: 'request_id', attributionMethod: 'request_id', conversationId, requestId: 'request',
+        args: { text: '{}', chars: 2, truncated: false }, result: { text: 'ok', chars: 2, truncated: false }, summary: { kind: 'read', title: 'Read', tone: 'good' }, outcome: 'ok', durationMs: 1 } });
+    await call(500); // Starts after provider creation, before actual final acceptance.
+    expect(await readCompletedFinal(id, conversationId)).toMatchObject({ completedAt: 1000 });
+    await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+    expect(await readCompletedFinal(id, conversationId)).toMatchObject({ completedAt: 1000 });
+    await call(1500);
+    expect(await readCompletedFinal(id, conversationId)).toBeNull();
+    await upsertMessageEvent(id, { kind: 'assistant_message', source: 'extension', time: 10,
+      messageId: 'answer', message: { text: 'A fresh final after more work', chars: 29, truncated: false }, state: 'final', final: true });
+    expect(await readCompletedFinal(id, conversationId)).toMatchObject({ completedAt: 2000 });
+    expect(await rebindSession(id, conversationId, 'completion-new-binding')).toBe(true);
+    expect(await readCompletedFinal(id, conversationId)).toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+it.each(['question', 'rebind'] as const)('rejects a final snapshot when %s changes during its disk read', async change => {
+  const conversationId = `completion-race-${change}`;
+  const opened = await recordChatObservations(conversationId, [
+    { kind: 'user_message', time: 1, messageId: 'question', text: 'Do work' },
+    { kind: 'assistant_message', time: 2, messageId: 'answer', text: 'Done', state: 'final', final: true }
+  ]);
+  await flushSessions();
+  const originalOpen = fs.open;
+  let intercepted = false;
+  const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    if (!intercepted && String(args[0]).endsWith('events.jsonl') && args[1] === 'r') {
+      intercepted = true;
+      if (change === 'rebind') await rebindSession(opened.sessionId!, conversationId, 'race-destination');
+      else await upsertMessageEvent(opened.sessionId!, { kind: 'user_message', source: 'extension', time: 3,
+        messageId: 'new-question', message: { text: 'Next', chars: 4, truncated: false } });
+    }
+    return originalOpen(...args);
+  });
+  try {
+    expect(await readCompletedFinal(opened.sessionId!, conversationId)).toBeNull();
+    expect(intercepted).toBe(true);
+  } finally { spy.mockRestore(); }
 });

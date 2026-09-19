@@ -1,438 +1,214 @@
+import type { LibrarySkill, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
+import { el, icon } from './dom.js';
 import { t, ui } from './i18n.js';
-import { $, el, run } from './dom.js';
-import type { SkillLibrary, SkillSummary } from '../shared/skills.js';
+import { skillDirectives } from '../shared/skill-invocation.js';
+
+/** Completion is limited to the leading command block and a collapsed caret. */
+export function skillCompletion(text: string, start: number, end = start): { start: number; end: number; query: string } | null {
+  if (start !== end || /\S/.test(text.slice(end).split(/\s/, 1)[0] ?? '')) return null;
+  const before = text.slice(0, start);
+  const match = /(?:^|\s)(\/(?:prompt(?:\s+[a-z0-9._-]*)?|[a-z0-9._-]*))$/i.exec(before);
+  if (!match) return null;
+  const at = start - match[1]!.length;
+  const preceding = text.slice(0, at).trim();
+  if (preceding && !/^(?:\/(?!prompt(?:\s|$))[a-z0-9._-]+|\/prompt\s+[a-z0-9._-]+)(?:\s+(?:\/(?!prompt(?:\s|$))[a-z0-9._-]+|\/prompt\s+[a-z0-9._-]+))*$/i.test(preceding)) return null;
+  const token = match[1]!;
+  return { start: at, end, query: token === '/prompt' ? '' : token.replace(/^\/prompt\s+|^\//, '').toLowerCase() };
+}
 
 type Reply<T> = { ok: true; data: T } | { ok: false; error: string };
+type Options = {
+  input: HTMLTextAreaElement; host: HTMLElement; selectedHost: HTMLElement;
+  openButton: HTMLElement; addButton: HTMLElement;
+  owner: () => string;
+  scope: () => SkillsDraftScope;
+  draft: () => string | undefined;
+  saveDraft: (authored: string) => void;
+  list: (scope: SkillsDraftScope) => Promise<Reply<SkillLibrary>>;
+  command?: (name: string) => void;
+};
 
-export interface SkillsRendererApi {
-  skillsList: () => Promise<Reply<SkillLibrary>>;
-  skillsImport: () => Promise<Reply<SkillLibrary | null>>;
-  skillsOpenFolder: () => Promise<Reply<void>>;
-  skillsRemove: (id: string) => Promise<Reply<SkillLibrary>>;
+function split(text: string): ReturnType<typeof skillDirectives> {
+  try { return skillDirectives(text); }
+  catch { return { ids: [], prefix: '', body: text }; } // Incomplete typed commands remain visible.
 }
+const title = (skill: LibrarySkill): string => skill.displayName || skill.name;
+const scopeLabel = (skill: LibrarySkill): string => skill.scope === 'repo' ? t('Project')
+  : skill.scope === 'system' ? t('System') : skill.scope === 'admin' ? t('Admin') : t('Personal');
 
-export interface SkillCommandTrigger {
-  lineStart: number;
-  lineEnd: number;
-  kind: 'prompt' | 'slash';
-  query: string;
-}
-
-export interface SkillsController {
-  onInput: () => void;
-  onKeydown: (event: KeyboardEvent) => boolean;
-  syncDraft: () => void;
-  open: () => void;
-}
-
-interface SkillsOptions {
-  api: SkillsRendererApi;
-  input: HTMLTextAreaElement;
-  getDraftIdentity: () => string;
-}
-
-interface DialogState {
-  epoch: number;
-  identity: string;
-  trigger: SkillCommandTrigger | null;
-}
-
-interface InlineState {
-  epoch: number;
-  identity: string;
-  trigger: SkillCommandTrigger;
-  matches: SkillSummary[];
-  selected: number;
-  loading: boolean;
-}
-
-function lineBounds(text: string, caret: number): { start: number; end: number } {
-  const start = text.lastIndexOf('\n', Math.max(0, caret - 1)) + 1;
-  const next = text.indexOf('\n', caret);
-  return { start, end: next < 0 ? text.length : next };
-}
-
-/**
- * Slash completion is deliberately limited to the initial command block. A prose,
- * quote, fence, blank separator or other non-command line ends that block.
- */
-export function skillCommandTrigger(text: string, caret: number): SkillCommandTrigger | null {
-  if (caret < 0 || caret > text.length) return null;
-  const { start, end } = lineBounds(text, caret);
-  const beforeLine = text.slice(0, start);
-  if (beforeLine) {
-    const prior = beforeLine.endsWith('\n') ? beforeLine.slice(0, -1) : beforeLine;
-    if (prior.split('\n').some(line => !/^\/(?:prompt(?:[ \t]+\S+)?|[^\s/]+)[ \t]*$/.test(line))) return null;
-  }
-  const beforeCaret = text.slice(start, caret);
-  const afterCaret = text.slice(caret, end);
-  if (afterCaret.trim() || !/^\/[^\s/]*$/.test(beforeCaret)) return null;
-  const query = beforeCaret.slice(1);
-  return { lineStart: start, lineEnd: end, kind: query === 'prompt' ? 'prompt' : 'slash', query };
-}
-
-function currentTrigger(text: string, trigger: SkillCommandTrigger): SkillCommandTrigger | null {
-  if (trigger.lineStart < 0 || trigger.lineStart > text.length) return null;
-  const end = text.indexOf('\n', trigger.lineStart);
-  const lineEnd = end < 0 ? text.length : end;
-  const line = text.slice(trigger.lineStart, lineEnd);
-  if (trigger.kind === 'prompt') {
-    if (line.trim() !== '/prompt') return null;
-    return { ...trigger, lineEnd, query: 'prompt' };
-  }
-  if (!/^\/[^\s/]*$/.test(line)) return null;
-  return { ...trigger, lineEnd, query: line.slice(1) };
-}
-
-function removeTriggerLine(text: string, trigger: SkillCommandTrigger | null): string {
-  if (!trigger) return text;
-  const current = currentTrigger(text, trigger);
-  if (!current) return text;
-  let end = current.lineEnd;
-  if (text[end] === '\n') end++;
-  return text.slice(0, current.lineStart) + text.slice(end);
-}
-
-function leadingDirectiveBlock(text: string, knownIds: ReadonlySet<string>): { end: number; ids: Set<string> } {
-  const ids = new Set<string>();
-  let offset = 0;
-  while (offset < text.length) {
-    const next = text.indexOf('\n', offset);
-    const lineEnd = next < 0 ? text.length : next;
-    const line = text.slice(offset, lineEnd).replace(/\r$/, '');
-    const prompt = /^\/prompt[ \t]+([^\s]+)[ \t]*$/.exec(line);
-    const shorthand = /^\/([^\s/]+)[ \t]*$/.exec(line);
-    const id = prompt?.[1] ?? (shorthand && knownIds.has(shorthand[1]!) ? shorthand[1] : undefined);
-    if (!id) break;
-    ids.add(id);
-    offset = next < 0 ? lineEnd : next + 1;
-  }
-  return { end: offset, ids };
-}
-
-/** Pure insertion helper used by both the full picker and inline slash completion. */
-export function insertSkillCommand(
-  text: string,
-  id: string,
-  knownIds: Iterable<string>,
-  trigger: SkillCommandTrigger | null = null
-): { text: string; caret: number } {
-  const known = new Set(knownIds);
-  let next = removeTriggerLine(text, trigger);
-  const block = leadingDirectiveBlock(next, known);
-  if (block.ids.has(id)) return { text: next, caret: block.end };
-  const command = `/${id}\n`;
-  if (block.end === 0) return { text: command + next, caret: command.length };
-  const separator = next[block.end - 1] === '\n' ? '' : '\n';
-  const insertion = `${separator}${command}`;
-  next = next.slice(0, block.end) + insertion + next.slice(block.end);
-  return { text: next, caret: block.end + insertion.length };
-}
-
-function filtered(skills: SkillSummary[], query: string): SkillSummary[] {
-  const needle = query.trim().toLocaleLowerCase();
-  if (!needle) return skills;
-  return skills.filter(skill => `${skill.id}\n${skill.name}\n${skill.description}`.toLocaleLowerCase().includes(needle));
-}
-
-export function createSkills(options: SkillsOptions): SkillsController {
-  const { api, input, getDraftIdentity } = options;
-  const dialog = $<HTMLDialogElement>('skillsDialog');
-  const search = $<HTMLInputElement>('skillsSearch');
-  const list = $('skillsList');
-  const status = $('skillsStatus');
-  const autocomplete = $('skillAutocomplete');
-  let library: SkillLibrary | null = null;
-  let libraryEpoch = 0;
-  let dialogEpoch = 0;
-  let inlineEpoch = 0;
-  let dialogLoadFailed = false;
-  let dialogState: DialogState | null = null;
-  let inlineState: InlineState | null = null;
-
-  const alive = (state: DialogState): boolean => dialogState?.epoch === state.epoch && dialog.open && state.identity === getDraftIdentity();
-
-  const loadLibrary = async (): Promise<SkillLibrary | null> => {
-    const epoch = ++libraryEpoch;
-    const next = await run(api.skillsList());
-    if (next && epoch === libraryEpoch) library = next;
-    return next;
+/** PR #260's library/chips are projections of the existing authored draft, not a second selection ledger. */
+export function initSkills(options: Options) {
+  const { input, host, selectedHost } = options;
+  const control = (label: string, className = 'btn'): HTMLButtonElement => {
+    const node = el('button', className, () => t(label)) as HTMLButtonElement; node.type = 'button'; return node;
   };
-
-  const knownIds = (): string[] => library?.skills.map(skill => skill.id) ?? [];
-
-  const dispatchInput = (): void => { input.dispatchEvent(new window.Event('input', { bubbles: true })); };
-
-  const apply = (skill: SkillSummary, identity: string, trigger: SkillCommandTrigger | null): boolean => {
-    if (identity !== getDraftIdentity()) return false;
-    const inserted = insertSkillCommand(input.value, skill.id, knownIds(), trigger);
-    input.value = inserted.text;
-    input.setSelectionRange(inserted.caret, inserted.caret);
-    dispatchInput();
-    input.focus();
-    return true;
-  };
-
+  host.className = 'skill-autocomplete'; host.setAttribute('role', 'listbox');
+  const cache = new Map<string, SkillLibrary>();
+  let epoch = 0, surfaceOwner = '', loadedKey: string | null = null, loading = false, error = '', composing = false;
+  let library: SkillLibrary | null = null, choices: Array<LibrarySkill | { command: string; name: string; description: string; glyph: string }> = [], selected = 0, painted = '';
+  // This is only the current textarea projection. The existing draft map holds the
+  // complete authored command block across navigation, failures and retries.
+  let displayedPrefix = '', prefixOwner = options.owner();
+  const scopeKey = (): string => JSON.stringify(options.scope());
+  const selectionKey = (): string => `${input.value}\0${input.selectionStart}\0${input.selectionEnd}`;
+  const authoredText = (): string => (prefixOwner === options.owner() ? displayedPrefix : '') + input.value;
+  const fragment = () => skillCompletion(input.value, input.selectionStart, input.selectionEnd);
+  const current = (): boolean => surfaceOwner === options.owner();
   const hideInline = (): void => {
-    inlineEpoch++;
-    inlineState = null;
-    autocomplete.hidden = true;
-    autocomplete.replaceChildren();
-    input.removeAttribute('aria-controls');
-    input.removeAttribute('aria-activedescendant');
-    input.removeAttribute('aria-expanded');
+    host.hidden = true; choices = []; input.removeAttribute('aria-controls'); input.removeAttribute('aria-expanded'); input.removeAttribute('aria-activedescendant');
   };
-
-  const liveInlineTrigger = (state: InlineState): SkillCommandTrigger | null => {
-    if (state.identity !== getDraftIdentity()) return null;
-    const current = skillCommandTrigger(input.value, input.selectionStart);
-    return current?.kind === 'slash' && current.lineStart === state.trigger.lineStart ? current : null;
+  const close = (): void => {
+    epoch++; loading = false; loadedKey = null; hideInline();
+    if (prefixOwner !== options.owner()) { selectedHost.replaceChildren(); selectedHost.hidden = true; }
   };
-
-  const renderInline = (state: InlineState): void => {
-    if (inlineState?.epoch !== state.epoch || state.identity !== getDraftIdentity()) return;
-    autocomplete.replaceChildren();
-    input.setAttribute('aria-controls', 'skillAutocomplete');
-    input.setAttribute('aria-expanded', 'true');
-    if (state.loading) {
-      autocomplete.append(el('p', 'skill-autocomplete-empty', () => t("Loading skills…")));
-      autocomplete.hidden = false;
-      input.removeAttribute('aria-activedescendant');
-      return;
-    }
-    if (!state.matches.length) {
-      const empty = el('p', 'skill-autocomplete-empty', () => library?.skills.length ? t("No skills match your search.") : t("No installed skills."));
-      autocomplete.append(empty); autocomplete.hidden = false; input.removeAttribute('aria-activedescendant'); return;
-    }
-    state.selected = Math.min(Math.max(0, state.selected), state.matches.length - 1);
-    state.matches.forEach((skill, index) => {
-      const row = el('button', 'skill-autocomplete-option') as HTMLButtonElement;
-      row.type = 'button'; row.id = `skillAutocompleteOption-${index}`; row.setAttribute('role', 'option');
-      row.setAttribute('aria-selected', String(index === state.selected));
-      const copy = el('span', 'skill-autocomplete-copy');
-      copy.append(el('strong', '', `/${skill.id}`), el('span', '', skill.name), el('small', '', skill.description));
-      row.append(copy);
-      row.addEventListener('pointerdown', event => event.preventDefault());
-      row.addEventListener('click', () => {
-        const trigger = liveInlineTrigger(state);
-        if (!trigger) { hideInline(); return; }
-        if (apply(skill, state.identity, trigger)) hideInline();
+  const renderSelected = (): void => {
+    selectedHost.replaceChildren();
+    const ids = split(prefixOwner === options.owner() ? displayedPrefix : '').ids;
+    selectedHost.hidden = !ids.length;
+    const catalog = cache.get(scopeKey());
+    for (const id of ids) {
+      const skill = catalog?.skills.find(row => row.id === id);
+      const name = skill ? title(skill) : id;
+      const chip = el('div', 'composer-selected-skill'); chip.dataset.skillId = id;
+      chip.title = skill?.path ?? `/${id}`;
+      const remove = control('Remove', 'composer-selected-skill-remove'); remove.replaceChildren(icon('i-x'));
+      ui(remove, 'aria-label', () => t('Remove {0}', [name]));
+      const owner = options.owner();
+      remove.addEventListener('click', () => {
+        if (owner !== options.owner()) return;
+        const retained = split(displayedPrefix).ids.filter(value => value !== id);
+        project(`${retained.map(value => `/${value}\n`).join('')}${input.value}`);
+        input.focus();
       });
-      autocomplete.append(row);
-    });
-    autocomplete.hidden = false;
-    input.setAttribute('aria-activedescendant', `skillAutocompleteOption-${state.selected}`);
-  };
-
-  const renderDialog = (state: DialogState): void => {
-    if (!alive(state)) return;
-    const skills = filtered(library?.skills ?? [], search.value);
-    list.replaceChildren();
-    status.textContent = '';
-    if (library?.directory) ui(status, 'title', () => t("Skill directory: {0}", [library!.directory]));
-    if (!library) {
-      if (dialogLoadFailed) {
-        const failure = el('div', 'skills-empty skills-load-error');
-        const retry = el('button', 'btn', () => t("Retry")) as HTMLButtonElement;
-        retry.type = 'button';
-        retry.addEventListener('click', () => void loadDialog(state));
-        failure.append(
-          el('strong', '', () => t("Skills could not be loaded.")),
-          el('span', '', () => t("Check the error above, then try again.")),
-          retry
-        );
-        list.append(failure);
-      } else list.append(el('p', 'skills-empty', () => t("Loading skills…")));
-      return;
-    }
-    if (library.errors.length) {
-      const errors = el('div', 'skills-errors'); errors.setAttribute('role', 'status');
-      errors.append(el('strong', '', () => t("Some skill files could not be loaded.")));
-      for (const error of library.errors) errors.append(el('div', '', error));
-      list.append(errors);
-    }
-    if (!skills.length) {
-      const empty = el('div', 'skills-empty');
-      empty.append(
-        el('strong', '', () => search.value.trim() ? t("No skills match your search.") : t("No skills yet.")),
-        el('span', '', () => search.value.trim() ? t("Try another name or description.") : t("Import a text skill file to add one."))
-      );
-      list.append(empty); return;
-    }
-    for (const skill of skills) {
-      const row = el('article', 'skill-row'); row.dataset.skillId = skill.id;
-      const copy = el('div', 'skill-row-copy');
-      const heading = el('div', 'skill-row-heading'); heading.append(el('strong', '', skill.name), el('code', '', `/${skill.id}`));
-      copy.append(heading, el('p', '', skill.description));
-      const actions = el('div', 'skill-row-actions');
-      const remove = el('button', 'btn skill-remove', () => t("Remove")) as HTMLButtonElement;
-      remove.type = 'button'; ui(remove, 'aria-label', () => t("Remove {0}", [skill.name]));
-      remove.addEventListener('click', async () => {
-        const owner = dialogState;
-        if (!owner || !alive(owner)) return;
-        remove.disabled = true;
-        const next = await run(api.skillsRemove(skill.id));
-        if (next) publishLibrary(next);
-        if (!alive(owner)) return;
-        if (!next) remove.disabled = false;
-      });
-      const use = el('button', 'btn btn-solid skill-use', () => t("Use")) as HTMLButtonElement;
-      use.type = 'button'; ui(use, 'aria-label', () => t("Use {0}", [skill.name]));
-      use.addEventListener('click', () => {
-        const owner = dialogState;
-        if (!owner || !alive(owner)) return;
-        if (apply(skill, owner.identity, owner.trigger)) dialog.close();
-      });
-      actions.append(remove, use); row.append(copy, actions); list.append(row);
+      chip.append(icon('i-skill', 'ico composer-selected-skill-icon'), el('span', 'composer-selected-skill-title', name), remove);
+      selectedHost.append(chip);
     }
   };
-
-  const publishLibrary = (next: SkillLibrary): void => {
-    ++libraryEpoch;
-    dialogLoadFailed = false;
-    library = next;
-    const current = dialogState;
-    if (current && alive(current)) renderDialog(current);
+  const restore = (): void => {
+    close();
+    const draft = split(options.draft() ?? input.value);
+    displayedPrefix = draft.prefix; prefixOwner = options.owner(); input.value = draft.body;
+    renderSelected();
   };
-
-  const openDialog = (trigger: SkillCommandTrigger | null = null): void => {
-    hideInline();
-    const state: DialogState = { epoch: ++dialogEpoch, identity: getDraftIdentity(), trigger };
-    dialogState = state;
-    search.value = '';
-    library = null;
-    dialogLoadFailed = false;
-    $<HTMLButtonElement>('skillsImport').disabled = false;
-    $<HTMLButtonElement>('skillsOpenFolder').disabled = false;
-    list.replaceChildren(el('p', 'skills-empty', () => t("Loading skills…")));
-    if (!dialog.open) dialog.showModal();
-    search.focus();
-    void loadDialog(state);
+  const project = (authored: string): void => {
+    options.saveDraft(authored);
+    const draft = split(authored); displayedPrefix = draft.prefix; prefixOwner = options.owner(); input.value = draft.body;
+    renderSelected(); input.setSelectionRange(input.value.length, input.value.length);
+    input.dispatchEvent(new input.ownerDocument.defaultView!.Event('input', { bubbles: true }));
   };
-
-  const loadDialog = async (state: DialogState): Promise<void> => {
-    if (!alive(state)) return;
-    dialogLoadFailed = false;
-    library = null;
-    renderDialog(state);
-    const next = await loadLibrary();
-    if (!alive(state)) { if (dialogState?.epoch === state.epoch && dialog.open) dialog.close(); return; }
-    if (next) { dialogLoadFailed = false; renderDialog(state); return; }
-    dialogLoadFailed = true;
-    renderDialog(state);
-  };
-
-  const refreshInline = (trigger: SkillCommandTrigger): void => {
-    if (dialog.open) return;
-    const identity = getDraftIdentity();
-    const state: InlineState = { epoch: ++inlineEpoch, identity, trigger, matches: [], selected: 0, loading: true };
-    inlineState = state;
-    renderInline(state);
-    void loadLibrary().then(next => {
-      if (inlineState?.epoch !== state.epoch || identity !== getDraftIdentity()) return;
-      if (!next) { hideInline(); return; }
-      const current = skillCommandTrigger(input.value, input.selectionStart);
-      if (!current || current.kind !== 'slash' || current.lineStart !== trigger.lineStart) { hideInline(); return; }
-      state.trigger = current;
-      state.matches = filtered(next.skills, current.query);
-      state.loading = false;
-      renderInline(state);
-    });
-  };
-
-  const onInput = (): void => {
-    if (dialog.open) return;
-    const trigger = skillCommandTrigger(input.value, input.selectionStart);
-    if (!trigger) { hideInline(); return; }
-    if (trigger.kind === 'prompt') { openDialog(trigger); return; }
-    const active = inlineState;
-    if (active && !autocomplete.hidden && active.identity === getDraftIdentity() && active.trigger.lineStart === trigger.lineStart) {
-      active.trigger = trigger;
-      active.selected = 0;
-      if (!active.loading && library) active.matches = filtered(library.skills, trigger.query);
-      renderInline(active);
-      return;
+  const choose = (skill: typeof choices[number]): void => {
+    if ('command' in skill) {
+      const range = fragment();
+      if (!current() || !range || painted !== selectionKey() || composing) { close(); return; }
+      const text = range ? input.value.slice(0, range.start) + input.value.slice(range.end) : input.value;
+      const authored = (prefixOwner === options.owner() ? displayedPrefix : '') + text;
+      close(); project(authored); options.command?.(skill.command); input.focus(); return;
     }
-    refreshInline(trigger);
+    if (!current() || composing) { close(); return; }
+    const range = fragment();
+    if (!range || painted !== selectionKey()) { close(); return; }
+    const text = range ? input.value.slice(0, range.start) + input.value.slice(range.end).replace(/^\s+/, '') : input.value;
+    const draft = split((prefixOwner === options.owner() ? displayedPrefix : '') + text);
+    const prefix = draft.ids.includes(skill.id) ? draft.prefix
+      : `${draft.prefix}${draft.prefix && !/\s$/.test(draft.prefix) ? '\n' : ''}/${skill.id}\n`;
+    close(); project(prefix + draft.body); input.focus();
   };
-
-  const onKeydown = (event: KeyboardEvent): boolean => {
-    if (event.isComposing) return false;
-    const trigger = skillCommandTrigger(input.value, input.selectionStart);
-    if (trigger?.kind === 'prompt' && ['Enter', 'Tab'].includes(event.key)) {
-      event.preventDefault(); openDialog(trigger); return true;
-    }
-    const state = inlineState;
-    if (!state || autocomplete.hidden) return false;
-    if (event.key === 'Escape') { event.preventDefault(); hideInline(); return true; }
-    const current = liveInlineTrigger(state);
-    if (!current) { hideInline(); return false; }
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-      event.preventDefault();
-      if (state.matches.length) {
-        const delta = event.key === 'ArrowDown' ? 1 : -1;
-        state.selected = (state.selected + delta + state.matches.length) % state.matches.length;
-        renderInline(state);
-      }
-      return true;
-    }
-    if (event.key === 'Enter' || event.key === 'Tab') {
-      event.preventDefault();
-      const skill = state.matches[state.selected];
-      if (skill && apply(skill, state.identity, current)) hideInline();
-      return true;
-    }
-    return false;
+  const filtered = (query: string): LibrarySkill[] => {
+    const needle = query.trim().toLocaleLowerCase();
+    return (library?.skills ?? []).filter(skill => `${skill.id} ${title(skill)} ${skill.description} ${skill.scope}`.toLocaleLowerCase().includes(needle));
   };
-
-  $('composerSkills').addEventListener('click', () => openDialog());
-  $('skillsClose').addEventListener('click', () => dialog.close());
-  search.addEventListener('input', () => { if (dialogState) renderDialog(dialogState); });
-  search.addEventListener('keydown', event => {
-    if (event.isComposing) return;
-    if (event.key === 'ArrowDown' || event.key === 'Enter') {
-      const first = list.querySelector<HTMLButtonElement>('.skill-use');
-      if (first) { event.preventDefault(); first.focus(); }
+  const paintInline = (): void => {
+    if (!current() || composing) { hideInline(); return; }
+    const range = fragment();
+    if (!range) { hideInline(); return; }
+    const query = range?.query ?? '';
+    const commands = options.command ? [
+      { command: 'plan', name: 'Plan', description: 'Turn the next composer request into editable stages.', glyph: 'i-steps' },
+      { command: 'goal', name: 'Goal', description: 'Pursue a saved objective and stop when it is complete.', glyph: 'i-target' },
+      { command: 'loop', name: 'Loop', description: 'Keep continuing toward the saved objective.', glyph: 'i-loop' },
+      { command: 'compact', name: 'Compact', description: 'Compact this chat and resume it in a fresh conversation.', glyph: 'i-copy' }
+    ].filter(row => row.command.includes(query)) : [];
+    choices = [...commands, ...(loading && !library ? [] : filtered(query).slice(0, 64))];
+    selected = Math.min(selected, Math.max(0, choices.length - 1)); painted = selectionKey();
+    const renderEpoch = epoch, renderOwner = options.owner(), renderSelection = selectionKey();
+    const chooseCurrent = (choice: typeof choices[number]): void => {
+      if (epoch === renderEpoch && options.owner() === renderOwner && selectionKey() === renderSelection) choose(choice);
+    };
+    host.replaceChildren(); host.hidden = false;
+    input.setAttribute('aria-expanded', 'true'); input.setAttribute('aria-controls', host.id);
+    for (const [index, skill] of choices.entries()) {
+      const command = 'command' in skill;
+      if (index === 0 || (index === commands.length && !command)) host.append(el('div', 'slash-menu-section-title', () => t(command ? 'Commands' : 'Skills')));
+      const row = control('', 'skill-choice skill-autocomplete-option slash-menu-option');
+      row.replaceChildren(); row.id = `skill-option-${index}`; row.setAttribute('role', 'option'); row.setAttribute('aria-selected', String(index === selected));
+      if (!command) row.dataset.skillId = skill.id;
+      row.title = command ? `/${skill.command}` : skill.path;
+      const copy = el('span', 'slash-menu-copy'); copy.append(el('strong', '', command ? t(skill.name) : title(skill)), el('small', '', command ? t(skill.description) : skill.shortDescription ?? skill.description));
+      row.append(icon(command ? skill.glyph : 'i-skill', 'ico slash-menu-icon'), copy, el('span', 'slash-menu-meta', () => command ? '' : scopeLabel(skill)));
+      row.addEventListener('pointerdown', event => event.preventDefault()); row.addEventListener('click', () => chooseCurrent(skill)); host.append(row);
     }
-  });
-  list.addEventListener('keydown', event => {
-    if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
-    const uses = [...list.querySelectorAll<HTMLButtonElement>('.skill-use')];
-    const current = uses.indexOf(document.activeElement as HTMLButtonElement);
-    if (current < 0 || !uses.length) return;
-    event.preventDefault(); uses[(current + (event.key === 'ArrowDown' ? 1 : -1) + uses.length) % uses.length]!.focus();
-  });
-  $('skillsImport').addEventListener('click', async () => {
-    const state = dialogState; if (!state || !alive(state)) return;
-    const button = $<HTMLButtonElement>('skillsImport'); button.disabled = true;
+    if (error) host.append(el('p', 'slash-menu-empty', error));
+    if (choices.length) { input.setAttribute('aria-activedescendant', `skill-option-${selected}`); host.querySelector(`#skill-option-${selected}`)?.scrollIntoView?.({ block: 'nearest' }); }
+    else input.removeAttribute('aria-activedescendant');
+  };
+  const load = async (): Promise<void> => {
+    const request = ++epoch, owner = options.owner(), scope = options.scope(), key = JSON.stringify(scope);
+    surfaceOwner = owner; loadedKey = key; loading = true; error = ''; library = cache.get(key) ?? null;
+    paintInline();
     try {
-      const next = await run(api.skillsImport());
-      if (next) publishLibrary(next);
-      if (!alive(state)) return;
-    } finally { if (alive(state)) button.disabled = false; }
-  });
-  $('skillsOpenFolder').addEventListener('click', async () => {
-    const state = dialogState; if (!state || !alive(state)) return;
-    const button = $<HTMLButtonElement>('skillsOpenFolder'); button.disabled = true;
-    try { await run(api.skillsOpenFolder()); }
-    finally { if (alive(state)) button.disabled = false; }
-  });
-  dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
-  dialog.addEventListener('close', () => {
-    const state = dialogState; dialogEpoch++; dialogState = null;
-    if (state?.identity === getDraftIdentity()) input.focus();
-  });
-  dialog.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && !event.isComposing) { event.preventDefault(); dialog.close(); }
-  });
-
-  return {
-    open: () => openDialog(),
-    onInput,
-    onKeydown,
-    syncDraft: () => {
-      hideInline();
-      if (dialogState && dialogState.identity !== getDraftIdentity() && dialog.open) dialog.close();
-    }
+      const result = await options.list(scope);
+      if (request !== epoch || owner !== options.owner() || scopeKey() !== key) return;
+      if (!result.ok) error = result.error;
+      else {
+        library = result.data; cache.delete(key); cache.set(key, library);
+        while (cache.size > 12) cache.delete(cache.keys().next().value!);
+      }
+    } catch (failure) { if (request === epoch && current()) error = failure instanceof Error ? failure.message : String(failure); }
+    finally { if (request === epoch && current()) { loading = false; paintInline(); renderSelected(); } }
   };
+  const update = (): void => {
+    options.saveDraft(authoredText());
+    if (composing) return;
+    if (!fragment()) { hideInline(); loadedKey = null; return; }
+    selected = 0;
+    if (loadedKey !== scopeKey() || !current()) void load(); else paintInline();
+  };
+  input.addEventListener('compositionstart', () => { composing = true; hideInline(); });
+  for (const [button, add] of [[options.openButton, false], [options.addButton, true]] as const) {
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      const menu = button.closest('details'); if (menu) menu.open = false;
+      if (add) {
+        const range = fragment();
+        const text = range ? input.value.slice(0, range.start) + input.value.slice(range.end) : input.value;
+        close();
+        project((prefixOwner === options.owner() ? displayedPrefix : '') + `Please add the following skills to my COS skills:\n${text}`);
+      } else {
+        input.setRangeText(input.value ? '/\n' : '/', 0, 0, 'start');
+        input.setSelectionRange(1, 1);
+        input.dispatchEvent(new input.ownerDocument.defaultView!.Event('input', { bubbles: true }));
+      }
+      input.focus();
+    });
+  }
+  input.addEventListener('compositionend', () => { composing = false; update(); });
+  input.addEventListener('input', event => { if ((event as InputEvent).isComposing) { hideInline(); return; } update(); });
+  input.addEventListener('click', () => { if (!host.hidden) paintInline(); });
+  document.addEventListener('click', event => {
+    if (!host.contains(event.target as Node) && event.target !== input) hideInline();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !event.isComposing && !host.hidden) { hideInline(); input.focus(); }
+  });
+  return { close, restore, authoredText, keydown: (event: KeyboardEvent): boolean => {
+    if (host.hidden || !current() || composing || event.isComposing) return false;
+    if (!fragment() || painted !== selectionKey()) { hideInline(); return false; }
+    if (event.key === 'Escape') { hideInline(); event.preventDefault(); return true; }
+    if (!choices.length || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return false;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      selected = (selected + (event.key === 'ArrowDown' ? 1 : choices.length - 1)) % choices.length; paintInline();
+    } else if (event.key === 'Enter' || event.key === 'Tab') choose(choices[selected]!);
+    else return false;
+    event.preventDefault(); return true;
+  } };
 }

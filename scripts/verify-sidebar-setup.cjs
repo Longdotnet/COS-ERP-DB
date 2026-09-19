@@ -1,4 +1,11 @@
 // Isolated renderer/Chromium acceptance. No backend, provider, credentials or pairing.
+if (!process.versions.electron) {
+  const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+  const result = require('node:child_process').spawnSync(require('electron'), [__filename],
+    { env, encoding: 'utf8', windowsHide: true });
+  process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
+  process.exit(result.status ?? 1);
+}
 const { app, BrowserWindow } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -10,6 +17,7 @@ app.whenReady().then(async () => {
   const { createServer } = await import('vite');
   const fixture = `
     localStorage.removeItem('chat-on-steroids.sidebar-order');
+    localStorage.removeItem('cos.ui.language');
     const config = {
       roots: [{name:'demo',path:'C:/demo'}], readOnly:true,
       capabilities: {browse:true,search:true,read:true,metadata:true,create:false,edit:false,move:false,deleteFile:false,command:false,screen:false,control:false,clipboardRead:false,clipboardWrite:false},
@@ -61,7 +69,39 @@ app.whenReady().then(async () => {
     await win.loadURL(server.resolvedUrls.local[0]+'fixture.html');
     win.webContents.setZoomFactor(1);
     const js = code=>win.webContents.executeJavaScript(code);
+    const screenshot = async name => {
+      await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true});
+      await new Promise(r=>setTimeout(r,200));
+      fs.writeFileSync(path.join(output,name),(await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG());
+    };
     for(let i=0;i<100 && !(await js('!!window.fixtureReady && document.querySelectorAll(".project-group > .sess").length === 5'));i++) await new Promise(r=>setTimeout(r,25));
+    await js(`window.disclosureEvents=[]; for(const type of ['keydown','keypress','keyup','click']) document.addEventListener(type,e=>window.disclosureEvents.push({type,key:e.key,tag:e.target.tagName,cls:e.target.className,open:document.querySelector('.project-group')?.open}),true)`);
+    // Project groups start closed. Exercise native summary activation before the
+    // existing visible-row geometry, drag ordering and pagination checks.
+    assert.equal(await js(`document.querySelector('.project-group').open`), false);
+    await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
+    const headingPoint = await js(`(() => {const r=document.querySelector('.project-heading').getBoundingClientRect();return {x:Math.round(r.left+35),y:Math.round(r.top+r.height/2)}})()`);
+    const expectDisclosure = async open => {
+      for (let i=0;i<100;i++) {
+        if (await js(`document.querySelector('.project-group').open === ${open}`)) return;
+        await new Promise(r=>setTimeout(r,10));
+      }
+      assert.equal(await js(`document.querySelector('.project-group').open`),open,
+        JSON.stringify(await js(`({focus:document.activeElement.outerHTML.slice(0,250),events:window.disclosureEvents.slice(-12)})`)));
+    };
+    win.webContents.sendInputEvent({type:'mouseDown',button:'left',clickCount:1,...headingPoint});
+    win.webContents.sendInputEvent({type:'mouseUp',button:'left',clickCount:1,...headingPoint});
+    await expectDisclosure(true);
+    await js(`document.querySelector('.project-heading').focus()`);
+    for (const keyCode of ['Space','Enter']) {
+      win.webContents.sendInputEvent({type:'keyDown',keyCode});
+      // Enter's native summary activation uses the character event. Electron's
+      // low-level keyDown/keyUp pair does not synthesize that part of typing.
+      if (keyCode === 'Enter') win.webContents.sendInputEvent({type:'char',keyCode:'\r'});
+      win.webContents.sendInputEvent({type:'keyUp',keyCode});
+      await expectDisclosure(keyCode === 'Enter');
+    }
+    await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
     const geometry = await js(`(() => { const group=document.querySelector('.project-group');
       const title=group.querySelector('.project-name').getBoundingClientRect(), chat=group.querySelector('.sess-top b').getBoundingClientRect();
       return {title:title.left,chat:chat.left,count:group.querySelectorAll(':scope > .sess').length,color:getComputedStyle(document.getElementById('newChat')).color,
@@ -81,21 +121,26 @@ app.whenReady().then(async () => {
     assert.deepEqual(moved,['task-1','task-2','task-0','task-3','task-4']);
     assert.equal(await js(`document.querySelector('.sess.is-sel') === null`),true);
     await new Promise(r=>setTimeout(r,200));
-    fs.writeFileSync(path.join(output,'sidebar.png'),(await win.webContents.capturePage()).toPNG());
+    await screenshot('sidebar.png');
+    win.webContents.setZoomFactor(1.17);
+    await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
+    assert.equal(await js('document.documentElement.scrollWidth <= innerWidth'),true);
+    await screenshot('sidebar-base-zoom.png');
+    win.webContents.setZoomFactor(1);
     await js(`document.querySelector('.project-show-more').click()`);
     assert.equal(await js(`document.querySelectorAll('.project-group > .sess').length`),13);
     await js(`document.querySelector('[data-tab="setup"]').click(); document.getElementById('wizExpand').click()`);
     assert.equal(await js(`document.getElementById('wizard').classList.contains('is-tidy')`),true);
     assert.equal(await js(`document.querySelector('[data-panel="setup"]').classList.contains('is-active')`),true);
     await new Promise(r=>setTimeout(r,200));
-    fs.writeFileSync(path.join(output,'setup-collapsed.png'),(await win.webContents.capturePage()).toPNG());
+    await screenshot('setup-collapsed.png');
     await js(`document.getElementById('wizExpand').click()`);
     assert.equal(await js(`document.getElementById('wizard').classList.contains('is-tidy')`),false);
     assert.equal(await js(`document.querySelector('[data-panel="setup"]').contains(document.getElementById('setupProfile'))`),false);
     await new Promise(r=>setTimeout(r,100));
-    fs.writeFileSync(path.join(output,'setup-clean.png'),(await win.webContents.capturePage()).toPNG());
-    await js(`document.getElementById('chatSettingsBtn').click(); document.getElementById('uiLanguage').scrollIntoView({block:'center'});`);
-    for(const [width,zoom] of [[1100,1],[800,1],[1100,1.5]]) {
+    await screenshot('setup-clean.png');
+    await js(`document.querySelector('[data-tab="appearance"]').click(); document.getElementById('uiLanguage').scrollIntoView({block:'center'});`);
+    for(const [width,zoom] of [[1100,1],[800,1],[1100,1.17],[800,1.17],[1100,1.5]]) {
       win.setSize(width,900); win.webContents.setZoomFactor(zoom);
       await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
       await js(`document.getElementById('setupProfile').scrollIntoView({block:'center'});document.getElementById('setupProfile').click()`);
@@ -114,10 +159,43 @@ app.whenReady().then(async () => {
     assert.equal(await js(`document.getElementById('setupProfileCurrent').textContent`),'Work');
     await js(`document.getElementById('setupProfile').scrollIntoView({block:'center'});document.getElementById('setupProfile').click()`);
     assert.equal(await js(`document.querySelectorAll('[data-remove-profile-id]:not(:disabled)').length`),2);
+    const compactProfiles = await js(`(() => {
+      const menu = document.getElementById('setupProfileMenu').getBoundingClientRect();
+      const trigger = document.getElementById('setupProfile').getBoundingClientRect();
+      const rows = [...document.querySelectorAll('.setup-profile-option')].map(row => {
+        const choice = row.firstElementChild.getBoundingClientRect();
+        const remove = row.lastElementChild.getBoundingClientRect();
+        return {left:choice.left, choiceRight:choice.right, removeLeft:remove.left, removeRight:remove.right};
+      });
+      return {width:menu.width, right:menu.right, triggerWidth:trigger.width, triggerRight:trigger.right, rows};
+    })()`);
+    assert.ok(compactProfiles.width >= compactProfiles.triggerWidth && compactProfiles.width <= 190, JSON.stringify(compactProfiles));
+    assert.ok(Math.abs(compactProfiles.right - compactProfiles.triggerRight) <= 1, JSON.stringify(compactProfiles));
+    for (const row of compactProfiles.rows) {
+      assert.ok(compactProfiles.right - row.removeRight <= 12, JSON.stringify(compactProfiles));
+      assert.ok(Math.abs(row.removeLeft - compactProfiles.rows[0].removeLeft) <= 1, JSON.stringify(compactProfiles));
+      assert.ok(row.choiceRight <= row.removeLeft, JSON.stringify(compactProfiles));
+    }
     // Wake the hidden fixture's compositor before retaining the final frame.
     await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true});
     await new Promise(r=>setTimeout(r,250));
     fs.writeFileSync(path.join(output,'settings-profiles.png'),(await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG());
+    const longProfile = await js(`(() => {
+      const choice = document.querySelector('.setup-profile-option > :first-child');
+      const text = choice.textContent; choice.textContent = 'Long-profile-'.repeat(6);
+      const menu = document.getElementById('setupProfileMenu');
+      const bounds = menu.getBoundingClientRect();
+      const label = choice.getBoundingClientRect();
+      const remove = choice.nextElementSibling.getBoundingClientRect();
+      const result = {width:bounds.width, left:bounds.left, right:bounds.right, viewport:innerWidth,
+        labelRight:label.right, removeLeft:remove.left, removeRight:remove.right,
+        overflow:menu.scrollWidth > menu.clientWidth + 1};
+      choice.textContent = text;
+      return result;
+    })()`);
+    assert.ok(longProfile.width <= 260 && longProfile.left >= 0 && longProfile.right <= longProfile.viewport, JSON.stringify(longProfile));
+    assert.ok(longProfile.labelRight <= longProfile.removeLeft && !longProfile.overflow, JSON.stringify(longProfile));
+    assert.ok(longProfile.right - longProfile.removeRight <= 12, JSON.stringify(longProfile));
     win.webContents.sendInputEvent({type:'keyDown',keyCode:'Escape'});
     win.webContents.sendInputEvent({type:'keyUp',keyCode:'Escape'});
     await new Promise(r=>setTimeout(r,50));
@@ -129,6 +207,6 @@ app.whenReady().then(async () => {
     await js(`document.querySelector('[data-remove-profile-id="default"]').click()`);
     for(let i=0;i<100 && await js(`document.querySelectorAll('[data-remove-profile-id]').length!==1`);i++) await new Promise(r=>setTimeout(r,25));
     assert.equal(await js(`document.querySelector('[data-remove-profile-id]').disabled`),true);
-    console.log(JSON.stringify({geometry,drag:moved,showMore:13,collapse:true,profileLayout:true,output}));
+    console.log(JSON.stringify({projectDisclosure:{initiallyCollapsed:true,pointer:true,space:true,enter:true},geometry,drag:moved,showMore:13,collapse:true,profileLayout:compactProfiles,longProfile,output}));
   } finally { win?.destroy(); await server.close(); app.quit(); }
 }).catch(error=>{console.error(error);app.exit(1)});

@@ -91,6 +91,21 @@ export interface AssetRef {
   height?: number;
 }
 
+/** Recording-asset storage is global; cleanup never changes the configured 2 GiB ceiling. */
+export interface ImageStorageInfo {
+  /** All bytes charged to the global session-asset quota, including preserved non-image assets. */
+  usedBytes: number;
+  limitBytes: number;
+}
+
+export interface ImageStorageClearResult extends ImageStorageInfo {
+  /** Physical image bytes removed by this explicit user operation. */
+  freedBytes: number;
+  removedFiles: number;
+}
+
+export type ImageStorageClearMode = 'oldest-gib' | 'all';
+
 /** Compact human-readable presentation of one tool call. */
 export interface ActivitySummary {
   /** Short verb phrase: "Edited src/main/mcp/server.ts". */
@@ -179,8 +194,10 @@ export const ATTRIBUTION_LABELS: Record<CallAttribution, string> = {
 };
 
 export interface ToolCallRecord {
+  /** Internal code-mode invocation: retained for audit, never a separate model exchange. */
+  nested?: boolean;
   /** Child lifetime, independent of the initial tool response and output delivery. */
-  process?: { sessionId: string; completedAt?: number; exitCode?: number | null; durationMs?: number };
+  process?: { sessionId: string; completedAt?: number; exitCode?: number | null; durationMs?: number; benignExit?: boolean };
   /** Recorded model evidence, when known; absence is not the current picker selection. */
   model?: string;
   reasoningEffort?: ReasoningEffort;
@@ -202,6 +219,8 @@ export interface ToolCallRecord {
   /** Files this call demonstrably changed, with line counts where computable. */
   changes?: FileChange[];
   assets?: AssetRef[];
+  /** Image assets explicitly removed from local recording storage; same-call replay cannot restore them. */
+  retiredImageAssetIds?: string[];
   /**
    * This call was the caller's last word: a worker's successful finish report. Recorded so
    * the session itself, not only the in-memory swarm, knows the worker stopped working here.
@@ -217,8 +236,11 @@ export function toolCallSummary(call: Pick<ToolCallRecord, 'tool' | 'summary'>):
     ? { ...call.summary, metric: 'started' } : call.summary;
 }
 
-/** Process-status revisions are delivery cursors, not new model work. */
+/** Rendering, identity and process-status revisions are cursors, not new work. */
 export function workSequence(event: SessionEvent): number {
+  if (event.kind === 'user_message') return event.contentSeq ?? event.origin ?? event.seq;
+  if (event.kind === 'assistant_message') return event.contentSeq ?? event.finalContentSeq ?? event.origin ?? event.seq;
+  if (event.kind === 'page_tool') return event.contentSeq ?? event.origin ?? event.seq;
   return event.kind === 'tool_call' ? event.origin ?? event.seq : event.seq;
 }
 
@@ -253,6 +275,10 @@ interface BaseEvent {
   /** 1-based, strictly increasing within a session. Ordering never relies on time. */
   seq: number;
   time: number;
+  /** Provider timestamp for transcript presentation, independent of local activity. */
+  authoredAt?: number;
+  /** Read projection: owning start outside this page, or null for an unowned row. */
+  turnOrigin?: number | null;
   source: EventSource;
   /** Multi-agent attribution. Absent when no swarm is running. */
   agent?: string;
@@ -270,14 +296,18 @@ export type SessionEvent =
       inputId?: string;
       /** Tool handout remains unconfirmed until a later exact invocation proves receipt. */
       inputDelivery?: 'offered' | 'confirmed';
-      /** Kept even when the optional local preview cannot be stored. */
-      inputImageCount?: number;
       /** Original app-authored text, excluding transport-only control instructions. */
       authoredText?: string;
+      /** Native badge on this exact user message. Missing means unobserved; null means absent. */
+      reaction?: string | null;
       attachments?: import('./input.js').InputAttachment[];
       assets?: AssetRef[];
+      /** Image assets explicitly removed from local recording storage; same-message replay cannot restore them. */
+      retiredImageAssetIds?: string[];
       /** First sequence assigned to this stable website message; revisions keep this anchor. */
       origin?: number;
+      /** Store-owned authored-content revision; metadata and rehydration preserve it. */
+      contentSeq?: number;
     })
   | (BaseEvent & {
       kind: 'assistant_message';
@@ -304,7 +334,34 @@ export type SessionEvent =
       goalEligible?: boolean;
       /** Store-owned sequence of the latest final text/state change; rendering/metadata cannot advance it. */
       finalContentSeq?: number;
+      /** Local acceptance time of final content; provider time can predate its last tools. */
+      finalObservedAt?: number;
       /** First sequence assigned to this logical message; later revisions keep this anchor. */
+      origin?: number;
+      /** Store-owned text/state revision, including interim progress before the final. */
+      contentSeq?: number;
+    })
+  | (BaseEvent & {
+      /** ChatGPT-native generated media, independent of assistant prose and local MCP calls. */
+      kind: 'native_image';
+      /** Exact provider message UUID that owns this output. */
+      messageId: string;
+      /** Stable non-secret id from the typed sediment image pointer. */
+      providerAssetId: string;
+      providerRole: 'tool' | 'assistant';
+      providerChannel?: 'final';
+      /** Exact typed provider lifecycle for this image payload; it is not a turn boundary. */
+      providerStatus?: 'in_progress' | 'finished_successfully';
+      /** Provider-declared source geometry, used only to reserve truthful layout space. */
+      width?: number;
+      height?: number;
+      /** Locally retained preview geometry and content-addressed bytes, when capture succeeded. */
+      previewWidth?: number;
+      previewHeight?: number;
+      previewStatus: 'pending' | 'available' | 'unavailable';
+      previewError?: 'not_loaded' | 'ambiguous' | 'tainted' | 'oversized' | 'invalid' | 'quota' | 'removed';
+      asset?: AssetRef;
+      /** First sequence assigned to this exact provider-message/asset tuple. */
       origin?: number;
     })
   /**
@@ -332,7 +389,7 @@ export type SessionEvent =
    * neither affects identity. `origin` names the seq of the first record of that site object,
    * for readers working from a cursor that has already consumed it.
    */
-  | (BaseEvent & { kind: 'page_tool'; messageId: string; label: string; origin?: number })
+  | (BaseEvent & { kind: 'page_tool'; messageId: string; label: string; origin?: number; contentSeq?: number })
   /**
    * `detail` names an app-authored reopening: the page reported this turn ended, and a tool
    * call under the same server turn then proved it had not. Absent on the page's own starts.
@@ -383,6 +440,27 @@ export type SessionEventKind = SessionEvent['kind'];
  * compaction's three rows into one.
  */
 export const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
+
+/** Page readback may escape ASCII punctuation. Letters and digits cannot be escaped.
+ * Keep this grammar in sync with markedAs() in the unbundled extension/content.js. */
+const CONTINUATION_MARKER_ESCAPED = /^\s*(?:\\?\[){2}CLF\\?-(HANDOFF|RESUME)\\?:((?:[A-Za-z0-9]|\\?[_-]){16,64})(?:\\?\]){2}(?:\s|$)/;
+
+/**
+ * Undo one layer of ASCII-punctuation escaping in page readback only. Callers try exact
+ * text first; authored Send instructions and ordinary user-message receipts remain unchanged.
+ */
+export function unescapeMarkdown(value: string): string {
+  return value.replace(/\\([!-/:-@[-`{-~])/g, '$1');
+}
+
+/** The continuation marker at the head of `text`, as typed or as the composer escaped it. */
+export function continuationMarkerOf(text: string | null | undefined):
+  { kind: 'HANDOFF' | 'RESUME'; token: string; marker: string } | null {
+  const value = typeof text === 'string' ? text : '';
+  const match = CONTINUATION_MARKER.exec(value) ?? CONTINUATION_MARKER_ESCAPED.exec(value.slice(0, 200));
+  if (!match) return null;
+  return { kind: match[1] as 'HANDOFF' | 'RESUME', token: match[2]!.replace(/\\/g, ''), marker: match[0] };
+}
 
 /**
  * An event before the store assigns its sequence number.
@@ -446,6 +524,12 @@ export function originTitle(origin: SessionOrigin, source: string | null): strin
 }
 
 export interface SessionSummary {
+  /** Rebuildable transcript boundaries; no message bodies or execution authority. */
+  timelineTurns?: import('./chronology.js').TimelineTurns;
+  /** Rebuildable request-to-turn proof from recorded MCP calls, never a caller permission. */
+  requestTurns?: import('./chronology.js').RequestTurns;
+  /** Rebuildable native question boundary; tool-result instructions never replace it. */
+  nativeQuestion?: { messageId: string; origin: number } | null;
   /** Durable naming authority; absent only on legacy recordings. */
   titleSource?: 'fallback' | 'provider' | 'manual';
   /** Latest proven native picker selection; scoped to its frontend, never worker creation intent. */
@@ -470,10 +554,15 @@ export interface SessionSummary {
    * can be recognised rather than silently filed as if nothing had moved.
    */
   chatIds: string[];
+  /** Durable departure times from the same rebind commit. Used only to recover plans
+   * accepted before a historical frontend was replaced, never to infer caller identity. */
+  retiredChatAt?: Record<string, number>;
   startedAt: number;
   updatedAt: number;
   /** Null while the session is still the active one. */
   endedAt: number | null;
+  /** Explicit user departure suspends activity and automatic recovery until the exact page returns. */
+  browserRecoveryDismissedAt?: number;
   events: number;
   userMessages: number;
   toolCalls: number;
@@ -647,7 +736,9 @@ export interface AgentInfo {
   primeConversationId?: string;
   id: string;
   role: AgentRole;
+  /** Spawn label; reused assignments fall back to the stable worker id. */
   label: string;
+  /** Spawn brief, or a bounded inbox preview for the current reused assignment. */
   task: string;
   /**
    * Requested reasoning level for this worker's chat, or null to inherit the default.
@@ -675,7 +766,7 @@ export interface AgentInfo {
    */
   activatedAt: number | null;
   finishedAt: number | null;
-  /** Result text the worker reported when it finished. */
+  /** Current completion report; cleared when work resumes. Prior reports remain in history/inbox. */
   result: string | null;
   /** Messages waiting for this agent, including offered-but-unacknowledged ones. */
   pending: number;
@@ -867,6 +958,7 @@ export function eventTokens(event: SessionEvent): number {
       // most likely to need compacting — the multi-agent ones.
       return storedTextTokens(event.message);
     case 'tool_call':
+      if (event.call.nested === true) return 0;
       return (
         storedTextTokens(event.call.args) +
         Math.min(MAX_TOOL_RESULT_TOKENS, storedTextTokens(event.call.result)) +

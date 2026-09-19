@@ -25,6 +25,7 @@ export interface CallEvidence {
   /** Free-form qualifier the summariser may use, e.g. "lines 200-420". */
   detail: string | null;
   exitCode: number | null;
+  benignExit?: boolean;
   timedOut: boolean;
   /** Child/process lifetime when the command surface measured it itself. */
   durationMs: number | null;
@@ -61,6 +62,8 @@ export interface CallCaller {
   conversationId: string | null;
   /** Durable local session principal carried by the same exact request proof. */
   sessionId?: string | null;
+  /** Selected agent family. This selects state only after the broker checks its owner. */
+  runId?: string;
 }
 
 export interface CallContext {
@@ -72,6 +75,11 @@ export interface CallContext {
   transportKey: string | null;
   /** Resolved agent id in multi-agent mode, else null. */
   agent: string | null;
+  /**
+   * Whether this call may keep its workspace, plan, terminals and worker family under its
+   * transport request id before browser proof names the durable chat.
+   */
+  allowUnattributed?: boolean;
   /** Who this call was proven to be, for the broker tools to route by. */
   caller: CallCaller;
   /**
@@ -316,6 +324,7 @@ export function noteExec(result: {
   store.evidence.timedOut = result.timedOut === true;
   // A timeout is our failure and outranks a child status; benign child statuses are exempt.
   const exempt = result.benignExit === true;
+  store.evidence.benignExit = exempt;
   if (result.exitCode !== null && result.exitCode !== 0 && !exempt) {
     noteOutcome('process_exit_nonzero');
   }

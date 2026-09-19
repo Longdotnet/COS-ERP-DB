@@ -4,10 +4,13 @@ import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
 import { prependUserPrompt } from '../src/shared/user-prompt.js';
-import type { SessionEvent, SessionSummary } from '../src/shared/session.js';
+import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/session.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import type { LocalProject } from '../src/shared/projects.js';
 import type { TerminalLiveUpdate } from '../src/shared/terminal-live.js';
+vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({ update: vi.fn() }) }));
+vi.mock('../src/renderer/pet.js', () => ({ initPet: () => () => {} }));
+import { positionOf, projectTimeline } from '../src/shared/chronology.js';
 
 /**
  * The session timeline as the user reads it while a chat is running.
@@ -85,8 +88,17 @@ function toolCall(seq: number, callId: string): SessionEvent {
   };
 }
 
-/** The rows the recorder writes for one Compact & Resume, in the order it observes them. */
-function compaction(seq: number): SessionEvent[] {
+/**
+ * The rows the recorder writes for one Compact & Resume, in the order it observes them.
+ *
+ * `escaped` is how ChatGPT's composer records the same two prompts since 2026-09-16: it
+ * round-trips inserted text through its own Markdown serializer, which escapes ASCII
+ * punctuation, so the marker arrives as `[[CLF-RESUME\:<token>]]`. These are the exact shapes
+ * read back out of a live install's session store.
+ */
+function compaction(seq: number, escaped = false): SessionEvent[] {
+  const mark = (kind: 'HANDOFF' | 'RESUME') =>
+    escaped ? `[[CLF-${kind}\\:${TOKEN}]]` : `[[CLF-${kind}:${TOKEN}]]`;
   return [
     {
       seq,
@@ -95,7 +107,7 @@ function compaction(seq: number): SessionEvent[] {
       kind: 'user_message',
       messageId: 'm-brief-request',
       turnId: 'turn-brief',
-      message: text(`[[CLF-HANDOFF:${TOKEN}]] Write the handoff brief for this session.`)
+      message: text(`${mark('HANDOFF')} Write the handoff brief for this session.`)
     },
     { seq: seq + 1, time: T0 + (seq + 1) * 1000, source: 'extension', kind: 'turn_start', turnId: 'turn-brief' },
     {
@@ -124,7 +136,7 @@ function compaction(seq: number): SessionEvent[] {
       source: 'extension',
       kind: 'user_message',
       messageId: 'm-bootstrap',
-      message: text(`[[CLF-RESUME:${TOKEN}]] Continue from this brief: keep the loop running.`)
+      message: text(`${mark('RESUME')} Continue from this brief: keep the loop running.`)
     }
   ];
 }
@@ -135,10 +147,20 @@ async function settle(ms = 0): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean } = {}) {
+/** History paging yields to the browser frame after each bounded read. Timer
+ * ticks alone can all finish before that frame on Linux and macOS. */
+async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Promise<void> {
+  await settle();
+  await new Promise<void>(resolve => w.requestAnimationFrame(() => resolve()));
+  await settle();
+}
+
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
+  w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  w.HTMLDialogElement.prototype.close = function () { this.open = false; };
   Object.assign(globalThis, {
     window: w,
     Event: w.Event,
@@ -182,6 +204,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   const ok = (data: any) => Promise.resolve({ ok: true, data });
   const live = { events: [...events], inputs: [] as InputEntry[], sent: [] as InputArgs[], automation: 'off', controlCalls: [] as Array<{ id: string; action: string }>, compacting: false, finishHeld: true };
   let sessionListener: () => void = () => undefined;
+  let writeSessionListener: (id: string) => void = () => undefined;
   const taskProgressListeners = new Set<(progress: any) => void>();
   const terminalLiveListeners = new Set<(update: TerminalLiveUpdate) => void>();
   const api: any = new Proxy(
@@ -208,10 +231,27 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         terminalLiveListeners.add(listener);
         return () => terminalLiveListeners.delete(listener);
       },
-      listSessions: () => ok({ sessions: options.sessions ?? [{ ...summary(live.events), ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }], activeId: summary(live.events).id, pressure: [] }),
+      onWriteSession: (fn: (id: string) => void) => {
+        writeSessionListener = fn;
+        return () => undefined;
+      },
+      listSessions: () => {
+        const sessions = options.sessions ?? [{ ...summary(live.events), ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
+        const known = new Set(sessions.map(row => row.id));
+        const openings = live.inputs.filter(row => row.opening && row.sessionId && !known.has(row.sessionId)).map(row => ({
+          ...summary(live.events), id: row.sessionId!, title: row.text, conversationId: null, chatIds: []
+        }));
+        return ok({ sessions: [...openings, ...sessions], activeId: summary(live.events).id, pressure: [] });
+      },
       listProjects: () => ok(projects),
       // IPC snapshots cannot share the backend's mutable array with the renderer.
       listInputs: () => ok(structuredClone(live.inputs)),
+      cancelInput: vi.fn((id: string) => {
+        const entry = live.inputs.find(row => row.id === id);
+        if (!entry) return ok(false);
+        entry.state = 'cancelled'; entry.cancelledByUser = true;
+        return ok(true);
+      }),
       listPausedHelpers: () => ok(pausedHelpers),
       retryHelper: (id: string, sourceSessionId: string) => {
         live.controlCalls.push({ id: sourceSessionId, action: `retry:${id}` });
@@ -221,6 +261,9 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       sendInput: (input: InputArgs) => {
         live.sent.push(input);
         const row: InputEntry = { ...input, state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+        if (options.reserveOpenings && input.sessionId === null) Object.assign(row, {
+          opening: true, requestedSessionId: null, sessionId: input.id
+        });
         if (input.mode === 'finish' && input.stages) {
           row.stagesApplied = true;
           live.inputs.push(row, ...input.stages.map((text, index) => ({ ...row, id: `${input.id}-${index}`, text, stages: undefined })));
@@ -229,18 +272,24 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         live.inputs.push(row);
         return ok(row);
       },
-      getSession: (_id: string, options?: { from?: number; before?: number; limit?: number }) => {
+      getSession: (_id: string, options?: { from?: number; before?: number; after?: number; limit?: number }) => {
         const from = options?.from ?? 0;
-        const eligible = live.events.filter((event) => event.seq >= from && (options?.before === undefined || event.seq < options.before));
-        const page = options?.before === undefined ? eligible : eligible.slice(-(options.limit ?? 160));
+        const eligible = live.events.filter((event) => event.seq >= from &&
+          (options?.before === undefined || positionOf(event) < options.before) &&
+          (options?.after === undefined || positionOf(event) > options.after))
+          .sort((a, b) => options?.from !== undefined ? a.seq - b.seq : positionOf(a) - positionOf(b));
+        const limit = options?.limit ?? 30;
+        const page = options?.after !== undefined || options?.from !== undefined
+          ? eligible.slice(0, limit) : eligible.slice(-limit);
+        const opening = live.inputs.find(row => row.opening && row.sessionId === _id);
         return ok({
-          summary: summary(live.events),
+          summary: opening ? { ...summary(live.events), id: _id, title: opening.text, conversationId: null, chatIds: [] } : summary(live.events),
           events: page,
           total: live.events.length,
-          nextFrom: live.events.reduce((max, e) => Math.max(max, e.seq + 1), 0)
+          nextFrom: page.reduce((max, e) => Math.max(max, e.seq + 1), from)
         });
       },
-      getHandoff: () => ok(null)
+      getHandoff: (sessionId: string, handoffId: string) => ok(options.handoff?.sessionId === sessionId && options.handoff.id === handoffId ? options.handoff : null)
     },
     {
       get(target, prop) {
@@ -262,6 +311,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     w,
     live,
     notifySession: () => sessionListener(),
+    writeSession: (id: string) => writeSessionListener(id),
     progress: (value: any) => { for (const listener of taskProgressListeners) listener(value); },
     terminal: (value: TerminalLiveUpdate) => { for (const listener of terminalLiveListeners) listener(value); },
     async append(more: SessionEvent[]) {
@@ -295,6 +345,50 @@ it('shows terminal output while exec_command is still running and retires the ep
   expect(app.w.document.querySelector('.live-terminal-metric')?.textContent).toBe('✓ exit 0');
   await settle(800);
   expect(app.w.document.querySelector('details.live-terminal')).toBeNull();
+});
+
+it('patches native reactions in place and hides streamed envelopes without changing authored messages', async () => {
+  const user: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension', messageId: 'reaction-user', message: text('Question') };
+  const answer: SessionEvent = { kind: 'assistant_message', seq: 2, time: T0 + 1, source: 'extension', messageId: 'reaction-answer', message: text('\uE200message_'), final: false };
+  const { w, append } = await boot([user, answer]);
+  const bubble = w.document.querySelector('.said.is-user')!;
+  expect(w.document.querySelector<HTMLElement>('.ev-assistant_message')!.hidden).toBe(true);
+  for (const [index, reaction] of ['😂', '❤️', null].entries()) {
+    await append([{ ...user, seq: index + 3, origin: 1, reaction }]);
+    expect(w.document.querySelector('.said.is-user')).toBe(bubble);
+    expect(w.document.querySelector('.message-reaction')?.textContent ?? null).toBe(reaction);
+  }
+  expect(bubble.textContent).toContain('Question');
+  await append([{ ...answer, seq: 7, origin: 2, message: text('\uE200message_reaction\uE202😂\uE201\nThe answer.'), final: true }]);
+  expect(w.document.querySelector('.ev-assistant_message .msg')?.textContent?.trim()).toBe('The answer.');
+  expect(w.document.querySelector('.message-reaction')).toBeNull(); // Never infer a target from adjacency.
+});
+
+it('keeps a reaction on the native question across 100 interim messages, tool calls and injected corrections', async () => {
+  const question: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension',
+    messageId: 'native-question', message: text('Original native question'), reaction: '👀' };
+  const middle: SessionEvent[] = Array.from({ length: 100 }, (_, i) => ({ kind: 'assistant_message', seq: i + 2,
+    time: T0 + i + 1, source: 'extension', messageId: `interim-${i}`, message: text(`Update ${i}`), final: false }));
+  const tools = Array.from({ length: 15 }, (_, i) => ({ ...toolCall(i + 102, `call-${i}`), time: T0 + i + 101 }));
+  const injected: SessionEvent = { kind: 'user_message', seq: 117, time: T0 + 116, source: 'app', messageId: 'input:correction',
+    inputId: 'correction', inputDelivery: 'confirmed', message: text('An injected correction') };
+  const final: SessionEvent = { kind: 'assistant_message', seq: 118, time: T0 + 117, source: 'extension', messageId: 'final',
+    message: text('\uE200message_reaction\uE202👀\uE201\nFinished.'), final: true };
+  const { w } = await boot([question, ...middle, ...tools, injected, final]);
+  const correction = [...w.document.querySelectorAll('.said.is-user')].find(node => node.textContent?.includes('An injected correction'))!;
+  expect(correction.querySelector('.message-reaction')).toBeNull();
+  expect(w.document.querySelector('.message-reaction')).toBeNull(); // The native question is on an older page.
+  const pane = w.document.getElementById('chatBody')!;
+  Object.defineProperties(pane, { clientHeight: { value: 400 }, scrollHeight: { value: 10000 } });
+  for (let page = 0; page < 3; page++) {
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+    await settleHistoryFrame(w);
+  }
+  const badges = [...w.document.querySelectorAll('.message-reaction')];
+  expect(badges).toHaveLength(1);
+  expect(badges[0]!.closest('.said')!.textContent).toContain('Original native question');
+  expect(w.document.getElementById('timeline')!.textContent).not.toContain('message_reaction');
 });
 
 it.each(['compaction', 'blocked', 'worker'])('retires %s control status when leaving its session, including late IPC and locale refresh', async kind => {
@@ -353,6 +447,135 @@ it('clears control projections on an existing-session switch and fences A to B t
   expect(status.textContent).toBe('');
   expect(w.document.getElementById('cancelCompaction')!.hidden).toBe(true);
   expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
+});
+
+it('keeps the prior transcript inert until the selected detail arrives and fences A to B to A', async () => {
+  const attachment = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'a-only.png', mimeType: 'image/png', size: 42, preview: 'data:image/webp;base64,YQ==' };
+  const aEvents: SessionEvent[] = [
+    { seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'a-question', message: text('A QUESTION'), attachments: [attachment] },
+    { seq: 2, time: T0 + 1, source: 'extension', kind: 'assistant_message', messageId: 'a-answer', message: text('A ANSWER'), state: 'final', final: true }
+  ];
+  const first = { ...summary(aEvents), title: 'Session A', lastHandoffId: 'handoff-a' };
+  const second = { ...summary([]), id: '2026-09-02-test0000', title: 'Session B', lastHandoffId: null };
+  const saved: Handoff = { id: 'handoff-a', sessionId: first.id, createdAt: T0, text: 'A HANDOFF', sourceEvents: 2, sourceTokens: 10, notes: [] };
+  const app = await boot(aEvents, true, [], [], { sessions: [first, second], handoff: saved });
+  const { w } = app;
+  const api = (w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: { busy: true }, recovery: [] } });
+  await app.append([]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(w.document.getElementById('chatTitle')!.textContent).toBe('Session A');
+  expect(timeline.textContent).toContain('A QUESTION');
+  expect(timeline.querySelector('img[alt="a-only.png"]')).not.toBeNull();
+  expect(w.document.getElementById('handoffBox')!.textContent).toContain('A HANDOFF');
+  expect(w.document.getElementById('sessionControlStatus')!.textContent).toContain('Compaction');
+
+  type Reply = (value: unknown) => void;
+  const details: Array<{ id: string; reply: Reply }> = [];
+  const controls: Array<{ id: string; reply: Reply }> = [];
+  api.getSession = vi.fn((id: string) => new Promise(resolve => details.push({ id, reply: resolve })));
+  api.getSessionControls = vi.fn((id: string) => new Promise(resolve => controls.push({ id, reply: resolve })));
+  const detail = (sum: SessionSummary, rows: SessionEvent[]) => ({ ok: true, data: { summary: sum, events: rows, total: rows.length,
+    nextFrom: rows.reduce((cursor, event) => Math.max(cursor, event.seq + 1), 0) } });
+
+  // Begin an A refresh, then change ownership twice. A stale response cannot become current
+  // merely because the selected id later returns to A.
+  app.notifySession();
+  await vi.waitFor(() => expect(details.map(entry => entry.id)).toEqual([first.id]));
+  (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLButtonElement).click();
+  expect(w.document.getElementById('chatTitle')!.textContent).toBe('Session B');
+  expect(timeline.textContent).toContain('A QUESTION');
+  expect(timeline.querySelector('img[alt="a-only.png"]')).not.toBeNull();
+  expect(timeline.hasAttribute('inert')).toBe(true);
+  expect(timeline.getAttribute('aria-busy')).toBe('true');
+  expect(w.document.getElementById('timelineEmpty')!.hidden).toBe(true);
+  expect(w.document.getElementById('handoffBox')!.textContent).toBe('');
+  expect(w.document.getElementById('sessionControlStatus')!.textContent).toBe('');
+  await vi.waitFor(() => expect(details.map(entry => entry.id)).toEqual([first.id, second.id]));
+  // The queue read also repaints detail while the destination read remains pending.
+  await settle();
+  expect(timeline.textContent).toContain('A QUESTION');
+  expect(w.document.getElementById('timelineEmpty')!.hidden).toBe(true);
+
+  (w.document.querySelector(`#sessionList [data-id="${first.id}"]`) as HTMLButtonElement).click();
+  expect(w.document.getElementById('chatTitle')!.textContent).toBe('Session A');
+  expect(timeline.textContent).toContain('A QUESTION');
+  await vi.waitFor(() => expect(details.map(entry => entry.id)).toEqual([first.id, second.id, first.id]));
+
+  const staleA: Extract<SessionEvent, { kind: 'user_message' }> = {
+    seq: 4, time: T0 + 4, source: 'extension', kind: 'user_message', messageId: 'stale-a', message: text('STALE A QUESTION'), attachments: [attachment]
+  };
+  details[1]!.reply({ ok: false, error: 'B detail unavailable' });
+  details[0]!.reply(detail(first, [staleA]));
+  controls[0]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: { busy: true } } });
+  controls[1]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: 'blocked', job: null } });
+  await settle();
+  expect(w.document.getElementById('chatTitle')!.textContent).toBe('Session A');
+  expect(timeline.textContent).not.toContain('STALE A QUESTION');
+  expect(timeline.textContent).toContain('A QUESTION');
+  expect(timeline.hasAttribute('inert')).toBe(true);
+  expect(w.document.getElementById('sessionControlStatus')!.textContent).toBe('');
+
+  const current: SessionEvent[] = [{ seq: 3, time: T0 + 3, source: 'extension', kind: 'assistant_message', messageId: 'a-current', message: text('CURRENT A ANSWER'), state: 'final', final: true }];
+  details[2]!.reply(detail(first, current));
+  controls[2]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: null, recovery: [] } });
+  await settle();
+  expect(timeline.textContent).toContain('CURRENT A ANSWER');
+  expect(timeline.textContent).not.toContain('STALE A QUESTION');
+  expect(timeline.querySelector('img[alt="a-only.png"]')).toBeNull();
+  expect(timeline.hasAttribute('inert')).toBe(false);
+  expect(timeline.hasAttribute('aria-busy')).toBe(false);
+  expect(w.document.getElementById('timelineEmpty')!.hidden).toBe(true);
+});
+
+it.each(['failed', 'empty', 'new-chat'] as const)('retires retained rows after a %s destination without a welcome flash', async outcome => {
+  const rows: SessionEvent[] = [{ seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'a', message: text('Previous chat') }];
+  const first = summary(rows), second = { ...summary([]), id: 'other', title: 'Other session' };
+  const { w } = await boot(rows, true, [], [], { sessions: [first, second] });
+  let reply!: (value: unknown) => void;
+  (w as any).api.getSession = () => new Promise(resolve => { reply = resolve; });
+  const timeline = w.document.getElementById('timeline')!;
+  const welcome = w.document.getElementById('timelineEmpty')!;
+  (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLElement).click();
+  await settle();
+  expect(timeline.textContent).toContain('Previous chat');
+  expect(welcome.hidden).toBe(true);
+  if (outcome === 'new-chat') w.document.getElementById('newChat')!.click();
+  reply(outcome === 'failed' ? { ok: false, error: 'Read failed' } : { ok: true, data: { summary: second, events: [], total: 0, nextFrom: 0 } });
+  await settle();
+  expect(timeline.textContent).toBe('');
+  expect(timeline.hasAttribute('inert')).toBe(false);
+  expect(timeline.hasAttribute('aria-busy')).toBe(false);
+  expect(welcome.hidden).toBe(outcome !== 'new-chat');
+});
+
+it('keeps the current transcript and handoff mounted when Write Directly focuses the same session', async () => {
+  const attachment = { id: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', name: 'current.png', mimeType: 'image/png', size: 42, preview: 'data:image/webp;base64,YQ==' };
+  const rows: SessionEvent[] = [
+    { seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'current-question', message: text('CURRENT QUESTION'), attachments: [attachment] },
+    toolCall(2, 'current-tool')
+  ];
+  const current = { ...summary(rows), title: 'Current session', lastHandoffId: 'current-handoff' };
+  const saved: Handoff = { id: 'current-handoff', sessionId: current.id, createdAt: T0, text: 'CURRENT HANDOFF', sourceEvents: 2, sourceTokens: 10, notes: [] };
+  const app = await boot(rows, true, [], [], { sessions: [current], handoff: saved });
+  const { w } = app;
+  const api = (w as any).api;
+  let reject!: (value: unknown) => void;
+  api.getSession = vi.fn(() => new Promise(resolve => { reject = resolve; }));
+
+  app.writeSession(current.id);
+  expect(w.document.activeElement).toBe(w.document.getElementById('chatInput'));
+  expect(w.document.getElementById('chatTitle')!.textContent).toBe('Current session');
+  expect(w.document.getElementById('timeline')!.textContent).toContain('CURRENT QUESTION');
+  expect(w.document.querySelector('img[alt="current.png"]')).not.toBeNull();
+  expect(w.document.querySelector('details.tool')?.textContent).toContain('Read README.md');
+  expect(w.document.getElementById('handoffBox')!.textContent).toContain('CURRENT HANDOFF');
+  expect(api.getSession).toHaveBeenCalledWith(current.id, { from: 3, limit: 30 });
+
+  reject({ ok: false, error: 'same-session refresh unavailable' });
+  await settle();
+  expect(w.document.getElementById('timeline')!.textContent).toContain('CURRENT QUESTION');
+  expect(w.document.getElementById('handoffBox')!.textContent).toContain('CURRENT HANDOFF');
 });
 
 it('reorders queued tasks by drag and keyboard through the durable IPC operation', async () => {
@@ -439,6 +662,137 @@ it('shows ordinary after-turn messages in the task dock until actual delivery', 
   expect(w.document.getElementById('timeline')!.textContent).toContain('Next task');
 });
 
+it('identifies automatic Continue without user-task editing or reordering and keeps its cancellation', async () => {
+  const { w, live, append } = await boot([]);
+  const sessionId = summary([]).id;
+  const recovery: InputEntry = { id: 'automatic-continue', sessionId, text: 'Resume the unfinished work.', mode: 'after-turn',
+    dueAt: 0, model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b',
+    recovery: { questionId: 'source-question', pro: false, busyUntil: Date.now() + 60_000, phase: 'ready' } };
+  live.inputs.push(recovery, ...['first', 'second'].map((text, index): InputEntry => ({
+    id: `authored-${index}`, sessionId, text, mode: 'after-turn', dueAt: 0, model: null, reasoningEffort: null,
+    state: 'queued', owner: null, createdAt: index + 1, conversationId: 'chat-b'
+  })));
+  const api = (w as any).api;
+  api.reorderQueuedInputs = vi.fn(async () => ({ ok: true, data: true }));
+  await append([]);
+  const card = w.document.querySelector<HTMLElement>('#finishQueue [data-input-id="automatic-continue"]')!;
+  expect(card.textContent).toContain('Automatic Continue');
+  expect(card.textContent).toContain(recovery.text);
+  expect(card.querySelector<HTMLElement>('.queue-label')!.title).toContain('without a final answer');
+  expect(card.querySelector('[aria-label="Edit queued task"]')).toBeNull();
+  expect(card.querySelector('[draggable="true"]')).toBeNull();
+  const second = w.document.querySelector('#finishQueue [data-input-id="authored-1"] .queue-label')!;
+  second.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));
+  await settle();
+  expect(api.reorderQueuedInputs).toHaveBeenCalledWith(sessionId, ['authored-1', 'authored-0']);
+  w.document.querySelector<HTMLButtonElement>('#finishQueue [aria-label="Cancel automatic Continue"]')!.click();
+  await settle();
+  expect(api.cancelInput).toHaveBeenCalledWith(recovery.id);
+  expect(live.inputs[0]!.state).toBe('cancelled');
+  expect(w.document.querySelector('#finishQueue [data-input-id="automatic-continue"]')).toBeNull();
+  expect(w.document.querySelectorAll('#finishQueue [aria-label="Edit queued task"]')).toHaveLength(2);
+});
+
+it('keeps a transport-deferred immediate upload visible with cancellation instead of an invalid task editor', async () => {
+  const { w, live, append } = await boot([]);
+  live.inputs.push({ id: 'native-correction', sessionId: summary([]).id, text: 'Waiting upload', mode: 'after-turn', requestedMode: 'auto',
+    dueAt: 0, model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b',
+    attachments: [{ id: 'native-file', name: 'notes.txt', mimeType: 'text/plain', size: 12 }] });
+  await append([]);
+  const row = w.document.querySelector('#inputQueue [data-input-id="native-correction"]');
+  expect(row?.textContent).toContain('Waiting upload');
+  expect(row?.textContent).toContain('notes.txt');
+  expect(w.document.querySelector('#finishQueue [data-input-id="native-correction"]')).toBeNull();
+  (row!.querySelector('[aria-label="Cancel delivery"]') as HTMLButtonElement).click();
+  await settle();
+  expect(live.inputs[0]?.state).toBe('cancelled');
+  expect(w.document.querySelector('[data-input-id="native-correction"]')).toBeNull();
+});
+
+it('keeps cancelled Continue attempts at their own times across a long session instead of stacking them under the current chat', async () => {
+  const rows: SessionEvent[] = [0, 1, 2, 3].map(index => ({
+    seq: index + 1, time: T0 + index * 60_000, source: 'extension', kind: 'user_message',
+    messageId: `night-question-${index}`, message: text(`NIGHT QUESTION ${index}`)
+  }));
+  const { w, live, append } = await boot(rows);
+  for (let index = 0; index < 3; index++) live.inputs.push({
+    id: `retired-continue-${index}`, sessionId: summary(rows).id, text: `UNSENT CONTINUE ${index}`,
+    mode: 'after-turn', dueAt: T0 + index * 60_000 + 1000, createdAt: T0 + index * 60_000 + 1000,
+    model: null, reasoningEffort: null, state: 'cancelled', owner: null, conversationId: `old-chat-${index}`,
+    error: 'Automatic Continue cancelled: the source turn, activity or setting changed.',
+    recovery: { questionId: `night-question-${index}`, pro: false, busyUntil: T0 + index * 60_000 + 61_000, phase: 'ready' }
+  });
+  await append([]);
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('UNSENT CONTINUE');
+  const timeline = w.document.getElementById('timeline')!;
+  for (let index = 0; index < 3; index++) {
+    const card = timeline.querySelector<HTMLElement>(`[data-input-id="retired-continue-${index}"]`)!;
+    expect(card).not.toBeNull();
+    expect(card.querySelector('time')?.textContent).toBe(new Date(live.inputs[index]!.createdAt).toLocaleString());
+    const content = timeline.textContent!;
+    expect(content.indexOf(`NIGHT QUESTION ${index}`)).toBeLessThan(content.indexOf(`UNSENT CONTINUE ${index}`));
+    expect(content.indexOf(`UNSENT CONTINUE ${index}`)).toBeLessThan(content.indexOf(`NIGHT QUESTION ${index + 1}`));
+  }
+});
+
+it.each(['trash', 'empty-save'])('removes a queued message during editing via %s even while a refresh is delayed', async action => {
+  const { w, live, append } = await boot([]);
+  live.inputs.push({ id: 'remove-edit', sessionId: summary([]).id, text: 'Delete me', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  (w.document.querySelector('[aria-label="Edit queued task"]') as HTMLButtonElement).click();
+  const field = w.document.querySelector<HTMLTextAreaElement>('#finishQueue textarea')!;
+  (w as any).api.listInputs = () => new Promise(() => {});
+  if (action === 'empty-save') field.value = ' \n\t ';
+  const button = action === 'trash' ? w.document.querySelector('#finishQueue [aria-label="Remove queued task"]') : field.nextElementSibling;
+  expect(button).not.toBeNull();
+  (button as HTMLButtonElement).click(); await settle();
+  expect((w as any).api.cancelInput).toHaveBeenCalledWith('remove-edit');
+  expect(live.inputs[0]?.state).toBe('cancelled');
+  expect(w.document.querySelector('#finishQueue textarea')).toBeNull();
+  expect(w.document.getElementById('finishQueue')!.hidden).toBe(true);
+});
+
+it.each(['cancelled', 'browser'])('retires the editor when Save learns the queued message became %s', async state => {
+  const { w, live, append } = await boot([]);
+  live.inputs.push({ id: 'retired-edit', sessionId: summary([]).id, text: 'Original', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  (w.document.querySelector('[aria-label="Edit queued task"]') as HTMLButtonElement).click();
+  const field = w.document.querySelector<HTMLTextAreaElement>('#finishQueue textarea')!;
+  field.value = 'Late edit';
+  (w as any).api.editQueuedInput = async () => {
+    live.inputs[0]!.state = state as InputEntry['state'];
+    return { ok: true, data: false };
+  };
+  (field.nextElementSibling as HTMLButtonElement).click(); await settle();
+  expect(w.document.querySelector('#finishQueue textarea')).toBeNull();
+  expect(live.inputs[0]?.text).toBe('Original');
+  if (state === 'cancelled') expect(w.document.querySelector('#finishQueue [data-input-id="retired-edit"]')).toBeNull();
+  else expect(w.document.querySelector('#finishQueue [data-input-id="retired-edit"]')).not.toBeNull();
+});
+
+it('retires a queued editor synchronously on New Chat and ignores its delayed save after returning', async () => {
+  const { w, live, append } = await boot([]);
+  live.inputs.push({ id: 'old-editor', sessionId: summary([]).id, text: 'Original', mode: 'finish', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  (w.document.querySelector('[aria-label="Edit queued task"]') as HTMLButtonElement).click();
+  let resolveSave!: (value: unknown) => void;
+  (w as any).api.editQueuedInput = () => new Promise(resolve => { resolveSave = resolve; });
+  const field = w.document.querySelector<HTMLTextAreaElement>('#finishQueue textarea')!;
+  field.value = 'Old save'; (field.nextElementSibling as HTMLButtonElement).click();
+  w.document.getElementById('newChat')!.click();
+  expect(w.document.querySelector('#finishQueue textarea')).toBeNull();
+  expect(w.document.getElementById('finishQueue')!.hidden).toBe(true);
+  (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click(); await settle();
+  (w.document.querySelector('[aria-label="Edit queued task"]') as HTMLButtonElement).click();
+  const fresh = w.document.querySelector<HTMLTextAreaElement>('#finishQueue textarea')!;
+  fresh.value = 'New edit'; resolveSave({ ok: true, data: true }); await settle();
+  expect(w.document.querySelector('#finishQueue textarea')).toBe(fresh);
+  expect(fresh.value).toBe('New edit');
+});
+
 it('keeps canonical image attachments above the user text bubble for the selected session', async () => {
   const app = await boot([]);
   const { w } = app;
@@ -454,6 +808,236 @@ it('keeps canonical image attachments above the user text bubble for the selecte
   await settle();
   expect(getImage).toHaveBeenCalledWith(summary([]).id, 'abcdef.bin');
   expect(attachments.querySelector('img')?.getAttribute('src')).toBe('data:image/webp;base64,YQ==');
+});
+
+it('reserves every saved user-image slot before IPC and keeps missing previews inside their slots', async () => {
+  const app = await boot([]);
+  const pending: Array<(value: unknown) => void> = [];
+  (app.w as any).api.getSessionImage = vi.fn(() => new Promise(resolve => pending.push(resolve)));
+  await app.append([{ seq: 1, time: T0, source: 'app', kind: 'user_message', messageId: 'two-images',
+    message: text('Inspect both'), assets: ['one.webp', 'two.webp'].map(id => ({ id, mimeType: 'image/webp', bytes: 12 })) }]);
+  const attachments = app.w.document.querySelector('.message-attachments')!;
+  const slots = [...attachments.querySelectorAll('.user-image-slot')];
+  expect(slots).toHaveLength(2);
+  expect(attachments.children).toHaveLength(2);
+  pending[0]!({ ok: true, data: null }); await settle();
+  expect(slots[0]!.textContent).toContain('Image unavailable');
+  pending[1]!({ ok: true, data: 'data:image/webp;base64,YQ==' }); await settle();
+  expect(slots[1]!.querySelector('img')).not.toBeNull();
+  expect([...attachments.children]).toEqual(slots);
+});
+
+it('keeps a retained fallback and its unsaved notice inside the reserved user-image footprint', async () => {
+  const app = await boot([]);
+  const dataUrl = 'data:image/webp;base64,YQ==';
+  app.live.inputs.push({ id: 'fallback-input', sessionId: summary([]).id, state: 'sent', owner: null,
+    text: 'Fallback', mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0,
+    conversationId: 'chat-b', messageId: 'fallback-message', toolImages: [{ name: 'fallback.webp', dataUrl }] });
+  (app.w as any).api.getSessionImage = vi.fn(async () => ({ ok: true, data: null }));
+  await app.append([{ seq: 1, time: T0, source: 'app', kind: 'user_message', messageId: 'fallback-message',
+    inputId: 'fallback-input', message: text('Fallback'), assets: [{ id: 'missing.webp', mimeType: 'image/webp', bytes: 12 }] }]);
+  const attachments = app.w.document.querySelector('.message-attachments')!;
+  expect(attachments.children).toHaveLength(1);
+  const slot = attachments.firstElementChild!;
+  expect(slot.className).toBe('user-image-slot');
+  expect(slot.querySelector('img')?.getAttribute('src')).toBe(dataUrl);
+  expect(slot.querySelector('.retained-image-notice')?.textContent).toBe('Not saved to history');
+});
+
+it.each([false, true])('keeps retained image previews at the canonical row across queue/history arrival and off-tail reload (historyFirst=%s)', async historyFirst => {
+  const app = await boot([]);
+  const { w, live, append } = app;
+  const row: InputEntry = { id: 'image-input', sessionId: summary([]).id, state: 'sent', owner: null, text: 'Original image request',
+    mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, deliveredAt: T0 + 10, conversationId: 'chat-b',
+    messageId: 'input:image-input', historyRecorded: false, historyAnchored: true,
+    toolImages: [{ name: 'retained.webp', dataUrl: 'data:image/webp;base64,YQ==' }] };
+  const message: SessionEvent = { seq: 1, time: T0, source: 'app', kind: 'user_message', messageId: row.messageId,
+    inputId: row.id, inputDelivery: 'confirmed', message: text(row.text) };
+  if (historyFirst) await append([message]);
+  live.inputs.push(row);
+  await append(historyFirst ? [] : [message]);
+  expect(w.document.querySelectorAll('#timeline .said.is-user img')).toHaveLength(1);
+  expect(w.document.querySelector('#timeline .said.is-user img')?.getAttribute('src')).toBe(row.toolImages![0]!.dataUrl);
+  const retainedNotice = w.document.querySelector('#timeline .retained-image-notice')!;
+  expect(retainedNotice.textContent).toBe('Not saved to history');
+  expect(retainedNotice.parentElement?.className).toBe('user-image-slot');
+  expect(retainedNotice.previousElementSibling?.tagName).toBe('IMG');
+  expect(w.document.querySelector('#inputQueue')!.textContent).not.toContain(row.text);
+  // Queue changes must repaint the same canonical row, never borrow another owner.
+  live.inputs[0] = { ...row, sessionId: 'another-session' };
+  await append([]);
+  expect(w.document.querySelector('#timeline .said.is-user img')).toBeNull();
+  live.inputs[0] = row; await append([]);
+  const api = (w as any).api;
+  api.getSessionImage = vi.fn(async () => ({ ok: true, data: row.toolImages![0]!.dataUrl }));
+  await append([{ ...message, seq: 2, origin: 1, assets: [{ id: 'saved.webp', mimeType: 'image/webp', bytes: 1 }] }]);
+  expect(w.document.querySelectorAll('#timeline .said.is-user img')).toHaveLength(1);
+  expect(w.document.querySelector('#timeline .retained-image-notice')).toBeNull();
+  await append(Array.from({ length: 180 }, (_, i): SessionEvent => ({ seq: i + 3, time: T0 + i + 20, kind: 'user_message',
+    source: 'extension', messageId: `newer-${i}`, message: text(`Newer ${i}`) })));
+  const original = api.getSession;
+  api.getSession = async (id: string, options: any) => {
+    const result = await original(id, options);
+    if (options?.from === undefined && options?.before === undefined) result.data.events = result.data.events.slice(-160);
+    return result;
+  };
+  w.document.getElementById('newChat')!.click(); await settle();
+  (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click(); await settle();
+  expect(w.document.querySelector('#timeline')!.textContent).not.toContain(row.text);
+  expect(w.document.querySelector('#inputQueue')!.textContent).not.toContain(row.text);
+});
+
+it.each([false, true])('hands a delivered bubble to exact native history without a blank or duplicate (historyFirst=%s)', async historyFirst => {
+  const { w, live, append } = await boot([]);
+  const row: InputEntry = { id: 'delivery-one', sessionId: summary([]).id, state: 'browser', owner: 'page', text: 'Follow-up once',
+    mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-b' };
+  live.inputs.push(row); await append([]);
+  const original = w.document.querySelector('#inputQueue .pending-message');
+  await append([]);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBe(original);
+  const message: SessionEvent = { seq: 1, time: T0 + 1, source: 'app', kind: 'user_message', messageId: 'native-followup',
+    inputId: row.id, message: text(row.text) };
+  if (historyFirst) await append([message]);
+  else {
+    live.inputs[0] = { ...row, state: 'sent', messageId: 'native-followup', historyAnchored: true, deliveredAt: T0 + 1 };
+    await append([]);
+  }
+  const count = () => [...w.document.querySelectorAll('#timeline .said.is-user, #inputQueue .pending-message')].filter(node => node.textContent?.includes(row.text)).length;
+  expect(count()).toBe(1);
+  if (historyFirst) live.inputs[0] = { ...row, state: 'sent', messageId: 'native-followup', historyAnchored: true, deliveredAt: T0 + 1 };
+  await append(historyFirst ? [] : [message]);
+  expect(count()).toBe(1);
+  expect(w.document.querySelector('#inputQueue .pending-message')).toBeNull();
+});
+
+it.each([undefined, 4])('never resurrects committed off-page inputs beside genuinely waiting inputs when old timestamps reappear (historySeq=%s)', async historySeq => {
+  const events = Array.from({ length: 180 }, (_, i): SessionEvent => ({ ...toolCall(i + 10, `receipt-${i}`), time: T0 - 100 }));
+  const { w, live, append } = await boot(events);
+  const base = { sessionId: summary([]).id, owner: null, mode: 'auto' as const, model: null, reasoningEffort: null,
+    dueAt: T0, createdAt: T0, conversationId: 'chat-b' };
+  live.inputs.push({ ...base, id: 'old-delivered', text: 'Already delivered correction', state: 'sent',
+    messageId: 'input:old-delivered', deliveredAt: T0 + 20, historyAnchored: true, historyRecorded: true, historySeq },
+    { ...base, id: 'still-waiting', text: 'Genuinely waiting correction', state: 'queued' },
+    { ...base, id: 'history-in-flight', text: 'Receipt preceding history snapshot', state: 'sent',
+      messageId: 'input:history-in-flight', deliveredAt: T0 + 30, historyAnchored: true, historySeq: 200 });
+  for (let i = 0; i < 2; i++) {
+    await append([]);
+    const queue = w.document.querySelector('#inputQueue')!;
+    expect(queue.textContent).not.toContain('Already delivered correction');
+    expect(queue.textContent).toContain('Genuinely waiting correction');
+    expect(queue.textContent).toContain('Receipt preceding history snapshot');
+  }
+  await append([{ seq: 200, origin: 200, time: T0 + 30, kind: 'user_message', source: 'app',
+    inputId: 'history-in-flight', messageId: 'input:history-in-flight', message: text('Receipt preceding history snapshot') }]);
+  expect(w.document.querySelector('#inputQueue')!.textContent).not.toContain('Receipt preceding history snapshot');
+  expect(w.document.querySelector('#timeline')!.textContent).toContain('Receipt preceding history snapshot');
+});
+
+it('does not request conversation-only controls for a local chat without a provider binding', async () => {
+  const reserved = { ...summary([]), conversationId: null, chatIds: [], origin: { kind: 'desktop' as const, fromSessionId: null, agentId: null, task: '' } };
+  const { w, append } = await boot([], true, [], [], { sessions: [reserved] });
+  const controls = vi.fn(async () => ({ ok: false, error: 'session_not_recorded' }));
+  (w as any).api.getSessionControls = controls;
+  await append([]); await append([]);
+  expect(controls).not.toHaveBeenCalled();
+  expect(w.document.getElementById('compactSession')!.hidden).toBe(true);
+});
+
+it('removes a withdrawn newest chat after sidebar pagination while preserving the older page', async () => {
+  const opening = { ...summary([]), id: 'reserved-opening', title: 'Withdrawn', updatedAt: T0 + 3,
+    conversationId: null, chatIds: [], origin: { kind: 'desktop' as const, fromSessionId: null, agentId: null, task: '' } };
+  const retained = { ...summary([]), id: 'retained-chat', updatedAt: T0 + 2 };
+  const older = { ...summary([]), id: 'older-chat', updatedAt: T0 + 1 };
+  const { w, append } = await boot([], false, [], [], { sessions: [opening, retained] });
+  let withdrawn = false, complete = false;
+  (w as any).api.listSessions = async (options: any) => ({ ok: true, data: {
+    sessions: options?.cursor ? [older] : withdrawn ? [retained] : [opening, retained],
+    total: complete ? 1 : withdrawn ? 2 : 3, nextCursor: options?.cursor || complete ? null : { updatedAt: retained.updatedAt, id: retained.id },
+    activeId: null, pressure: [], blocked: []
+  } });
+  await append([]);
+  w.document.getElementById('sessionList')!.closest('.scroll')!.dispatchEvent(new w.Event('scroll'));
+  await settle();
+  expect(w.document.querySelector('[data-id="older-chat"]')).not.toBeNull();
+  withdrawn = true; await append([]);
+  expect(w.document.querySelector('[data-id="reserved-opening"]')).toBeNull();
+  expect(w.document.querySelector('[data-id="older-chat"]')).not.toBeNull();
+  complete = true; await append([]);
+  expect(w.document.querySelector('[data-id="older-chat"]')).toBeNull();
+  expect(w.document.querySelector('[data-id="retained-chat"]')).not.toBeNull();
+});
+
+it('reserves geometry and hydrates multiple native generated images independently in source order', async () => {
+  const app = await boot([]);
+  const { w } = app;
+  const pending = new Map<string, (value: unknown) => void>();
+  (w as any).api.getSessionImage = vi.fn((_sessionId: string, assetId: string) => new Promise(resolve => pending.set(assetId, resolve)));
+  const messageId = '3150f756-bf2d-45fa-ac0f-45010b2239fb';
+  const events: SessionEvent[] = [
+    { seq: 1, time: T0, source: 'extension', kind: 'native_image', messageId,
+      providerAssetId: 'file_blue', providerRole: 'tool', providerChannel: 'final', width: 1254, height: 1254,
+      previewStatus: 'available', previewWidth: 12, previewHeight: 12, asset: { id: 'blue.webp', mimeType: 'image/webp', bytes: 12 } },
+    { seq: 2, time: T0 + 1, source: 'extension', kind: 'native_image', messageId,
+      providerAssetId: 'file_orange', providerRole: 'tool', providerChannel: 'final', width: 1024, height: 768,
+      previewStatus: 'available', previewWidth: 16, previewHeight: 12, asset: { id: 'orange.webp', mimeType: 'image/webp', bytes: 12 } }
+  ];
+  await app.append(events);
+
+  const rows = [...w.document.querySelectorAll<HTMLElement>('.said.native-image')];
+  expect(rows).toHaveLength(2);
+  expect(w.document.querySelectorAll('.generated-image-gallery')).toHaveLength(1);
+  expect(w.document.querySelector('.generated-image-gallery')?.querySelectorAll('.ev-native_image')).toHaveLength(2);
+  const frames = rows.map(row => row.querySelector<HTMLElement>('.generated-image-frame')!);
+  expect(frames.map(frame => frame.style.aspectRatio)).toEqual(['1254 / 1254', '1024 / 768']);
+  expect(frames.every(frame => frame.textContent === 'Image preview is loading')).toBe(true);
+
+  pending.get('orange.webp')?.({ ok: true, data: 'data:image/webp;base64,b3Jhbmdl' });
+  await settle();
+  expect(frames[1]!.querySelector('img')?.getAttribute('src')).toContain('b3Jhbmdl');
+  expect(frames[0]!.querySelector('img')).toBeNull();
+  pending.get('blue.webp')?.({ ok: true, data: 'data:image/webp;base64,Ymx1ZQ==' });
+  await settle();
+  expect(frames[0]!.querySelector('img')?.getAttribute('src')).toContain('Ymx1ZQ==');
+});
+
+it('keeps generated-image metadata visible when recording storage is full', async () => {
+  const app = await boot([]);
+  await app.append([{ seq: 1, time: T0, source: 'extension', kind: 'native_image',
+    messageId: '5150f756-bf2d-45fa-ac0f-45010b2239fb', providerAssetId: 'file_quota_fixture',
+    providerRole: 'tool', providerChannel: 'final', providerStatus: 'finished_successfully',
+    width: 1254, height: 1254, previewStatus: 'unavailable', previewError: 'quota' }]);
+  const row = app.w.document.querySelector('.said.native-image')!;
+  expect(row.textContent).toContain('recording storage is full');
+  expect(row.querySelector('.generated-image-frame')).toBeTruthy();
+  expect(row.querySelector('img')).toBeNull();
+  expect(row.querySelector('.generated-image-frame')?.classList.contains('is-unavailable')).toBe(true);
+  expect(row.querySelector('button')?.textContent).toBe('Free image storage');
+});
+
+it('does not group images across an intervening authored message or another turn', async () => {
+  const app = await boot([]);
+  const image = (seq: number, turnId: string): SessionEvent => ({ seq, time: T0 + seq,
+    source: 'extension', kind: 'native_image', messageId: `image-${seq}`, providerAssetId: `file-${seq}`,
+    providerRole: 'tool', turnId, previewStatus: 'pending' });
+  await app.append([image(1, 'a'), image(2, 'a'),
+    { seq: 3, time: T0 + 3, source: 'extension', kind: 'assistant_message', messageId: 'text-3',
+      turnId: 'a', final: false, message: { text: 'Between images', chars: 14, truncated: false } },
+    image(4, 'a'), image(5, 'b')]);
+  const galleries = [...app.w.document.querySelectorAll('.generated-image-gallery')];
+  expect(galleries.map(gallery => gallery.querySelectorAll('.ev-native_image').length)).toEqual([2, 1, 1]);
+  expect(galleries[0]?.nextElementSibling?.textContent).toContain('Between images');
+});
+
+it('retains one exact-message gallery when only one image gains a proven turn', async () => {
+  const app = await boot([]);
+  const first: SessionEvent = { seq: 1, time: T0, source: 'extension', kind: 'native_image',
+    messageId: 'shared-image-message', providerAssetId: 'file-one', providerRole: 'tool', previewStatus: 'pending' };
+  await app.append([first, { ...first, seq: 2, time: T0 + 1, providerAssetId: 'file-two' }]);
+  const gallery = app.w.document.querySelector('.generated-image-gallery');
+  await app.append([{ ...first, seq: 3, origin: 1, turnId: 'proven-turn', previewStatus: 'unavailable', previewError: 'quota' }]);
+  expect(app.w.document.querySelectorAll('.generated-image-gallery')).toHaveLength(1);
+  expect(app.w.document.querySelector('.generated-image-gallery')).toBe(gallery);
+  expect(gallery?.querySelectorAll('.ev-native_image')).toHaveLength(2);
 });
 
 it('shows a native image-only message immediately as a card without a guessed caption or image fetch', async () => {
@@ -505,6 +1089,23 @@ it('restores the image draft after rejected injection and removes native-only de
   expect(app.w.document.querySelector('[aria-label="Remove image.png"]')).not.toBeNull();
 });
 
+it.each([7, 10, 11])('uses the same visible delivery choice and payload for %s attached images', async count => {
+  const { w, live } = await boot([]);
+  const files = Array.from({ length: count }, (_, index) => ({
+    id: `image-${index}`, name: `image-${index}.png`, mimeType: 'image/png', size: 42
+  }));
+  (w as any).api.chooseFiles = async () => ({ ok: true, data: files });
+  w.document.getElementById('attachImages')!.click(); await settle();
+  const inject = w.document.querySelector<HTMLElement>('[data-delivery="tool"]')!;
+  expect(inject.hidden).toBe(count > 10);
+  expect(w.document.getElementById('immediateDeliveryLabel')!.textContent).toBe(count > 10 ? 'After this turn' : 'Inject now');
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(live.sent).toHaveLength(1);
+  expect(live.sent[0]?.attachments).toEqual(files);
+  expect(live.sent[0]?.delivery).toBe(count > 10 ? undefined : 'tool');
+});
+
 it('uses the same separate image row for pending and recorded native attachments', async () => {
   const app = await boot([]);
   const attachment = { id: 'a'.repeat(32), name: 'meme.png', mimeType: 'image/png', size: 42, preview: 'data:image/webp;base64,YQ==' };
@@ -522,30 +1123,16 @@ it('uses the same separate image row for pending and recorded native attachments
   expect(recorded.querySelector('.composer-image')).toBeNull();
 });
 
-it('keeps a quota-blocked image injection at its delivery anchor and replaces the retained preview after backfill', async () => {
-  const message: SessionEvent = { seq: 1, time: T0, source: 'app', kind: 'user_message', messageId: 'input:quota-image',
-    inputId: 'quota-image', inputDelivery: 'confirmed', inputImageCount: 1, message: text('Image instruction') };
-  const app = await boot([message, toolCall(2, 'later-work')]);
-  app.live.inputs.push({ id: 'quota-image', sessionId: summary([]).id, text: 'Image instruction',
-    mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, owner: 'image-request', conversationId: 'chat-b',
-    state: 'sent', createdAt: T0, offeredAt: T0, deliveredAt: T0 + 100,
-    messageId: 'input:quota-image', historyRecorded: false, toolImages: [{ name: 'reference.webp', dataUrl: 'data:image/webp;base64,YQ==' }] });
-  await app.append([]);
-  const row = app.w.document.querySelector('.said.is-user')!;
-  expect(row.querySelector('img')?.getAttribute('src')).toBe('data:image/webp;base64,YQ==');
-  expect(row.textContent).toContain('not yet saved to history');
-  expect(app.w.document.getElementById('inputQueue')!.textContent).not.toContain('Image instruction');
-  expect(app.w.document.querySelectorAll('.said.is-user')).toHaveLength(1);
-  const timeline = app.w.document.getElementById('timeline')!;
-  expect(timeline.children.length).toBeGreaterThan(1);
-  expect(timeline.children[0]!.contains(row)).toBe(true);
-  (app.w as any).api.getSessionImage = vi.fn(async () => ({ ok: true, data: 'data:image/webp;base64,Yg==' }));
-  app.live.events[0] = { ...message, seq: 3, origin: 1, assets: [{ id: 'aaaaaaaa.webp', mimeType: 'image/webp', bytes: 1 }] };
-  app.live.inputs[0]!.historyRecorded = true;
-  await app.append([]);
-  expect(app.w.document.querySelectorAll('.said.is-user')).toHaveLength(1);
-  expect(app.w.document.querySelector('.said.is-user img')?.getAttribute('src')).toBe('data:image/webp;base64,Yg==');
-  expect(app.w.document.querySelector('.said.is-user')!.textContent).not.toContain('not yet saved to history');
+it('keeps all ten injected image previews when the outbox message gains its canonical history row', async () => {
+  const { w, live, append } = await boot([]);
+  const images = Array.from({ length: 10 }, (_, index) => ({ name: `reference-${index}.webp`, dataUrl: 'data:image/webp;base64,YQ==' }));
+  live.inputs.push({ id: 'ten-images', sessionId: summary([]).id, text: 'Ten references', images, mode: 'auto', dueAt: 0,
+    state: 'tool', owner: 'request', createdAt: 0, conversationId: 'chat-b', model: null, reasoningEffort: null });
+  await append([]);
+  expect(w.document.querySelectorAll('#inputQueue [data-input-id="ten-images"] img')).toHaveLength(10);
+  await append([{ seq: 1, source: 'app', time: T0, kind: 'user_message', inputId: 'ten-images', messageId: 'input:ten-images', message: text('Ten references') }]);
+  expect(w.document.querySelectorAll('#timeline .user-image-slot img')).toHaveLength(10);
+  expect(w.document.querySelector('#inputQueue [data-input-id="ten-images"]')).toBeNull();
 });
 
 it('explains a legacy missing image recording without asserting a provider receipt', async () => {
@@ -554,7 +1141,9 @@ it('explains a legacy missing image recording without asserting a provider recei
   event.call.tool = 'view_image';
   event.call.result = text('');
   await app.append([event]);
-  const tool = app.w.document.querySelector('details.tool')!;
+  const tool = app.w.document.querySelector('details.tool') as HTMLDetailsElement;
+  tool.open = true; tool.dispatchEvent(new app.w.Event('toggle'));
+  await settle();
   expect(tool.textContent).toContain('No image preview was retained in this recording.');
   expect(tool.textContent).not.toContain('received');
 });
@@ -572,9 +1161,11 @@ it('loads recorded tool images on expansion and hides truncated binary envelopes
   const tool = w.document.querySelector('details.tool') as HTMLDetailsElement;
   expect(getImage).not.toHaveBeenCalled();
   expect(tool.textContent).not.toContain('AAAA');
-  expect(tool.textContent).toContain('aaaaaaaa.txt');
+  expect(tool.textContent).not.toContain('aaaaaaaa.txt');
   tool.open = true; tool.dispatchEvent(new w.Event('toggle'));
   await settle();
+  expect(tool.textContent).toContain('aaaaaaaa.txt');
+  expect(tool.textContent).not.toContain('AAAA');
   expect(getImage).toHaveBeenCalledWith(summary([]).id, 'abcdefab.png');
   expect(tool.querySelector('img')?.getAttribute('src')).toBe('data:image/png;base64,YQ==');
 });
@@ -631,29 +1222,140 @@ it.each(['', '\n', '\n\n'])('hides complete worker instructions without an app r
   expect(w.document.body.textContent).not.toContain('Invisible complete guidance');
 });
 
-it('appends dropped files to the originating composer draft and caps attachments', async () => {
+it('imports one physical file drop from the composer, timeline, or sidebar exactly once and caps attachments', async () => {
   const { w } = await boot([], false);
   const api = (w as any).api;
   const image = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'dropped.md', size: 12, mimeType: 'text/markdown' };
   api.dropFiles = vi.fn(async () => ({ ok: true, data: [image] }));
-  const composer = w.document.getElementById('composer')!;
-  const drop = (count: number) => {
+  const drop = (target: Element, count: number) => {
     const event = new w.Event('drop', { bubbles: true, cancelable: true });
     Object.defineProperty(event, 'dataTransfer', { value: { types: ['Files'], files: Array.from({ length: count }, () => new w.File(['image'], 'image.png', { type: 'image/png' })) } });
-    composer.dispatchEvent(event);
+    target.dispatchEvent(event);
     return event;
   };
-  expect(drop(1).defaultPrevented).toBe(true);
-  await settle();
-  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(1);
-  expect(w.document.getElementById('composerImages')!.textContent).toContain('dropped.md');
-  drop(20);
+  expect(drop(w.document.getElementById('timeline')!, 1).defaultPrevented).toBe(true);
   await settle();
   expect(api.dropFiles).toHaveBeenCalledTimes(1);
-  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(1);
+  expect(drop(w.document.getElementById('composer')!, 1).defaultPrevented).toBe(true);
+  await settle();
+  expect(api.dropFiles).toHaveBeenCalledTimes(2);
+  expect(drop(w.document.getElementById('sessionList')!, 1).defaultPrevented).toBe(true);
+  await settle();
+  expect(api.dropFiles).toHaveBeenCalledTimes(3);
+  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(3);
+  expect(w.document.getElementById('composerImages')!.textContent).toContain('dropped.md');
+  drop(w.document.getElementById('composer')!, 18);
+  await settle();
+  expect(api.dropFiles).toHaveBeenCalledTimes(3);
+  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(3);
 });
 
-it('removes a project group in one click, keeps its chats and draft, and rejects an older refresh', async () => {
+it('leaves file drops on the Folders card to its explicit folder-import owner', async () => {
+  const { w } = await boot([], false);
+  const api = (w as any).api;
+  api.dropFiles = vi.fn(async () => ({ ok: true, data: [] }));
+  api.addRootPath = vi.fn(async () => ({ ok: true, data: null }));
+  const folder = new w.File(['folder'], 'folder-entry', { type: '' });
+  const event = new w.Event('drop', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'dataTransfer', { value: { types: ['Files'], files: [folder] } });
+  w.document.getElementById('foldersCard')!.dispatchEvent(event);
+  await settle();
+  expect(api.addRootPath).toHaveBeenCalledExactlyOnceWith(folder);
+  expect(api.dropFiles).not.toHaveBeenCalled();
+});
+
+it('keeps ordinary draft edits and parallel imports in the same draft lifetime', async () => {
+  const { w } = await boot([], false);
+  const api = (w as any).api;
+  const finishes: Array<(value: unknown) => void> = [];
+  api.dropFiles = vi.fn(() => new Promise(resolve => finishes.push(resolve)));
+  const paste = (name: string) => {
+    const event = new w.Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: { files: [new w.File(['image'], name, { type: 'image/png' })] } });
+    w.document.getElementById('chatInput')!.dispatchEvent(event);
+  };
+  paste('first.png');
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'An ordinary edit while importing'; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+  paste('second.png');
+  await vi.waitFor(() => expect(api.dropFiles).toHaveBeenCalledTimes(2));
+  finishes[1]!({ ok: true, data: [{ id: '11111111-2222-4333-8444-555555555555', name: 'second.png', size: 4, mimeType: 'image/png' }] });
+  finishes[0]!({ ok: true, data: [{ id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'first.png', size: 4, mimeType: 'image/png' }] });
+  await settle();
+  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(2);
+  expect(w.document.getElementById('composerImages')!.textContent).toContain('first.png');
+  expect(w.document.getElementById('composerImages')!.textContent).toContain('second.png');
+  expect(input.value).toBe('An ordinary edit while importing');
+  expect(w.document.querySelector('.toast')?.textContent ?? '').not.toContain('draft changed');
+  (w.document.querySelector(`[data-id="${summary([]).id}"]`) as HTMLButtonElement).click();
+  await settle();
+  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(0);
+  w.document.getElementById('newChat')!.click(); await settle();
+  expect(input.value).toBe('An ordinary edit while importing');
+  expect(w.document.querySelectorAll('#composerImages .attachment-card')).toHaveLength(2);
+});
+
+it.each(['new-same-key', 'a-b-a', 'opening-adopt-new', 'same-session-send-next', 'same-session-failed-send', 'plan-replaces', 'retry-replaces'])('rejects a late attachment import after the draft owner changed (%s)', async mode => {
+  const a = { ...summary([]), id: 'draft-a', conversationId: 'chat-a' };
+  const b = { ...summary([]), id: 'draft-b', conversationId: 'chat-b' };
+  const options = mode === 'a-b-a' ? { sessions: [a, b] }
+    : mode.startsWith('same-session') || mode.endsWith('replaces') ? { sessions: [a] }
+    : mode === 'opening-adopt-new' ? { reserveOpenings: true } : {};
+  const app = await boot([], false, [], [], options);
+  const { w } = app;
+  if (mode === 'a-b-a' || mode.startsWith('same-session') || mode.endsWith('replaces'))
+    (w.document.querySelector('[data-id="draft-a"]') as HTMLButtonElement).click();
+  if (mode === 'retry-replaces') {
+    app.live.inputs.push({ id: 'failed-retry', sessionId: a.id, text: 'Restored failed message',
+      mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, state: 'failed', owner: null,
+      createdAt: T0, conversationId: a.conversationId, error: 'Delivery failed' });
+    await app.append([]);
+  }
+  let finish!: () => void;
+  const attachment = { id: 'cccccccc-dddd-4eee-8fff-000000000000', name: 'late.png', size: 4, mimeType: 'image/png', preview: 'data:image/webp;base64,AAAA' };
+  (w as any).api.dropFiles = vi.fn(() => new Promise(resolve => { finish = () => resolve({ ok: true, data: [attachment] }); }));
+  const paste = new w.Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(paste, 'clipboardData', { value: { files: [new w.File(['image'], 'late.png', { type: 'image/png' })] } });
+  w.document.getElementById('chatInput')!.dispatchEvent(paste);
+  await vi.waitFor(() => expect((w as any).api.dropFiles).toHaveBeenCalledTimes(1));
+
+  if (mode === 'new-same-key') {
+    w.document.getElementById('newChat')!.click();
+  } else if (mode === 'a-b-a') {
+    (w.document.querySelector('[data-id="draft-b"]') as HTMLButtonElement).click();
+    (w.document.querySelector('[data-id="draft-a"]') as HTMLButtonElement).click();
+  } else if (mode === 'opening-adopt-new') {
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Adopt this opening';
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(w.document.querySelector('.sess.is-sel')).not.toBeNull());
+    w.document.getElementById('newChat')!.click();
+  } else if (mode.startsWith('same-session')) {
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    if (mode === 'same-session-failed-send')
+      (w as any).api.sendInput = vi.fn(async () => ({ ok: false, error: 'test rejected send' }));
+    input.value = 'Submitted draft';
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    if (mode === 'same-session-send-next') await vi.waitFor(() => expect(app.live.sent).toHaveLength(1));
+    else await vi.waitFor(() => expect((w as any).api.sendInput).toHaveBeenCalledTimes(1));
+    await settle();
+    input.value = 'Next draft'; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+  } else if (mode === 'plan-replaces') {
+    (w as any).api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Stage one', 'Stage two'] }));
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Turn this into a plan';
+    w.document.getElementById('createPlan')!.click();
+    await vi.waitFor(() => expect(input.value).toBe(''));
+  } else {
+    (w.document.querySelector('.delivery-retry') as HTMLButtonElement).click();
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('Restored failed message');
+  }
+  finish(); await settle();
+  expect(w.document.querySelector('#composerImages .attachment-card')).toBeNull();
+  expect(w.document.querySelector('.toast')?.textContent).toContain('draft changed');
+});
+
+it.each([false, true])('removes a project group in one click, keeps its chats and draft, and rejects an older refresh (selectedSkill=%s)', async selectedSkill => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Removed', path: '/removed', createdAt: 1 };
   const other = { id: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', name: 'Other', path: '/other', createdAt: 2 };
   const parent = { ...summary([]), projectId: project.id };
@@ -665,6 +1367,14 @@ it('removes a project group in one click, keeps its chats and draft, and rejects
   (w.document.querySelector('.worker-toggle') as HTMLButtonElement).click();
   (w.document.querySelector(`[data-new-project="${project.id}"]`) as HTMLButtonElement).click();
   input.value = 'Keep my draft';
+  input.dispatchEvent(new w.Event('input', { bubbles: true }));
+  if (selectedSkill) {
+    api.skillLibrary = () => Promise.resolve({ ok: true, data: { skills: [
+      { id: 'review', name: 'Review', description: '', path: '/skills/review/SKILL.md', scope: 'managed', source: 'managed', managed: true, allowImplicitInvocation: true }
+    ], roots: [], errors: [], includeInstructions: true } });
+    input.value = '/re\n' + input.value; input.setSelectionRange(3, 3); input.dispatchEvent(new w.Event('input', { bubbles: true })); await settle();
+    w.document.querySelector<HTMLButtonElement>('.skill-choice[data-skill-id="review"]')!.click();
+  }
   let finishList!: (value: unknown) => void;
   api.listSessions = () => new Promise(resolve => { finishList = resolve; });
   (w.document.getElementById('chatRefresh') as HTMLButtonElement).click();
@@ -675,8 +1385,9 @@ it('removes a project group in one click, keeps its chats and draft, and rejects
   expect(api.removeProject).toHaveBeenCalledExactlyOnceWith(project.id);
   expect(w.document.querySelector(`[data-project-id="${project.id}"]`)).toBeNull();
   expect(w.document.querySelector(`[data-project-id="${other.id}"]`)).not.toBeNull();
-  expect(w.document.querySelector(`#sessionList > [data-id="${parent.id}"]`)).not.toBeNull();
-  expect(w.document.querySelector('#sessionList > .worker-group [data-id="child-session"]')).not.toBeNull();
+  expect(w.document.querySelector(`#chatList > [data-id="${parent.id}"]`)).not.toBeNull();
+  expect(w.document.querySelector('#chatList > .worker-group [data-id="child-session"]')).not.toBeNull();
+  expect(w.document.querySelector(`#projectList [data-id="${parent.id}"]`)).toBeNull();
   expect(input.value).toBe('Keep my draft');
   expect(input.placeholder).toBe('Ask anything…');
   finishList({ ok: true, data: { sessions: [parent, child], activeId: null, pressure: [], blocked: [] } });
@@ -684,7 +1395,7 @@ it('removes a project group in one click, keeps its chats and draft, and rejects
   expect(w.document.querySelector(`[data-project-id="${project.id}"]`)).toBeNull();
   (w.document.getElementById('chatSend') as HTMLButtonElement).click();
   await settle();
-  expect(live.sent[0]).toMatchObject({ sessionId: null, projectId: null, text: 'Keep my draft' });
+  expect(live.sent[0]).toMatchObject({ sessionId: null, projectId: null, text: selectedSkill ? '/review\nKeep my draft' : 'Keep my draft' });
 });
 
 it('keeps the project visible when its removal fails', async () => {
@@ -712,7 +1423,7 @@ it('Share a folder creates a sidebar project and keeps it when an older list ref
   await settle();
   expect(api.addProject).toHaveBeenCalledTimes(1);
   expect(api.addRoot).not.toHaveBeenCalled();
-  expect(w.document.querySelector(`[data-project-id="${project.id}"]`)).not.toBeNull();
+  expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${project.id}"]`)?.open).toBe(true);
   finishList({ ok: true, data: { sessions: [], activeId: null, pressure: [], blocked: [] } });
   await settle();
   expect(w.document.querySelector(`[data-project-id="${project.id}"]`)).not.toBeNull();
@@ -751,25 +1462,26 @@ it('cancelling Share a folder preserves the selected composer and creates no sid
   expect(w.document.querySelector('.project-group')).toBeNull();
 });
 
-it('groups project chats and starts an empty composer with the selected project identity', async () => {
+it('groups project chats and restores each project composer with its selected identity', async () => {
   const projects = [{ id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Alpha', path: '/alpha', createdAt: 1 }, { id: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', name: 'Beta', path: '/beta', createdAt: 2 }];
   const { w, live, append } = await boot([], false, [], projects);
   const groups = w.document.querySelectorAll<HTMLDetailsElement>('.project-group');
   expect(groups).toHaveLength(2);
+  expect([...groups].map(group => group.open)).toEqual([false, false]);
   expect(groups[0]!.querySelector('[data-id]')?.getAttribute('data-id')).toBe(summary([]).id);
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   const choose = (id: string) => (w.document.querySelector(`[data-new-project="${id}"]`) as HTMLButtonElement).click();
-  choose(projects[0]!.id); input.value = 'Alpha draft';
-  choose(projects[1]!.id); expect(input.value).toBe(''); input.value = 'Beta draft';
+  choose(projects[0]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[0]!.id}"]`)!.open).toBe(true); input.value = 'Alpha draft';
+  choose(projects[1]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[1]!.id}"]`)!.open).toBe(true); expect(input.value).toBe(''); input.value = 'Beta draft';
   (w.document.getElementById('newChat') as HTMLButtonElement).click();
   expect(input.value).toBe(''); input.value = 'Unfiled draft';
-  choose(projects[0]!.id); expect(input.value).toBe(''); input.value = 'Alpha request';
+  choose(projects[0]!.id); expect(input.value).toBe('Alpha draft'); input.value = 'Alpha request';
   (w.document.getElementById('chatSend') as HTMLButtonElement).click();
   await settle();
   expect(live.sent[0]).toMatchObject({ sessionId: null, projectId: projects[0]!.id, text: 'Alpha request' });
-  choose(projects[1]!.id); expect(input.value).toBe('');
+  choose(projects[1]!.id); expect(input.value).toBe('Beta draft');
   const beta = w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[1]!.id}"]`)!;
-  beta.open = false; beta.dispatchEvent(new w.Event('toggle')); await append([]);
+  beta.querySelector('summary')!.click(); await append([]);
   expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[1]!.id}"]`)!.open).toBe(false);
 });
 
@@ -806,6 +1518,84 @@ it('folds a whole Compact & Resume into one row that says the new chat opened', 
   expect(card.textContent).toContain('Bootstrap sent into the new chat');
 });
 
+it('folds a Compact & Resume whose marker ChatGPT escaped as Markdown', async () => {
+  // Same fold, same assertions, but the two prompts are recorded the way the composer has
+  // written them since 2026-09-16. Every reader of the shared marker regex reads text that
+  // came back out of the page, so they all stopped matching at once: this card was not built
+  // at all, and the raw marker was left on screen in the rows it should have replaced.
+  const { w } = await boot([
+    { seq: 1, time: T0, source: 'app', kind: 'session_start', conversationId: 'chat-a', title: 'Loop under test' },
+    toolCall(2, 'call-1'),
+    ...compaction(3, true),
+    toolCall(9, 'call-2')
+  ]);
+  const timeline = w.document.getElementById('timeline')!;
+
+  const cards = timeline.querySelectorAll('details.compaction');
+  expect(cards).toHaveLength(1);
+  expect(cards[0]!.querySelector('summary')!.textContent).toMatch(/^Compact & Resume:New chat opened at .* \(44 characters\)$/);
+  // Stripped in the form it was recorded in, so no half-removed marker survives either.
+  expect(timeline.textContent).not.toContain('[[CLF-');
+  expect(timeline.textContent).not.toContain('CLF-RESUME');
+  expect([...timeline.children].map((row) => row.className)).toEqual(['ev ev-tool_call', 'ev ev-compaction', 'ev ev-tool_call']);
+
+  cards[0]!.toggleAttribute('open', true);
+  expect(cards[0]!.textContent).toContain('Brief request');
+  expect(cards[0]!.textContent).toContain('keep the loop running');
+});
+
+it('retires a pending Skills picker when sending replaces its draft', async () => {
+  const { w, live } = await boot([], false);
+  let resolve!: (value: unknown) => void;
+  (w as any).api.skillLibrary = () => new Promise(done => { resolve = done; });
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/'; input.setSelectionRange(1, 1); input.dispatchEvent(new w.Event('input', { bubbles: true }));
+  expect((w.document.getElementById('skillPicker') as HTMLElement).hidden).toBe(false);
+  input.value = 'Complete my task'; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(live.sent[0]?.text).toBe('Complete my task');
+  expect((w.document.getElementById('skillPicker') as HTMLElement).hidden).toBe(true);
+  input.value = 'Next task';
+  resolve({ ok: true, data: { skills: [{ id: 'old', name: 'Old', description: '', path: '/skills/old/SKILL.md', scope: 'managed', managed: true, source: 'managed', allowImplicitInvocation: true }], roots: [], errors: [], includeInstructions: true } });
+  await settle();
+  expect(input.value).toBe('Next task');
+  expect((w.document.getElementById('skillPicker') as HTMLElement).hidden).toBe(true);
+});
+
+it('uses slash Skills completion and delivers the selected directive once with the unchanged task', async () => {
+  const { w, live } = await boot([], false);
+  (w as any).api.skillLibrary = vi.fn(async () => ({ ok: true, data: { skills: [
+    { id: 'review', name: 'Review code', description: 'Inspect before editing', path: '/skills/review/SKILL.md', managed: true, source: 'managed', scope: 'managed', allowImplicitInvocation: true }
+  ], roots: [], errors: [], includeInstructions: true } }));
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Do my entire task.\nKeep the second line.';
+  input.dispatchEvent(new w.Event('input', { bubbles: true }));
+  input.value = '/re\n' + input.value; input.setSelectionRange(3, 3); input.dispatchEvent(new w.Event('input', { bubbles: true })); await settle();
+  w.document.querySelector<HTMLButtonElement>('.skill-choice[data-skill-id="review"]')!.click();
+  expect(input.value).toBe('Do my entire task.\nKeep the second line.');
+  expect(w.document.querySelectorAll('.composer-selected-skill')).toHaveLength(1);
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(live.sent).toHaveLength(1);
+  expect(live.sent[0]!.text).toBe('/review\nDo my entire task.\nKeep the second line.');
+  expect(w.document.querySelectorAll('.composer-selected-skill')).toHaveLength(0);
+});
+
+it('keeps Projects and Chats separate while preserving disclosure state through activity refresh', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const linked = { ...summary([]), id: 'linked-chat', projectId: project.id };
+  const standalone = { ...summary([]), id: 'standalone-chat', projectId: undefined };
+  const app = await boot([], false, [], [project], { sessions: [linked, standalone] });
+  expect(app.w.document.querySelector('#projectList [data-id="linked-chat"]')).not.toBeNull();
+  expect(app.w.document.querySelector('#chatList [data-id="standalone-chat"]')).not.toBeNull();
+  expect(app.w.document.querySelector('#chatList [data-id="linked-chat"]')).toBeNull();
+  const projects = app.w.document.getElementById('projectsSection') as HTMLDetailsElement;
+  projects.open = false; await app.append([]);
+  expect(app.w.document.getElementById('projectsSection')).toBe(projects);
+  expect(projects.open).toBe(false);
+});
+
 it('starts in New Chat despite active history and selects only the exact acknowledged send', async () => {
   const app = await boot([], false);
   const { w, live } = app;
@@ -816,7 +1606,7 @@ it('starts in New Chat despite active history and selects only the exact acknowl
   (w.document.getElementById('chatAutomation') as HTMLSelectElement).value = 'loop';
   w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   await settle();
-  expect(live.sent[0]).toMatchObject({ sessionId: null, text: 'A new request', automation: 'loop' });
+  expect(live.sent[0]).toMatchObject({ sessionId: null, text: 'A new request', automation: 'loop', authoredSource: 'text' });
   live.inputs[0] = { ...live.inputs[0]!, state: 'sent', conversationId: 'chat-b', deliveredSessionId: summary([]).id };
   await app.append([]);
   expect(w.document.querySelector('#sessionList .is-sel')?.getAttribute('data-id')).toBe(summary([]).id);
@@ -836,20 +1626,26 @@ it('selects an acknowledged New Chat while recording notifications keep arriving
 });
 
 it.each(['composer', 'bubble'])('clears New Chat drafts and removes a delivery cancelled with %s', async (control) => {
-  const app = await boot([], false);
+  const app = await boot([], false, [], [], { reserveOpenings: true });
   const { w, live } = app;
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   input.value = 'Old attempt';
   w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   await settle();
+  const owner = live.inputs[0]!.sessionId!;
+  expect(w.document.querySelector('#sessionList .is-sel')?.getAttribute('data-id')).toBe(owner);
   expect(w.document.getElementById('inputQueue')!.textContent).toContain('Old attempt');
   live.inputs[0] = { ...live.inputs[0]!, state: 'browser' };
   input.value = 'Discard this draft';
   w.document.getElementById('newChat')!.click();
   await app.append([]);
   expect(input.value).toBe('');
-  expect(w.document.getElementById('inputQueue')!.textContent).toContain('Old attempt');
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Old attempt');
   expect(live.inputs[0]!.state).toBe('browser'); // Preserve ambiguous receipts; never retry them.
+  (w.document.querySelector(`#sessionList [data-id="${owner}"]`) as HTMLButtonElement).click();
+  await settle();
+  expect(w.document.getElementById('inputQueue')!.textContent).toContain('Old attempt');
+  input.value = ''; input.dispatchEvent(new w.Event('input'));
   const cancel = vi.fn(async (id: string) => { live.inputs = live.inputs.map(row => row.id === id ? { ...row, state: 'cancelled' as const, error: 'Not sent: this delivery was cancelled before Send was authorized.' } : row); return { ok: true, data: true }; });
   (w as any).api.cancelInput = cancel;
   expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Cancel delivery');
@@ -858,6 +1654,7 @@ it.each(['composer', 'bubble'])('clears New Chat drafts and removes a delivery c
   await settle();
   expect(cancel).toHaveBeenCalledWith(live.inputs[0]!.id);
   expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Old attempt');
+  w.document.getElementById('newChat')!.click();
   input.value = 'Fresh attempt';
   w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   await settle();
@@ -866,13 +1663,19 @@ it.each(['composer', 'bubble'])('clears New Chat drafts and removes a delivery c
 });
 
 it.each([false, true])('dismisses retired delivery errors in selected-chat=%s without resending', async selected => {
-  const app = await boot([], selected);
+  const app = await boot([], selected, [], [], { reserveOpenings: true });
   const { w, live } = app;
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   const submit = () => w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   input.value = 'Expired request'; submit(); await settle();
+  const owner = live.inputs[0]!.sessionId!;
   live.inputs[0] = { ...live.inputs[0]!, state: 'cancelled', error: 'Delivery confirmation timed out. The message may already have reached ChatGPT.' };
-  if (!selected) w.document.getElementById('newChat')!.click();
+  if (!selected) {
+    w.document.getElementById('newChat')!.click();
+    await app.append([]);
+    expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Expired request');
+    (w.document.querySelector(`#sessionList [data-id="${owner}"]`) as HTMLButtonElement).click();
+  }
   await app.append([]);
   const queue = w.document.getElementById('inputQueue')!;
   expect(queue.textContent).toContain('Expired request');
@@ -885,6 +1688,7 @@ it.each([false, true])('dismisses retired delivery errors in selected-chat=%s wi
   (queue.querySelector('[title="Dismiss delivery notice"]') as HTMLButtonElement).click();
   await app.append([]);
   expect(queue.textContent).not.toContain('Expired request');
+  w.document.getElementById('newChat')!.click();
   input.value = 'Fresh request'; submit(); await settle();
   expect(live.sent.at(-1)).toMatchObject({ text: 'Fresh request' });
   expect(queue.textContent).not.toContain('Expired request');
@@ -1240,6 +2044,7 @@ it('shows Send directly before MCP, keeps After this turn selected, and changes 
   const options = w.document.getElementById('sendOptions')!;
   expect(options.hidden).toBe(false);
   expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Send directly');
+  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(false);
   (options.querySelector('[data-delivery="after-turn"]') as HTMLButtonElement).click();
   await append([]);
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('after-turn');
@@ -1320,6 +2125,41 @@ it('opens the saved task editor from the Goal dock and still closes it on outsid
   await settle();
 });
 
+it.each(['off', 'goal', 'loop'])('retains the first-message draft and task across chat navigation (%s)', async mode => {
+  const { w, live } = await boot([], false, [], [], { reserveOpenings: true });
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  const objective = w.document.getElementById('sessionObjective') as HTMLTextAreaElement;
+  const automation = w.document.getElementById('chatAutomation') as HTMLSelectElement;
+  const delivery = w.document.getElementById('loopDelivery') as HTMLSelectElement;
+  (w.document.querySelector(`#automationSwitch [data-mode="${mode}"]`) as HTMLButtonElement).click();
+  input.value = 'First message\nwith pasted context'; input.dispatchEvent(new w.Event('input'));
+  objective.value = 'Keep the original task'; objective.dispatchEvent(new w.Event('input'));
+  delivery.value = 'after-turn'; delivery.dispatchEvent(new w.Event('change'));
+  const visitExisting = () => (w.document.querySelector(`[data-id="${summary([]).id}"]`) as HTMLButtonElement).click();
+  const returnToDraft = () => w.document.getElementById('newChat')!.click();
+  visitExisting(); await settle();
+  expect(input.value).toBe('');
+  input.value = 'Separate existing-chat draft';
+  returnToDraft(); await settle();
+  returnToDraft(); await settle();
+  expect(input.value).toBe('First message\nwith pasted context');
+  expect(objective.value).toBe('Keep the original task');
+  expect(automation.value).toBe(mode);
+  expect(delivery.value).toBe('after-turn');
+  visitExisting(); await settle();
+  expect(input.value).toBe('Separate existing-chat draft');
+  returnToDraft(); await settle();
+  input.value = ''; objective.value = '';
+  visitExisting(); returnToDraft(); await settle();
+  expect(input.value).toBe(''); expect(objective.value).toBe('');
+  input.value = 'Actually send this';
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
+  await settle();
+  expect(live.sent.at(-1)).toMatchObject({ text: 'Actually send this', automation: mode });
+  returnToDraft(); await settle();
+  expect(input.value).toBe(''); expect(objective.value).toBe(''); expect(automation.value).toBe('off');
+});
+
 it('retains the New Chat objective through Goal, Off and Goal toggles', async () => {
   const { w } = await boot([], false);
   const objective = w.document.getElementById('sessionObjective') as HTMLTextAreaElement;
@@ -1354,11 +2194,15 @@ it('keeps editable stages and sends the original request with the full workflow 
   const stage = w.document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit stage 1"]')!;
   stage.value = 'Build the edited foundation'; stage.dispatchEvent(new w.Event('input'));
   expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Start full plan');
+  (w.document.querySelector(`[data-id="${summary([]).id}"]`) as HTMLButtonElement).click();
+  await settle();
+  w.document.getElementById('newChat')!.click(); await settle();
+  expect(w.document.getElementById('taskPlanPreview')!.textContent).toContain('Build the edited foundation');
   w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
   w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true }));
   await settle();
   expect(live.sent).toHaveLength(1);
-  expect(live.sent[0]).toMatchObject({ text: 'Build the edited foundation', stages: ['Verify it'], objective: 'Build the whole task' });
+  expect(live.sent[0]).toMatchObject({ text: 'Build the edited foundation', stages: ['Verify it'], objective: 'Build the whole task', authoredSource: 'objective' });
   expect(w.document.getElementById('taskPlanPreview')!.hidden).toBe(true);
   expect(w.document.getElementById('finishQueue')!.hidden).toBe(false);
   expect(w.document.getElementById('finishQueue')!.textContent).toContain('Verify it');
@@ -1403,9 +2247,9 @@ it.each([true, false])('hands plan presentation to queued stages while sending a
 });
 
 it.each(['delivery', 'model', 'refresh-failed', 'enqueue-failed'])('retries the durable full plan without pasting stage one (%s)', async failure => {
-  const { w, live, append } = await boot([], false);
+  const { w, live, append } = await boot([], true);
   const api = (w as any).api;
-  const original: InputEntry = { id: 'failed-plan', sessionId: null, projectId: null, text: 'Implement everything',
+  const original: InputEntry = { id: 'failed-plan', sessionId: summary([]).id, requestedSessionId: null, opening: true, projectId: null, text: 'Implement everything',
     objective: 'Original complete request', stages: ['Verify gameplay', 'Verify voice', 'Final review'], automation: 'off',
     model: 'gpt-5.6-sol', reasoningEffort: 'high', mode: 'auto', dueAt: 1, createdAt: 1, state: 'failed',
     owner: 'old-page', conversationId: null, error: failure === 'model' || failure === 'refresh-failed'
@@ -1481,9 +2325,33 @@ it('renders one legacy interrupted-response card across reloads and updates it a
   ]);
   expect(w.document.querySelectorAll('.chat-error-notice')).toHaveLength(1);
   expect(w.document.querySelector('.chat-error-notice')!.textContent).toContain('Reloaded chat');
+  expect(w.document.querySelector('.chat-error-notice')!.classList.contains('is-resolved')).toBe(false);
   await append([{ seq: 6, time: T0 + 6, source: 'extension', kind: 'assistant_message', final: true, messageId: 'answer', message: text('Done') }]);
   expect(w.document.querySelectorAll('.chat-error-notice')).toHaveLength(1);
   expect(w.document.querySelector('.chat-error-notice')!.textContent).toContain('later completed');
+  expect(w.document.querySelector('.chat-error-notice')!.classList.contains('is-resolved')).toBe(true);
+  expect(w.document.querySelector('.chat-error-notice strong')!.textContent).toBe('Recovered after interruption');
+  await append([{ seq: 7, time: T0 + 7, source: 'app', kind: 'turn_start', turnId: 'replacement' }]);
+  expect(w.document.querySelector('.chat-error-notice')!.classList.contains('is-resolved')).toBe(false);
+  expect(w.document.querySelector('.chat-error-notice')!.textContent).toContain('Work continued');
+});
+
+it('explicitly queues an image injection before the first MCP call without choosing browser delivery', async () => {
+  const app = await boot([]);
+  const api = (app.w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id,
+    activeTurnId: 'plain-turn', canInject: false, canSendDirectly: true, queueAtFinish: false } });
+  await app.append([]);
+  const image = { id: '11111111-2222-4333-8444-555555555555', name: 'image.png', mimeType: 'image/png', size: 42 };
+  api.chooseFiles = async () => ({ ok: true, data: [image] });
+  app.w.document.getElementById('attachImages')!.click(); await settle();
+  const action = app.w.document.querySelector('[data-delivery="tool"]') as HTMLButtonElement;
+  expect(action.hidden).toBe(false); action.click();
+  (app.w.document.getElementById('chatInput') as HTMLTextAreaElement).value = 'Describe this image';
+  app.w.document.getElementById('composer')!.dispatchEvent(new app.w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(app.live.sent).toHaveLength(1);
+  expect(app.live.sent[0]).toMatchObject({ mode: 'auto', delivery: 'tool', text: 'Describe this image', attachments: [image] });
 });
 
 it('docks recent app repair progress without hiding authored lookalikes', async () => {
@@ -1621,7 +2489,7 @@ it('queues every generated stage in an existing session without Send and preserv
   input.value = 'Build the whole task'; input.dispatchEvent(new w.Event('input'));
   w.document.getElementById('createPlan')!.click(); await settle();
   expect(live.sent).toHaveLength(1);
-  expect(live.sent[0]).toMatchObject({ sessionId: summary([]).id, text: 'Build foundation', stages: ['Verify it'], mode: 'finish', model: null, reasoningEffort: null });
+  expect(live.sent[0]).toMatchObject({ sessionId: summary([]).id, text: 'Build foundation', stages: ['Verify it'], mode: 'finish', model: null, reasoningEffort: null, authoredSource: 'objective' });
   expect(input.value).toBe('');
   input.value = ''; input.dispatchEvent(new w.Event('input'));
   expect(w.document.querySelectorAll('#finishQueue .queued-input')).toHaveLength(2);
@@ -1824,7 +2692,7 @@ it('streams a new Goal opening, queues it once, and displays authoritative deliv
   finish({ ok: true, data: { reply: 'Inspect and implement the task', model: 'fixture' } });
   await settle();
   expect(live.sent).toHaveLength(1);
-  expect(live.sent[0]).toMatchObject({ text: 'Inspect and implement the task', objective: 'Implement and verify', automation: 'goal' });
+  expect(live.sent[0]).toMatchObject({ text: 'Inspect and implement the task', objective: 'Implement and verify', automation: 'goal', authoredSource: 'objective' });
   expect(row.textContent).toContain('Opening message queued');
   live.inputs = live.inputs.map(input => ({ ...input, state: 'failed', error: 'Model could not be selected' }));
   await append([]);
@@ -2122,6 +2990,67 @@ it('shows the immediate recovery deadline before a draft exists and clears it on
   expect(row.hidden).toBe(true);
 });
 
+it.each([
+  { reason: 'silence', kind: 'silence' },
+  { reason: 'listening', kind: 'post-reload' },
+  { reason: 'native-busy', kind: 'native-busy' },
+  { reason: 'quiet', kind: 'post-reload' }
+] as const)('shows the shared $reason deadline once while keeping independent Loop waits', async ({ reason, kind }) => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api, original = api.getSessionControls;
+  const deadline = Date.now() + 60_000;
+  const goalWait = { reason, until: deadline };
+  const recovery = [{ kind: kind as string, deadline, visibleAt: 0 }];
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data,
+    automation: 'loop', objective: 'Keep working', goalWait, recovery, goalDraft: null } });
+  await append([]);
+  const lifecycle = w.document.getElementById('goalLifecycle')!;
+  expect(lifecycle.hidden).toBe(true);
+  expect(lifecycle.querySelector('[role="timer"]')).toBeNull();
+  expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(false);
+  expect(w.document.getElementById('activeGoalRow')!.hidden).toBe(false);
+  expect(w.document.querySelectorAll('#composerDock [role="timer"]')).toHaveLength(1);
+
+  // A different deadline is independent, even when both owners happen to be waiting.
+  goalWait.until += 15_000;
+  await append([]);
+  expect(lifecycle.hidden).toBe(false);
+  expect(w.document.querySelectorAll('#composerDock [role="timer"]')).toHaveLength(2);
+
+  // A hidden recovery row must not swallow the only visible indication of a wait.
+  goalWait.until = deadline; recovery[0]!.visibleAt = deadline - 15_000;
+  await append([]);
+  expect(lifecycle.hidden).toBe(false);
+  expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
+
+  // Attribution and pickup have their own actions, even at the same timestamp.
+  recovery[0]!.visibleAt = 0; recovery[0]!.kind = 'pickup';
+  await append([]);
+  expect(lifecycle.hidden).toBe(false);
+  expect(w.document.querySelectorAll('#composerDock [role="timer"]')).toHaveLength(2);
+});
+
+it.each([false, true])('does not redisplay the old reload receipt after Continue starts the next turn (developer mode: %s)', async developerMode => {
+  const reloadedAt = Date.now() - 60_000;
+  const repair: SessionEvent = { seq: 1, time: reloadedAt, source: 'app', kind: 'progress',
+    progressId: 'browser-repair:fixture', turnId: 'silent-turn',
+    message: text('Reloaded chat to recover an unresponsive open turn.') };
+  const { w, append, live } = await boot([repair], true, [], [], { developerMode });
+  const host = w.document.getElementById('recoveryStatus')!;
+  expect(host.hidden).toBe(false);
+  await append([{ seq: 2, time: Date.now(), source: 'app', kind: 'turn_start', turnId: 'silent-turn' }]);
+  expect(host.hidden).toBe(false); // Reopening the same source is not a new question.
+  await append([
+    { seq: 3, time: Date.now(), source: 'extension', kind: 'user_message', messageId: 'continue-message', message: text('Continue the work.') },
+    { seq: 4, time: Date.now(), source: 'extension', kind: 'turn_start', turnId: 'continued-turn' }
+  ]);
+  expect(host.hidden).toBe(true);
+  expect(live.events).toContainEqual(repair);
+  if (developerMode) expect(w.document.getElementById('timeline')!.textContent).toContain(repair.message.text);
+  await append([{ ...repair, seq: 5, time: Date.now(), turnId: 'continued-turn', progressId: 'browser-repair:new-turn' }]);
+  expect(host.hidden).toBe(false);
+});
+
 it('reuses the Goal animation for a session-finish draft while ordinary automation is off', async () => {
   const { w, append } = await boot([]);
   const api = (w as any).api, original = api.getSessionControls;
@@ -2206,6 +3135,7 @@ it('opens every selected chat at the bottom and preserves manual reading during 
   const timeline = w.document.getElementById('timeline')!;
   Object.defineProperties(pane, { clientHeight: { value: 400 },
     scrollHeight: { get: () => timeline.querySelectorAll('[data-timeline-key]').length * 100 } });
+  w.document.getElementById('timelineContent')!.getBoundingClientRect = () => ({ height: pane.scrollHeight } as DOMRect);
   const select = async (id: string) => {
     (w.document.querySelector(`#sessionList [data-id="${id}"]`) as HTMLElement).click();
     await settle();
@@ -2240,6 +3170,28 @@ it('opens every selected chat at the bottom and preserves manual reading during 
   expect(w.document.getElementById('chatTitle')!.textContent).toBe(first.title);
 });
 
+it.each(['empty', 'failed'])('keeps a fitting chat live after an %s older-page read', async outcome => {
+  const { w, append } = await boot([{ seq: 12, time: T0, source: 'extension', kind: 'user_message',
+    messageId: 'short', message: text('Short chat') }]);
+  const api = (w as any).api, original = api.getSession;
+  const read = vi.fn((id: string, options: any) => options?.before && outcome === 'failed'
+    ? Promise.resolve({ ok: false, error: 'Read failed' }) : original(id, options));
+  api.getSession = read;
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  Object.defineProperties(pane, { clientHeight: { value: 800 }, scrollHeight: { value: 800 } });
+  pane.scrollTop = 0;
+  pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 })); await settle();
+  expect(read).toHaveBeenCalledWith(expect.any(String), { before: 12, limit: 30 });
+  expect(pane.scrollTop).toBe(0);
+  expect(timeline.querySelector('.timeline-window-note')).toBeNull();
+  expect(w.document.getElementById('timelineContent')!.style.getPropertyValue('--timeline-scroll-reserve')).toBe('');
+  await append([{ seq: 13, time: T0 + 1, source: 'extension', kind: 'assistant_message',
+    messageId: 'fresh', message: text('Still receiving live output'), final: true }]);
+  expect(timeline.textContent).toContain('Still receiving live output');
+  expect(read).toHaveBeenLastCalledWith(expect.any(String), { from: 13, limit: 30 });
+});
+
 it('loads bounded earlier pages on deliberate upward scrolling without draining on render', async () => {
   const rows = Array.from({ length: 360 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
     source: 'extension', kind: 'user_message', messageId: `history-${i}`, message: text(`History item ${i + 1}`) }));
@@ -2255,28 +3207,32 @@ it('loads bounded earlier pages on deliberate upward scrolling without draining 
   for (const row of timeline.querySelectorAll<HTMLElement>('[data-timeline-key]')) row.getBoundingClientRect = () => {
     const top = [...timeline.querySelectorAll('[data-timeline-key]')].indexOf(row) * 20 - pane.scrollTop;
     return { top, bottom: top + 20, height: 20, left: 0, right: 100, width: 100, x: 0, y: top, toJSON: () => ({}) };
-  };  const up = async () => { pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 })); await settle(); };
+  };
+  const up = async () => {
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+    await settleHistoryFrame(w);
+  };
   await up();
-  expect(pane.scrollTop).toBe(1600);
-  expect(timeline.textContent).toContain('History item 121');
-  expect(timeline.textContent).not.toContain('History item 360');
+  expect(pane.scrollTop).toBe(600);
+  expect(timeline.textContent).toContain('History item 301');
+  expect(timeline.textContent).toContain('History item 360');
   await append([{ seq: 361, time: T0 + 361, source: 'extension', kind: 'user_message', messageId: 'newest', message: text('Newest live input') }]);
-  expect(timeline.textContent).toContain('History item 121');
+  expect(timeline.textContent).toContain('History item 301');
   expect(timeline.textContent).not.toContain('Newest live input');
-  await up(); expect(timeline.textContent).toContain('History item 41');
-  await up(); expect(timeline.textContent).toContain('History item 1');
+  for (let page = 0; page < 12 && !timeline.textContent?.includes('History item 1'); page++) await up();
+  expect(timeline.textContent).toContain('History item 1');
   expect(timeline.querySelectorAll('[data-timeline-key]').length).toBeLessThanOrEqual(160);
-  (timeline.querySelector('[data-history="latest"]') as HTMLElement).click(); await settle();
-  expect(timeline.textContent).toContain('Newest live input');
+  expect(timeline.querySelector('[data-history="latest"]')).toBeNull();
 });
 it('scrolls forward through evicted history with wheel, keyboard and scrollbar, then resumes live deltas', async () => {
   const rows = Array.from({ length: 400 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
     source: 'extension', kind: 'user_message', messageId: `bidirectional-${i}`, message: text(`Bidirectional item ${i + 1}.`) }));
   const { w, live, append } = await boot(rows);
   const api = (w as any).api;
-  const read = vi.fn(async (_id: string, options: { from?: number; before?: number; limit: number }) => {
-    const eligible = live.events.filter(e => (options.from === undefined || e.seq >= options.from) && (options.before === undefined || e.seq < options.before));
-    const page = options.from === undefined ? eligible.slice(-options.limit) : eligible.slice(0, options.limit);
+  const read = vi.fn(async (_id: string, options: { from?: number; before?: number; after?: number; limit: number }) => {
+    const eligible = live.events.filter(e => (options.from === undefined || e.seq >= options.from) && (options.before === undefined || positionOf(e) < options.before) && (options.after === undefined || positionOf(e) > options.after));
+    const page = options.from === undefined && options.after === undefined ? eligible.slice(-options.limit) : eligible.slice(0, options.limit);
     return { ok: true, data: { summary: summary(live.events), events: page, total: live.events.length,
       nextFrom: page.reduce((next, e) => Math.max(next, e.seq + 1), options.from ?? 0) } };
   });
@@ -2297,14 +3253,18 @@ it('scrolls forward through evicted history with wheel, keyboard and scrollbar, 
     const top = index < 0 ? 0 : index * 20 - pane.scrollTop;
     return { top, bottom: top + 20, height: 20 } as DOMRect;
   };
-  for (let i = 0; i < 3; i++) {
-    pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 })); await settle();
+  for (let i = 0; i < 14 && !timeline.textContent?.includes('Bidirectional item 1.'); i++) {
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+    await settleHistoryFrame(w);
   }
   expect(timeline.textContent).toContain('Bidirectional item 1.');
   expect(timeline.textContent).not.toContain('Bidirectional item 400.');
   const downward = async (kind: string) => {
     pane.scrollTop = pane.scrollHeight - pane.clientHeight;
-    const anchor = timeline.querySelectorAll<HTMLElement>('[data-timeline-key]')[140]!;
+    const anchor = [...timeline.querySelectorAll<HTMLElement>('[data-timeline-key]')].find(row => {
+      const rect = row.getBoundingClientRect(); return rect.bottom > 0 && rect.top >= 0;
+    })!;
     const before = anchor.getBoundingClientRect().top;
     if (kind === 'wheel') pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: 100 }));
     else if (kind === 'keyboard') pane.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'PageDown' }));
@@ -2314,33 +3274,132 @@ it('scrolls forward through evicted history with wheel, keyboard and scrollbar, 
       pane.scrollTop += 100; pane.dispatchEvent(new w.Event('scroll'));
       w.dispatchEvent(new w.Event('pointerup'));
     }
-    await settle();
+    await settleHistoryFrame(w);
     expect(anchor.isConnected).toBe(true);
     expect(anchor.getBoundingClientRect().top).toBe(before);
     expect(timeline.querySelectorAll('[data-timeline-key]').length).toBeLessThanOrEqual(160);
     const count = read.mock.calls.length;
-    pane.dispatchEvent(new w.Event('scroll')); await settle();
+    pane.dispatchEvent(new w.Event('scroll')); await settleHistoryFrame(w);
     expect(read).toHaveBeenCalledTimes(count);
   };
-  await downward('wheel');
-  expect(timeline.textContent).toContain('Bidirectional item 240.');
-  await downward('keyboard');
-  expect(timeline.textContent).toContain('Bidirectional item 320.');
-  await downward('scrollbar');
+  for (let page = 0; page < 14 && !timeline.textContent?.includes('Bidirectional item 400.'); page++) {
+    await downward(['wheel', 'keyboard', 'scrollbar'][page % 3]!);
+  }
   expect(timeline.textContent).toContain('Bidirectional item 400.');
+  expect(read.mock.calls.every(([, options]) => options.limit === 30)).toBe(true);
   await downward('wheel'); // Empty forward page proves we reached the current tail.
   await append([{ seq: 401, time: T0 + 401, source: 'extension', kind: 'user_message', messageId: 'live-again', message: text('Live again') }]);
   expect(timeline.textContent).toContain('Live again');
   geometryChanges.disconnect();
 });
 
-it('keeps admitting newer data when dense collapsed activity reaches the resident bound', async () => {
+it('keeps a revised long answer reachable in both directions and never uses its revision as a history boundary', async () => {
+  const rows = Array.from({ length: 360 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
+    source: 'extension', kind: 'user_message', messageId: `origin-${i}`, message: text(`Origin row ${i + 1}.`) }));
+  rows[99] = { seq: 1000, origin: 100, time: T0 + 99, source: 'extension', kind: 'assistant_message',
+    messageId: 'long-reviewed-answer', message: text('Detailed ratings. '.repeat(1000)), final: true };
+  const { w } = await boot(rows);
+  const api = (w as any).api;
+  const read = vi.fn(api.getSession);
+  api.getSession = read;
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  // The renderer fills a requested edge across animation frames. A permanently
+  // underfilled mock kept that demand alive, making the last read depend on timing.
+  Object.defineProperties(pane, { clientHeight: { value: 400 },
+    scrollHeight: { get: () => Math.max(400, timeline.querySelectorAll('[data-timeline-key]').length * 20) } });
+  let geometryRows: Map<Element, number> | null = null;
+  const geometryChanges = new w.MutationObserver(() => { geometryRows = null; });
+  geometryChanges.observe(timeline, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-timeline-key'] });
+  w.HTMLElement.prototype.getBoundingClientRect = function () {
+    if (geometryChanges.takeRecords().length) geometryRows = null;
+    geometryRows ??= new Map([...timeline.querySelectorAll('[data-timeline-key]')].map((row, index) => [row, index]));
+    const index = geometryRows.get(this) ?? -1;
+    const top = index < 0 ? 0 : index * 20 - pane.scrollTop;
+    return { top, bottom: top + 20, height: 20 } as DOMRect;
+  };
+  const page = async (deltaY: number) => {
+    pane.scrollTop = deltaY < 0 ? 0 : pane.scrollHeight - pane.clientHeight;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY }));
+    await settleHistoryFrame(w);
+  };
+  for (let index = 0; index < 12 && !timeline.textContent?.includes('Detailed ratings.'); index++) await page(-100);
+  expect(timeline.textContent).toContain('Detailed ratings.');
+  expect(timeline.querySelectorAll('.ev-assistant_message')).toHaveLength(1);
+  expect(read).toHaveBeenLastCalledWith(expect.any(String), { before: 121, limit: 30 });
+  const newestBefore = Math.max(...[...timeline.querySelectorAll<HTMLElement>('.ev-user_message')]
+    .map(row => Number(row.textContent?.match(/Origin row (\d+)\./)?.[1] ?? 0)));
+  await page(100);
+  expect(read).toHaveBeenLastCalledWith(expect.any(String), { after: newestBefore, limit: 30 });
+  expect(timeline.textContent).toContain(`Origin row ${newestBefore + 30}.`);
+  await page(-100);
+  expect(timeline.textContent).toContain('Detailed ratings.');
+  expect(timeline.querySelectorAll('.ev-assistant_message')).toHaveLength(1);
+  geometryChanges.disconnect();
+});
+
+it('keeps reloaded interim messages above their tool groups through live results and repaint', async () => {
+  const working = '11111111-1111-4111-8111-111111111111';
+  const exchange = '22222222-2222-4222-8222-222222222222';
+  const parent = '33333333-3333-4333-8333-333333333333';
+  const turns = { working: { origin: 1, time: T0 } };
+  const rows: SessionEvent[] = [
+    { seq: 1, time: T0, kind: 'turn_start', source: 'extension', turnId: 'working' },
+    { seq: 2, time: T0 + 2000, kind: 'assistant_message', source: 'extension', turnId: 'working',
+      messageId: `assistant:${parent}:${working}:${exchange}`, message: text('FIRST UPDATE'), final: false },
+    ...[3, 4].map(seq => ({ ...toolCall(seq, `before-${seq}`), turnId: 'working' })),
+    { seq: 7, origin: 5, time: T0 + 5000, kind: 'assistant_message', source: 'extension',
+      messageId: `assistant:${exchange}:${working}:${exchange}`, message: text('SECOND UPDATE'), final: false },
+    { ...toolCall(6, 'after-6'), turnId: 'working' },
+    { ...toolCall(8, 'after-8'), turnId: 'working' }
+  ];
+  const { w, append } = await boot(projectTimeline(rows, turns));
+  const timeline = w.document.getElementById('timeline')!;
+  const reading = () => [...timeline.children].filter(row => row.matches('.ev-assistant_message, .tool-group'));
+  expect(reading().map(row => row.classList.contains('tool-group') ? 'TOOLS' : row.textContent))
+    .toEqual([expect.stringContaining('FIRST UPDATE'), 'TOOLS', expect.stringContaining('SECOND UPDATE'), 'TOOLS']);
+  const group = reading()[3] as HTMLDetailsElement;
+  group.open = true;
+  group.dispatchEvent(new w.Event('toggle'));
+  await append(projectTimeline([{ ...toolCall(9, 'after-9'), turnId: 'working' }], turns, {}, rows));
+  expect(reading()[3]).toBe(group);
+  expect(group.open).toBe(true);
+  expect(group.querySelectorAll('.ev-tool_call')).toHaveLength(3);
+  await append([]);
+  expect(reading()[2]?.textContent).toContain('SECOND UPDATE');
+  expect(reading()[3]).toBe(group);
+  expect(timeline.querySelectorAll('.ev-assistant_message')).toHaveLength(2);
+});
+
+it('keeps long surrounding prose while materializing large tool results only on expansion', async () => {
+  const call = toolCall(2, 'large-output');
+  if (call.kind !== 'tool_call') throw new Error('Expected fixture tool');
+  call.call.result = text('Recorded output. '.repeat(150000));
+  const { w, append } = await boot([
+    { seq: 1, time: T0, kind: 'assistant_message', source: 'extension', messageId: 'before-large', message: text('Prose before the large tool'), final: false },
+    call,
+    { seq: 3, time: T0 + 3000, kind: 'assistant_message', source: 'extension', messageId: 'after-large', message: text('Prose after the large tool'), final: true }
+  ]);
+  const timeline = w.document.getElementById('timeline')!;
+  const disclosure = timeline.querySelector<HTMLDetailsElement>('details.tool')!;
+  expect(disclosure.querySelector('.raw')).toBeNull();
+  expect(timeline.textContent).toContain('Prose before the large tool');
+  expect(timeline.textContent).toContain('Prose after the large tool');
+  disclosure.open = true; disclosure.dispatchEvent(new w.Event('toggle')); await settle();
+  expect(disclosure.querySelector('.raw')?.textContent).toContain('Recorded output.');
+  await append([]);
+  expect(timeline.querySelector('details.tool')).toBe(disclosure);
+  expect(disclosure.open).toBe(true);
+  expect(timeline.textContent).toContain('Prose before the large tool');
+});
+
+it('retains the visible collapsed group beyond the normal resident target and still admits newer data', async () => {
   const rows = Array.from({ length: 400 }, (_, i) => toolCall(i + 1, `dense-${i}`));
   const { w, live, append } = await boot(rows);
   const api = (w as any).api;
-  api.getSession = async (_id: string, options: { from?: number; before?: number; limit: number }) => {
-    const eligible = live.events.filter(e => (options.from === undefined || e.seq >= options.from) && (options.before === undefined || e.seq < options.before));
-    const page = options.from === undefined ? eligible.slice(-options.limit) : eligible.slice(0, options.limit);
+  api.getSession = async (_id: string, options: { from?: number; before?: number; after?: number; limit: number }) => {
+    const eligible = live.events.filter(e => (options.from === undefined || e.seq >= options.from) && (options.before === undefined || positionOf(e) < options.before) && (options.after === undefined || positionOf(e) > options.after));
+    const page = options.from === undefined && options.after === undefined ? eligible.slice(-options.limit) : eligible.slice(0, options.limit);
     return { ok: true, data: { summary: summary(live.events), events: page, total: live.events.length,
       nextFrom: page.reduce((next, e) => Math.max(next, e.seq + 1), options.from ?? 0) } };
   };
@@ -2352,16 +3411,20 @@ it('keeps admitting newer data when dense collapsed activity reaches the residen
       height: this.classList.contains('tool-group') ? 30 : 0 } as DOMRect;
   };
   const group = timeline.querySelector('.tool-group');
-  for (let i = 0; i < 2; i++) {
-    pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 })); await settle();
-  }
-  expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(320);
+  // One deliberate movement keeps filling the edge through collapsed batches.
+  // Await the actual read result, including its animation-frame yields.
+  pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+  await vi.waitFor(() => expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(rows.length), { timeout: 5000 });
   expect(timeline.querySelector('.tool-group')).toBe(group);
-  pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: 100 })); await settle();
+  expect(timeline.querySelectorAll('.raw')).toHaveLength(0);
+  for (let i = 0; i < 14; i++) {
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: 100 })); await settle();
+  }
   await append([{ seq: 401, time: T0 + 401_000, source: 'extension', kind: 'user_message',
     messageId: 'dense-live', message: text('New data at the resident bound') }]);
   expect(timeline.textContent).toContain('New data at the resident bound');
-  expect(timeline.querySelectorAll('.ev').length).toBeLessThanOrEqual(320);
+  expect(timeline.querySelector('.tool-group')).toBe(group);
+  expect(timeline.querySelectorAll('.ev').length).toBeLessThanOrEqual(rows.length + 1);
 });
 
 it.each(['older', 'newer'])('does not apply a %s-page response or scroll after switching to a new chat', async direction => {
@@ -2376,7 +3439,7 @@ it.each(['older', 'newer'])('does not apply a %s-page response or scroll after s
   const original = api.getSession;
   let release!: () => void;
   const pending = new Promise<void>(resolve => { release = resolve; });
-  api.getSession = async (id: string, options: any) => { if (options?.before || options?.from) await pending; return original(id, options); };
+  api.getSession = async (id: string, options: any) => { if (options?.before || options?.after !== undefined) await pending; return original(id, options); };
   pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: direction === 'older' ? -100 : 100 }));
   await settle();
   (w.document.getElementById('newChat') as HTMLElement).click(); await settle();

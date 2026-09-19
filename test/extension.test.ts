@@ -39,8 +39,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(13);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 13;');
+    expect(BRIDGE_PROTOCOL).toBe(14);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 14;');
   });
 
   /**
@@ -170,7 +170,8 @@ class FakeNode {
   }
 
   querySelectorAll(selector: string): FakeNode[] {
-    return this.all.get(selector) ?? [];
+    // @ehkogh/#318: flat classic fixtures must understand the adapter's union selectors.
+    return this.all.get(selector) ?? [...new Set(selector.split(/,\s*/).flatMap(part => this.all.get(part) ?? []))];
   }
 
   querySelector(selector: string): FakeNode | null {
@@ -188,7 +189,7 @@ class FakeNode {
   }
 
   closest(selector: string): FakeNode | null {
-    return this.closestMatches.has(selector) ? this : null;
+    return selector.split(/,\s*/).some(part => this.closestMatches.has(part)) ? this : null;
   }
 
   /** Flat fakes: a node only ever contains itself, which is all toolBlocks() asks. */
@@ -217,7 +218,7 @@ interface DomApi {
 
 function loadDom(sections: FakeNode[], pathname = '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'): DomApi {
   const document = {
-    querySelectorAll: (selector: string) => (selector === TURN_SELECTOR ? sections : []),
+    querySelectorAll: (selector: string) => (selector.split(/,\s*/).includes(TURN_SELECTOR) ? sections : []),
     querySelector: () => null
   };
   const context = vm.createContext({ document, location: { pathname } });
@@ -368,7 +369,7 @@ describe('ChatGPT DOM adapter', () => {
     const commentary = new FakeNode({ 'data-interrupted': 'false' }, 'Reading files');
     const answer = new FakeNode({ 'data-interrupted': 'false' }, 'Here is the summary');
     answer.with('.markdown', [new FakeNode({ class: 'markdown' }, 'Here is the summary')]);
-    const section = turn('assistant', 'request-answer').with('[data-interrupted]', [commentary, answer]);
+    const section = turn('assistant', 'request-answer').with('[data-interrupted], [data-clf-progress]', [commentary, answer]);
     const dom = loadDom([section]);
     const logical = dom.turns()[0]!;
 
@@ -500,7 +501,7 @@ function loadWorker(options: {
   fetch?: (input: string, init?: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
   tabsGet?: (tabId: number) => Promise<{ id?: number; url?: string; pendingUrl?: string; status?: string; autoDiscardable?: boolean }>;
   tabsQuery?: () => Promise<
-    Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string; status?: string; autoDiscardable?: boolean; active?: boolean }>
+    Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string; status?: string; autoDiscardable?: boolean; active?: boolean; discarded?: boolean; frozen?: boolean }>
   >;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
   windowsGet?: (windowId: number) => Promise<{ focused?: boolean }>;
@@ -608,7 +609,9 @@ function loadWorker(options: {
     }
   };
   const fetch = options.fetch ?? (async () => response(503, {}));
-  vm.runInNewContext(backgroundSource, {
+  // This legacy VM harness exercises non-debugger hosts. The real MV3 entry fixture
+  // separately loads the unchanged module graph and verifies browser registration.
+  vm.runInNewContext(backgroundSource.replace(/^import .*$/gm, ''), {
     chrome,
     fetch,
     AbortController,
@@ -740,7 +743,93 @@ function journalOf(session: FakeStorageArea): any[] {
   return Array.isArray(value) ? value : [];
 }
 
+it.each(['discarded', 'frozen', 'woke', 'navigated', 'loading', 'closed', 'missing'])(
+  'rechecks suspended-tab recovery at the browser action (%s)', async state => {
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const tab = { id: 71, url: `https://chatgpt.com/c/${conversationId}`, discarded: state !== 'frozen', frozen: state === 'frozen' };
+    const reload = vi.fn();
+    const create = vi.fn();
+    const call = vi.fn(async () => ({ ok: true }));
+    const source = backgroundSource.slice(backgroundSource.indexOf('async function performBrowserRepairs('),
+      backgroundSource.indexOf('\nfunction conversationStillOpen('));
+    const repair = vm.runInNewContext(`${source}\nperformBrowserRepairs`, {
+      tabConversations: { '71': conversationId }, tabDocuments: { '71': 'suspended-document' },
+      conversationForTab: (value: { url?: string }) => value.url?.split('/c/')[1] ?? null,
+      createChatTab: create, call,
+      chrome: { tabs: {
+        query: async () => state === 'missing' ? [] : [tab], reload,
+        get: async () => {
+          if (state === 'closed') throw new Error('Tab closed');
+          return { ...tab, discarded: state !== 'woke' && state !== 'frozen',
+            ...(state === 'navigated' ? { url: 'https://example.com/' } : {}),
+            ...(state === 'loading' ? { pendingUrl: tab.url } : {}) };
+        }
+      } }, CHATGPT_TAB_URLS: ['https://chatgpt.com/*']
+    });
+    await repair([{ conversationId, token: 'suspension', suspended: true }], {});
+    expect(reload).toHaveBeenCalledTimes(state === 'discarded' || state === 'frozen' ? 1 : 0);
+    expect(create).not.toHaveBeenCalled();
+  }
+);
+
+it.each(['still-frozen', 'woke', 'navigated', 'new-document'] as const)(
+  'rechecks suspension after the app grants the reload (%s)', async state => {
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const tab = { id: 71, url: `https://chatgpt.com/c/${conversationId}`, frozen: true };
+    const documents = { '71': 'suspended-document' };
+    let claimed = false;
+    const reload = vi.fn();
+    const call = vi.fn(async (url: string) => {
+      if (url === '/repairs/claim') {
+        claimed = true;
+        if (state === 'new-document') documents['71'] = 'replacement-document';
+      }
+      return { ok: true, data: { allowed: true } };
+    });
+    const source = backgroundSource.slice(backgroundSource.indexOf('async function performBrowserRepairs('),
+      backgroundSource.indexOf('\nfunction conversationStillOpen('));
+    const repair = vm.runInNewContext(`${source}\nperformBrowserRepairs`, {
+      tabConversations: { '71': conversationId }, tabDocuments: documents,
+      conversationForTab: (value: { url?: string }) => value.url?.split('/c/')[1] ?? null,
+      createChatTab: vi.fn(), call,
+      chrome: { tabs: { query: async () => [tab], reload, get: async () => ({ ...tab,
+        frozen: !(claimed && state === 'woke'),
+        ...(claimed && state === 'navigated' ? { url: 'https://example.com/' } : {})
+      }) } }, CHATGPT_TAB_URLS: ['https://chatgpt.com/*']
+    });
+    await repair([{ conversationId, token: 'suspension-claim', reason: 'stalled', suspended: true, requiresClaim: true }], {});
+    expect(claimed).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(state === 'still-frozen' ? 1 : 0);
+    expect(call.mock.calls.filter(([url]) => url.includes('repairFailed='))).toHaveLength(state === 'still-frozen' ? 0 : 1);
+  });
+
 describe('accepted helper tab cleanup', () => {
+  it('shares pending diagnostic reads and discards a result after disconnect', async () => {
+    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics()'),
+      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics()')));
+    let complete!: (value: unknown) => void;
+    const snapshot = vi.fn(() => new Promise(resolve => { complete = resolve; }));
+    const call = vi.fn(async () => ({ ok: true }));
+    const context = vm.createContext({ token: 'fixture-token', disconnected: false, connectionEpoch: 1, port: 8765,
+      companionDiagnosticsFlight: null, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
+    const publish = vm.runInContext(`${source}\npublishCompanionDiagnostics`, context);
+    const first = publish();
+    const second = publish();
+    expect(first).toBe(second);
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(1));
+    context.connectionEpoch++;
+    context.disconnected = true;
+    complete({ capturedAt: 1 });
+    await first;
+    expect(call).not.toHaveBeenCalled();
+    context.disconnected = false;
+    const third = publish();
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    complete({ capturedAt: 2 });
+    await third;
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+
   for (const outcome of ['accepted', 'rejected', 'navigated', 'pinned', 'busy', 'draft', 'pinned-during-proof'] as const) {
     it(`closes only the exact accepted helper document (${outcome})`, async () => {
       const helper = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -773,6 +862,47 @@ describe('accepted helper tab cleanup', () => {
       else expect(worker.tabsRemove).not.toHaveBeenCalled();
     });
   }
+});
+
+describe('automatic Continue shares scheduled reload custody', () => {
+  it.each(['accepted', 'draft', 'navigated', 'rejected'] as const)('never reloads immediately after Stop (%s)', async outcome => {
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    let url = `https://chatgpt.com/c/${chat}`;
+    const actions: string[] = [];
+    let consumed = false;
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      tabsGet: async () => ({ id: 1, url }),
+      tabsSendMessage: async (_id, message) => {
+        if (message.type === 'clf-recovery-reload-check') return { safe: outcome !== 'draft' };
+        return { ok: true };
+      },
+      fetch: async (address, init) => {
+        const route = new URL(address).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/input/claim') {
+          const body = JSON.parse(String(init?.body)); actions.push(body.recoveryAction);
+          if (body.recoveryAction === 'stopped') {
+            if (outcome === 'navigated') url = 'https://chatgpt.com/';
+            const allowed = !consumed && outcome !== 'rejected'; consumed = true;
+            return response(200, { ok: allowed });
+          }
+          return response(200, { ok: true });
+        }
+        return response(200, {});
+      }
+    });
+    await worker.registerTab(1);
+    const message = { type: 'desktop_input', id: 'ffffffff-1111-4222-8333-444444444444',
+      owner: '1:document-1-0:0', conversationId: chat, recoveryAction: 'stopped' };
+    await worker.send(message);
+    expect(worker.tabsReload).not.toHaveBeenCalled();
+    expect(actions.includes('reloaded')).toBe(false);
+    if (outcome === 'accepted') {
+      await worker.send(message);
+      expect(worker.tabsReload).not.toHaveBeenCalled();
+    }
+  });
 });
 
 /**
@@ -866,18 +996,20 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     expect(worker.tabsReload).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['unattributed', 'assistant-error'].flatMap(reason =>
-    ['unresolved', 'resolved-during-scan', 'claim-unavailable'].map(mode => ({ reason, mode }))))(
+  it.each(['unattributed', 'assistant-error', 'silence', 'no-tab', 'goal', 'compaction'].flatMap(reason =>
+    ['unresolved', 'resolved-during-scan', 'claim-unavailable', 'navigated-during-claim'].map(mode => ({ reason, mode }))))(
     'claims $reason recovery after the tab scan: $mode', async ({ reason, mode }) => {
       let armed = false;
       let handed = false;
       let resolved = false;
+      let navigated = false;
       const trace: string[] = [];
       const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
         const url = new URL(input);
         if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
         if (url.pathname === '/repairs/claim') {
           trace.push('claim');
+          if (mode === 'navigated-during-claim') navigated = true;
           expect(init.method).toBe('POST');
           expect(JSON.parse(String(init.body))).toEqual({ token: 'attribution-attempt' });
           return mode === 'claim-unavailable' ? response(503, {}) : response(200, { allowed: !resolved });
@@ -894,6 +1026,9 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
         return response(200, {});
       });
       const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+        tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${navigated ? OTHER : CHAT}` }),
+        tabsSendMessage: async (_id, message) => message.type === 'clf-repair-check'
+          ? { safe: true, revision: 1, turnId: 'source', questionId: 'question' } : { ok: true },
         tabsQuery: async () => {
           if (handed) {
             trace.push('scan');
@@ -925,6 +1060,88 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
    * so the ambiguity is resolved rather than deferred - the registry-bound copy is the one
    * reloaded, deterministically, and no third tab is ever created to settle it.
    */
+  it.each(['stop-before-claim', 'work-after-claim', 'stop-after-claim', 'navigation-after-claim'] as const)(
+    'vetoes the exact browser repair at its last page check: %s', async scenario => {
+      let armed = false, handed = false, claimed = false, receipts = 0;
+      const fetch = vi.fn(async (input: string) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+        if (url.pathname === '/status') {
+          if (url.searchParams.has('repaired')) receipts++;
+          if (armed && !handed) { handed = true; return response(200, { repairs: [{ conversationId: CHAT,
+            token: 'quiet-repair', reason: 'silence', requiresClaim: true }] }); }
+          return response(200, { repairs: [] });
+        }
+        return response(200, {});
+      });
+      const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+        tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+        tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${claimed && scenario === 'navigation-after-claim' ? OTHER : CHAT}` }),
+        tabsSendMessage: async (_id, message) => {
+          if (message.type !== 'clf-repair-check') return { ok: true };
+          if (scenario === 'stop-before-claim') return { safe: false };
+          if (message.expected) {
+            expect(message.expected).toEqual({ revision: 1, turnId: 'source', questionId: 'question' });
+            return { safe: scenario === 'navigation-after-claim', revision: 2, turnId: 'source', questionId: 'question' };
+          }
+          return { safe: true, revision: 1, turnId: 'source', questionId: 'question' };
+        } });
+      await worker.registerTab(21);
+      await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+      await worker.fireAlarm(); armed = true; await worker.fireAlarm();
+      expect(claimed).toBe(scenario !== 'stop-before-claim');
+      expect(worker.tabsReload).not.toHaveBeenCalled();
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+      expect(receipts).toBe(0);
+    });
+
+  it.each(['empty', 'draft-before-claim', 'draft-after-claim', 'question-after-claim', 'unresponsive'] as const)(
+    'preserves the compaction draft at the browser claim boundary: %s', async scenario => {
+      let armed = false, handed = false, claimed = false, repaired = 0, failed = 0;
+      const fetch = vi.fn(async (input: string) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+        if (url.pathname === '/status') {
+          if (url.searchParams.has('repaired')) repaired++;
+          if (url.searchParams.has('repairFailed')) failed++;
+          if (armed && !handed) {
+            handed = true;
+            return response(200, { repairs: [{ conversationId: CHAT, token: 'compaction-draft',
+              reason: 'compaction', requiresClaim: true }] });
+          }
+          return response(200, { repairs: [] });
+        }
+        return response(200, {});
+      });
+      const checks: Record<string, unknown>[] = [];
+      const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+        tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+        tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+        tabsSendMessage: async (_id, message) => {
+          if (message.type !== 'clf-repair-check') return { ok: true };
+          checks.push(message);
+          if (scenario === 'unresponsive') return null;
+          return { safe: scenario !== 'draft-before-claim' &&
+            !(claimed && (scenario === 'draft-after-claim' || scenario === 'question-after-claim')),
+            revision: 1, turnId: 'source', questionId: claimed && scenario === 'question-after-claim' ? 'next' : 'question' };
+        } });
+      await worker.registerTab(21);
+      await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+      await worker.fireAlarm(); armed = true; await worker.fireAlarm();
+      const reloads = scenario === 'empty' || scenario === 'unresponsive' ? 1 : 0;
+      expect(worker.tabsReload).toHaveBeenCalledTimes(reloads);
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+      expect(repaired).toBe(reloads);
+      expect(claimed).toBe(scenario !== 'draft-before-claim');
+      expect(failed).toBe(scenario === 'draft-after-claim' || scenario === 'question-after-claim' ? 1 : 0);
+      expect(checks).toHaveLength(claimed ? 2 : 1);
+      expect(checks.every(message => message.draftOnly === true)).toBe(true);
+      if (claimed && scenario !== 'unresponsive') expect(checks[1]!.expected)
+        .toEqual({ revision: 1, turnId: 'source', questionId: 'question' });
+    });
+
   it('reloads the registry-bound copy when one chat has two tabs', async () => {
     const { fetch, asked } = appWith(CHAT);
     const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
@@ -1245,6 +1462,66 @@ describe('active agent tab discard protection', () => {
     await worker.fireAlarm();
     expect(worker.tabsUpdate).not.toHaveBeenCalled();
   });
+
+  it('reports discarded and frozen shells separately from genuinely open conversations', async () => {
+    const DISCARDED = 'bbbbbbbb-cccc-4ddd-8eee-111111111111';
+    const FROZEN = 'cccccccc-dddd-4eee-8fff-222222222222';
+    const posted: Array<{ openConversations?: string[]; stalledConversations?: string[] }> = [];
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch: vi.fn(async (input: string, init?: Record<string, unknown>) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/status') {
+          posted.push(JSON.parse(String(init?.body || '{}')));
+          return response(200, { ok: true, repairs: [] });
+        }
+        return response(404, {});
+      }),
+      tabsQuery: async () => [
+        { id: 1, windowId: 7, url: `https://chatgpt.com/c/${DISCARDED}`, discarded: true },
+        { id: 2, windowId: 7, url: `https://chatgpt.com/c/${FROZEN}`, frozen: true },
+        { id: 3, windowId: 7, url: `https://chatgpt.com/c/${CHAT}`, status: 'complete' }
+      ]
+    });
+
+    await worker.fireAlarm();
+
+    // The shells keep their URLs and stay inside openConversations — the app decides what a
+    // dead page means — while stalledConversations names the ones that cannot record or receive.
+    expect(posted.at(-1)?.openConversations).toEqual([DISCARDED, FROZEN, CHAT]);
+    expect(posted.at(-1)?.stalledConversations).toEqual([DISCARDED, FROZEN]);
+  });
+
+  it('protects a newly created input tab until its conversation binds', async () => {
+    const inputId = 'ffffffff-1111-4222-8333-444444444444';
+    const session = new FakeStorageArea();
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session,
+      fetch: vi.fn(async (input: string) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/status') {
+          return response(200, { ok: true, repairs: [], inputs: [{ id: inputId }], inputOpeningIds: [inputId] });
+        }
+        return response(404, {});
+      })
+    });
+
+    await worker.fireAlarm();
+
+    expect(worker.tabsCreate).toHaveBeenCalledTimes(1);
+    expect(worker.tabsUpdate).toHaveBeenCalledWith(99, { autoDiscardable: false });
+    expect(session.data.discardProtectedTabs).toEqual({ '99': true });
+
+    // The cos-input marker holds the protection across later passes; release belongs to the
+    // app's policy set once a real conversation binds, not to a sweep that cannot see one yet.
+    await worker.fireAlarm();
+    expect(worker.tabsUpdate).not.toHaveBeenCalledWith(99, { autoDiscardable: true });
+    expect(session.data.discardProtectedTabs).toEqual({ '99': true });
+  });
 });
 
 describe('app-owned retained tab pool', () => {
@@ -1378,13 +1655,14 @@ describe('worker settings authority', () => {
     const token = '0123456789abcdef0123456789abcdef';
 
     await worker.send({ type: 'compact', conversationId: CHAT, ticket: true, automatic: true }, 44);
-    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceLost: true }, 44);
+    const sourceError = 'The browser could not insert the handoff request (native_edit_rejected).';
+    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceLost: true, sourceError }, 44);
     await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDispatch: true }, 44);
     await worker.send({ type: 'compact', conversationId: CHAT, token, destinationDispatch: true }, 44);
 
     expect(posted).toEqual([
       expect.objectContaining({ conversationId: CHAT, ticket: true, automatic: true }),
-      expect.objectContaining({ conversationId: CHAT, token, sourceLost: true }),
+      expect.objectContaining({ conversationId: CHAT, token, sourceLost: true, sourceError }),
       expect.objectContaining({ conversationId: CHAT, token, sourceDispatch: true }),
       expect.objectContaining({ conversationId: CHAT, token, destinationDispatch: true })
     ]);
@@ -1797,23 +2075,87 @@ describe('extension command delivery', () => {
     ]);
   });
 
+  it.each(['healthy', 'missing', 'loading', 'discarded', 'frozen', 'navigated'] as const)(
+    'repairs missing recorders through maintenance without opening or reloading (%s)', async scenario => {
+      const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const fetch = vi.fn(async (input: string) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/status') return response(200, { ok: true, repairs: [], commandIds: [] });
+        return response(404, {});
+      });
+      const tab = { id: 41, url: `https://chatgpt.com/c/${chat}`,
+        ...(scenario === 'loading' ? { status: 'loading' } : {}),
+        ...(scenario === 'discarded' ? { discarded: true } : {}),
+        ...(scenario === 'frozen' ? { frozen: true } : {}) };
+      const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+        tabsQuery: async () => [tab],
+        tabsGet: async () => scenario === 'navigated' ? { id: 41, url: 'https://example.com/' } : tab });
+      if (scenario === 'healthy') worker.tabsSendMessage.mockResolvedValue({ ok: true, recorderVersion: 15 });
+      // Startup restoration is a separate path; exercise the later maintenance pass.
+      await worker.installed('update');
+      worker.scriptingExecuteScript.mockClear();
+      worker.scriptingInsertCSS.mockClear();
+      await worker.fireAlarm();
+      if (scenario === 'healthy' || scenario === 'missing') {
+        await vi.waitFor(() => expect(worker.scriptingExecuteScript).toHaveBeenCalledWith({
+          target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js']
+        }));
+        if (scenario === 'missing') await vi.waitFor(() => expect(worker.scriptingInsertCSS).toHaveBeenCalled());
+      } else expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
+      const calls = worker.scriptingExecuteScript.mock.calls.length;
+      await worker.fireAlarm();
+      expect(worker.scriptingExecuteScript).toHaveBeenCalledTimes(calls);
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+      expect(worker.tabsReload).not.toHaveBeenCalled();
+    });
+
+  it.each(['live', 'retired', 'expired', 'foreign-chat', 'unknown-policy'] as const)(
+    'keeps command tab custody through conversation promotion and MV3 restoration (%s)', async scenario => {
+      const CHAT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      let commandIds: string[] | undefined = scenario === 'unknown-policy' ? undefined : ['cmd-handoff'];
+      const fetch = vi.fn(async (input: string) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/status') return response(200, { ok: true, repairs: [], commandIds });
+        return response(404, {});
+      });
+      const session = new FakeStorageArea({ discardProtectedTabs: { '71': {
+        commandId: 'cmd-handoff', at: Date.now() - (scenario === 'expired' ? 31 * 60_000 : 0),
+        conversationId: scenario === 'foreign-chat' ? 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' : null
+      } } });
+      const worker = loadWorker({ local: new FakeStorageArea(paired), session, fetch });
+      await worker.createTab({ id: 71, url: `https://chatgpt.com/c/${CHAT}`, autoDiscardable: false });
+      if (scenario === 'retired') commandIds = [];
+      await worker.fireAlarm();
+      const releases = () => worker.tabsUpdate.mock.calls.filter(call =>
+        (call[1] as { autoDiscardable?: boolean })?.autoDiscardable === true);
+      expect(releases()).toHaveLength(scenario === 'live' ? 0 : 1);
+      if (scenario === 'live') {
+        expect(session.data.discardProtectedTabs).toMatchObject({ '71': { commandId: 'cmd-handoff', conversationId: CHAT } });
+        commandIds = [];
+        await worker.fireAlarm();
+        expect(releases()).toEqual([[71, { autoDiscardable: true }]]);
+      }
+    });
+
   it('keeps a live recorder but revalidates the idempotent MAIN-world Fiber helper', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 13 });
+    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 15 });
 
     await worker.installed('update');
 
-    expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-recorder-ping' });
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-recorder-ping' }, undefined);
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
     ]);
     expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
   });
 
-  it('repairs a missing MAIN-world Fiber helper on demand for the sending tab only', async () => {
+  it('repairs the matching recorder and helper together for the requesting document only', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
@@ -1821,14 +2163,33 @@ describe('extension command delivery', () => {
     const repaired = await worker.send({ type: 'repair_fiber' }, 73);
 
     expect(repaired).toMatchObject({ ok: true });
-    expect(worker.scriptingExecuteScript).toHaveBeenCalledWith({
-      target: { tabId: 73, documentIds: ['document-73-0'] },
-      world: 'MAIN',
-      files: ['fiber.js']
-    });
+    const target = { tabId: 73, documentIds: ['document-73-0'] };
+    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target, files: ['chatgpt-dom.js'] }],
+      [{ target, world: 'MAIN', files: ['fiber.js'] }],
+      [{ target, files: ['content.js'] }]
+    ]);
+    expect(worker.scriptingInsertCSS).toHaveBeenCalledWith({ target, files: ['overlay.css'] });
+    expect(worker.tabsReload).not.toHaveBeenCalled();
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
 
     await worker.navigateTab(73, 'https://example.com/left');
     expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false, error: 'tab_closed' });
+  });
+
+  it.each([1, 2, 3])('stops paired helper repair when Chrome loses the target during injection %s', async stage => {
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session });
+    let injections = 0;
+    worker.scriptingExecuteScript.mockImplementation(async () => {
+      if (++injections === stage) throw new Error('The target document no longer exists');
+      return [];
+    });
+    expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false });
+    expect(worker.scriptingExecuteScript).toHaveBeenCalledTimes(stage);
+    expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
+    expect(worker.tabsReload).not.toHaveBeenCalled();
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
   });
 
   it('has no way to ask the app for work at all', async () => {
@@ -1933,7 +2294,7 @@ describe('extension revival delivery', () => {
 
   const liveRecorder = async (_tabId: number, message: Record<string, unknown>) =>
     message.type === 'clf-recorder-ping'
-      ? { ok: true, recorderVersion: 13 }
+      ? { ok: true, recorderVersion: 15 }
       : { ok: true, claimed: true };
 
   it('scans before opening and routes to the oldest exact worker tab', async () => {
@@ -2034,6 +2395,42 @@ describe('extension revival delivery', () => {
     await worker.fireAlarm();
 
     await worker.fireAlarm();
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+  });
+
+  it('reloads a discarded exact tab and offers the revival to its reloaded document', async () => {
+    let discarded = true;
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea({ recoveryMonitoring: true }),
+      fetch: app(),
+      tabsQuery: async () => [
+        { id: 4, windowId: 7, url: `https://chatgpt.com/c/${CHAT}`, ...(discarded ? { discarded: true } : { status: 'complete' }) }
+      ],
+      tabsGet: async id => ({ id, url: `https://chatgpt.com/c/${CHAT}`, discarded }),
+      tabsSendMessage: liveRecorder
+    });
+
+    await worker.fireAlarm();
+
+    // A discarded shell can never answer the ping or accept an injection. Reloading it is the
+    // exact repair; creating a second tab for the same conversation is the failure this
+    // prevents.
+    expect(worker.tabsReload).toHaveBeenCalledWith(4);
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(worker.tabsSendMessage.mock.calls.some(([id, message]) => id === 4 && message.type === 'clf-run-command')).toBe(false);
+
+    // The reloaded document registers, and that registration re-enters this exact flow.
+    discarded = false;
+    await worker.registerTab(4, 'document-4-reloaded');
+    await vi.waitFor(() =>
+      expect(worker.tabsSendMessage).toHaveBeenCalledWith(4, {
+        type: 'clf-run-command',
+        id: revival.id,
+        conversationId: CHAT,
+        deferredRecovery: true
+      })
+    );
     expect(worker.tabsCreate).not.toHaveBeenCalled();
   });
 
@@ -2155,6 +2552,97 @@ describe('extension revival delivery', () => {
 });
 
 describe('extension observation journal', () => {
+  it.each([false, true])('retains a slow durable event batch beyond ten seconds, including a split retry: %s', async split => {
+    vi.useFakeTimers();
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const signals: AbortSignal[] = [];
+    const posted: Array<{ events: Array<{ text: string }> }> = [];
+    let release = () => {};
+    let delayed = false;
+    const worker = loadWorker({ local, session, fetch: async (input, init = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname !== '/events') return response(404, {});
+      const batch = JSON.parse(String(init.body));
+      posted.push(batch);
+      if (split && posted.length === 1) return response(413, { error: 'body_too_large' });
+      if (delayed) return response(200, { stored: batch.events.length });
+      delayed = true;
+      const signal = init.signal as AbortSignal;
+      signals.push(signal);
+      return new Promise<ReturnType<typeof response>>((resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+        release = () => {
+          signal.removeEventListener('abort', abort);
+          resolve(response(200, { stored: batch.events.length }));
+        };
+      });
+    } });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await worker.registerTab(61);
+      pending = worker.send({ type: 'events', conversationId: chat, entries: ['first', 'second'].map(text => ({
+        conversationId: chat, event: { kind: 'progress', time: Date.now(), text }
+      })) }, 61);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.aborted).toBe(false);
+      expect(journalOf(session).map(entry => entry.event.text)).toEqual(['first', 'second']);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      await pending;
+      expect(journalOf(session)).toEqual([]);
+      expect(posted.map(batch => batch.events.map(event => event.text))).toEqual(
+        split ? [['first', 'second'], ['first'], ['second']] : [['first', 'second']]
+      );
+    } finally {
+      release();
+      await pending;
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an event batch durable when its extended deadline expires and drains it on a later successful attempt', async () => {
+    vi.useFakeTimers();
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const signals: AbortSignal[] = [];
+    let healthy = false;
+    const worker = loadWorker({ local, session, fetch: async (input, init = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname !== '/events') return response(404, {});
+      if (healthy) return response(200, { stored: 1 });
+      const signal = init.signal as AbortSignal;
+      signals.push(signal);
+      return new Promise<ReturnType<typeof response>>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    } });
+    try {
+      await worker.registerTab(61);
+      const pending = worker.send({ type: 'events', conversationId: chat, entries: [{
+        conversationId: chat, event: { kind: 'progress', time: Date.now(), text: 'preserve this observation' }
+      }] }, 61);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(signals[0]!.aborted).toBe(true);
+      expect(journalOf(session).map(entry => entry.event.text)).toEqual(['preserve this observation']);
+      healthy = true;
+      const retry = worker.send({ type: 'status' }, 61);
+      await vi.advanceTimersByTimeAsync(0);
+      await retry;
+      expect(journalOf(session)).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('delivers another chat and its Goal while a slow chat holds one slot, without overlapping same-chat batches', async () => {
     const a = '11111111-2222-3333-4444-555555555555';
     const b = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -2735,6 +3223,38 @@ describe('extension observation journal', () => {
     ]);
   });
 
+  it('forwards the page-model helper health, and only the words the page may say', async () => {
+    // This field crosses three files, and that join is where two checkpoint fields have already
+    // been lost with every unit test still green — see scripts/verify-compact-chain.mjs. The
+    // page is the only thing that can see the MAIN-world helper, and the app is the only thing
+    // that can say a handoff will never reconcile its marker without it.
+    const conversationId = '22222222-3333-4444-5555-666666666666';
+    const seen: Array<string | null> = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        seen.push(url.searchParams.get('fiber'));
+        return response(200, { sessionId: 'session', entries: [], stream: [], nextSince: 0 });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch
+    });
+
+    for (const fiber of ['absent', 'empty', 'ok']) {
+      await worker.send({ type: 'activity', conversationId, since: 0, fiber }, 73);
+    }
+    // Anything else is dropped rather than passed on for the app to validate a second time.
+    await worker.send({ type: 'activity', conversationId, since: 0, fiber: 'maybe' }, 73);
+    await worker.send({ type: 'activity', conversationId, since: 0 }, 73);
+
+    expect(seen).toEqual(['absent', 'empty', 'ok', null, null]);
+  });
+
   it('selects only the exact owned Goal tab without activating Chrome or opening a duplicate', async () => {
     const conversationId = '22222222-3333-4444-5555-666666666666';
     const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
@@ -2849,6 +3369,80 @@ describe('extension observation journal', () => {
     expect(closed).toEqual([]);
     await worker.closeTab(11);
     expect(closed).toEqual([conversationId]);
+    const closeRequest = fetch.mock.calls.find(([input]) => new URL(input).pathname === '/closed');
+    expect(JSON.parse(String(closeRequest?.[1]?.body))).toEqual({ conversationId, manual: true });
+  });
+
+  it('relays one exact recorded-call disclosure only while its document and route stay current', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const other = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let tabUrl = `https://chatgpt.com/c/${conversationId}`;
+    let tabStatus = 'complete';
+    let pendingUrl: string | undefined;
+    const detailBodies: unknown[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const path = new URL(input).pathname;
+      if (path === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (path === '/activity/detail') {
+        detailBodies.push(JSON.parse(String(init.body)));
+        return response(200, { ok: true, conversationId, callId: 'call-1', detailRevision: 17 });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsGet: async (id) => ({ id, url: tabUrl, status: tabStatus, ...(pendingUrl ? { pendingUrl } : {}) })
+    });
+
+    await worker.send({ type: 'bind', conversationId }, 63);
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: 'call-1', detailRevision: 17 }, 63))
+      .resolves.toMatchObject({ ok: true, data: { callId: 'call-1', detailRevision: 17 } });
+    expect(detailBodies).toEqual([{ conversationId, callId: 'call-1', detailRevision: 17 }]);
+
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: ['call-1'], detailRevision: 17 }, 63))
+      .resolves.toMatchObject({ ok: false, status: 400, error: 'bad_activity_detail' });
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: 'call-1', detailRevision: 0 }, 63))
+      .resolves.toMatchObject({ ok: false, status: 400, error: 'bad_activity_detail' });
+    await expect(worker.send({ type: 'activity_detail', conversationId: other, callId: 'call-1', detailRevision: 17 }, 63))
+      .resolves.toMatchObject({ ok: false, error: 'stale_document' });
+    tabStatus = 'loading';
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: 'call-1', detailRevision: 17 }, 63))
+      .resolves.toMatchObject({ ok: false, error: 'stale_document' });
+    tabStatus = 'complete'; pendingUrl = tabUrl;
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: 'call-1', detailRevision: 17 }, 63))
+      .resolves.toMatchObject({ ok: false, error: 'stale_document' });
+    pendingUrl = undefined;
+    tabUrl = `https://chatgpt.com/c/${other}`;
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: 'call-1', detailRevision: 17 }, 63))
+      .resolves.toMatchObject({ ok: false, error: 'stale_document' });
+    expect(detailBodies).toHaveLength(1);
+  });
+
+  it('discards a recorded-call detail response if the browser route changes during the read', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const other = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let tabUrl = `https://chatgpt.com/c/${conversationId}`;
+    const fetch = vi.fn(async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (path === '/activity/detail') {
+        tabUrl = `https://chatgpt.com/c/${other}`;
+        return response(200, { ok: true, conversationId, callId: 'call-1', detailRevision: 17 });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(), fetch,
+      tabsGet: async (id) => ({ id, url: tabUrl, status: 'complete' })
+    });
+
+    await worker.send({ type: 'bind', conversationId }, 64);
+    await expect(worker.send({ type: 'activity_detail', conversationId, callId: 'call-1', detailRevision: 17 }, 64))
+      .resolves.toMatchObject({ ok: false, error: 'stale_document' });
+    expect(fetch.mock.calls.filter(([input]) => new URL(String(input)).pathname === '/activity/detail')).toHaveLength(1);
   });
 
   it.each(['absent', 'present', 'query-failed', 'same-chat', 'pending-chat', 'still-loading'])(
@@ -3466,7 +4060,8 @@ describe('extension connection', () => {
     const worker = loadWorker({
       local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
       session: new FakeStorageArea(),
-      fetch
+      fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${conversationId}` })
     });
 
     const reply = await worker.send({
@@ -3484,6 +4079,33 @@ describe('extension connection', () => {
       status: 200,
       data: { conversationId, confirmed: [requestId], complete: true }
     });
+  });
+
+  it('does not publish request ownership from a document on another conversation route', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const otherConversationId = '11111111-2222-3333-4444-555555555555';
+    const requested: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const pathname = new URL(input).pathname;
+      requested.push(pathname);
+      return pathname === '/hello'
+        ? response(200, { app: 'chat-on-steroids', paired: true })
+        : response(200, { ok: true });
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${otherConversationId}` })
+    });
+
+    await expect(worker.send({
+      type: 'correlate',
+      conversationId,
+      calls: [{ messageId: 'request-message', tool: 'exec_command', order: 0, answered: false,
+        requestId: 'f0f00009-1111-4111-8111-111111111111' }]
+    })).resolves.toMatchObject({ ok: false, error: 'stale_document' });
+    expect(requested).not.toContain('/correlations');
   });
 
   it('does not re-ask where the app is before every single request', async () => {
@@ -3690,6 +4312,14 @@ describe('the overlay stylesheet', () => {
     expect(used.size, 'the stylesheet animates nothing — has the namespace changed?').toBeGreaterThan(0);
     expect([...used].filter((name) => !defined.has(name))).toEqual([]);
   });
+
+  it('wraps long recorded call lines inside their disclosure panel', async () => {
+    const css = await fs.readFile(path.join(process.cwd(), 'extension', 'overlay.css'), 'utf8');
+    const rule = /\.clf-stream-recorded-detail\s+pre\s*\{([^}]+)\}/.exec(css)?.[1] ?? '';
+    expect(rule).toMatch(/white-space:\s*pre-wrap/);
+    expect(rule).toMatch(/overflow-wrap:\s*anywhere/);
+    expect(rule).toMatch(/overflow:\s*auto/);
+  });
 });
 
 /**
@@ -3811,4 +4441,51 @@ it.each(['idle', 'selected', 'selected-before-proof', 'selected-during-proof', '
   });
   await prune([tab], { managedConversations: [conversationId] }, new Set(), new Set([conversationId]));
   expect(remove).toHaveBeenCalledTimes(scenario === 'idle' ? 1 : 0);
+});
+
+it.each([
+  { name: 'just read then switched away', age: 0, close: false },
+  { name: 'one millisecond before grace expires', age: 299_999, close: false },
+  { name: 'exact grace boundary', age: 300_000, close: true },
+  { name: 'old access', age: 600_000, close: true },
+  { name: 'absent timestamp', timestamp: undefined, close: true },
+  { name: 'invalid timestamp', timestamp: NaN, close: true },
+  { name: 'infinite timestamp', timestamp: Infinity, close: true },
+  { name: 'zero timestamp', timestamp: 0, close: true },
+  { name: 'negative timestamp', timestamp: -1, close: true },
+  { name: 'future timestamp', age: -1, close: true },
+  { name: 'read and left before proof', age: 600_000, freshAt: 1, close: false },
+  { name: 'read and left during proof', age: 600_000, freshAt: 2, close: false },
+  { name: 'explicit retired cleanup', age: 0, retired: true, close: true },
+  { name: 'surplus copy cleanup', age: 10, duplicate: true, close: true }
+])('honors tab-local reading intent without changing separate retirement authority: $name', async scenario => {
+  const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const now = 1_800_000_000_000;
+  const tab = { id: 71, url: `https://chatgpt.com/c/${conversationId}`, active: false, pinned: false,
+    lastAccessed: 'age' in scenario ? now - scenario.age! : scenario.timestamp };
+  const remove = vi.fn();
+  const proof = vi.fn(async () => ({ safe: true, conversationId, navigationEpoch: 0 }));
+  let snapshots = 0;
+  const get = vi.fn(async () => ({ ...tab,
+    lastAccessed: ++snapshots === scenario.freshAt ? now : tab.lastAccessed }));
+  const code = backgroundSource.slice(backgroundSource.indexOf('async function pruneManagedTabs('),
+    backgroundSource.indexOf('\nfunction maintain(', backgroundSource.indexOf('async function pruneManagedTabs(')));
+  const prune = vm.runInNewContext(`${code}\npruneManagedTabs`, {
+    Date: { now: () => now },
+    cleanConversationId: (id: string) => id, conversationForTab: () => conversationId,
+    conversationFromUrl: (url: string) => url.split('/c/')[1], tabDocuments: { '71': 'doc' },
+    tabEpochs: { '71': 0 }, ownsDocument: (source: { tab: number }) => source.tab === 71,
+    journalCountForConversation: () => 0, tabReply: proof, chrome: { tabs: { get, remove } }
+  });
+  const policy = { managedConversations: [conversationId], idleCloseAfterMs: 300_000,
+    retiredConversations: scenario.retired ? [conversationId] : [],
+    conversationActivityAt: { [conversationId]: now - 3_600_000 } };
+  const tabs = scenario.duplicate ? [tab, { ...tab, id: 72, lastAccessed: now }] : [tab];
+  const remaining = await prune(tabs, policy, new Set(), new Set([conversationId]));
+  expect(remove.mock.calls).toEqual(scenario.close ? [[71]] : []);
+  expect(remaining.map((held: { id: number }) => held.id)).toEqual(
+    scenario.close ? tabs.filter(held => held.id !== 71).map(held => held.id) : tabs.map(held => held.id));
+  if (scenario.freshAt === 1) expect(proof).not.toHaveBeenCalled();
+  if (scenario.freshAt === 2) expect(proof).toHaveBeenCalledOnce();
+  expect(policy.conversationActivityAt[conversationId]).toBe(now - 3_600_000);
 });

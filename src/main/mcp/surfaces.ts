@@ -24,6 +24,7 @@
 import type { Capabilities } from '../../shared/types.js';
 import { desktopAutomationSupported } from '../platform.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from '../../shared/windows-computer.js';
+import { BROWSER_TOOLS, BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../../shared/browser-control.js';
 
 export const SURFACE_IDS = ['core', 'desktop', 'plugins'] as const;
 export type SurfaceId = (typeof SURFACE_IDS)[number];
@@ -90,12 +91,8 @@ export interface SurfaceDefinition {
 /**
  * Core — the coding loop.
  *
- * `session` and `agents` live here rather than on surfaces of their own, and that is a
- * decision with a concrete reason rather than a tidiness preference:
+ * Workers are part of the coding loop:
  *
- *  - `session` is how a chat discovers and reads local recordings of past or concurrently
- *    running work — including exact authored messages and the arguments/result of one call.
- *    That is part of the coding loop rather than an extra connector.
  *  - `agents` is one flat tool and is registered only while multi-agent mode is on.
  *    Fresh installs enable it; an existing config that keeps it off still pays nothing for
  *    it here. A dedicated connector for one conditional schema is pure setup overhead with
@@ -113,12 +110,11 @@ const CORE: SurfaceDefinition = {
     'Read and edit code and text files on this computer, run commands in a real terminal, and query configured SQL Server databases directly. ' +
     'Use for: opening and reading files, searching a repository, applying patches, creating, renaming and deleting files, ' +
     'running builds, tests, linters, git, npm and shell commands, continuing long-running or interactive terminal sessions, ' +
-    'querying database data or schema with read-only SQL, and saving images and files ChatGPT generates onto this computer. ' +
-    'Also searches and reads local recordings of previous or concurrently running ChatGPT work, and — when the user has ' +
+    'querying database data or schema with read-only SQL, and displaying task plans. When the user has ' +
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
   cardSummary: 'Files, patches, terminal and configured SQL Server databases. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'database', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'database', 'update_plan', 'agents', 'session_finish', 'exec']
 };
 
 /**
@@ -136,14 +132,15 @@ const DESKTOP: SurfaceDefinition = {
   serverName: 'chat-on-steroids-desktop',
   connectorName: `${CONNECTOR_BRAND} Desktop`,
   description:
-    'See and control this computer desktop, including its clipboard. ' +
+    'Control browser tabs in the background and this computer desktop, including its clipboard. ' +
+    'Attach existing Chrome/Edge/Brave tabs or open new tabs; inspect DOM refs, page screenshots, JavaScript, console errors and network requests; click, fill forms and navigate without foreground activation. ' +
     'Use for: listing and launching apps, taking background window screenshots, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in native applications, ' +
     'and reading the clipboard or copying and pasting text between programs.',
   cardSummary:
-    'Apps, background window screenshots, mouse/keyboard control and the clipboard. Optional — connect it only if you want desktop automation.',
+    'Browser tabs, DOM, console, network and background screenshots; native apps, input and clipboard where supported.',
   required: false,
-  tools: [...WINDOWS_COMPUTER_METHODS, 'read_clipboard', 'write_clipboard', 'observe', 'computer', 'exec']
+  tools: [...BROWSER_TOOLS, ...WINDOWS_COMPUTER_METHODS, 'read_clipboard', 'write_clipboard', 'observe', 'computer', 'exec']
 };
 
 const PLUGINS: SurfaceDefinition = {
@@ -166,8 +163,11 @@ export function surfaceDefinition(id: SurfaceId): SurfaceDefinition {
 
 /** Platform/capability projection used by setup; each registrar enforces the same split. */
 export function desktopToolNames(caps: Capabilities, platform: NodeJS.Platform = process.platform): string[] {
-  if (platform !== 'win32') return [...(caps.screen ? ['observe'] : []), ...(caps.control || caps.clipboardRead || caps.clipboardWrite ? ['computer'] : [])];
+  const browser = [...(caps.screen ? BROWSER_READ_TOOLS : []), ...(caps.control ? BROWSER_WRITE_TOOLS : [])];
+  if (!desktopAutomationSupported(platform)) return browser;
+  if (platform !== 'win32') return [...browser, ...(caps.screen ? ['observe'] : []), ...(caps.control || caps.clipboardRead || caps.clipboardWrite ? ['computer'] : [])];
   return [
+    ...browser,
     ...(caps.screen ? WINDOWS_COMPUTER_READ_METHODS : []),
     ...(caps.control ? WINDOWS_COMPUTER_INPUT_METHODS : []),
     ...(caps.clipboardRead ? ['read_clipboard'] : []),
@@ -196,8 +196,7 @@ export function surfaceIsUseful(
   // still gives this surface something real to advertise.
   if (id === 'desktop') {
     return (
-      desktopAutomationSupported(platform, release) &&
-      (caps.screen || caps.control || caps.clipboardRead || caps.clipboardWrite)
+      caps.screen || caps.control || (desktopAutomationSupported(platform, release) && (caps.clipboardRead || caps.clipboardWrite))
     );
   }
   return true;

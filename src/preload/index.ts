@@ -1,6 +1,5 @@
+import type { WorkspaceTerminalEvent, WorkspaceTerminalInfo } from '../shared/workspace-terminal.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
-import type { SkillLibrary } from '../shared/skills.js';
-import type { ChatgptPermissionNotice } from '../shared/chatgpt-permission-notice.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import type { TaskProgress } from '../shared/task-progress.js';
 import type { TerminalLiveUpdate } from '../shared/terminal-live.js';
@@ -10,6 +9,8 @@ import type { InputAttachment } from '../shared/input.js';
 import type { UsageOverview } from '../shared/usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
+import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
+import type { SkillSummary, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
 import { createDatabaseApi } from './database-api.js';
 /**
@@ -21,9 +22,12 @@ import { createDatabaseApi } from './database-api.js';
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
+import type { AppState, Capabilities, CompanionDiagnostics, Config, Diagnosis, LogEntry } from '../shared/types.js';
 import type {
   Handoff,
+  ImageStorageClearMode,
+  ImageStorageClearResult,
+  ImageStorageInfo,
   SessionEvent,
   SessionSummary,
   ClearAgentResult,
@@ -81,10 +85,16 @@ export interface SessionDetail {
 
 const api = {
   ...createDatabaseApi(call),
-  skillsList: () => call<SkillLibrary>('skills:list'),
-  skillsImport: () => call<SkillLibrary | null>('skills:import'),
-  skillsOpenFolder: () => call<void>('skills:openFolder'),
-  skillsRemove: (id: string) => call<SkillLibrary>('skills:remove', { id }),
+  terminalCreate: (id: string, projectId: string, cols: number, rows: number) => call<WorkspaceTerminalInfo>('workspaceTerminal:request', { action: 'create', id, projectId, cols, rows }),
+  terminalWrite: (id: string, data: string) => call<void>('workspaceTerminal:request', { action: 'write', id, data }),
+  terminalResize: (id: string, cols: number, rows: number) => call<void>('workspaceTerminal:request', { action: 'resize', id, cols, rows }),
+  terminalAck: (id: string, count: number) => call<void>('workspaceTerminal:request', { action: 'ack', id, count }),
+  terminalClose: (id: string) => call<void>('workspaceTerminal:request', { action: 'close', id }),
+  onTerminalEvent: (listener: (event: WorkspaceTerminalEvent) => void): (() => void) => {
+    const wrapped = (_event: unknown, value: WorkspaceTerminalEvent): void => listener(value);
+    ipcRenderer.on('workspaceTerminal:event', wrapped);
+    return () => ipcRenderer.removeListener('workspaceTerminal:event', wrapped);
+  },
   openLegalNotices: () => call<void>('plugins:legalNotices'),
   pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
   pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
@@ -103,6 +113,8 @@ const api = {
     return () => ipcRenderer.removeListener('plugins:changed', wrapped);
   },
   chooseFiles: () => call<InputAttachment[]>('sessions:files'),
+  listSkills: () => call<SkillSummary[]>('skills:list'),
+  skillLibrary: (scope: SkillsDraftScope) => call<SkillLibrary>('skills:library', scope),
   dropFiles: async (files: File[]): Promise<Reply<InputAttachment[]>> => {
     if (!files.length || files.length > 20) return { ok: false, error: 'Attach up to 20 files per message' };
     try {
@@ -155,22 +167,39 @@ const api = {
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
+  listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
+  watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
+  onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {
+    const wrapped = (_event: unknown, change: ProjectFilesChanged): void => listener(change);
+    ipcRenderer.on('projectFiles:changed', wrapped);
+    return () => ipcRenderer.removeListener('projectFiles:changed', wrapped);
+  },
+  previewProjectFile: (projectId: string, path: string) => call<ProjectFilePreview>('projectFiles:preview', { projectId, path }),
+  createProjectFileEntry: (projectId: string, directory: string, name: string, kind: 'file' | 'directory') =>
+    call<ProjectFileMutationResult>('projectFiles:create', { projectId, directory, name, kind }),
+  renameProjectFileEntry: (projectId: string, path: string, name: string) => call<ProjectFileMutationResult>('projectFiles:rename', { projectId, path, name }),
+  saveProjectFile: (projectId: string, path: string, text: string, expectedModifiedAt: string, expectedBytes: number, expectedRevision: string) =>
+    call<ProjectFileSaveResult>('projectFiles:save', { projectId, path, text, expectedModifiedAt, expectedBytes, expectedRevision }),
+  deleteProjectFileEntry: (projectId: string, path: string) => call<boolean>('projectFiles:delete', { projectId, path }),
+  revealProjectFileEntry: (projectId: string, path = '') => call<boolean>('projectFiles:reveal', { projectId, path }),
+  attachProjectFile: (projectId: string, path: string) => call<InputAttachment>('projectFiles:attach', { projectId, path }),
   getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
-  getSession: (id: string, options?: { from?: number; before?: number; limit?: number }) =>
+  getImageStorage: () => call<ImageStorageInfo>('sessions:imageStorage'),
+  clearImageStorage: (mode: ImageStorageClearMode) => call<ImageStorageClearResult>('sessions:clearImageStorage', { mode }),
+    getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),
   stopSessionTurn: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:stopTurn', { id, expectedTurnId }),
   releaseSessionFinish: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:releaseFinish', { id, expectedTurnId }),
   generateFinishGoal: (id: string, expectedTurnId: string) => call<string>('sessions:generateFinishGoal', { id, expectedTurnId }),
   getChatModels: () => call<ChatModelCatalog>('chatModels:get'),
-  getChatgptPermissionNotice: () => call<ChatgptPermissionNotice>('chatgptPermissionNotice:get'),
-  acknowledgeChatgptPermissionNotice: () => call<ChatgptPermissionNotice>('chatgptPermissionNotice:ack'),
-  onChatgptPermissionNotice: (listener: (notice: ChatgptPermissionNotice) => void): (() => void) => {
-    const wrapped = (_event: unknown, notice: ChatgptPermissionNotice): void => listener(notice);
-    ipcRenderer.on('chatgptPermissionNotice:changed', wrapped);
-    return () => ipcRenderer.removeListener('chatgptPermissionNotice:changed', wrapped);
-  },
   browserPreferences: (patch: Partial<BrowserPreferences> = {}) => call<BrowserPreferences>('browser:preferences', patch),
+  companionDiagnostics: () => call<CompanionDiagnostics | null>('bridge:diagnostics'),
   requestChatModels: () => call<ChatModelCatalog>('chatModels:request'),
+  onToolApprovalNotice: (listener: () => void): (() => void) => {
+    const wrapped = (): void => listener();
+    ipcRenderer.on('setup:toolApprovalNotice', wrapped);
+    return () => ipcRenderer.removeListener('setup:toolApprovalNotice', wrapped);
+  },
   onChatModelsChanged: (listener: (catalog: ChatModelCatalog) => void): (() => void) => {
     const wrapped = (_event: unknown, catalog: ChatModelCatalog): void => listener(catalog);
     ipcRenderer.on('chatModels:changed', wrapped);
