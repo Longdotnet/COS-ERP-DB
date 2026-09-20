@@ -125,7 +125,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
     'apply_patch enables atomic add/update/move/delete within approved roots and permissions. Never copy read’s line-number prefixes into a patch.'
   );
   lines.push(
-    'database accesses configured SQL Server directly. Use it instead of shell/SQL client commands. Omit connection for the current/default DB; use workspace_context for the selected Database Explorer object and list_connections for configured ids. Respect refused writes and keep credentials out of SQL/tool arguments.'
+    'database accesses configured SQL Server directly. Use it, not exec_command/sqlcmd/Invoke-Sqlcmd/ODBC/SqlClient/scripts, for DB data/schema. For current/default DB, omit connection and do not reuse an old id. For “this table” or the selected Database Explorer object, use action=workspace_context. For a live slowdown/blocking/open-transaction incident, prefer action=incident_diagnose; use action=incident_history for recent local snapshots plus LinkQDiagnostics server history when available. Use action=list_connections for configured/default ids. If a write is refused, do not bypass it. Queries are read-only; never request database credentials in SQL or tool arguments.'
   );
   if (sessionTools) lines.push(
     '',

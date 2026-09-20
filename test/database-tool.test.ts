@@ -36,6 +36,8 @@ it('publishes a small credential-free database schema and returns structured que
   expect(json).toContain('sql');
   expect(json).toContain('search_objects');
   expect(json).toContain('growth_diagnostics');
+  expect(json).toContain('incident_diagnose');
+  expect(json).toContain('incident_history');
   expect(json).toContain('workspace_context');
   expect(json).toContain('list_connections');
   expect(json).toContain('cursor');
@@ -49,6 +51,45 @@ it('publishes a small credential-free database schema and returns structured que
     action: 'query', connection: 'linkq-test', database: 'L80LINKQ.TEST', rowCount: 1
   });
   expect(result.content[0]).toMatchObject({ type: 'text' });
+  await server.close();
+});
+
+it('exposes bounded read-only incident diagnosis and local incident history to the model', async () => {
+  const server = new McpServer({ name: 'database fixture', version: '1' });
+  const reg = createRegistrar(server, {
+    roots: [], caps: { ...DEFAULT_CAPABILITIES }, readOnly: false, sessionTools: false, agentTools: false
+  }, 'core');
+  let invoke!: (args: any) => Promise<ToolResult>;
+  reg.register = ((_name: string, _config: any, handler: (args: any) => Promise<ToolResult>) => { invoke = handler; }) as typeof reg.register;
+  const execute = vi.fn(async () => ({ action: 'test' as const, connection: 'unused', database: 'unused', ok: true as const, elapsedMs: 1 }));
+  const snapshot = {
+    id: '2a9e7e99-1f04-45aa-a690-f621b8ca742d',
+    connection: 'linkq-test',
+    database: 'L80LINKQ.TEST',
+    capturedAt: '2026-09-19T01:30:00.000Z',
+    savedAt: '2026-09-19T01:30:00.000Z',
+    summary: { totalMb: 1000, dataUsedMb: 700, logUsedPercent: 20, activeRequestCount: 2, blockedRequestCount: 1, failedJobCount: 0 },
+    requests: [], jobs: [], findings: [], limitations: []
+  };
+  const incident = {
+    diagnose: vi.fn(async () => snapshot as any),
+    history: vi.fn(async () => ({ connection: 'linkq-test', snapshots: [snapshot, { ...snapshot, id: 'e263121d-d67d-4352-b061-8433f6319fa6' }] as any[] })),
+    serverHistory: vi.fn(async () => ({ connection: 'linkq-test', database: 'L80LINKQ.TEST', capturedAt: snapshot.capturedAt, available: true, captures: [], limitations: [], elapsedMs: 2 }))
+  };
+  registerDatabaseTool(reg, execute, incident);
+
+  const live = await invoke({ action: 'incident_diagnose' });
+  expect(incident.diagnose).toHaveBeenCalledWith(undefined);
+  expect(execute).not.toHaveBeenCalled();
+  expect(live.structuredContent).toMatchObject({
+    action: 'incident_diagnose', connection: 'linkq-test', snapshot: { summary: { blockedRequestCount: 1 } }
+  });
+
+  const history = await invoke({ action: 'incident_history', connection: 'linkq-test', incidentLimit: 1 });
+  expect(incident.history).toHaveBeenCalledWith('linkq-test');
+  expect(incident.serverHistory).toHaveBeenCalledWith('linkq-test');
+  expect((history.structuredContent as { snapshots: unknown[] }).snapshots).toHaveLength(1);
+  expect(history.structuredContent).toMatchObject({ serverHistory: { available: true } });
   await server.close();
 });
 

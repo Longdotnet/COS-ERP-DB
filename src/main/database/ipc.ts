@@ -45,6 +45,49 @@ import {
   readDatabaseGrowthHistory,
   saveDatabaseGrowthSnapshot
 } from './growth-history.js';
+import type {
+  DatabaseColumnProfileRequest,
+  DatabaseColumnProfileResult,
+  DatabaseColumnSearchResult,
+  DatabaseDeadlockHistoryResult,
+  DatabaseFieldConsumerRequest,
+  DatabaseFieldConsumersResult,
+  DatabaseIncidentHistoryResult,
+  DatabaseIncidentCauseTraceRequest,
+  DatabaseIncidentCauseTraceResult,
+  DatabaseIncidentWatchStatus,
+  DatabaseJobsResult,
+  DatabaseLivePerformanceResult,
+  DatabaseQueryStoreRequest,
+  DatabaseQueryStoreResult,
+  DatabaseSchemaCompareRequest,
+  DatabaseSchemaCompareResult,
+  DatabaseServerIncidentHistoryResult,
+  DatabaseSourceTraceRequest,
+  DatabaseSourceTraceResult
+} from '../../cos-erp-db/investigation/types.js';
+import {
+  captureIncident,
+  clearIncidentHistory,
+  deleteIncident,
+  executeColumnProfile,
+  executeColumnSearch,
+  executeDeadlocks,
+  executeFieldConsumers,
+  executeIncidentCauseTrace,
+  executeJobs,
+  executeLivePerformance,
+  executeQueryStore,
+  executeSchemaCompare,
+  executeServerIncidentHistory,
+  executeSourceTrace,
+  readIncidentHistory
+} from '../../cos-erp-db/investigation/service.js';
+import {
+  readIncidentWatchStatus,
+  startIncidentWatch,
+  stopIncidentWatch
+} from './incident-watch.js';
 
 type RegisterHandler = <T>(channel: string, handler: (payload: unknown) => Promise<T>) => void;
 
@@ -91,6 +134,7 @@ export function registerDatabaseIpc(handle: RegisterHandler): void {
 
   handle<DatabaseSettingsState>('database:profileRemove', async payload => {
     const { id } = profileIdArg.parse(payload);
+    stopIncidentWatch(id);
     // Secret first: if secure-storage cleanup fails, keep visible metadata rather than leaving a
     // hidden credential that could resurrect when the same profile id is created again.
     await clearDatabasePassword(id);
@@ -114,6 +158,120 @@ export function registerDatabaseIpc(handle: RegisterHandler): void {
     const result = await executeDatabaseAction({ action: 'test', connection: id });
     if (result.action !== 'test') throw new Error('Unexpected database test result');
     return { connection: result.connection, database: result.database, elapsedMs: result.elapsedMs };
+  });
+
+  handle<DatabaseColumnSearchResult>('database:investigator:columns', async payload => {
+    const parsed = profileIdArg.extend({ search: z.string().trim().min(1).max(256) }).strict().parse(payload);
+    return executeColumnSearch(parsed.id, parsed.search);
+  });
+
+  handle<DatabaseColumnProfileResult>('database:investigator:columnProfile', async payload => {
+    const parsed = z.object({
+      connection: profileIdArg.shape.id,
+      objectId: z.number().int().positive(),
+      column: z.string().min(1).max(256)
+    }).strict().parse(payload) as DatabaseColumnProfileRequest;
+    return executeColumnProfile(parsed);
+  });
+
+  handle<DatabaseFieldConsumersResult>('database:investigator:fieldConsumers', async payload => {
+    const parsed = z.object({
+      connection: profileIdArg.shape.id,
+      objectId: z.number().int().positive(),
+      column: z.string().min(1).max(256)
+    }).strict().parse(payload) as DatabaseFieldConsumerRequest;
+    return executeFieldConsumers(parsed);
+  });
+
+  handle<DatabaseLivePerformanceResult>('database:investigator:performance', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return executeLivePerformance(id);
+  });
+
+  handle<DatabaseQueryStoreResult>('database:investigator:queryStore', async payload => {
+    const parsed = z.object({
+      connection: profileIdArg.shape.id,
+      hours: z.union([z.literal(1), z.literal(6), z.literal(24), z.literal(168)]).optional(),
+      sort: z.enum(['duration', 'cpu', 'reads', 'executions']).optional()
+    }).strict().parse(payload) as DatabaseQueryStoreRequest;
+    return executeQueryStore(parsed);
+  });
+
+  handle<DatabaseDeadlockHistoryResult>('database:investigator:deadlocks', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return executeDeadlocks(id);
+  });
+
+  handle<DatabaseSourceTraceResult>('database:investigator:sourceTrace', async payload => {
+    const parsed = z.object({
+      connection: profileIdArg.shape.id,
+      objectId: z.number().int().positive(),
+      column: z.string().min(1).max(256),
+      sourceRoot: z.string().trim().min(1).max(4096)
+    }).strict().parse(payload) as DatabaseSourceTraceRequest;
+    return executeSourceTrace(parsed);
+  });
+
+  handle<DatabaseIncidentCauseTraceResult>('database:investigator:incidentCauseTrace', async payload => {
+    const parsed = z.object({
+      connection: profileIdArg.shape.id,
+      sql: z.string().trim().min(1).max(8_000),
+      sourceRoot: z.string().trim().min(1).max(4096)
+    }).strict().parse(payload) as DatabaseIncidentCauseTraceRequest;
+    return executeIncidentCauseTrace(parsed);
+  });
+
+  handle<DatabaseJobsResult>('database:investigator:jobs', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return executeJobs(id);
+  });
+
+  handle<DatabaseSchemaCompareResult>('database:investigator:schemaCompare', async payload => {
+    const parsed = z.object({
+      baselineConnection: profileIdArg.shape.id,
+      currentConnection: profileIdArg.shape.id
+    }).strict().parse(payload) as DatabaseSchemaCompareRequest;
+    return executeSchemaCompare(parsed);
+  });
+
+  handle<DatabaseIncidentHistoryResult>('database:investigator:incidentCapture', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return captureIncident(id);
+  });
+
+  handle<DatabaseIncidentHistoryResult>('database:investigator:incidentHistory', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return readIncidentHistory(id);
+  });
+
+  handle<DatabaseServerIncidentHistoryResult>('database:investigator:serverIncidentHistory', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return executeServerIncidentHistory(id);
+  });
+
+  handle<DatabaseIncidentHistoryResult>('database:investigator:incidentDelete', async payload => {
+    const parsed = z.object({ id: profileIdArg.shape.id, snapshotId: z.string().uuid() }).strict().parse(payload);
+    return deleteIncident(parsed.id, parsed.snapshotId);
+  });
+
+  handle<DatabaseIncidentHistoryResult>('database:investigator:incidentClear', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return clearIncidentHistory(id);
+  });
+
+  handle<DatabaseIncidentWatchStatus>('database:investigator:incidentWatchStatus', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return readIncidentWatchStatus(id);
+  });
+
+  handle<DatabaseIncidentWatchStatus>('database:investigator:incidentWatchStart', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return startIncidentWatch(id);
+  });
+
+  handle<DatabaseIncidentWatchStatus>('database:investigator:incidentWatchStop', async payload => {
+    const { id } = profileIdArg.parse(payload);
+    return stopIncidentWatch(id);
   });
 
   handle<DatabaseGrowthDiagnosticsResult>('database:growthDiagnostics', async payload => {

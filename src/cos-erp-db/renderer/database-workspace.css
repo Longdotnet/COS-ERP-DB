@@ -1,0 +1,96 @@
+.database-workspace-shell {
+  width: 100%;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.database-workspace-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+  margin: 0 -2px 14px;
+  padding: 17px 18px;
+  border: 1px solid color-mix(in srgb, var(--db-blue) 22%, var(--edge));
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--db-blue) 12%, transparent), transparent 42%),
+    linear-gradient(120deg, color-mix(in srgb, var(--db-purple) 5%, var(--card)), var(--card));
+  box-shadow: var(--lift);
+}
+
+.database-workspace-header h2 { margin: 0; color: var(--ink); font-size: 18px; font-weight: 650; }
+.database-workspace-header p { max-width: 780px; margin: 5px 0 0; color: var(--soft); font-size: 11.5px; line-height: 1.5; }
+
+.database-language-switch {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: var(--sunk);
+}
+
+.database-language-switch button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--soft);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.database-language-switch button:hover { color: var(--ink); background: var(--hover); }
+.database-language-switch button[aria-pressed='true'] {
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 1px 3px #0002;
+  font-weight: 650;
+}
+
+.database-workspace-nav {
+  position: sticky;
+  top: -1px;
+  z-index: 8;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 5px;
+  margin: 0 -2px 16px;
+  padding: 5px;
+  border: 1px solid var(--edge);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--card) 94%, transparent);
+  box-shadow: 0 5px 18px #0001;
+  backdrop-filter: blur(12px);
+}
+
+.database-workspace-nav button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--soft);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.database-workspace-nav button:hover { background: var(--hover); color: var(--ink); }
+.database-workspace-nav button.is-active {
+  background: var(--db-blue-wash);
+  color: color-mix(in srgb, var(--db-blue) 84%, var(--ink));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--db-blue) 25%, transparent);
+}
+
+.database-workspace-view[hidden] { display: none; }
+.database-connections-view { padding: 8px 0 24px; }
+
+@media (max-width: 760px) {
+  .database-workspace-header { grid-template-columns: minmax(0, 1fr); }
+  .database-language-switch { justify-self: start; }
+  .database-workspace-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); position: static; }
+}

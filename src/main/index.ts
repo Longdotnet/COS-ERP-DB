@@ -82,6 +82,7 @@ import { editContextMenuTemplate } from './edit-context-menu.js';
 import { configureCosErpDbIdentity, COS_ERP_DB_AUTO_UPDATE } from '../cos-erp-db/app-identity.js';
 import { initDatabaseSubsystem } from './database/subsystem.js';
 import { closeSqlServerPools } from './database/sqlserver.js';
+import { stopAllIncidentWatches } from './database/incident-watch.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -506,7 +507,7 @@ app.on('will-quit', (event) => {
       // The budget has to clear the drains it contains, or it would silently defeat them:
       // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
       // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
+      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge(), stopAllIncidentWatches()] },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',

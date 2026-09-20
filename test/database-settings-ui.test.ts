@@ -138,6 +138,61 @@ beforeEach(() => {
     })),
     deleteDatabaseGrowthSnapshot: vi.fn((id: string) => reply({ connection: id, snapshots: [] })),
     clearDatabaseGrowthHistory: vi.fn((id: string) => reply({ connection: id, snapshots: [] })),
+    readDatabaseIncidentWatchStatus: vi.fn((id: string) => reply({
+      connection: id,
+      watching: false,
+      intervalMs: 10000,
+      startedAt: null,
+      lastCheckedAt: null,
+      lastCapturedAt: null,
+      capturedCount: 0,
+      incidentActive: false,
+      lastError: null
+    })),
+    startDatabaseIncidentWatch: vi.fn((id: string) => reply({
+      connection: id,
+      watching: true,
+      intervalMs: 10000,
+      startedAt: '2026-09-19T02:00:00.000Z',
+      lastCheckedAt: null,
+      lastCapturedAt: null,
+      capturedCount: 0,
+      incidentActive: false,
+      lastError: null
+    })),
+    stopDatabaseIncidentWatch: vi.fn((id: string) => reply({
+      connection: id,
+      watching: false,
+      intervalMs: 10000,
+      startedAt: '2026-09-19T02:00:00.000Z',
+      lastCheckedAt: '2026-09-19T02:01:00.000Z',
+      lastCapturedAt: null,
+      capturedCount: 0,
+      incidentActive: false,
+      lastError: null
+    })),
+    clearDatabaseIncidentHistory: vi.fn((id: string) => reply({ connection: id, snapshots: [] })),
+    traceDatabaseIncidentCause: vi.fn((request: { connection: string; sql: string; sourceRoot: string }) => reply({
+      connection: request.connection,
+      database: 'L80LINKQ.TEST',
+      candidates: [
+        { kind: 'table', schema: 'dbo', table: 'L09TDDMUNGVIEN', name: 'L09TDDMUNGVIEN', confidence: 'high', evidence: 'UPDATE target' },
+        { kind: 'column', schema: 'dbo', table: 'L09TDDMUNGVIEN', name: 'Ten_UvTd', confidence: 'high', evidence: 'UPDATE SET column' }
+      ],
+      confirmedField: { objectId: 42, schema: 'dbo', table: 'L09TDDMUNGVIEN', columnId: 2, column: 'Ten_UvTd', type: 'nvarchar(200)', nullable: true, identity: false, computed: false, primaryKey: false, indexed: false },
+      consumers: [{ objectId: 100, schema: 'dbo', name: 'Sp_SaveUngVien', type: 'SQL_STORED_PROCEDURE', dependencyDirection: 'references-table', confidence: 'high', reason: 'SQL Server dependency and column text evidence.' }],
+      source: {
+        sourceRoot: request.sourceRoot,
+        searchedFiles: 120,
+        skippedFiles: 4,
+        matches: [{ path: '/src-net10-1.0.0/Modules/HRM/Recruitment/frmUngVien.cs', line: 84, preview: 'txtTenUv.DataBindings.Add("Text", source, "Ten_UvTd");', kind: 'winforms-binding', matchedTerm: 'Ten_UvTd', confidence: 'high' }],
+        truncated: false,
+        limitations: [],
+        elapsedMs: 9
+      },
+      limitations: [],
+      elapsedMs: 14
+    })),
     searchDatabaseObjects: vi.fn(() => reply({ objects: [], hasMore: false, elapsedMs: 1 })),
     readDatabaseTablePage: vi.fn(() => reply({
       schema: 'dbo',
@@ -162,6 +217,74 @@ beforeEach(() => {
       ...(request.section === 'dependencies' ? { outboundDependencies: [], inboundDependencies: [] } : {}),
       elapsedMs: 2
     })),
+    searchDatabaseColumns: vi.fn((_id: string, search: string) => reply({
+      connection: 'linkq-test',
+      database: 'L80LINKQ.TEST',
+      search,
+      matches: [{ objectId: 42, schema: 'dbo', table: 'L09TDDMUNGVIEN', columnId: 1, column: 'Ma_UvTd', type: 'varchar(20)', nullable: false, identity: false, computed: false, primaryKey: true, indexed: true }],
+      truncated: false,
+      elapsedMs: 3
+    })),
+    profileDatabaseColumn: vi.fn(() => reply({
+      connection: 'linkq-test',
+      database: 'L80LINKQ.TEST',
+      object: { objectId: 42, schema: 'dbo', table: 'L09TDDMUNGVIEN' },
+      column: { objectId: 42, schema: 'dbo', table: 'L09TDDMUNGVIEN', columnId: 1, column: 'Ma_UvTd', type: 'varchar(20)', nullable: false, identity: false, computed: false, primaryKey: true, indexed: true },
+      sampleLimit: 10000,
+      sampledRows: 755,
+      nullRows: 0,
+      blankRows: 2,
+      distinctValues: 741,
+      minValue: 'UV001',
+      maxValue: 'UV999',
+      maxDataLengthBytes: 12,
+      examples: [{ value: 'UV001', count: 2 }],
+      limitations: ['Profile statistics use at most 10,000 rows.'],
+      elapsedMs: 4
+    })),
+    readDatabaseFieldConsumers: vi.fn(() => reply({
+      connection: 'linkq-test',
+      database: 'L80LINKQ.TEST',
+      source: { objectId: 42, schema: 'dbo', table: 'L09TDDMUNGVIEN', column: 'Ma_UvTd' },
+      consumers: [{ objectId: 100, schema: 'dbo', name: 'Sp_LoadUngVien', type: 'SQL_STORED_PROCEDURE', dependencyDirection: 'references-table', confidence: 'high', reason: 'SQL Server records a dependency on the table and the module text mentions this column.' }],
+      limitations: [],
+      elapsedMs: 2
+    })),
+    traceDatabaseSource: vi.fn(() => reply({
+      connection: 'linkq-test',
+      database: 'L80LINKQ.TEST',
+      source: { objectId: 42, schema: 'dbo', table: 'L09TDDMUNGVIEN', column: 'Ma_UvTd' },
+      sourceRoot: '/src-net10-1.0.0',
+      searchedFiles: 120,
+      skippedFiles: 4,
+      matches: [{ path: 'Modules/HRM/Recruitment/frmUngVien.cs', line: 84, preview: 'txtMaUv.DataBindings.Add("Text", source, "Ma_UvTd");', kind: 'winforms-binding', confidence: 'high' }],
+      truncated: false,
+      limitations: [],
+      elapsedMs: 9
+    })),
+    compareDatabaseSchemas: vi.fn((request: { baselineConnection: string; currentConnection: string }) => reply({
+      baseline: { connection: request.baselineConnection, database: 'L80LINKQ.OLD', capturedAt: '2026-09-17T01:00:00.000Z' },
+      current: { connection: request.currentConnection, database: 'L80LINKQ.TEST', capturedAt: '2026-09-17T02:00:00.000Z' },
+      summary: {
+        tablesAdded: 0, tablesRemoved: 0,
+        columnsAdded: 0, columnsRemoved: 0, columnsChanged: 0,
+        indexesAdded: 0, indexesRemoved: 0, indexesChanged: 0,
+        proceduresAdded: 0, proceduresRemoved: 0, proceduresChanged: 1,
+        viewsAdded: 0, viewsRemoved: 0, viewsChanged: 0
+      },
+      differences: [{
+        kind: 'procedure-changed',
+        object: 'dbo.Sp_GetUngVien',
+        detail: 'Stored procedure definition changed.',
+        baseline: 'CREATE PROCEDURE dbo.Sp_GetUngVien AS SELECT Ma_UvTd FROM dbo.L09TDDMUNGVIEN;',
+        current: 'ALTER PROCEDURE dbo.Sp_GetUngVien AS SELECT Ma_UvTd, Ten_UvTd FROM dbo.L09TDDMUNGVIEN;',
+        confidence: 'high'
+      }],
+      totalDifferenceCount: 1,
+      truncated: false,
+      limitations: [],
+      elapsedMs: 6
+    })),
     setDatabaseWorkspaceContext: vi.fn((context: unknown) => reply(context))
   };
   Object.assign(dom.window, { api });
@@ -170,6 +293,468 @@ beforeEach(() => {
 afterEach(() => {
   dom.window.close();
   vi.unstubAllGlobals();
+});
+
+it('organizes Database as a workspace and switches its fork UI between English and Vietnamese', async () => {
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+
+  expect(document.querySelector('.database-workspace-header h2')!.textContent).toBe('Database Workspace');
+  expect((document.querySelector('[data-database-workspace-view="investigate"]') as HTMLElement).hidden).toBe(false);
+  expect((document.querySelector('[data-database-workspace-view="connections"]') as HTMLElement).hidden).toBe(true);
+
+  (document.querySelector('[data-database-view="connections"]') as HTMLButtonElement).click();
+  expect((document.querySelector('[data-database-workspace-view="investigate"]') as HTMLElement).hidden).toBe(true);
+  expect((document.querySelector('[data-database-workspace-view="connections"]') as HTMLElement).hidden).toBe(false);
+
+  const vietnamese = document.querySelector<HTMLButtonElement>('[data-database-language="vi"]')!;
+  vietnamese.click();
+  expect(vietnamese.getAttribute('aria-pressed')).toBe('true');
+  expect(document.querySelector('.database-workspace-header h2')!.textContent).toBe('Không gian cơ sở dữ liệu');
+  expect(document.querySelector('[data-database-view="connections"]')!.textContent).toBe('Kết nối');
+  expect(document.querySelector('.database-investigator-head h2')!.textContent).toBe('Điều tra database');
+});
+
+it('searches one ERP field and uses the Analyze menu for data, SQL and C#/WinForms evidence', async () => {
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+
+  (document.querySelector('[data-investigator-tab="column"]') as HTMLButtonElement).click();
+  const search = document.getElementById('databaseInvestigatorColumnSearch') as HTMLInputElement;
+  search.value = 'Ma_UvTd';
+  search.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  await tick();
+
+  expect(api.searchDatabaseColumns).toHaveBeenCalledWith('linkq-test', 'Ma_UvTd');
+  const match = document.querySelector<HTMLButtonElement>('.database-column-result')!;
+  expect(match.textContent).toContain('dbo.L09TDDMUNGVIEN.Ma_UvTd');
+  expect(match.textContent).toContain('varchar(20)');
+  match.click();
+
+  const profile = document.querySelector<HTMLButtonElement>('[data-db-label="Profile data"]')!;
+  profile.click();
+  await tick();
+  expect(api.profileDatabaseColumn).toHaveBeenCalledWith({ connection: 'linkq-test', objectId: 42, column: 'Ma_UvTd' });
+  expect(document.querySelector('.database-investigator-grid')!.textContent).toContain('755');
+  expect(document.querySelector('.database-investigator-grid')!.textContent).toContain('741');
+
+  const findConsumers = document.querySelector<HTMLButtonElement>('[data-db-label="Find SQL consumers"]')!;
+  findConsumers.click();
+  await tick();
+  expect(api.readDatabaseFieldConsumers).toHaveBeenCalledWith({ connection: 'linkq-test', objectId: 42, column: 'Ma_UvTd' });
+  const consumerTable = [...document.querySelectorAll<HTMLElement>('.database-investigator-table')]
+    .find(node => node.textContent?.includes('dbo.Sp_LoadUngVien'))!;
+  expect(consumerTable.textContent).toContain('dbo.Sp_LoadUngVien');
+  expect(consumerTable.textContent).toContain('high');
+
+  const sourceRoot = document.getElementById('databaseInvestigatorSourceRoot') as HTMLInputElement;
+  sourceRoot.value = '/src-net10-1.0.0';
+  const trace = document.querySelector<HTMLButtonElement>('[data-db-label="Trace C#/WinForms"]')!;
+  trace.click();
+  await tick();
+  expect(api.traceDatabaseSource).toHaveBeenCalledWith({ connection: 'linkq-test', objectId: 42, column: 'Ma_UvTd', sourceRoot: '/src-net10-1.0.0' });
+  expect(document.querySelector('.database-source-preview')!.textContent).toContain('DataBindings.Add');
+});
+
+it('offers one Tools menu that jumps directly to the V2 investigators', async () => {
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+
+  const tools = document.querySelector<HTMLDetailsElement>('.database-investigator-more')!;
+  const labels = [...tools.querySelectorAll<HTMLButtonElement>('.database-investigator-menu-item')].map(node => node.textContent);
+  expect(labels).toEqual(expect.arrayContaining([
+    'Field & C#/WinForms trace',
+    'Query Store history',
+    'Deadlock history',
+    'Procedure & View Compare',
+    'SQL Agent Jobs'
+  ]));
+
+  tools.querySelector<HTMLButtonElement>('[data-db-label="Query Store history"]')!.click();
+  expect(document.querySelector('.database-investigator-titlebar h3')!.textContent).toBe('Query Store history');
+
+  tools.querySelector<HTMLButtonElement>('[data-db-label="Procedure & View Compare"]')!.click();
+  expect(document.querySelector('.database-investigator-titlebar h3')!.textContent).toBe('Procedure & View Compare');
+});
+
+it('renders Procedure and View differences as readable baseline-current code cards', async () => {
+  state.settings.connections.unshift({
+    id: 'linkq-old',
+    name: 'LinkQ Old',
+    provider: 'sqlserver',
+    accessMode: 'read-only',
+    server: 'linkq-old.local',
+    database: 'L80LINKQ.OLD',
+    port: 1433,
+    encrypt: false,
+    trustServerCertificate: true,
+    authentication: { type: 'sql', user: 'long' }
+  });
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+
+  document.querySelector<HTMLButtonElement>('[data-db-label="Procedure & View Compare"]')!.click();
+  document.querySelector<HTMLButtonElement>('.database-schema-controls .is-primary')!.click();
+  await tick();
+
+  expect(api.compareDatabaseSchemas).toHaveBeenCalledWith({ baselineConnection: 'linkq-old', currentConnection: 'linkq-test' });
+  const card = document.querySelector<HTMLElement>('.database-code-diff-card')!;
+  expect(card.textContent).toContain('dbo.Sp_GetUngVien');
+  expect(card.textContent).toContain('Procedure changed');
+  expect(card.textContent).toContain('high');
+  expect(card.textContent).toContain('Stored procedure definition changed.');
+  const versions = [...card.querySelectorAll<HTMLElement>('.database-compare-snippet')].map(node => node.textContent);
+  expect(versions[0]).toContain('SELECT Ma_UvTd FROM');
+  expect(versions[1]).toContain('SELECT Ma_UvTd, Ten_UvTd FROM');
+});
+
+it('shows saved Incident Snapshot session evidence as a blocking tree and keeps legacy snapshots readable', async () => {
+  const currentId = '33333333-3333-4333-8333-333333333333';
+  const legacyId = '44444444-4444-4444-8444-444444444444';
+  api.readDatabaseIncidentHistory = vi.fn(() => reply({
+    connection: 'linkq-test',
+    snapshots: [{
+      id: currentId,
+      connection: 'linkq-test',
+      database: 'L80LINKQ.TEST',
+      capturedAt: '2026-09-19T01:30:00.000Z',
+      savedAt: '2026-09-19T01:30:01.000Z',
+      summary: { totalMb: 2048, dataUsedMb: 1500, logUsedPercent: 33, activeRequestCount: 3, blockedRequestCount: 2, failedJobCount: 0 },
+      requests: [{
+        sessionId: 51,
+        status: 'sleeping',
+        command: 'idle',
+        database: 'L80LINKQ.TEST',
+        login: 'erp_user',
+        host: 'ERP-SRV-01',
+        program: 'LinkQ ERP',
+        elapsedMs: 0,
+        cpuMs: 0,
+        logicalReads: 10,
+        writes: 0,
+        waitType: null,
+        lastWaitType: null,
+        waitMs: 0,
+        waitResource: null,
+        blockingSessionId: 0,
+        openTransactionCount: 1,
+        transactionBeginTime: '2026-09-19T01:23:00.000Z',
+        transactionAgeSeconds: 420,
+        queryHash: null,
+        queryPlanHash: null,
+        isBlocked: false,
+        isBlocker: true,
+        isRootBlocker: true,
+        isSleepingTransaction: true,
+        reasonMask: 12,
+        sql: 'UPDATE dbo.L09TDDMUNGVIEN SET Ten_UvTd = @name WHERE Ma_UvTd = @id'
+      }, {
+        sessionId: 52,
+        status: 'suspended',
+        command: 'SELECT',
+        database: 'L80LINKQ.TEST',
+        login: 'report_user',
+        host: 'REPORT-01',
+        program: 'LinkQ Report',
+        elapsedMs: 73000,
+        cpuMs: 1200,
+        logicalReads: 9000,
+        writes: 0,
+        waitType: 'LCK_M_S',
+        lastWaitType: 'LCK_M_S',
+        waitMs: 65000,
+        waitResource: 'KEY: 7:72057594012345678',
+        blockingSessionId: 51,
+        openTransactionCount: 0,
+        transactionBeginTime: null,
+        transactionAgeSeconds: null,
+        queryHash: '0xAAA',
+        queryPlanHash: '0xBBB',
+        isBlocked: true,
+        isBlocker: true,
+        isRootBlocker: false,
+        isSleepingTransaction: false,
+        reasonMask: 11,
+        sql: 'SELECT * FROM dbo.L09TDDMUNGVIEN'
+      }, {
+        sessionId: 53,
+        status: 'suspended',
+        command: 'SELECT',
+        database: 'L80LINKQ.TEST',
+        login: 'desk_user',
+        host: 'DESK-01',
+        program: 'LinkQ HRM',
+        elapsedMs: 15000,
+        cpuMs: 50,
+        logicalReads: 120,
+        writes: 0,
+        waitType: 'LCK_M_S',
+        lastWaitType: 'LCK_M_S',
+        waitMs: 12000,
+        waitResource: 'KEY: 7:72057594087654321',
+        blockingSessionId: 52,
+        openTransactionCount: 0,
+        transactionBeginTime: null,
+        transactionAgeSeconds: null,
+        queryHash: null,
+        queryPlanHash: null,
+        isBlocked: true,
+        isBlocker: false,
+        isRootBlocker: false,
+        isSleepingTransaction: false,
+        reasonMask: 9,
+        sql: 'SELECT Ten_UvTd FROM dbo.L09TDDMUNGVIEN'
+      }, {
+        sessionId: 54,
+        status: 'suspended',
+        command: 'UPDATE',
+        database: 'L80LINKQ.TEST',
+        login: 'batch_user',
+        host: 'BATCH-01',
+        program: 'LinkQ Batch',
+        elapsedMs: 11000,
+        cpuMs: 300,
+        logicalReads: 40,
+        writes: 2,
+        waitType: 'LCK_M_U',
+        lastWaitType: 'LCK_M_U',
+        waitMs: 10500,
+        waitResource: 'OBJECT: 7:42:0',
+        blockingSessionId: -2,
+        openTransactionCount: 1,
+        transactionBeginTime: '2026-09-19T01:29:00.000Z',
+        transactionAgeSeconds: 60,
+        queryHash: null,
+        queryPlanHash: null,
+        isBlocked: true,
+        isBlocker: false,
+        isRootBlocker: false,
+        isSleepingTransaction: false,
+        reasonMask: 1,
+        sql: 'UPDATE dbo.L00ZONES SET Zone = Zone'
+      }],
+      jobs: [],
+      findings: [],
+      limitations: []
+    }, {
+      id: legacyId,
+      connection: 'linkq-test',
+      database: 'L80LINKQ.TEST',
+      capturedAt: '2026-09-18T01:30:00.000Z',
+      savedAt: '2026-09-18T01:30:01.000Z',
+      summary: { totalMb: 2000, dataUsedMb: 1400, logUsedPercent: 20, activeRequestCount: 1, blockedRequestCount: 0, failedJobCount: null },
+      requests: [{
+        sessionId: 77,
+        status: 'running',
+        command: 'SELECT',
+        database: 'L80LINKQ.TEST',
+        login: 'legacy_user',
+        host: 'OLD-CLIENT',
+        program: 'Legacy WinForms',
+        elapsedMs: 1200,
+        cpuMs: 100,
+        logicalReads: 2,
+        writes: 0,
+        waitType: null,
+        waitMs: 0,
+        blockingSessionId: 0,
+        openTransactionCount: 0,
+        sql: 'SELECT 1 AS LegacySnapshot'
+      }],
+      jobs: [],
+      findings: [],
+      limitations: []
+    }]
+  }));
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+
+  const loadHistory = [...document.querySelectorAll<HTMLButtonElement>('.database-investigator-actions .btn')]
+    .find(node => node.textContent === 'Load history')!;
+  loadHistory.click();
+  await tick();
+
+  expect(api.readDatabaseIncidentHistory).toHaveBeenCalledWith('linkq-test');
+  const rootBlocker = document.querySelector<HTMLElement>('.database-blocking-node[data-session-id="51"]')!;
+  const blockedChild = rootBlocker.querySelector<HTMLElement>('.database-blocking-node[data-session-id="52"]')!;
+  expect(rootBlocker.textContent).toContain('Root blocker');
+  expect(rootBlocker.textContent).toContain('Sleeping transaction');
+  expect(rootBlocker.textContent).toContain('Long transaction');
+  expect(rootBlocker.textContent).toContain('ERP-SRV-01');
+  expect(rootBlocker.textContent).toContain('LinkQ ERP');
+  expect(rootBlocker.textContent).toContain('7 min');
+  expect(rootBlocker.textContent).toContain('UPDATE dbo.L09TDDMUNGVIEN');
+  expect(blockedChild.textContent).toContain('Blocked');
+  expect(blockedChild.textContent).toContain('Long request');
+  expect(blockedChild.textContent).toContain('KEY: 7:72057594012345678');
+  expect(blockedChild.querySelector('.database-blocking-node[data-session-id="53"]')).toBeTruthy();
+  expect(document.querySelector<HTMLElement>('.database-blocking-node[data-session-id="54"]')!.textContent).toContain('Special blocker -2');
+
+  const sourceRoot = document.getElementById('databaseInvestigatorSourceRoot') as HTMLInputElement;
+  sourceRoot.value = '/src-net10-1.0.0';
+  sourceRoot.dispatchEvent(new dom.window.Event('change'));
+  rootBlocker.querySelector<HTMLButtonElement>('.database-incident-trace')!.click();
+  await tick();
+
+  expect(api.traceDatabaseIncidentCause).toHaveBeenCalledWith({
+    connection: 'linkq-test',
+    sql: 'UPDATE dbo.L09TDDMUNGVIEN SET Ten_UvTd = @name WHERE Ma_UvTd = @id',
+    sourceRoot: '/src-net10-1.0.0'
+  });
+  const cause = document.querySelector<HTMLElement>('.database-incident-cause')!;
+  expect(cause.textContent).toContain('ERP Cause Trace · Session 51');
+  expect(cause.textContent).toContain('dbo.L09TDDMUNGVIEN.Ten_UvTd');
+  expect(cause.textContent).toContain('Sp_SaveUngVien');
+  expect(cause.textContent).toContain('frmUngVien.cs');
+
+  const legacyRow = [...document.querySelectorAll<HTMLElement>('.database-incident-row')]
+    .find(node => node.textContent?.includes('9/18/2026')) ?? document.querySelectorAll<HTMLElement>('.database-incident-row')[1]!;
+  [...legacyRow.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent === 'View details')!.click();
+
+  const legacy = document.querySelector<HTMLElement>('.database-blocking-node[data-session-id="77"]')!;
+  expect(legacy.textContent).toContain('legacy_user');
+  expect(legacy.textContent).toContain('OLD-CLIENT');
+  expect(legacy.textContent).toContain('Legacy WinForms');
+  expect(legacy.textContent).toContain('SELECT 1 AS LegacySnapshot');
+  expect(legacy.textContent).toContain('Transaction age—');
+});
+
+it('starts and stops Incident Black Box watch and can clear local incident history', async () => {
+  vi.spyOn(window, 'confirm').mockReturnValue(true);
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+  await tick();
+
+  expect(api.readDatabaseIncidentWatchStatus).toHaveBeenCalledWith('linkq-test');
+  expect(document.querySelector('.database-incident-watch')!.textContent).toContain('Stopped');
+
+  [...document.querySelectorAll<HTMLButtonElement>('.database-investigator-actions .btn')]
+    .find(node => node.textContent === 'Start Watch')!.click();
+  await tick();
+  expect(api.startDatabaseIncidentWatch).toHaveBeenCalledWith('linkq-test');
+  expect(document.querySelector('.database-incident-watch')!.textContent).toContain('Watching');
+
+  [...document.querySelectorAll<HTMLButtonElement>('.database-investigator-actions .btn')]
+    .find(node => node.textContent === 'Stop Watch')!.click();
+  await tick();
+  expect(api.stopDatabaseIncidentWatch).toHaveBeenCalledWith('linkq-test');
+
+  [...document.querySelectorAll<HTMLButtonElement>('.database-investigator-actions .btn')]
+    .find(node => node.textContent === 'Clear history')!.click();
+  await tick();
+  expect(api.clearDatabaseIncidentHistory).toHaveBeenCalledWith('linkq-test');
+});
+
+it('loads diagnostics-worker server history and renders its sessions with the same blocking hierarchy', async () => {
+  api.readDatabaseServerIncidentHistory = vi.fn(() => reply({
+    connection: 'linkq-test',
+    database: 'L80LINKQ.TEST',
+    capturedAt: '2026-09-19T01:38:00.000Z',
+    available: true,
+    captures: [{
+      captureId: 901,
+      capturedAt: '2026-09-19T01:37:45.000Z',
+      serverName: 'SQL-ERP-01',
+      instanceName: 'MSSQLSERVER',
+      blockingCount: 1,
+      longRequestCount: 1,
+      openTransactionCount: 1,
+      sessions: [{
+        captureId: 901,
+        sessionId: 91,
+        status: 'sleeping',
+        command: 'idle',
+        database: 'L80LINKQ.TEST',
+        login: 'erp_user',
+        host: 'ERP-APP-01',
+        program: 'LinkQ ERP',
+        elapsedMs: 0,
+        cpuMs: 0,
+        logicalReads: 0,
+        writes: 0,
+        waitType: null,
+        lastWaitType: null,
+        waitMs: 0,
+        waitResource: null,
+        blockingSessionId: 0,
+        openTransactionCount: 1,
+        transactionBeginTime: '2026-09-19T01:32:45.000Z',
+        transactionAgeSeconds: 300,
+        queryHash: null,
+        queryPlanHash: null,
+        isBlocked: false,
+        isBlocker: true,
+        isRootBlocker: true,
+        isSleepingTransaction: true,
+        reasonMask: 12,
+        reasons: ['long-transaction', 'blocking-chain'],
+        sql: 'UPDATE dbo.L09TDDMUNGVIEN SET Ten_UvTd = @name',
+        runningStatement: null
+      }, {
+        captureId: 901,
+        sessionId: 92,
+        status: 'suspended',
+        command: 'SELECT',
+        database: 'L80LINKQ.TEST',
+        login: 'report_user',
+        host: 'REPORT-02',
+        program: 'LinkQ Report',
+        elapsedMs: 65000,
+        cpuMs: 500,
+        logicalReads: 2000,
+        writes: 0,
+        waitType: 'LCK_M_S',
+        lastWaitType: 'LCK_M_S',
+        waitMs: 62000,
+        waitResource: 'PAGE: 7:1:12345',
+        blockingSessionId: 91,
+        openTransactionCount: 0,
+        transactionBeginTime: null,
+        transactionAgeSeconds: null,
+        queryHash: '0x1234',
+        queryPlanHash: '0x5678',
+        isBlocked: true,
+        isBlocker: false,
+        isRootBlocker: false,
+        isSleepingTransaction: false,
+        reasonMask: 11,
+        reasons: ['blocked', 'long-request', 'blocking-chain'],
+        sql: 'SELECT * FROM dbo.L09TDDMUNGVIEN',
+        runningStatement: 'SELECT Ma_UvTd, Ten_UvTd FROM dbo.L09TDDMUNGVIEN'
+      }]
+    }],
+    limitations: [],
+    elapsedMs: 4
+  }));
+
+  const { initDatabaseSettings } = await import('../src/cos-erp-db/renderer/database-settings.js');
+  initDatabaseSettings();
+  await tick();
+
+  const loadServer = [...document.querySelectorAll<HTMLButtonElement>('.database-investigator-actions .btn')]
+    .find(node => node.textContent === 'Load server history')!;
+  loadServer.click();
+  await tick();
+
+  expect(api.readDatabaseServerIncidentHistory).toHaveBeenCalledWith('linkq-test');
+  const history = document.querySelector<HTMLElement>('.database-server-history')!;
+  expect(history.textContent).toContain('#901');
+  expect(history.textContent).toContain('SQL-ERP-01');
+  expect(history.textContent).toContain('Blocked 1');
+  const rootBlocker = history.querySelector<HTMLElement>('.database-blocking-node[data-session-id="91"]')!;
+  const blocked = rootBlocker.querySelector<HTMLElement>('.database-blocking-node[data-session-id="92"]')!;
+  expect(rootBlocker.textContent).toContain('Sleeping transaction');
+  expect(blocked.textContent).toContain('PAGE: 7:1:12345');
+  expect(blocked.textContent).toContain('Running statement');
+  expect(blocked.textContent).toContain('SELECT Ma_UvTd, Ten_UvTd');
 });
 
 it('keeps saved SQL Server connections visible while creating a new one', async () => {

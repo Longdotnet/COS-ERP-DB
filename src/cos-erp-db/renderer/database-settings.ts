@@ -2,9 +2,11 @@ import type { AppApi } from '../../preload/index.js';
 import type { DatabaseProfileDraft, DatabaseSettingsState } from '../../shared/database.js';
 import { $, el, icon, run, toast } from '../../renderer/dom.js';
 import { ui } from '../../renderer/i18n.js';
-import { t } from './i18n.js';
+import { databaseLanguage, setDatabaseLanguage, t } from './i18n.js';
 import { initDatabaseExplorer, setDatabaseExplorerState } from './database-explorer.js';
 import { initDatabaseGrowthDashboard, setDatabaseGrowthDashboardState } from './database-growth-dashboard.js';
+import { initDatabaseInvestigator, setDatabaseInvestigatorState } from './database-investigator.js';
+import './database-workspace.css';
 
 const api = (window as Window & { api: AppApi }).api;
 
@@ -12,6 +14,8 @@ let state: DatabaseSettingsState | null = null;
 let editorId: string | null = null;
 let drafting = false;
 let dirty = false;
+type DatabaseWorkspaceView = 'investigate' | 'explore' | 'storage' | 'connections';
+let workspaceView: DatabaseWorkspaceView = 'investigate';
 
 function input(id: string, type = 'text', placeholder = ''): HTMLInputElement {
   const node = document.createElement('input');
@@ -47,23 +51,45 @@ function ensureDatabaseSurface(): HTMLElement {
   const tab = document.createElement('button');
   tab.type = 'button';
   tab.dataset.tab = 'database';
-  tab.append(icon('i-terminal'), document.createTextNode(t('Databases')));
+  const tabLabel = document.createElement('span');
+  ui(tabLabel, 'textContent', () => t('Databases'));
+  tab.append(icon('i-terminal'), tabLabel);
   const agentsTab = tabs.querySelector<HTMLElement>('[data-tab="settings"]');
   tabs.insertBefore(tab, agentsTab);
 
   const panel = document.createElement('section');
   panel.className = 'panel';
   panel.dataset.panel = 'database';
-  const heading = el('div', 'settings-heading');
-  heading.append(
-    el('h1', '', () => t('Databases')),
-    el('p', '', () => t('Manage SQL Server connections used by the Core database tool.'))
-  );
   mount = document.createElement('div');
   mount.id = 'cosErpDbSettingsMount';
-  panel.append(heading, mount);
+  panel.append(mount);
   document.querySelector('main')!.append(panel);
   return mount;
+}
+
+function workspaceNavButton(view: DatabaseWorkspaceView, text: string): HTMLButtonElement {
+  const node = document.createElement('button');
+  node.type = 'button';
+  node.dataset.databaseView = view;
+  ui(node, 'textContent', () => t(text));
+  node.addEventListener('click', () => showWorkspaceView(view));
+  return node;
+}
+
+function paintLanguageButtons(): void {
+  for (const node of document.querySelectorAll<HTMLButtonElement>('[data-database-language]')) {
+    node.setAttribute('aria-pressed', String(node.dataset.databaseLanguage === databaseLanguage()));
+  }
+}
+
+function showWorkspaceView(view: DatabaseWorkspaceView): void {
+  workspaceView = view;
+  for (const node of document.querySelectorAll<HTMLElement>('[data-database-view]')) {
+    node.classList.toggle('is-active', node.dataset.databaseView === view);
+  }
+  for (const node of document.querySelectorAll<HTMLElement>('[data-database-workspace-view]')) {
+    node.hidden = node.dataset.databaseWorkspaceView !== view;
+  }
 }
 
 function buildDatabaseSettings(): void {
@@ -72,8 +98,57 @@ function buildDatabaseSettings(): void {
 
   const pane = el('div', 'pane');
   pane.classList.add('database-settings-pane');
+
+  const workspaceHeader = el('section', 'database-workspace-header');
+  const workspaceCopy = el('div');
+  workspaceCopy.append(
+    el('h2', '', () => t('Database Workspace')),
+    el('p', '', () => t('Configure connections, investigate incidents, browse objects and inspect storage from one place.'))
+  );
+  const languageSwitch = el('div', 'database-language-switch');
+  const english = document.createElement('button');
+  english.type = 'button';
+  english.dataset.databaseLanguage = 'en';
+  english.textContent = 'English';
+  const vietnamese = document.createElement('button');
+  vietnamese.type = 'button';
+  vietnamese.dataset.databaseLanguage = 'vi';
+  vietnamese.textContent = 'Tiếng Việt';
+  for (const languageButton of [english, vietnamese]) {
+    languageButton.addEventListener('click', () => {
+      setDatabaseLanguage(languageButton.dataset.databaseLanguage === 'vi' ? 'vi' : 'en');
+      paintLanguageButtons();
+    });
+  }
+  languageSwitch.append(english, vietnamese);
+  workspaceHeader.append(workspaceCopy, languageSwitch);
+
+  const workspaceNav = el('nav', 'database-workspace-nav');
+  workspaceNav.setAttribute('aria-label', 'Database workspace');
+  workspaceNav.append(
+    workspaceNavButton('investigate', 'Investigate'),
+    workspaceNavButton('explore', 'Explore'),
+    workspaceNavButton('storage', 'Storage'),
+    workspaceNavButton('connections', 'Connections')
+  );
+
+  const investigatorView = el('div', 'database-workspace-view');
+  investigatorView.dataset.databaseWorkspaceView = 'investigate';
+  const investigatorMount = el('div', 'database-investigator-mount');
+  investigatorView.append(investigatorMount);
+
+  const explorerView = el('div', 'database-workspace-view');
+  explorerView.dataset.databaseWorkspaceView = 'explore';
   const growthMount = el('div', 'database-growth-mount');
   const explorerMount = el('div', 'database-explorer-mount');
+  explorerView.append(explorerMount);
+
+  const storageView = el('div', 'database-workspace-view');
+  storageView.dataset.databaseWorkspaceView = 'storage';
+  storageView.append(growthMount);
+
+  const connectionsView = el('div', 'database-workspace-view database-connections-view');
+  connectionsView.dataset.databaseWorkspaceView = 'connections';
   const row = el('div', 'database-connections-head');
   const text = el('span', 'setting-text');
   text.append(el('b', '', () => t('SQL Server connections')), el('em', '', () => t('Stored locally. ChatGPT can use the Core database tool for read-only queries.')));
@@ -175,10 +250,14 @@ function buildDatabaseSettings(): void {
     encryptRow, trustRow,
     defaultRow, status, actions
   );
-  pane.append(growthMount, explorerMount, row, profileList, editor);
+  connectionsView.append(row, profileList, editor);
+  pane.append(workspaceHeader, workspaceNav, investigatorView, explorerView, storageView, connectionsView);
   mount.append(pane);
+  initDatabaseInvestigator(investigatorMount);
   initDatabaseGrowthDashboard(growthMount);
   initDatabaseExplorer(explorerMount);
+  paintLanguageButtons();
+  showWorkspaceView(workspaceView);
 }
 
 function authenticationFields(): void {
@@ -246,6 +325,7 @@ function renderProfileList(next: DatabaseSettingsState, selectedId: string | nul
 }
 
 function loadEditor(next: DatabaseSettingsState): void {
+  setDatabaseInvestigatorState(next);
   setDatabaseGrowthDashboardState(next);
   setDatabaseExplorerState(next);
   const profiles = next.settings.connections;
@@ -405,6 +485,11 @@ function wire(): void {
 export function initDatabaseSettings(): void {
   buildDatabaseSettings();
   wire();
+  window.addEventListener('cos:database-workspace-view', event => {
+    const detail = event instanceof window.CustomEvent ? event.detail : null;
+    const view = detail && typeof detail === 'object' && 'view' in detail ? (detail as { view?: unknown }).view : null;
+    if (view === 'investigate' || view === 'explore' || view === 'storage' || view === 'connections') showWorkspaceView(view);
+  });
   void run(api.getDatabaseState()).then(next => {
     if (!next) return;
     state = next;
