@@ -41,7 +41,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 18;
+  const VERSION = 21;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Retire it across versions too: picker/plugin replies use their own v1
@@ -76,7 +76,7 @@
   const TURN_SECTION = `section[data-testid^="conversation-turn"], ${SHELL_TURN}`;
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
   const MARKDOWN = '.markdown, [data-content-search-unit-key$=":assistant"] [data-markdown-text-style="assistant-message"]';
-  const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
+  const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents, div:has(> [data-testid="cot-v5-tool-icon-pile"])';
   const GENERATED_IMAGE = '[class~="group/imagegen-image"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
   const MAX_RENDERED_HTML = 120_000;
@@ -158,15 +158,60 @@
     return raw === null ? 0 : Math.max(0, Math.min(999, Math.round(raw)));
   }
 
-  /**
-   * The React Fiber node for a DOM element.
-   *
-   * React hangs it off a property whose name carries a per-build random suffix, so the
-   * key has to be discovered rather than named.
-   */
+  // One synchronous observation owns these path views. Never retain a React tree
+  // between requests or mutate its return pointers when a memoized child is shared.
+  let currentPaths = null;
+  function committedPath(fiber) {
+    const path = [], seen = new Set();
+    let at = fiber, base = null, paired = false;
+    const view = (node, parent) => ({ memoizedProps: node.memoizedProps,
+      memoizedState: node.memoizedState, updateQueue: node.updateQueue, return: parent });
+    const remember = (node, value) => {
+      currentPaths?.set(node, value);
+      if (node.alternate) currentPaths?.set(node.alternate, value);
+    };
+    while (at && path.length < 400) {
+      if (seen.has(at)) return null;
+      seen.add(at);
+      const cached = currentPaths?.get(at);
+      if (cached && cached.root.current === cached.current) { base = cached; break; }
+      paired ||= !!at.alternate;
+      if (at.tag === 3) {
+        const root = at.stateNode, current = root?.current;
+        if (!current || (current !== at && current !== at.alternate)) return null;
+        base = { root, current, node: current, view: view(current, null) };
+        remember(at, base);
+        break;
+      }
+      path.push(at); at = at.return;
+    }
+    // Older unpaired owner facades have no root bookkeeping. A double-buffered
+    // or actual React tree must prove its committed root, including on unmount.
+    if (!base) return !paired && !at && path.every(node => typeof node.tag !== 'number') ? fiber : null;
+    let budget = 4096;
+    for (let index = path.length - 1; index >= 0; index--) {
+      const wanted = path[index];
+      let selected = null;
+      // Walk only this parent's child list, never an arbitrary subtree or cache.
+      // Return links can still name the previous parent after a React bailout.
+      for (let child = base.node.child; child; child = child.sibling) {
+        if (--budget < 0) return null;
+        if (child !== wanted && child !== wanted.alternate) continue;
+        if (selected) return null;
+        selected = child;
+      }
+      if (!selected || base.root.current !== base.current) return null;
+      base = { root: base.root, current: base.current, node: selected, view: view(selected, base.view) };
+      remember(wanted, base);
+    }
+    return base.view;
+  }
+
+  /** The DOM's original Fiber pointer may be the previous render. Read the
+   * root-selected child path, preserving current ancestors of shared children. */
   function fiberOf(node) {
     for (const key in node) {
-      if (key.charCodeAt(0) === 95 && key.indexOf('__reactFiber$') === 0) return node[key];
+      if (key.charCodeAt(0) === 95 && key.indexOf('__reactFiber$') === 0) return committedPath(node[key]);
     }
     return null;
   }
@@ -479,7 +524,12 @@
       if (!message || typeof message !== 'object') continue;
       const author = message.author;
       if (!author || author.role !== 'assistant') continue;
-      if (requestOf(message) || resultOf(message) || hiddenMessage(message)) continue;
+      // ChatGPT visually hides public preambles even while their text still grows.
+      // That presentation flag must not freeze or discard these typed public updates.
+      const publicPreamble = message.recipient === 'all' && channelOf(message) === 'commentary' &&
+        message.content?.content_type === 'text' && message.metadata?.is_thinking_preamble_message === true &&
+        message.metadata.is_visually_hidden !== true;
+      if (requestOf(message) || resultOf(message) || (hiddenMessage(message) && !publicPreamble)) continue;
       // Private reasoning, by ChatGPT's own routing. Never a transcript row.
       if (analysisMessage(message)) continue;
       const id = str(message.id);
@@ -1130,6 +1180,41 @@
     return { app: str(resource.app_name), resource: str(resource.resource_uri) };
   }
 
+  function conflictingRequestScope(left, right) {
+    return ['request_id', 'working_turn_id', 'turn_exchange_id'].some(key =>
+      str(left.metadata?.[key]) && str(right.metadata?.[key]) && left.metadata[key] !== right.metadata[key]);
+  }
+
+  /** Native results can point through a completed assistant/all intermediate message.
+   * Follow its exact parent links inside this turn, stopping at any other tool boundary.
+   * Repeated ids, cycles and contradictory request/working-turn ids provide no receipt. */
+  function resultParentsOf(messages) {
+    const byId = new Map(), parents = new Map();
+    for (const message of messages || []) {
+      const id = str(message?.id);
+      if (id) byId.set(id, byId.has(id) ? null : message);
+    }
+    for (const message of messages || []) {
+      const result = resultOf(message);
+      if (!result || !ourApp(result.app)) continue;
+      const visited = new Set();
+      let id = str(message.metadata?.parent_id), parentId = null;
+      while (id && visited.size < MAX_CALLS && !visited.has(id)) {
+        visited.add(id);
+        const parent = byId.get(id);
+        if (!parent) { if (!byId.has(id)) parentId = id; break; }
+        if (conflictingRequestScope(parent, message)) break;
+        const request = requestOf(parent);
+        if (request) { if (identify(request, result)) parentId = id; break; }
+        if (parent.author?.role !== 'assistant' || parent.recipient !== 'all' ||
+            parent.status !== 'finished_successfully' || parent.end_turn === true) break;
+        id = str(parent.metadata?.parent_id);
+      }
+      parents.set(message, parentId);
+    }
+    return parents;
+  }
+
   /** Rehydrated direct calls can expose only their public result object. Its UUID,
    * request id and invoked resource are exact evidence; no parent or payload is guessed. */
   function completedCallOf(message) {
@@ -1142,7 +1227,7 @@
     return { ...result, messageId, requestId, tool, createTime: num(message.create_time) };
   }
   /** Exact number of this app's own invocations represented by the whole turn, or null. */
-  function localCountOf(messages) {
+  function localCountOf(messages, resultParents = resultParentsOf(messages)) {
     if (!Array.isArray(messages)) return null;
     const ids = [];
     let anonymous = 0;
@@ -1164,8 +1249,7 @@
 
       const result = resultOf(message);
       if (result && ourApp(result.app)) {
-        const meta = message && typeof message === 'object' ? message.metadata : null;
-        remember((meta && typeof meta === 'object' ? str(meta.parent_id) : null) || completedCallOf(message)?.messageId);
+        remember(resultParents.get(message) || completedCallOf(message)?.messageId);
       }
     }
     return Math.min(999, ids.length + anonymous);
@@ -1194,30 +1278,43 @@
     if (!group) return null;
 
     const turnMessages = turnMessagesOf(fiber);
-    const localCount = localCountOf(turnMessages);
     const messages = group.messages;
+    const resultParents = resultParentsOf(turnMessages || messages);
+    const localCount = localCountOf(turnMessages, resultParents);
     const request = requestOf(messages[0]);
-    if (!request) {
-      const completed = completedCallOf(messages[0]);
-      return completed ? { v: VERSION, index, tool: completed.tool, path: null, app: completed.app,
-        resource: completed.resource, messageId: completed.messageId, turnId: str(group.turnId),
-        conversationId: str(group.clientThreadId) || str(group.conversationId), createTime: completed.createTime,
-        hidden: int(own.call(group, 'collapsedSameToolCallCount') ? group.collapsedSameToolCallCount : null),
-        localCount, answered: true } : null;
-    }
-
+    // A rejected result join is not positive evidence for the request's label.
+    // Keep an explicit contradictory parent/result visible as an unknown row.
+    const conflictingResult = request?.messageId && messages.some(message =>
+      str(message?.metadata?.parent_id) === request.messageId && resultOf(message) &&
+      identify(request, resultOf(message)) === null);
     let result = null;
-    if (request.messageId) {
+    if (request?.messageId) {
       // An index loop and no array method: this walks page-owned data, and the page can
       // replace Array.prototype.find but it cannot replace the language.
       for (let at = 1; at < messages.length && result === null; at++) {
         const message = messages[at];
-        const meta = message && typeof message === 'object' ? message.metadata : null;
-        if (meta && typeof meta === 'object' && str(meta.parent_id) === request.messageId) {
+        if (resultParents.get(message) === request.messageId) {
           result = resultOf(message);
         }
       }
     }
+
+    let completed = request ? null : completedCallOf(messages[0]);
+    // A settled native disclosure can retain a stale request before a parentless result.
+    // Represent the result's own UUID, leaving the unrelated request unanswered in callsOf.
+    // Never borrow a neighbor's result to complete that request or a still-running group.
+    if (request && !result && group.isCompletionRequestInProgress === false && messages.length === 2 &&
+        messages[0].status === 'finished_successfully' && messages[1].status === 'finished_successfully' &&
+        !conflictingRequestScope(messages[0], messages[1]) && ourPath(request.path)) {
+      const displayed = completedCallOf(messages[1]);
+      if (displayed && displayed.requestId === request.requestId && identify(request, displayed) === displayed.tool) completed = displayed;
+    }
+    if (completed) return { v: VERSION, index, tool: completed.tool, path: null, app: completed.app,
+      resource: completed.resource, messageId: completed.messageId, turnId: str(group.turnId),
+      conversationId: str(group.clientThreadId) || str(group.conversationId), createTime: completed.createTime,
+      hidden: int(own.call(group, 'collapsedSameToolCallCount') ? group.collapsedSameToolCallCount : null),
+      localCount, answered: true };
+    if (!request) return null;
 
     /**
      * How many calls the row shows in place of, as the page counts them.
@@ -1232,7 +1329,7 @@
     return {
       v: VERSION,
       index,
-      tool: identify(request, result),
+      tool: conflictingResult ? null : identify(request, result),
       path: request.path,
       app: result ? result.app : null,
       resource: result ? result.resource : null,
@@ -1335,6 +1432,7 @@
     const out = [];
     const seen = new Set();
     const answered = new Set();
+    const resultParents = resultParentsOf(messages);
     // Results first, so a request can say whether its own answer has arrived. `parent_id`
     // is what pairs them; position does not, and pairing by position is how a row came to
     // sit over another tool's output.
@@ -1342,8 +1440,7 @@
       const message = messages[at];
       const result = resultOf(message);
       if (!result || !ourApp(result.app)) continue;
-      const meta = message && typeof message === 'object' ? message.metadata : null;
-      const parent = meta && typeof meta === 'object' ? str(meta.parent_id) : null;
+      const parent = resultParents.get(message);
       if (parent) answered.add(parent);
     }
 
@@ -1417,27 +1514,196 @@
     }
     return { conversationId: found, conflict: false };
   }
-  /** #318 identified this native cache. Read only metadata for ids explicitly named
-   * by the mounted exchange. No child traversal, cached prose or cached final status. */
-  function shellRequestMetadata(queries, entry, conversation) {
-    if (conversation.conflict || !conversation.conversationId) return [];
+  /** The native shell subscribes to its live mapping independently of the history
+   * query (144961 / QH.C). Read published React values, never invoke store actions
+   * or enumerate cached branches. The mounted owner and exact user id fence this
+   * optional source before any message metadata can leave the helper. */
+  function shellLiveMapping(fiber, entry) {
+    const user = entry.turn.items.find(item => item?.type === 'user-message');
+    const userId = str(user?.messageId) || str(user?.serverMessageId);
+    if (!userId) return null;
+    const snapshots = new Map();
+    const inspected = new WeakSet();
+    const value = (object, key) => object && typeof object === 'object'
+      ? Object.getOwnPropertyDescriptor(object, key)?.value : undefined;
+    let conflict = false;
+    const inspect = candidate => {
+      if (!candidate || typeof candidate !== 'object' || inspected.has(candidate)) return;
+      inspected.add(candidate);
+      const conversation = value(candidate, 'renderedConversation'), turns = value(candidate, 'renderedTurns');
+      const mapping = value(conversation, 'mapping');
+      if (!mapping || !Array.isArray(turns) || turns.length > 4096 ||
+          turns.filter(turn => turn?.id === entry.id && turn.turn === entry.turn).length !== 1) return;
+      const node = value(mapping, userId), message = value(node, 'message');
+      if (value(node, 'id') !== userId || value(message, 'id') !== userId || message.author?.role !== 'user') return;
+      const prior = snapshots.get(mapping);
+      if (prior && prior.renderedConversation.current_node !== conversation.current_node) conflict = true;
+      snapshots.set(mapping, candidate);
+    };
+    let remaining = 2048;
+    for (let at = fiber, up = 0; at && up < MAX_CLIMB && remaining > 0; up++, at = at.return) {
+      if (at.memoizedProps?.conversationId !== entry.conversationId) continue;
+      for (let hook = at.memoizedState; hook && remaining-- > 0; hook = hook.next) {
+        const state = value(hook, 'memoizedState');
+        inspect(state); if (Array.isArray(state)) inspect(state[0]);
+      }
+      const data = at.updateQueue?.memoCache?.data;
+      if (!Array.isArray(data) || data.length > 32) continue;
+      for (const row of data) {
+        if (!Array.isArray(row) || row.length > 1024) continue;
+        for (const item of row) { if (--remaining < 0) break; inspect(item); }
+      }
+    }
+    return conflict || snapshots.size > 1 || remaining <= 0 ? false : snapshots.values().next().value || null;
+  }
+  /** The renderer publishes its chosen current_node together with the very same
+   * turn object. Follow parent links back to that turn's actual user, never pick
+   * a child or import another branch. Untyped early messages contribute ids only. */
+  function shellCurrentPath(snapshot, entry) {
+    if (snapshot?.renderedTurns.at(-1)?.turn !== entry.turn) return [];
+    const mapping = snapshot.renderedConversation.mapping, ids = [], seen = new Set();
+    let id = snapshot.renderedConversation.current_node;
+    for (let at = 0; at < MAX_ROWS && typeof id === 'string' && id.length <= MAX_TEXT && !seen.has(id); at++) {
+      const node = Object.getOwnPropertyDescriptor(mapping, id)?.value, message = node?.message;
+      if (node?.id !== id || message?.id !== id) return [];
+      seen.add(id); ids.push(id);
+      if (message.author?.role === 'user') {
+        const user = entry.turn.items.find(item => item?.type === 'user-message');
+        return id === (user?.messageId || user?.serverMessageId) && entry.turn.messageIds.every(value => seen.has(value))
+          ? ids.reverse() : [];
+      }
+      id = node.parent;
+    }
+    return [];
+  }
+  /** #318 identified the history cache. Both sources project only explicitly named
+   * messages. Typed public items own presentation; cache text cannot supply a final. */
+  function shellRequestMetadata(fiber, queries, shell, conversation) {
+    if (conversation.conflict) return [];
+    const entry = shell.entry;
     const ids = entry.turn.messageIds;
     if (!Array.isArray(ids) || ids.length > MAX_ROWS || new Set(ids).size !== ids.length) return [];
-    const matches = queries.filter(query => Array.isArray(query?.queryKey) && query.queryKey.length === 2 &&
-      query.queryKey[0] === 'chatgpt-conversation' && query.queryKey[1] === conversation.conversationId);
-    if (matches.length !== 1) return [];
-    const data = matches[0].state?.data;
+    let live;
+    try { live = shellLiveMapping(fiber, entry); } catch { return []; }
+    if (live === false) return [];
+    // A freshly submitted shell exchange can still carry only its provisional
+    // local-chatgpt id while the page route already names the real conversation.
+    // The mounted live mapping is independently fenced by this exact entry, turn
+    // object and user message id, so retain its request metadata during that gap.
+    // Cache metadata still requires the concrete server conversation join below.
+    if (!conversation.conversationId && !live) return [];
+    const matches = conversation.conversationId ? queries.filter(query => Array.isArray(query?.queryKey) && query.queryKey.length === 2 &&
+      query.queryKey[0] === 'chatgpt-conversation' && query.queryKey[1] === conversation.conversationId) : [];
+    if (matches.length > 1) return [];
+    const data = matches[0]?.state?.data;
     if (data?.conversation_id && data.conversation_id !== conversation.conversationId) return [];
-    const mapping = data?.mapping;
+    const mapping = live?.renderedConversation?.mapping || data?.mapping;
     if (!mapping || typeof mapping !== 'object') return [];
     const out = [];
-    for (const id of ids) {
+    const publicBudget = { remaining: MAX_TURN_TEXT };
+    const selected = new Set(ids);
+    const invocationIds = new Set();
+    const sourceCounts = new Map();
+    for (const reference of shell.callSources.values()) if (reference.id)
+      sourceCounts.set(reference.id, (sourceCounts.get(reference.id) || 0) + 1);
+    const messageAt = id => {
+      const node = id && Object.getOwnPropertyDescriptor(mapping, id)?.value;
+      return node?.id === id && node.message?.id === id ? node.message : null;
+    };
+    // Native dynamic-tool-call.callId explicitly names the functions.exec
+    // invocation (811613 / L). Its source can disappear from messageIds when
+    // paired results replace sourceMessage. Read metadata, never its code.
+    for (const id of shell.executionIds) {
+      const message = messageAt(id);
+      if (message?.author?.role === 'assistant' && message.recipient === 'functions.exec') invocationIds.add(id);
+    }
+    const serverName = name => OUR_APPS.find(app => name === app || name === app.replaceAll(' ', '_'));
+    for (const call of shell.calls) {
+      const reference = shell.callSources.get(call.messageId);
+      if (!reference?.id || !selected.has(reference.id) || sourceCounts.get(reference.id) !== 1) continue;
+      const result = messageAt(reference.id);
+      if (result?.author?.role !== 'tool') continue;
+      const resource = resultOf(result);
+      if (resource && (serverName(resource.app) !== serverName(reference.server) || toolName(resource.resource) !== call.tool)) continue;
+      const invocation = messageAt(call.messageId);
+      if (invocation) {
+        const asked = requestOf(invocation), path = asked?.path;
+        // Native N() keeps callId while replacing sourceMessage with the result.
+        // This mounted relation, not cache position or a sibling's request id,
+        // permits reading the original invocation's metadata after a reload.
+        if (invocation.recipient !== 'api_tool.call_tool' || !path || serverName(path.slice(1, path.indexOf('/', 1))) !== serverName(reference.server) ||
+            toolName(path) !== call.tool) continue;
+        for (const key of ['request_id', 'working_turn_id', 'turn_exchange_id']) {
+          const a = str(invocation.metadata?.[key]), b = str(result.metadata?.[key]);
+          if (a && b && a !== b) return [];
+        }
+        invocationIds.add(call.messageId);
+      }
+      reference.metadataId = reference.id;
+    }
+    for (const id of new Set([...ids, ...invocationIds, ...shellCurrentPath(live, entry)])) {
       if (typeof id !== 'string' || !id || id.length > MAX_TEXT || !own.call(mapping, id)) continue;
-      const node = mapping[id], message = node?.message;
+      const node = Object.getOwnPropertyDescriptor(mapping, id)?.value, message = node?.message;
       if (node?.id !== id || message?.id !== id) continue;
-      out.push({ id, create_time: num(message.create_time), metadata: { request_id: str(message.metadata?.request_id) } });
+      const request = str(message.metadata?.request_id), cached = data?.mapping?.[id]?.message;
+      if (live && cached?.id === id && request && cached.metadata?.request_id && cached.metadata.request_id !== request) return [];
+      const publicMessage = selected.has(id) && message.author?.role === 'assistant' && !hiddenMessage(message) &&
+        message.metadata?.is_visually_hidden_reasoning_group !== true && message.metadata?.summary_type !== 'raw_cot';
+      const thought = publicMessage && thoughtMessage(message) && Array.isArray(message.content.thoughts)
+        ? message.content.thoughts.at(-1)?.summary : null;
+      const preamble = publicMessage && channelOf(message) === 'commentary' &&
+        (!message.recipient || message.recipient === 'all') ? authoredText(message) : null;
+      out.push({ id, create_time: num(message.create_time), metadata: { request_id: request },
+        ...(typeof thought === 'string' ? { thought: budgetedText(thought, publicBudget, MAX_RENDERED_TEXT) } : {}),
+        ...(preamble ? { preamble: budgetedText(preamble, publicBudget, MAX_RENDERED_TEXT),
+          publicIdentity: { parent_id: str(message.metadata?.parent_id), working_turn_id: str(message.metadata?.working_turn_id),
+            turn_exchange_id: str(message.metadata?.turn_exchange_id) } } : {}) });
     }
     return out;
+  }
+  /** Public shell titles/preambles have no ids of their own. Their selected source
+   * messages do. Match only unique public representations; never mint ids from a
+   * group index, use raw analysis, or suppress DOM based on this text comparison. */
+  function shellPublicActivity(shell, metadata, rendered, budget, section, exactAnchors) {
+    const publicItems = shell.entry.turn.items.flatMap(item => item?.type === 'chatgpt-reasoning-group' &&
+      Array.isArray(item.items) && item.reasoningRecap?.type !== 'hide_all' ? item.items : []).filter(item => item?.type === 'reasoning' &&
+        item.isTransient !== true && ['thought', 'preamble'].includes(item.presentation) && typeof item.content === 'string');
+    const ids = shell.entry.turn.messageIds;
+    const order = new Map(Array.isArray(ids) && ids.length <= MAX_ROWS ? ids.map((id, index) => [id, index]) : []);
+    for (const message of rendered) if (order.has(message.rawMessageId)) message.order = order.get(message.rawMessageId);
+    const events = [];
+    const blocks = [...section.querySelectorAll('[data-markdown-text-style="assistant-message"]')]
+      .filter(node => node.closest('[data-turn-key]') === section && !node.closest(OWN_SURFACES)).slice(0, MAX_ROWS);
+    for (const source of metadata) for (const kind of ['thought', 'preamble']) {
+      const text = source[kind];
+      const matches = publicItems.filter(item => item.presentation === kind && item.content === text);
+      if (!text || matches.length !== 1 ||
+          metadata.filter(other => other[kind] === text).length !== 1) continue;
+      const authored = kind === 'preamble' ? authoredAssistantMessages([{ id: source.id, author: { role: 'assistant' },
+        channel: 'commentary', metadata: source.publicIdentity, create_time: source.create_time,
+        content: { content_type: 'text', parts: [text] } }], budget)[0] : null;
+      const publicText = kind === 'thought' ? budgetedText(visibleText(text), budget, 300) : authored?.rawText;
+      if (!publicText) continue;
+      if (kind === 'thought') events.push({ messageId: source.id, label: publicText, order: order.get(source.id) });
+      else if (!rendered.some(message => message.rawMessageId === source.id)) rendered.push({ messageId: authored.messageId,
+        rawMessageId: source.id, role: 'assistant', stable: authored.stable, rawText: publicText, renderedHtml: '',
+        order: order.get(source.id), createTime: authoredTime(source) });
+      if (kind === 'preamble') {
+        // Native ChatGptMarkdown is owned by the exact typed reasoning item.
+        // Text equality above selects public content; only this object relation
+        // may place a local tool chunk beside the provider's own prose node.
+        const nodes = blocks.filter(node => {
+          for (let at = fiberOf(node), up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+            if (at.memoizedProps?.item === matches[0]) return true;
+            if (at.memoizedProps?.entry) break;
+          }
+          return false;
+        });
+        if (nodes.length === 1) exactAnchors.set(nodes[0], source.id);
+      }
+    }
+    rendered.sort((a, b) => a.order - b.order);
+    return { events, notifications: [] };
   }
   /** Translate only publicly identified items in the mounted exchange. Missing item ids
    * stay missing; a stopped turn does not manufacture replies to its tool calls. */
@@ -1447,7 +1713,7 @@
       if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; break; }
     }
     if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_ROWS) return null;
-    const messages = [], calls = [], slots = [], seen = new Set();
+    const messages = [], calls = [], slots = [], seen = new Set(), callSources = new Map(), executionIds = [];
     const remember = id => { if (!id || seen.has(id)) return false; seen.add(id); return true; };
     let work = 0;
     for (const [index, item] of entry.turn.items.entries()) {
@@ -1466,19 +1732,28 @@
         const nodes = [...section.querySelectorAll('[data-content-search-unit-key]')].filter(node =>
           node.closest('[data-turn-key]') === section && node.getAttribute('data-content-search-unit-key') === key);
         if (nodes.length === 1) slots.push({ node: nodes[0], id });
-      } else if (item?.type === 'chatgpt-reasoning-group' && Array.isArray(item.items)) {
-        for (const step of item.items) {
+      } else {
+        const steps = item?.type === 'chatgpt-reasoning-group' && Array.isArray(item.items) ? item.items : [item];
+        for (const step of steps) {
           if (++work > MAX_ROWS) return null;
+          if (step?.type === 'dynamic-tool-call' && step.tool === 'exec') {
+            const id = str(step.callId);
+            if (!id) continue;
+            if (!remember(id) || executionIds.length >= MAX_CALLS) return null;
+            executionIds.push(id);
+            continue;
+          }
           if (step?.type !== 'mcp-tool-call' || !OUR_APPS.some(app =>
             step.invocation?.server === app || step.invocation?.server === app.replaceAll(' ', '_'))) continue;
           const id = str(step.callId), tool = toolName(step.invocation?.tool);
           if (!id || !tool) continue;
           if (!remember(id) || calls.length >= MAX_CALLS) return null;
           calls.push({ messageId: id, tool, order: calls.length, answered: step.completed === true, requestId: null, createTime: null });
+          callSources.set(id, { id: str(step.widgetStateSource?.messageId), server: step.invocation.server });
         }
       }
     }
-    return { entry, messages, calls, slots };
+    return { entry, messages, calls, slots, callSources, executionIds };
   }
   function turnsOf(scanToken) {
     const out = [];
@@ -1545,10 +1820,12 @@
         const calls = shell ? shell.calls : callsOf(messages, codeReceipts);
         const queries = shell ? shellQueries(fiber) : [];
         const conversation = shell ? shellConversation(queries, shell.entry.conversationId, conversationEvidenceOf(fiber)) : conversationEvidenceOf(fiber);
-        const metadata = shell ? shellRequestMetadata(queries, shell.entry, conversation) : messages;
+        const metadata = shell ? shellRequestMetadata(fiber, queries, shell, conversation) : messages;
         const requests = requestIdsOf(metadata);
         if (shell) for (const call of calls) {
-          const source = metadata.find(message => message.id === call.messageId);
+          const invocation = metadata.find(message => message.id === call.messageId);
+          const source = invocation?.metadata.request_id ? invocation :
+            metadata.find(message => message.id === shell.callSources.get(call.messageId)?.metadataId) || invocation;
           call.requestId = source?.metadata.request_id || null;
           call.createTime = source?.create_time ?? null;
         }
@@ -1558,8 +1835,8 @@
         const turnBudget = { remaining: Math.min(MAX_TURN_TEXT, responseBudget.remaining) };
         const before = turnBudget.remaining;
         const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget, exactAnchors, conversation.conversationId);
+        const nativeActivities = shell ? shellPublicActivity(shell, metadata, renderedMessages, turnBudget, section, exactAnchors) : nativeActivitiesOf(group.sections, messages, exactThoughtRows);
         responseBudget.remaining -= before - turnBudget.remaining;
-        const nativeActivities = shell ? { events: [], notifications: [] } : nativeActivitiesOf(group.sections, messages, exactThoughtRows);
         const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes);
         const activities = nativeActivities.events;
         const endMessageId = turnEndMessageId(messages);
@@ -1582,6 +1859,7 @@
           turnId: group.turnId,
           conversationId: conversation.conversationId,
           conversationConflict: conversation.conflict,
+          ...(shell && !conversation.conversationId ? { requestOwnerRequired: true } : {}),
           endMessageId,
           calls,
           codeModeCalls,
@@ -1602,6 +1880,9 @@
           for (const slot of shell.slots) {
             desiredTurnStamps.set(slot.node, `${scanToken}:${index}`);
             if (!conversation.conflict) desiredMessageStamps.set(slot.node, `${scanToken}:${index}:${encodeURIComponent(slot.id)}`);
+            // A slot and its inner Markdown are one native message. Publishing
+            // both as placement anchors would make every shell final ambiguous.
+            for (const [node, id] of exactAnchors) if (id === slot.id) exactAnchors.delete(node);
           }
           // Busy hint only, never a completion receipt or a Stop action target.
           const running = shell.entry.turn.status === 'in_progress' ? location.pathname : null;
@@ -1633,7 +1914,7 @@
       const section = sections[at];
       try {
         if (!section || !section.getAttribute) continue;
-        for (const node of section.querySelectorAll(`[data-clf-fiber-message], [data-content-search-unit-key], ${MARKDOWN}`)) {
+        for (const node of section.querySelectorAll(`[data-clf-fiber-message], [data-content-search-unit-key], [data-markdown-text-style="assistant-message"], ${MARKDOWN}`)) {
           const wantedMessage = desiredMessageStamps.get(node);
           const currentMessage = node.getAttribute('data-clf-fiber-message');
           if (wantedMessage === undefined) {
@@ -1932,6 +2213,9 @@
     if (!data || typeof data !== 'object' || ![ASK, 'clf-picker-ask', 'clf-plugin-ask'].includes(data.source)) return;
     const nonce = typeof data.nonce === 'string' ? data.nonce.slice(0, 64) : '';
     if (!nonce) return;
+    const previousPaths = currentPaths;
+    currentPaths = new WeakMap();
+    try {
     if (data.source === 'clf-plugin-ask') {
       let plugin = null;
       try { plugin = pluginSnapshot(); } catch { /* Unrecognized installed settings. */ }
@@ -1953,6 +2237,7 @@
         // Nothing further to try. The other side times out and keeps ChatGPT's labels.
       }
     }
+    } finally { currentPaths = previousPaths; }
   };
   // Re-execution is a repair, not a marker check. A stale primitive marker could survive
   // while its listener did not, so keep the actual listener and always replace it.

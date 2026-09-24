@@ -6,7 +6,7 @@ import zhCN from '../src/renderer/locales/zh-CN.json';
 import zhTW from '../src/renderer/locales/zh-TW.json';
 import ja from '../src/renderer/locales/ja.json';
 
-const names = { en: 'English', es: 'Español', 'zh-CN': '简体中文', 'zh-TW': '繁體中文', ja: '日本語' } as const;
+const names = { en: 'English', es: 'Español', 'zh-CN': '简体中文', 'zh-TW': '繁體中文', ja: '日本語', tr: 'Türkçe', fr: 'Français' } as const;
 let dom: JSDOM;
 beforeEach(() => {
   vi.resetModules();
@@ -105,6 +105,19 @@ describe('Japanese app interface and compact setup languages', () => {
     expect(t('Remove {0}')).toBe('{0}を取り除く');
     expect(t('unknown source {0}', [argument])).toBe(`unknown source ${argument}`);
     for (const source of ['__proto__', 'toString', 'exec_command', 'gpt-6-astra']) expect(t(source)).toBe(source);
+  });
+
+  it('translates app-owned IPC failures while preserving unknown errors and successful replies', async () => {
+    window.localStorage.setItem('cos.ui.language', 'ja');
+    const { run } = await import('../src/renderer/dom.js');
+    expect(await run(Promise.resolve({ ok: false, error: 'Secure credential storage is unavailable.' }))).toBeNull();
+    expect(document.querySelector('.toast')?.textContent).toBe(ja['Secure credential storage is unavailable.']);
+    const nativeError = 'NATIVE_ERROR: /Save/<img src=x> {0}\n  details';
+    expect(await run(Promise.resolve({ ok: false, error: nativeError }))).toBeNull();
+    expect(document.querySelector('.toast')?.textContent).toBe(nativeError);
+    expect(document.querySelector('.toast img')).toBeNull();
+    expect(await run(Promise.resolve({ ok: true, data: 'Settings' }))).toBe('Settings');
+    expect(document.querySelectorAll('.toast')).toHaveLength(1);
   });
 
   it('falls back to English for invalid saved data and can select Japanese when storage fails', async () => {

@@ -24,6 +24,24 @@ afterAll(async () => {
   await removeTempDir(dir);
 });
 
+describe('browser bridge port config', () => {
+  it('defaults fresh and legacy configs to Auto and round-trips every supported choice', async () => {
+    expect(defaultConfig().ui.browserBridgePort).toBe('auto');
+    const legacy = defaultConfig(); delete legacy.ui.browserBridgePort;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    expect((await loadConfig()).ui.browserBridgePort).toBe('auto');
+    for (const browserBridgePort of ['auto', 8865, 8866, 8867, 8868, 8869] as const) {
+      await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, browserBridgePort } });
+      expect((await loadConfig()).ui.browserBridgePort).toBe(browserBridgePort);
+    }
+  });
+  it.each([null, '', '8865', 'Auto', 0, 8765, 8864, 8870, 8865.5, true])('rejects an explicit invalid choice: %s', async value => {
+    const before = await fs.readFile(path.join(dir, 'config.json'), 'utf8');
+    await expect(saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, browserBridgePort: value as any } })).rejects.toThrow();
+    expect(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).toBe(before);
+  });
+});
+
 describe('settings migration', () => {
   it('round-trips custom appearance and isolates malformed appearance from permissions', async () => {
     const { defaultAppearance } = await import('../src/shared/appearance.js');

@@ -1128,9 +1128,9 @@ async function call(path, init = {}, retried = false) {
  * by accident, and it is why the marker in a chat URL is harmless on its own.
  */
 function provision(reconnect = false) {
-  // Singleflight. Everything that wants a token waits on the same request: `/pair` mints
-  // a fresh credential and invalidates the one before it, so two concurrent callers do
-  // not get two tokens, they get one working token and one that has already been revoked.
+  // Singleflight. Everything that wants a token waits on the same request. Current
+  // apps honor automatic reuse across browser profiles; older apps rotate on every
+  // /pair, so concurrent requests there would immediately revoke one another.
   // A pairing from an *older* connection intent is deliberately not shared: Disconnect may
   // have happened while it was in flight, and a later explicit Connect must be able to mint
   // under the new intent without waiting for/accepting that stale result.
@@ -1167,7 +1167,7 @@ async function pairOnce(intent = connectionEpoch, reconnect = false) {
       method: 'POST',
       cache: 'no-store',
       headers: { 'content-type': 'application/json', ...versionHeaders() },
-      body: JSON.stringify(reconnect ? { reconnect: true } : {})
+      body: JSON.stringify(reconnect ? { reconnect: true } : { reuse: true })
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || typeof data.token !== 'string') {
@@ -1614,6 +1614,8 @@ async function authorizeDocument(sender, message) {
   tabDocuments[key] = documentId;
   tabEpochs[key] = requestedEpoch;
   delete terminalDocuments[key];
+  const opening = discardProtectedTabs[key];
+  if (opening && opening !== true && !opening.documentId) opening.documentId = documentId;
   await persistLive();
   return { ok: true, tab: id, documentId, navigationEpoch: requestedEpoch };
 }
@@ -1642,6 +1644,8 @@ async function registerDocument(sender, message) {
   tabDocuments[key] = documentId;
   tabEpochs[key] = requestedEpoch;
   delete terminalDocuments[key];
+  const opening = discardProtectedTabs[key];
+  if (opening && opening !== true && !opening.documentId) opening.documentId = documentId;
   await persistLive();
   return { ok: true, tab: id, documentId, navigationEpoch: requestedEpoch };
 }
@@ -1820,7 +1824,8 @@ async function protectCreatedTab(tab, commandId = null) {
   if (!Number.isInteger(tab?.id)) return;
   // Keep the opening identity even if Chrome temporarily refuses the policy update.
   if (commandId) {
-    discardProtectedTabs[String(tab.id)] = { commandId, at: Date.now(), conversationId: null };
+    discardProtectedTabs[String(tab.id)] = { commandId, at: Date.now(), conversationId: null, url: tab.pendingUrl || tab.url,
+      ...(tabDocuments[String(tab.id)] ? { documentId: tabDocuments[String(tab.id)] } : {}) };
     await persistLive();
   }
   try {
@@ -2469,11 +2474,29 @@ async function maintainOnce() {
   if (!reply.ok || !reply.data) { await activeTabs?.revoke(); return; }
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);
   const liveOpenings = new Set(Array.isArray(reply.data.inputOpeningIds) ? reply.data.inputOpeningIds : []);
+  const liveCommands = new Set(Array.isArray(reply.data.commandIds) ? reply.data.commandIds : []);
   const renderingWanted = tab => {
     if (intent !== connectionEpoch || !token || disconnected) return false;
     if (liveChats.has(conversationForTab(tab))) return true;
     try {
       const url = new URL(tab.url);
+      // A worker/resume owns a command before it owns a provider conversation.
+      // Discard protection alone does not let a minimized page paint its editor.
+      // Reuse the created-tab custody and the app's current command publication.
+      const custody = discardProtectedTabs[String(tab.id)];
+      const queryCommand = url.searchParams.get('clf'), hashCommand = new URLSearchParams(url.hash.slice(1)).get('clf');
+      if (custody && custody !== true && liveCommands.has(custody.commandId) &&
+          Date.now() >= custody.at && Date.now() - custody.at < COMMAND_TAB_PROTECTION_MS &&
+          !Object.prototype.hasOwnProperty.call(terminalDocuments, String(tab.id)) &&
+          (!custody.documentId || custody.documentId === tabDocuments[String(tab.id)])) {
+        // Once the provider conversation is bound, its ordinary live-chat grant
+        // takes over. A manual move to another chat cannot borrow this opening.
+        const start = custody.url ? new URL(custody.url) : null;
+        if (!conversationFromUrl(tab.url) && url.origin === 'https://chatgpt.com' &&
+            url.pathname === (start?.pathname || '/') &&
+            (!queryCommand || !hashCommand || queryCommand === hashCommand) &&
+            (queryCommand || hashCommand) === custody.commandId) return true;
+      }
       const id = url.searchParams.get('cos-input') || new URLSearchParams(url.hash.slice(1)).get('cos-input');
       if (liveOpenings.has(id) && inputOpenings[id]?.tab === tab.id) return true;
       // Reuse has no input marker until native New Chat/Work -> Chat finishes.
@@ -2526,7 +2549,10 @@ async function maintainOnce() {
       ...(Number.isInteger(bounds.left) && Number.isInteger(bounds.top) ? { left: bounds.left, top: bounds.top } : {}) };
   }
   const backgroundReady = await reconcileBackgroundWindow(reply.data);
-  if (reply.data.placement) await placeSuccessorChat(reply.data.placement, null);
+  if (reply.data.placement) {
+    await placeSuccessorChat(reply.data.placement, null);
+    await refreshRendering();
+  }
   inspectRequestedModels(reply.data.modelCatalogRequest);
   inspectRequestedPluginRefresh(reply.data.pluginRefreshRequests, reply.data.background === true, reply.data.browserOnly === true);
   const repairConversations = new Set(repairs.map(entry => entry.conversationId));
@@ -2580,7 +2606,8 @@ async function maintainOnce() {
         reply.data.commandIds.includes(custody.commandId) && Date.now() >= custody.at &&
         Date.now() - custody.at < COMMAND_TAB_PROTECTION_MS &&
         (!custody.conversationId || custody.conversationId === conversation) &&
-        (!tab.pendingUrl || tab.pendingUrl === tab.url);
+        (!tab.pendingUrl || tab.pendingUrl === tab.url ||
+          !conversation && tab.pendingUrl === custody.url);
       if (carrying && conversation && !custody.conversationId) {
         custody.conversationId = conversation;
         changed = true;
@@ -3840,7 +3867,8 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
     // 30-second alarm. Reuse the elected tab and single maintenance flight; the
     // app's current claim/receipt still decides whether anything may be sent.
     void load().then(async () => {
-      if (Object.values(inputOpenings).some(opening => opening.tab === id)) return maintain(true);
+      if (Object.values(inputOpenings).some(opening => opening.tab === id) ||
+          discardProtectedTabs[String(id)]?.commandId) return maintain(true);
       const owner = (await chrome.storage.session.get('modelCatalogOwner')).modelCatalogOwner;
       if (owner?.tab === id && !owner.handedToInput) return maintain(true);
     }).catch(() => undefined);
@@ -3940,7 +3968,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
  * receive both its static manifest injection and this recovery injection.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 18;
+const PAGE_RECORDER_VERSION = 21;
 
 let deferredRecoveryWork = null;
 
@@ -4210,7 +4238,7 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
       // still present. Request-id ownership depends on fiber.js, and re-executing it is
       // idempotent because the helper keeps one listener per protocol version.
       try {
-        await chrome.scripting.executeScript({ target, world: 'MAIN', files: ['fiber.js'] });
+        await chrome.scripting.executeScript({ target, world: 'MAIN', files: ['usage.js', 'fiber.js'] });
       } catch {
         // The tab can navigate between the ping and repair. Static injection covers it.
       }
@@ -4228,7 +4256,7 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
     // Keep the React/Fiber reader in ChatGPT's own world, exactly like the static manifest
     // declaration. An older helper may still answer too; the nonce/version gate in
     // content.js makes those replies harmless, and a future version bump rejects them.
-    await chrome.scripting.executeScript({ target, world: 'MAIN', files: ['fiber.js'] });
+    await chrome.scripting.executeScript({ target, world: 'MAIN', files: ['usage.js', 'fiber.js'] });
     if (!current()) return false;
     await chrome.scripting.executeScript({ target, files: ['content.js'] });
     if (!current()) return false;

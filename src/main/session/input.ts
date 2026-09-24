@@ -18,7 +18,7 @@ import { logInfo } from '../logger.js';
 import { noteChatOrigin } from './recorder.js';
 import { isAstraModel, isProModel } from '../../shared/chat-models.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
-import { automaticFinishEnabled, consumeGoalReplyForInputNow } from '../goal.js';
+import { automaticFinishEnabled, goalDrivingMode, consumeGoalReplyForInputNow } from '../goal.js';
 import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
@@ -57,11 +57,13 @@ const entrySchema = inputArgs.extend({
   toolImages: inputArgs.shape.images,
   /** One after-turn pickup earned by confirmed silence or settled Thinking failed. */
   silenceBoundary: z.object({ turnId: z.string().min(1).max(256), conversationId: z.string().min(1).max(256), workSeq: z.number().int().nonnegative(), acceptedAt: z.number().nonnegative().optional(), listenUntil: z.number().nonnegative().optional(), nativeBusy: z.boolean().optional() }).optional(),
+  /** The active turn at admission; its final may already be waiting in the browser journal. */
+  queuedTurn: z.object({ conversationId: z.string().min(1).max(256), turnId: z.string().min(1).max(256) }).optional(),
   /** Shared unfinished-response fallback belongs to this question in every mode. */
   recovery: z.object({ questionId: z.string(), episode: z.string().max(200).optional(), pro: z.boolean(), busyUntil: z.number(), phase: z.enum(['ready', 'stopping', 'reloading', 'resumed']), reloadOwner: z.string().optional() }).optional(),
   /** Exact tool-free turn this explicit browser correction may interrupt. */
   directTurn: z.object({ id: z.string().min(1).max(256), startedAt: z.number() }).optional(),
-  finishOwner: z.object({ turnId: z.string().min(1).max(256), periodic: z.boolean(), userRequested: z.boolean().optional() }).optional(),
+  finishOwner: z.object({ turnId: z.string().min(1).max(256), periodic: z.boolean(), mode: z.enum(['goal', 'loop']).optional(), userRequested: z.boolean().optional() }).optional(),
   requestedMode: z.enum(['auto', 'after-turn', 'finish']).optional(),
   transportIntent: z.enum(['tool', 'browser']).optional(),
   text: z.string().min(1).max(240000),
@@ -152,7 +154,9 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
     (!astra && !!completed && !activity.possible && !activity.exact);
   const executing = inFlightToolCalls(session.conversationId) > 0;
   return { canInject, injectionTurnId, directTurn, queueAtFinish: astra && canInject && getConfig().ui.finishTool === true,
-    browserAllowed: !session.activeTurnId && !activity.possible && !activity.exact && !executing && (!astra || terminal),
+    // An adopted idle chat may have no recorded turn boundary. Explicit input can
+    // use its native composer; queued checkpoints still require `settled` below.
+    browserAllowed: !session.activeTurnId && !activity.possible && !activity.exact && !executing,
     // Completion already reconciles trailing same-request calls. A separate time
     // comparison would leave the composer unsettled after the activity clock stopped.
     settled: settled && !executing && (!!completed || (session.lastToolCallAt ?? 0) <= (end?.time ?? 0)) };
@@ -560,6 +564,9 @@ async function finishInputCurrent(entry: InputEntry): Promise<boolean> {
     session.activeTurnId === entry.finishOwner.turnId && session.finishTurn?.turnId === entry.finishOwner.turnId &&
     !session.finishTurn.released && config.ui.finishTool === true && !isChatBlocked(session.conversationId) &&
     session.origin?.kind !== 'worker' && session.origin?.kind !== 'helper' &&
+    // Earlier finish decisions always used Loop. A mode change cannot deliver
+    // either a legacy Loop instruction or a newly drafted decision for the old mode.
+    (entry.finishOwner.mode ?? 'loop') === goalDrivingMode(session.conversationId) &&
     (entry.finishOwner.userRequested === true || automaticFinishEnabled(session.conversationId));
 }
 /** The accepted outbox identity repairs a partially materialized session after restart. */
@@ -588,8 +595,14 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       if (!terminal(prior)) await materializeOpening(prior);
       return { ...prior };
     }
-    let policy = input.sessionId ? await sessionInputPolicy(input.sessionId) : null;
     const requestedSession = input.sessionId ? await getSession(input.sessionId) : null;
+    // Explicit injection has its own recipient and can never spend a browser completion.
+    const activity = requestedSession && input.delivery !== 'tool' && input.attachmentDelivery !== 'tool'
+      ? deliveryHooks?.activity?.(requestedSession) : null;
+    const sourceTurn = requestedSession?.activeTurnId ?? (activity?.exact ? activity.turnId : null);
+    const queuedTurn = requestedSession?.conversationId && sourceTurn
+      ? { conversationId: requestedSession.conversationId, turnId: sourceTurn } : undefined;
+    let policy = input.sessionId ? await sessionInputPolicy(input.sessionId) : null;
     const previousOpening = [...current].reverse().find(row => row.opening && row.sessionId === input.sessionId);
     // An explicit reviewed resend may replace a proven pre-send failure in the same
     // local chat. An ambiguous native Send still owns its receipt; never replay it.
@@ -624,7 +637,7 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const transportIntent = toolDelivery ? 'tool' as const : input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
       ? policy?.canInject ? 'tool' as const : !policy || policy.browserAllowed || policy.directTurn ? 'browser' as const : undefined : undefined;
     const directTurn = !toolDelivery && input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
-    const entry: InputEntry = { ...input, ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}),
+    const entry: InputEntry = { ...input, ...(queuedTurn ? { queuedTurn } : {}), ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}),
       ...(injectionOwner ? { toolTurnId: injectionOwner.turnId } : {}), ...(transportIntent ? { transportIntent } : {}),
       ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
@@ -677,7 +690,8 @@ function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry
   // Checkpoints inherit the current chat model, including later user selections.
   for (const [index, text] of entry.stages.entries()) next = append(next, {
     id: randomUUID(), sessionId, projectId: entry.projectId, text, authoredSource: 'none', mode: 'finish', dueAt: entry.createdAt + index,
-    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: entry.createdAt + index, conversationId: entry.conversationId
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: entry.createdAt + index, conversationId: entry.conversationId,
+    ...(entry.queuedTurn ? { queuedTurn: entry.queuedTurn } : {})
   });
   return next;
 }
@@ -833,7 +847,9 @@ export function authorizeBrowserInput(id: string, owner: string, conversationId:
     // Recorder work is serialized independently and can arrive during the durable
     // claim write. Keep the spent claim, but never publish stale Send permission.
     if (row.recovery && !await recoveryCurrent(row)) return false;
-    if (row.completedTurnId && row.sessionId && conversationId)
+    // Recovery still has a native final veto after this await. Its browser claim
+    // holds Goal until either the exact send receipt or a known pre-click abort.
+    if (!row.recovery && row.completedTurnId && row.sessionId && conversationId)
       await consumeGoalReplyForInputNow(conversationId, row.sessionId, row.completedTurnId);
     return !row.recovery || await recoveryCurrent(row);
   });
@@ -914,7 +930,12 @@ async function eligibleStageEnd(entry: InputEntry): Promise<string | null> {
   if (session.activeTurnId) return null;
   // A failure releases manual input immediately. Automatic follow-ups require
   // the confirmed refresh ticket above; only a real completion bypasses it.
-  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId || end.time < entry.createdAt) return null;
+  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId) return null;
+  // Queue intent names the turn we were waiting for, not when Chrome reported it.
+  // Other turns and legacy rows retain the later-completion rule. A rebind cannot
+  // lend this reference to another frontend, even if its turn id happens to match.
+  const queuedHere = entry.queuedTurn?.conversationId === session.conversationId && entry.queuedTurn?.turnId === end.turnId;
+  if (!queuedHere && end.time < entry.createdAt) return null;
   if (!(await sessionInputPolicy(entry.sessionId)).settled) return null;
   return end.turnId;
 }
@@ -1476,6 +1497,16 @@ export function failBrowserInput(id: string, owner: string, error: string): Prom
       await commit(current.map(row => row === entry ? releaseRecoveryClaim(row) : row));
       return true;
     }
+    // The document reports this only while its native Send has never been attempted.
+    // A final can arrive after authorization and veto that click. Retain the spent
+    // claim, but do not let an unsent Continue consume the final's Goal/Loop decision.
+    if (entry.recovery && entry.requiresAuthorization === true && error === 'After-turn pickup was withdrawn before Send.') {
+      await commit(current.map(row => row === entry
+        ? { ...row, state: 'failed', completedTurnId: undefined, error } : row));
+      return true;
+    }
+    // A generic transport failure supplies no proof that native Send was skipped.
+    if (entry.recovery && entry.sendAuthorizedAt !== undefined) return false;
     const pickupCancelled = !!(entry.silenceBoundary || entry.completedTurnId) && entry.requiresAuthorization === true &&
       entry.sendAuthorizedAt === undefined && error === 'After-turn pickup was withdrawn before Send.';
     // Losing a document before Send does not lose a still-valid refresh ticket.

@@ -2882,6 +2882,14 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
 .usage-summary span, .muted { color: var(--soft); font-size: calc(13px * var(--text-scale, 1)); }
 .usage-section { margin: 0 0 38px; }
 .usage-section h2 { display: flex; align-items: center; justify-content: space-between; font-size: calc(15px * var(--text-scale, 1)); margin-bottom: 15px; text-transform: none; letter-spacing: 0; }
+.usage-messages h2 { gap: 12px; flex-wrap: wrap; }
+.usage-week-start { min-height: 42px; max-width: 100%; gap: 18px; padding: 10px 14px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); font-size: calc(14px * var(--text-scale, 1)); }
+.usage-week-start:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.usage-message-counts { margin: 0; }
+.usage-message-counts .usage-limit { align-items: center; }
+.usage-message-counts dt { font-weight: 600; }
+.usage-message-counts dd { display: flex; align-items: baseline; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin: 0; font-variant-numeric: tabular-nums; }
+.usage-message-counts strong { font-size: calc(20px * var(--text-scale, 1)); font-weight: 600; overflow-wrap: anywhere; }
 .usage-limit { display: flex; justify-content: space-between; padding: 18px 0; border-bottom: 1px solid var(--line); gap: 20px; }
 .usage-limit > div { display: grid; gap: 6px; }
 .usage-limit > div:last-child { text-align: right; }
@@ -3414,6 +3422,7 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .usage-panel .setting-text b, .usage-panel .setting-text em { white-space: normal; }
 .usage-summary:empty { min-height: 110px; border: 0; }
 .usage-status { line-height: 1.5; margin: 0; }
+.usage-status:empty { display: none; }
 @media (max-width: 850px) {
   .usage-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px 0; }
   .usage-summary > div:nth-child(2) { border-right: 0; }
@@ -3462,7 +3471,9 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .queue-label[draggable='true']:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; border-radius: 3px; }
 
 .project-group { margin: 8px 0; }
+.project-group[data-sort-scope] { position: relative; }
 .project-heading { display: flex; align-items: center; gap: 9px; cursor: pointer; padding: 6px 8px; list-style: none; }
+.project-heading[data-sort-handle] { cursor: grab; user-select: none; }
 .project-heading::-webkit-details-marker { display: none; }
 .project-name { min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .project-new { display: grid; place-items: center; width: 26px; height: 26px; padding: 4px; opacity: 0; }
@@ -3475,10 +3486,10 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .sess[data-sort-scope] .sess-top { cursor: grab; user-select: none; }
 .sess[data-sort-scope]:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
 #sessionList.is-sorting, #sessionList.is-sorting * { cursor: grabbing; user-select: none; }
-.sess.is-sorting { opacity: .45; }
-.sess.sort-before::before, .sess.sort-after::after { content: ''; position: absolute; inset-inline: 0; height: 2px; border-radius: 2px; background: var(--blue); pointer-events: none; }
-.sess.sort-before::before { top: -2px; }
-.sess.sort-after::after { bottom: -2px; }
+:is(.sess, .project-group).is-sorting { opacity: .45; }
+:is(.sess, .project-group).sort-before::before, :is(.sess, .project-group).sort-after::after { content: ''; position: absolute; inset-inline: 0; height: 2px; border-radius: 2px; background: var(--blue); pointer-events: none; }
+:is(.sess, .project-group).sort-before::before { top: -2px; }
+:is(.sess, .project-group).sort-after::after { bottom: -2px; }
 
 /* Right-side work panes. Files and Sub-agents are mutually exclusive projections of the
    current task; the ChatGPT browser remains the independent left dock. */

@@ -34,7 +34,7 @@ Listed alphabetically by GitHub handle. "Adapted" means the implementation chang
 | [@nofihq](https://github.com/nofihq) | Waiting for late exact `session_finish` identity while sharing one bounded deadline with the finish hold: adapted from [#220](https://github.com/totec448-spec/chat-on-steroids/pull/220). Other response-branch and inbox changes were not incorporated. |
 | [@PatrickSys](https://github.com/PatrickSys) | Windows installer sandbox folder permissions: [#62](https://github.com/totec448-spec/chat-on-steroids/pull/62), incorporated into the 2.0.6 snapshot and retained in [#91](https://github.com/totec448-spec/chat-on-steroids/pull/91). |
 | [@pop15106](https://github.com/pop15106) | Correcting the unconditional Codex-quota claim in the README and hero: [#192](https://github.com/totec448-spec/chat-on-steroids/pull/192), adapted with current official usage documentation. |
-| [@redzrush101](https://github.com/redzrush101) | Affected-account diagnosis, repeated retests and privately supplied page captures and NetLog for [#311](https://github.com/totec448-spec/chat-on-steroids/issues/311). Their evidence established the alternate composer/user-bubble structure and the remaining follow-up-send, project-opening and worker-startup failures used by the independently implemented regression tests. This credits the diagnostic contribution; private exports are not published. |
+| [@redzrush101](https://github.com/redzrush101) | Affected-account diagnosis, repeated retests and privately supplied page captures and NetLog for [#311](https://github.com/totec448-spec/chat-on-steroids/issues/311). Their evidence established the alternate composer/user-bubble structure and the remaining follow-up-send, project-opening and worker-startup failures used by the independently implemented regression tests. The September 20 diagnostic report located the missing pre-conversation worker rendering policy and public shell activity projection. This credits the diagnostic contribution; private exports are not published. |
 | [@TaeyanG4](https://github.com/TaeyanG4) | Handling plugin schemas when a Refresh control is unavailable: [#92](https://github.com/totec448-spec/chat-on-steroids/pull/92), adapted into [#91](https://github.com/totec448-spec/chat-on-steroids/pull/91). |
 | [@ventianima-lab](https://github.com/ventianima-lab) | Preserving the exact message, conversation and page-epoch identity accepted by a desktop-send ACK when later canonical text differs, so the same send retains its turn-start boundary: adapted from the [code and regression tests in #185](https://github.com/totec448-spec/chat-on-steroids/issues/185#issuecomment-5647883368). This narrow repair does not reconstruct earlier missing history or resolve every symptom in the issue. |
 | [@yahiaal](https://github.com/yahiaal) | Publishing larger Plugins catalogs within the existing schema byte budget: [#216](https://github.com/totec448-spec/chat-on-steroids/pull/216), adapted to include the optional local code-mode tool in refresh observation and legacy enrollment. |
@@ -91,7 +91,8 @@ Timer and maintenance expiry share one diagnostic and a bounded, non-replaying w
 [@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka contributed the
 Windows target-thread focus repair ([#308](https://github.com/totec448-spec/chat-on-steroids/pull/308)).
 It is adapted with cleanup covering attachment exceptions and the existing actual foreground
-checks. The separate macOS input-validation proposal in #309 is not incorporated by this review.
+checks. The September 19 review left the separate macOS input-validation proposal in #309 open;
+the September 20 review below incorporates only its contradictory-window-ID correction.
 
 The September 19 backlog integration also adapts [@Maximapple](https://github.com/Maximapple)'s
 reporting-gap correction in [#284](https://github.com/totec448-spec/chat-on-steroids/pull/284),
@@ -101,7 +102,58 @@ The wake adaptation rechecks command ownership, live message debt and cancellati
 marker diagnostics report commitment only after settlement. These adaptations retain the existing
 browser recovery and continuation owners.
 
+The September 20 selective review incorporates [@cXSHoz](https://github.com/cXSHoz)'s
+catalogued IPC-error toast translation from [#331](https://github.com/totec448-spec/chat-on-steroids/pull/331).
+It adapts [@Maximapple](https://github.com/Maximapple)'s stalled-connect shutdown diagnosis and
+drain protection from [#324](https://github.com/totec448-spec/chat-on-steroids/pull/324), using
+one shared teardown without the proposed grace timer or optional-connector policy change.
+It also incorporates [@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka's
+contradictory AX window-ID guard from [#309](https://github.com/totec448-spec/chat-on-steroids/pull/309).
+The larger off-Space/focus change remains unincorporated. Exact source revisions, validation,
+and public GitHub co-author trailers are recorded in
+[`docs/worklog-2026-09-20-selective-pr-review.md`](docs/worklog-2026-09-20-selective-pr-review.md).
+
+The September 22 follow-up incorporates [@PourrezJ](https://github.com/PourrezJ)'s French
+translation from [#369](https://github.com/totec448-spec/chat-on-steroids/pull/369). Its
+1,431 translated entries are retained with one wording correction; 21 newer strings are
+added independently. Integration preserves Turkish and the existing language controls,
+drafts and preference storage. Validation is recorded in
+[the follow-up worklog](docs/worklog-2026-09-22-french-locale.md).
+
 ## Reports, review and proposed work
+
+The September 22 selective review adapts [@lavalava45](https://github.com/lavalava45)'s
+Plugins route correction (#351) and explicit refresh retry (#363),
+[@27mfp](https://github.com/27mfp)'s project-order proposal (#355),
+[@ayhanmalkoc](https://github.com/ayhanmalkoc)'s Turkish translation (#366), and
+[@Haz4rdovisk](https://github.com/Haz4rdovisk)'s installer-close correction from #345.
+The adaptations reuse the existing outbox, refresh ledger, sidebar order and locale owners.
+Independent fixes also address the cancellation, adopted-Astra input and scrolling reports
+in #357, #361 and #359. Validation and the disposition of every reviewed issue/PR are recorded
+in [the worklog](docs/worklog-2026-09-22-github-triage.md) and
+[review ledger](docs/github-triage-2026-09-22.md).
+
+The September 20 connection and Skills integration incorporates
+[@K4viar](https://github.com/K4viar) / Lucas Pazini Pinha's approved, package-bounded Skills
+links from [#334](https://github.com/totec448-spec/chat-on-steroids/pull/334),
+[@Akilaydin](https://github.com/Akilaydin) / Artem Ovchinnikov's transactional browser bridge
+port selection from [#337](https://github.com/totec448-spec/chat-on-steroids/pull/337), and
+[@Kenmege](https://github.com/Kenmege) / Dr Kennedy Umege's concurrent browser pairing,
+compaction hydration and shell/tunnel identity corrections from
+[#340](https://github.com/totec448-spec/chat-on-steroids/pull/340).
+
+
+[@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka proposed
+Japanese support and offered to provide the translation in
+[#320](https://github.com/totec448-spec/chat-on-steroids/issues/320). Japanese is now available
+in Appearance. This acknowledges the proposal and offer without attributing translation code
+that was implemented separately.
+
+[@Maximapple](https://github.com/Maximapple)'s exit-hang report in
+[#325](https://github.com/totec448-spec/chat-on-steroids/pull/325) prompted an Electron 44.3.0
+source and isolated-process check. Its immediate `SIGKILL` chain is not incorporated:
+Electron maps `process.exit()` back to `app.exit()`, and returning from that call can precede
+a successful normal process exit. This credits the report without attributing an adopted fix.
 
 [@TomerGamerTV](https://github.com/TomerGamerTV)'s slow observation-journal report in
 [#301](https://github.com/totec448-spec/chat-on-steroids/issues/301) led to the independently

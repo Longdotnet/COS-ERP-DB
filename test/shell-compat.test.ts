@@ -120,7 +120,7 @@ function editing(f: ReturnType<typeof fixture>) {
   return { box, serialize: () => serialize(box) };
 }
 
-async function recorder(f: ReturnType<typeof fixture>, replies: Record<string, (m: any) => any> = {}) {
+async function recorder(f: ReturnType<typeof fixture>, replies: Record<string, (m: any) => any> = {}, initialize = true) {
   const win = f.win as any, sent: any[] = [];
   let hook: any, listener: any;
   win.CLF_TEST_HOOK = (value: any) => { hook = value; };
@@ -136,7 +136,7 @@ async function recorder(f: ReturnType<typeof fixture>, replies: Record<string, (
     } }, storage: { onChanged: { addListener() {}, removeListener() {} } } };
   win.eval(contentSource);
   await vi.waitFor(() => expect(hook).toBeTruthy());
-  await hook.refreshFiber(); await hook.pullActivity(); hook.observe(); await hook.flush();
+  if (initialize) { await hook.refreshFiber(); await hook.pullActivity(); hook.observe(); await hook.flush(); }
   return { sent, hook, runtime: (message: any) => new Promise<any>(resolve => listener(message, {}, resolve)),
     events: () => sent.filter(m => m.type === 'events').flatMap(m => m.entries.map((entry: any) => entry.event)) };
 }
@@ -180,7 +180,7 @@ it('reads the real shell composer, messages and tools through existing contracts
   expect(JSON.stringify(turns)).not.toContain('Commentary without a provider');
   expect(f.api.turns().map((t: any) => t.role)).toEqual(['user', 'assistant']);
   expect(f.api.messages().map((m: any) => [m.id, m.role, m.text])).toEqual([[USER, 'user', 'hello'], [ANSWER, 'assistant', 'Answer']]);
-  expect(f.api.presentationTurns()).toEqual([]); // No alternate Overwrite/UI implementation.
+  expect(f.api.presentationTurns().map((t: any) => t.role)).toEqual(['user', 'assistant']);
 });
 
 it.each(['in_progress', 'cancelled', 'complete', 'unknown', undefined])('does not invent a tool receipt from turn status %s', async status => {
@@ -225,6 +225,331 @@ it('reads request metadata only for the mounted shell message ids in the exact n
   expect((await f.ask()).turns[0].requests).toEqual([]);
   f.queries[0].queryKey[1] = THREAD; f.queries[0].state.data.mapping[CALL].message.id = OTHER;
   expect((await f.ask()).turns[0].requests).toEqual([]);
+});
+
+// The exported native page subscribes to its live message mapping separately from
+// the history query. React publishes that value in hook state / compiler memo data.
+function liveShellMapping(f: ReturnType<typeof fixture>, compiler = false) {
+  const thought = '66666666-1111-4111-8111-111111111111';
+  const preamble = '77777777-1111-4111-8111-111111111111';
+  const plain = (id: string, role: string, text: string, channel?: string) => ({ id, message: {
+    id, author: { role }, channel, content: { content_type: 'text', parts: [text] }, metadata: {}, create_time: 1700000000
+  } });
+  const mapping: any = {
+    [USER]: plain(USER, 'user', 'hello'), [ANSWER]: plain(ANSWER, 'assistant', 'Answer', 'final'),
+    [CALL]: { id: CALL, message: { id: CALL, author: { role: 'assistant' }, recipient: 'api_tool.call_tool',
+      metadata: { request_id: OTHER }, content: { content_type: 'code', text: '{"path":"/Chat On Steroids Core/link_x/read","args":{"private":"DO_NOT_COPY"}}' } } },
+    [thought]: { id: thought, message: { id: thought, author: { role: 'assistant' },
+      content: { content_type: 'thoughts', thoughts: [{ summary: 'Inspecting the project', content: 'PRIVATE_REASONING_CONTENT' }] }, metadata: {} } },
+    [preamble]: plain(preamble, 'assistant', 'I will inspect the project.', 'commentary')
+  };
+  f.entry.turn.messageIds = [USER, thought, preamble, CALL, ANSWER];
+  f.entry.turn.items[1].items.unshift({ type: 'reasoning', presentation: 'thought', content: 'Inspecting the project', completed: false });
+  f.entry.turn.items[1].items[1].content = 'I will inspect the project.';
+  const owner: any = f.chain({ conversationId: THREAD }, f.top);
+  for (let at = 0; at < f.entry.turn.messageIds.length; at++) {
+    const id = f.entry.turn.messageIds[at]!; mapping[id].parent = f.entry.turn.messageIds[at - 1] ?? null;
+  }
+  const snapshot = { renderedConversation: { mapping, current_node: ANSWER }, renderedTurns: [{ id: TURN, turn: f.entry.turn }] };
+  if (compiler) owner.updateQueue = { memoCache: { data: [[null, THREAD, mapping, snapshot]] } };
+  else owner.memoizedState = { memoizedState: snapshot, next: null };
+  f.row.return = owner;
+  return { mapping, owner, thought, preamble, snapshot };
+}
+
+it.each([false, true])('captures live shell request metadata and public activity before a history query exists (compiler=%s)', async compiler => {
+  const f = fixture(), { thought, preamble } = liveShellMapping(f, compiler);
+  const turn = (await f.ask()).turns[0];
+  expect(f.queries).toEqual([]);
+  expect(turn.calls[0]).toMatchObject({ requestId: OTHER, messageId: CALL, answered: false });
+  expect(turn.activities).toEqual([{ messageId: thought, label: 'Inspecting the project', order: 1 }]);
+  expect(turn.messages.map((m: any) => [m.rawMessageId, m.order])).toEqual([[USER, 0], [preamble, 2], [ANSWER, 4]]);
+  expect(turn.messages.find((m: any) => m.rawMessageId === preamble)?.rawText).toBe('I will inspect the project.');
+  expect(JSON.stringify(turn)).not.toMatch(/PRIVATE_REASONING_CONTENT|DO_NOT_COPY/);
+  const r = await recorder(f);
+  await vi.waitFor(() => expect(r.sent).toContainEqual(expect.objectContaining({ type: 'correlate',
+    conversationId: THREAD, calls: expect.arrayContaining([expect.objectContaining({ requestId: OTHER })]) })));
+  expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'page_tool', messageId: thought, text: 'Inspecting the project' }));
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
+});
+
+// React keeps the host's original Fiber pointer across commits. The current root
+// and child lists are the published tree; memo bailouts can keep old return links.
+function bufferedShell(f: ReturnType<typeof fixture>, sharedChild = false) {
+  const { owner, snapshot } = liveShellMapping(f, true);
+  const native = f.doc.querySelector('[data-turn-key]')!;
+  const oldHost: any = { tag: 5, stateNode: native, memoizedProps: {}, return: f.row };
+  const nextEntry = sharedChild ? f.entry : structuredClone(f.entry);
+  const nextSnapshot = { renderedConversation: structuredClone(snapshot.renderedConversation),
+    renderedTurns: [{ id: TURN, turn: nextEntry.turn }] };
+  nextSnapshot.renderedConversation.mapping[CALL].message.metadata.request_id = 'wfr_committed_update';
+  const state: any = { current: null };
+  const oldRoot: any = { tag: 3, stateNode: state, return: null, child: owner };
+  const nextRoot: any = { tag: 3, stateNode: state, return: null };
+  const nextOwner: any = { tag: 0, memoizedProps: { conversationId: THREAD }, return: nextRoot,
+    updateQueue: { memoCache: { data: [[nextSnapshot]] } } };
+  const nextRow: any = sharedChild ? f.row : { tag: 0, memoizedProps: { entry: nextEntry }, return: nextOwner };
+  const nextHost: any = sharedChild ? oldHost : { tag: 5, stateNode: native, memoizedProps: {}, return: nextRow };
+  owner.tag = 0; owner.return = oldRoot; owner.child = f.row;
+  Object.assign(f.row, { tag: 0, child: oldHost });
+  nextRoot.child = nextOwner; nextOwner.child = nextRow; nextRow.child = nextHost;
+  for (const [a, b] of [[oldRoot, nextRoot], [owner, nextOwner], ...(!sharedChild ? [[f.row, nextRow], [oldHost, nextHost]] : [])]) {
+    a.alternate = b; b.alternate = a;
+  }
+  state.current = oldRoot;
+  (native as any).__reactFiber$fixture = oldHost;
+  return { state, oldRoot, nextRoot, oldHost, nextHost, owner, nextOwner, nextEntry, nextSnapshot, native };
+}
+
+it.each([false, true])('reads committed shell metadata across real React double-buffer shapes (shared child=%s)', async sharedChild => {
+  const f = fixture(), tree = bufferedShell(f, sharedChild);
+  expect((await f.ask()).turns[0].calls[0].requestId).toBe(OTHER);
+  // Work in progress is already reachable but has not been committed.
+  expect((await f.ask()).turns[0].requests.some((row: any) => row.requestId === 'wfr_committed_update')).toBe(false);
+  tree.state.current = tree.nextRoot;
+  expect((await f.ask()).turns[0].calls[0].requestId).toBe('wfr_committed_update');
+  // Preserve React's own pointers. The reader must not reparent a shared subtree.
+  expect((tree.native as any).__reactFiber$fixture).toBe(tree.oldHost);
+  expect(f.row.return).toBe(tree.owner);
+  tree.state.current = tree.oldRoot;
+  expect((await f.ask()).turns[0].calls[0].requestId).toBe(OTHER);
+});
+
+it.each(['foreign-current', 'unmounted', 'inconsistent-root', 'sibling-cycle'])('does not substitute stale React evidence for %s', async state => {
+  const f = fixture(), tree = bufferedShell(f);
+  await f.ask();
+  tree.state.current = tree.nextRoot;
+  if (state === 'foreign-current') tree.nextEntry.id = 'different-mounted-turn';
+  if (state === 'unmounted') tree.nextRoot.child = null;
+  if (state === 'inconsistent-root') tree.state.current = { tag: 3 };
+  if (state === 'sibling-cycle') { const sibling: any = {}; sibling.sibling = sibling; tree.nextOwner.child = sibling; }
+  expect((await f.ask()).turns).toEqual([]);
+  expect(f.api.messages()).toEqual([]);
+});
+
+it.each([false, true])('correlates a witnessed shell send before its client conversation resolves (compiler=%s)', async compiler => {
+  const f = fixture(), edit = editing(f), { owner } = liveShellMapping(f, compiler);
+  f.entry.conversationId = `local-chatgpt:${OTHER}`;
+  owner.memoizedProps.conversationId = f.entry.conversationId;
+  const native = f.doc.querySelector('[data-turn-key]')!;
+  native.remove();
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault();
+    f.doc.querySelector('[data-thread-find-target]')!.append(native);
+    edit.box.replaceChildren();
+  });
+  const r = await recorder(f);
+  expect(f.api.insertPrompt('hello', true)).toBe(true);
+  f.doc.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
+  // The native send and existing transcript observer must discover the new
+  // shell identities. Manually asking Fiber here hides the admission deadlock.
+  await vi.waitFor(async () => {
+    await r.hook.flush();
+    expect(r.events().filter((event: any) => event.kind === 'turn_start')).toHaveLength(1);
+  });
+  await vi.waitFor(() => expect(r.sent.filter(m => m.type === 'correlate')).toContainEqual(expect.objectContaining({
+    conversationId: THREAD, calls: expect.arrayContaining([expect.objectContaining({ requestId: OTHER })])
+  })));
+  const localTurnId = r.events().find((event: any) => event.kind === 'turn_start').turnId;
+  expect(r.events().filter((event: any) => event.kind === 'tool_evidence')).toContainEqual(expect.objectContaining({
+    turnId: localTurnId, calls: expect.arrayContaining([expect.objectContaining({ messageId: CALL, requestId: OTHER })])
+  }));
+  expect(f.queries).toEqual([]);
+  expect(JSON.stringify(r.sent)).not.toMatch(/PRIVATE_REASONING_CONTENT|DO_NOT_COPY/);
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
+});
+
+it('holds provisional shell request metadata until this document owns the native send', async () => {
+  const f = fixture(), { owner } = liveShellMapping(f, true);
+  f.entry.conversationId = `local-chatgpt:${OTHER}`;
+  owner.memoizedProps.conversationId = f.entry.conversationId;
+  // A readable mounted snapshot without a Send witness is not a route binding.
+  const r = await recorder(f);
+  await r.hook.refreshFiber(); await r.hook.flush();
+  expect(r.sent.filter(m => m.type === 'correlate')).toEqual([]);
+  expect(r.events().filter((event: any) => event.kind === 'tool_evidence')
+    .flatMap((event: any) => event.calls).some((call: any) => call.requestId === OTHER)).toBe(false);
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
+});
+
+it.each(['live', 'history', 'wrong-recipient', 'unselected', 'duplicate'])
+  ('reads the mounted native Code Mode invocation metadata without its result body (%s)', async state => {
+    const f = fixture(), { mapping } = liveShellMapping(f, true);
+    const execution = '88888888-3333-4333-8333-333333333333';
+    const requestId = 'wfr_native_execution';
+    mapping[execution] = { id: execution, message: { id: execution, author: { role: 'assistant' },
+      recipient: state === 'wrong-recipient' ? 'functions.other' : 'functions.exec',
+      metadata: { request_id: requestId }, content: { content_type: 'code' } } };
+    Object.defineProperty(mapping[execution].message.content, 'text', { get() { throw Error('Execution code must remain unread'); } });
+    const item = { type: 'dynamic-tool-call', callId: execution, tool: 'exec', completed: false };
+    if (state !== 'unselected') f.entry.turn.items[1].items.push(item);
+    if (state === 'duplicate') f.entry.turn.items[1].items.push(item);
+    if (state === 'history') {
+      f.row.return = f.top;
+      f.queries.push({ queryKey: ['chatgpt-conversation', THREAD], state: { data: { mapping } } });
+    }
+    const result = await f.ask();
+    const requests = result.turns.flatMap((turn: any) => turn.requests);
+    expect(requests.some((request: any) => request.requestId === requestId)).toBe(['live', 'history'].includes(state));
+    expect(JSON.stringify(result)).not.toContain('Execution code');
+  });
+
+it.each(['foreign-owner', 'missing-user', 'wrong-user', 'two-mappings', 'getter', 'duplicate-selected-id'])('does not borrow live shell metadata from %s', async kind => {
+  const f = fixture(), { mapping, owner, snapshot } = liveShellMapping(f);
+  if (kind === 'foreign-owner') owner.memoizedProps.conversationId = OTHER;
+  if (kind === 'missing-user') delete mapping[USER];
+  if (kind === 'wrong-user') mapping[USER].message.id = OTHER;
+  if (kind === 'two-mappings') owner.memoizedState.next = { memoizedState: { ...snapshot, renderedConversation: { ...snapshot.renderedConversation, mapping: { ...mapping, [CALL]: {
+    id: CALL, message: { ...mapping[CALL].message, metadata: { request_id: 'wfr_conflict' } }
+  } } } }, next: null };
+  if (kind === 'getter') Object.defineProperty(mapping, USER, { get() { throw Error('not a published value'); } });
+  if (kind === 'duplicate-selected-id') f.entry.turn.messageIds.push(CALL);
+  const turn = (await f.ask()).turns[0];
+  expect(turn).toBeDefined(); expect(turn.requests).toEqual([]); expect(turn.activities).toEqual([]);
+});
+
+it.each(['final', 'preamble', 'tools-only'])('places recorded shell tools after their user and beside the exact native response (%s)', async state => {
+  const f = fixture(), { preamble } = liveShellMapping(f, true), owner = 'local-shell-tools';
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  const section = f.doc.querySelector('[data-turn-key]')!;
+  const user = section.querySelector('[data-content-search-unit-key$=":user"]')!;
+  const answer = section.querySelector('[data-content-search-unit-key$=":assistant"]')!;
+  const publicNode = section.querySelector('[data-markdown-text-style]')!;
+  publicNode.textContent = 'I will inspect the project.';
+  (publicNode as any).__reactFiber$fixture = f.chain({ item: f.entry.turn.items[1].items[1], localConversationId: THREAD }, f.row);
+  const stream: any[] = [{ seq: 2, time: 102, kind: 'turn_start', turnId: owner }];
+  if (state === 'preamble') stream.push({ seq: 3, time: 103, kind: 'assistant_message', turnId: owner,
+    messageId: preamble, text: publicNode.textContent, state: 'streaming', final: false });
+  stream.push({ seq: 4, time: 104, kind: 'tool_call', turnId: owner, callId: 'local-call', requestId: OTHER,
+    tool: 'read', outcome: 'ok', durationMs: 4, summary: { kind: 'read', title: 'Read project source' } });
+  if (state === 'final') stream.push({ seq: 5, time: 105, kind: 'assistant_message', turnId: owner,
+    messageId: ANSWER, providerMessageId: ANSWER, text: 'Answer', state: 'final', final: true });
+  if (state !== 'final') { answer.remove(); f.entry.turn.items.pop(); }
+  if (state !== 'preamble') { publicNode.remove(); f.entry.turn.items[1].items.splice(0, 2); }
+  const r = await recorder(f, { activity: () => ({ ok: true, data: { entries: [], stream,
+    userAnchors: [{ seq: 1, time: 100, messageId: USER }], pendingTools: 0, job: null } }) });
+  r.hook.setRenderStream(true); await r.hook.pullActivity(); r.hook.renderStreams();
+  const root = section.querySelector('.clf-stream');
+  expect(root?.textContent).toContain('Read project source');
+  expect(user.compareDocumentPosition(root!) & f.win.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  if (state === 'final') expect(root!.compareDocumentPosition(answer) & f.win.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  if (state === 'preamble') expect(publicNode.compareDocumentPosition(root!) & f.win.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(f.queries).toEqual([]);
+  r.hook.setRenderStream(false); r.hook.renderStreams();
+  expect(section.querySelector('.clf-stream')).toBeNull();
+  expect(user.isConnected).toBe(true);
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
+});
+
+it.each(['current', 'older-turn', 'wrong-parent', 'cycle', 'unselected-branch'])('reads early metadata only on the native selected path of this exact turn (%s)', async state => {
+  const f = fixture(), { mapping, snapshot } = liveShellMapping(f, true), early = '88888888-1111-4111-8111-111111111111';
+  mapping[early] = { id: early, parent: ANSWER, message: { id: early, author: { role: 'assistant' }, channel: 'analysis',
+    metadata: { request_id: 'wfr_early_native' }, content: { content_type: 'text', parts: ['PRIVATE_EARLY_ANALYSIS'] } } };
+  if (state !== 'unselected-branch') snapshot.renderedConversation.current_node = early;
+  if (state === 'older-turn') snapshot.renderedTurns.push({ id: OTHER, turn: { ...f.entry.turn } });
+  if (state === 'wrong-parent') mapping[early].parent = OTHER;
+  if (state === 'cycle') mapping[early].parent = early;
+  const result = (await f.ask()).turns[0];
+  expect(result.requests.some((r: any) => r.requestId === 'wfr_early_native')).toBe(state === 'current');
+  expect(JSON.stringify(result)).not.toContain('PRIVATE_EARLY_ANALYSIS');
+});
+
+it.each(['hidden', 'raw-cot', 'unknown-presentation', 'hidden-group', 'different-public-label'])('does not export private or unrepresented reasoning (%s)', async kind => {
+  const f = fixture(), { mapping, thought } = liveShellMapping(f);
+  const group = f.entry.turn.items[1], message = mapping[thought].message;
+  if (kind === 'hidden') message.metadata.is_visually_hidden_from_conversation = true;
+  if (kind === 'raw-cot') message.metadata.summary_type = 'raw_cot';
+  if (kind === 'unknown-presentation') group.items[0].presentation = 'private';
+  if (kind === 'hidden-group') group.reasoningRecap = { type: 'hide_all' };
+  if (kind === 'different-public-label') group.items[0].content = 'A different summary';
+  expect((await f.ask()).turns[0].activities).toEqual([]);
+});
+it('keeps a public preamble under the existing stable source identity when its raw streaming id rotates', async () => {
+  const f = fixture(), { mapping, preamble } = liveShellMapping(f, true);
+  mapping[preamble].message.metadata = { working_turn_id: TURN, turn_exchange_id: OTHER };
+  const first = (await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === preamble);
+  expect(first.stable).toBe(true);
+  const replacement = '99999999-2222-4222-8222-111111111111';
+  mapping[replacement] = { ...mapping[preamble], id: replacement, message: { ...mapping[preamble].message, id: replacement } };
+  delete mapping[preamble]; mapping[CALL].parent = replacement;
+  f.entry.turn.messageIds = f.entry.turn.messageIds.map((id: string) => id === preamble ? replacement : id);
+  const second = (await f.ask()).turns[0].messages.find((m: any) => m.rawMessageId === replacement);
+  expect(second.messageId).toBe(first.messageId); expect(second.stable).toBe(true);
+});
+it('removes a public preamble placement stamp when the native typed owner is replaced', async () => {
+  const f = fixture(), { preamble } = liveShellMapping(f, true);
+  const node = f.doc.querySelector('[data-markdown-text-style]')!;
+  (node as any).__reactFiber$fixture = f.chain({ item: f.entry.turn.items[1].items[1] }, f.row);
+  await f.ask(); expect(node.getAttribute('data-clf-fiber-message')).toContain(preamble);
+  f.entry.turn.items[1].items[1] = { ...f.entry.turn.items[1].items[1] };
+  await f.ask(); expect(node.hasAttribute('data-clf-fiber-message')).toBe(false);
+  expect(node.isConnected).toBe(true);
+});
+it('uses the same exact call before and after history hydration and refuses a conflicting history request', async () => {
+  const f = fixture(), { mapping } = liveShellMapping(f, true);
+  const before = (await f.ask()).turns[0];
+  const cached = { id: CALL, message: { id: CALL, metadata: { request_id: OTHER } } };
+  f.queries.push({ queryKey: ['chatgpt-conversation', THREAD], state: { data: { conversation_id: THREAD, mapping: { [CALL]: cached } } } });
+  const after = (await f.ask()).turns[0];
+  expect(after.calls).toEqual(before.calls); expect(after.activities).toEqual(before.activities);
+  cached.message.metadata.request_id = 'wfr_conflicting_history';
+  const disputed = (await f.ask()).turns[0];
+  expect(disputed.requests).toEqual([]); expect(disputed.calls[0].requestId).toBeNull();
+  expect(mapping[CALL].message.metadata.request_id).toBe(OTHER);
+});
+
+// Native dump 811613: N() retains the invocation's callId but replaces its
+// sourceMessage with the tool result and publishes widgetStateSource.messageId.
+// The rendered turn's messageIds are the source ids, not the invocation ids.
+function pairedShellCall(f: ReturnType<typeof fixture>) {
+  const { mapping, owner } = liveShellMapping(f, true);
+  const resultId = '88888888-3333-4333-8333-333333333333';
+  const step = f.entry.turn.items[1].items.find((item: any) => item.type === 'mcp-tool-call');
+  step.completed = true;
+  step.widgetStateSource = { messageId: resultId };
+  step.invocationResourceUri = '/Chat On Steroids Core/link_x/read';
+  mapping[resultId] = { id: resultId, parent: CALL, message: { id: resultId,
+    author: { role: 'tool', name: 'api_tool.call_tool' }, recipient: 'all',
+    metadata: { invoked_resource: { app_name: 'Chat On Steroids Core', resource_uri: step.invocationResourceUri } },
+    content: { content_type: 'text', parts: ['PRIVATE_TOOL_RESULT'] } } };
+  mapping[ANSWER].parent = resultId;
+  f.entry.turn.messageIds = f.entry.turn.messageIds.map(id => id === CALL ? resultId : id);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  // A reopened historical row can lack the live renderer's selected-path snapshot.
+  delete owner.updateQueue;
+  f.queries.push({ queryKey: ['chatgpt-conversation', THREAD], state: { data: { mapping } } });
+  return { mapping, step, resultId };
+}
+
+it.each(['request', 'result', 'embedded'] as const)('keeps native paired shell request ownership after reload (%s metadata)', async source => {
+  const f = fixture(), { mapping, step, resultId } = pairedShellCall(f);
+  if (source !== 'request') {
+    delete mapping[CALL]; mapping[resultId].message.metadata.request_id = OTHER;
+    if (source === 'embedded') step.callId = 'native-mcp-call-not-a-provider-message';
+  }
+  const turn = (await f.ask()).turns[0];
+  expect(turn.calls).toEqual([expect.objectContaining({ messageId: step.callId, requestId: OTHER, answered: true })]);
+  expect(turn.requests).toContainEqual(expect.objectContaining({ requestId: OTHER }));
+  expect(JSON.stringify(turn)).not.toMatch(/PRIVATE_TOOL_RESULT|NEVER_COPY_TOOL_ARGS|DO_NOT_COPY/);
+  const r = await recorder(f);
+  await vi.waitFor(() => expect(r.sent).toContainEqual(expect.objectContaining({ type: 'correlate',
+    conversationId: THREAD, calls: expect.arrayContaining([expect.objectContaining({ requestId: OTHER })]) })));
+  expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'tool_evidence',
+    calls: expect.arrayContaining([expect.objectContaining({ messageId: step.callId, requestId: OTHER })]) }));
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
+});
+
+it.each(['unselected-source', 'wrong-tool', 'wrong-server', 'wrong-role', 'conflicting-request', 'duplicate-source'])('does not borrow paired shell invocation metadata from %s', async scenario => {
+  const f = fixture(), { mapping, step, resultId } = pairedShellCall(f);
+  if (scenario === 'unselected-source') step.widgetStateSource.messageId = OTHER;
+  if (scenario === 'wrong-tool') mapping[CALL].message.content.text = '{"path":"/Chat On Steroids Core/link_x/agents","args":{}}';
+  if (scenario === 'wrong-server') mapping[CALL].message.content.text = '{"path":"/Chat On Steroids Core Backup/link_x/read","args":{}}';
+  if (scenario === 'wrong-role') mapping[CALL].message.author.role = 'user';
+  if (scenario === 'conflicting-request') mapping[resultId].message.metadata.request_id = 'wfr_conflicting_result';
+  if (scenario === 'duplicate-source') f.entry.turn.items[1].items.push({ ...step, callId: OTHER });
+  const turn = (await f.ask()).turns[0];
+  expect(turn.calls.every((call: any) => call.requestId === null)).toBe(true);
+  expect(turn.requests.some((request: any) => request.requestId === OTHER)).toBe(false);
 });
 it.each(['duplicate-cache', 'conflicting-conversation', 'duplicate-id', 'unavailable-cache'])('keeps the transcript without ambiguous optional request metadata (%s)', async kind => {
   const f = fixture();
@@ -360,6 +685,51 @@ it.each([false, true])('bootstraps a shell worker with literal instructions and 
   expect(r.sent.filter(m => m.type === 'ack' && m.status === 'failed')).toEqual([]);
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 10000);
+
+it.each(['immediate', 'hydrating', 'foreign', 'retired'])('binds the fresh background worker from native receipt events with throttled timers (%s)', async state => {
+  const f = fixture(), edit = editing(f), { owner } = liveShellMapping(f, true);
+  const commandId = 'event-owned-worker', text = 'Read this diagnostic and report through agents.';
+  const native = f.doc.querySelector('[data-turn-key]')!;
+  native.remove(); page.reconfigure({ url: `https://chatgpt.com/?clf=${commandId}` });
+  f.entry.conversationId = `local-chatgpt:${OTHER}`; owner.memoizedProps.conversationId = f.entry.conversationId;
+  f.entry.turn.items[0].message = text;
+  native.querySelector('.whitespace-pre-wrap')!.textContent = text;
+  Object.defineProperty(f.doc, 'visibilityState', { configurable: true, value: 'hidden' });
+  const nativeTimeout = f.win.setTimeout.bind(f.win);
+  f.win.setTimeout = ((fn: TimerHandler, delay?: number) => Number(delay) >= 500 ? 98765 : nativeTimeout(fn, delay)) as typeof f.win.setTimeout;
+  let clicked = 0;
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault(); clicked++; edit.box.replaceChildren();
+    if (state === 'immediate') {
+      f.win.history.pushState({}, '', `/c/${THREAD}`); f.doc.querySelector('[data-thread-find-target]')!.append(native);
+    }
+  });
+  const r = await recorder(f, { redeem: () => ({ ok: true, command: { id: commandId, type: 'worker', text, agent: 'worker-1' } }) }, false);
+  try {
+    await vi.waitFor(() => expect(clicked).toBe(1));
+    if (state !== 'immediate') {
+      expect(r.sent.filter(message => message.type === 'ack')).toEqual([]);
+      if (state === 'retired') (f.win as any).__CLF_CONTENT_RECORDER__.stop();
+      if (state === 'foreign') {
+        f.entry.conversationId = THREAD; owner.memoizedProps.conversationId = THREAD;
+        f.win.history.pushState({}, '', `/c/${OTHER}`);
+      } else f.win.history.pushState({}, '', `/c/${THREAD}`);
+      f.doc.querySelector('[data-thread-find-target]')!.append(native);
+    }
+    if (state === 'foreign' || state === 'retired') {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      expect(r.sent.filter(message => message.type === 'ack' && message.status === 'sent')).toEqual([]);
+    } else {
+      await vi.waitFor(() => expect(r.sent.filter(message => message.type === 'ack')).toEqual([
+        expect.objectContaining({ id: commandId, status: 'sent', conversationId: THREAD, agent: 'worker-1' })
+      ]), { timeout: 2000 });
+      await vi.waitFor(() => expect(r.sent.some(message => message.type === 'correlate' &&
+        message.conversationId === THREAD && message.calls.some((call: any) => call.requestId === OTHER))).toBe(true));
+      expect(clicked).toBe(1); expect(f.doc.visibilityState).toBe('hidden');
+    }
+  } finally { (f.win as any).__CLF_CONTENT_RECORDER__.stop(); }
+});
+
 it('opens a local project from a cold shell page and binds its exact first send before recording', async () => {
   const f = fixture(), edit = editing(f), inputId = '88888888-1111-4111-8111-000000000001';
   const options = f.props.modelListConfig; f.props.modelListConfig = null;
@@ -460,15 +830,18 @@ it.each(['streaming', 'cancelled', 'conflicting-conversation'])('does not promot
   expect(turns[0].messages.filter((message: any) => message.role === 'assistant').every((message: any) => message.stable === false)).toBe(true);
 });
 
-it('commits a shell resume through its exact native marker before releasing recorded history', async () => {
+it.each([false, true])('commits a shell resume and records its response before identity hydration (provisional=%s)', async provisional => {
   const f = fixture(), edit = editing(f), commandId = 'shell-resume-command', token = '0123456789abcdef0123456789abcdef';
   f.doc.querySelector('[data-thread-find-target]')!.replaceChildren();
   page.reconfigure({ url: `https://chatgpt.com/?clf=${commandId}` });
-  const text = `[[CLF-RESUME:${token}]]\n\nTASK: continue **the project**. NEXT: verify the remaining work.`;
+  const text = `[[CLF-RESUME:${token}]]\n\nTASK: continue **the project**. NEXT: verify the remaining work.\n` +
+    'Keep the completed changes and verify the next part.\n'.repeat(800);
   let committed = false, historyBeforeCommit = false;
+  let resumed: ReturnType<typeof addExchange>;
   const submitted: string[] = [];
   f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
-    event.preventDefault(); submitted.push(edit.serialize()); addExchange(f, 9, submitted[0]!); edit.box.replaceChildren();
+    event.preventDefault(); submitted.push(edit.serialize()); resumed = addExchange(f, 9, submitted[0]!); edit.box.replaceChildren();
+    if (provisional) resumed.entry.conversationId = `local-chatgpt:${OTHER}`;
     f.win.history.pushState({}, '', `/c/${THREAD}`);
   });
   const r = await recorder(f, {
@@ -483,10 +856,19 @@ it('commits a shell resume through its exact native marker before releasing reco
     events: m => { if (!committed && m.entries.some((entry: any) => entry.event?.kind === 'user_message')) historyBeforeCommit = true;
       return { ok: true, pending: 0, durable: true }; }
   });
-  await vi.waitFor(() => expect(r.sent).toContainEqual(expect.objectContaining({ type: 'ack', id: commandId, status: 'sent', conversationId: THREAD })), { timeout: 5000 });
+  await vi.waitFor(() => expect(r.sent.filter(m => m.type === 'ack')).toContainEqual(
+    expect.objectContaining({ id: commandId, status: 'sent', conversationId: THREAD })), { timeout: 5000 });
   expect(submitted).toEqual([text]); expect(committed).toBe(true); expect(historyBeforeCommit).toBe(false);
   expect(r.sent.filter(m => m.destinationDispatch)).toHaveLength(1);
   expect(r.sent).toContainEqual(expect.objectContaining({ type: 'compact', token, destinationMessageId: '99999999-1111-4111-8111-000000000091' }));
+  await r.hook.pullActivity(); r.hook.observe(); await r.hook.flush();
+  const starts = r.events().filter((event: any) => event.kind === 'turn_start');
+  expect(starts).toHaveLength(1);
+  const localTurnId = starts[0].turnId;
+  resumed!.finish(); await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
+  expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'assistant_message',
+    providerMessageId: resumed!.answerId, turnId: localTurnId, final: true, goalEligible: true }));
+  expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'turn_end', turnId: localTurnId, outcome: 'completed' }));
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 10000);
 
