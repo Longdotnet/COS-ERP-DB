@@ -1,4 +1,5 @@
 import { ui, uiText, t, initLanguage } from './i18n.js';
+import { displayLocalServer } from './local-url.js';
 import { paintPluginRefreshReminder } from './plugin-refresh-reminder.js';
 import { initUsage, refreshUsage } from './usage.js';
 import { initSidebarResize } from './sidebar-resize.js';
@@ -9,8 +10,11 @@ import { initSetupGuide } from './setup-guide.js';
 import { initDatabaseSettings } from '../cos-erp-db/renderer/database-settings.js';
 import { initAppearance } from './appearance.js';
 import { initPet } from './pet.js';
+import { initPets } from './pets.js';
+import { initSkillsLibrary } from './skills-library.js';
 import type { AppearanceSettings } from '../shared/appearance.js';
 import type { BrowserBridgePort } from '../shared/browser-bridge.js';
+import { parseCommandAllowlistText } from '../shared/command-allowlist.js';
 /**
  * Renderer. No Node, no filesystem, no network — everything goes through window.api.
  *
@@ -31,7 +35,6 @@ import type { AppState, Capability, ChatBrowser, LogEntry, SurfaceStatus } from 
 import {
   browserExtensionRequired,
   isNewer,
-  RELEASES_PAGE,
   CAPABILITY_DETAILS,
   CAPABILITY_LABELS,
   capabilityTools,
@@ -50,7 +53,7 @@ declare global {
 
 const api = window.api;
 initLanguage();
-initPet();
+const pet = initPet(api, () => showTab('pets'));
 initSetupGuide();
 initDatabaseSettings();
 // Escape the translucent sidebar's backdrop-filter containing block.
@@ -113,7 +116,7 @@ let applying = false;
  * its `change` event saves it. Only that exact dirty case is protected; an idle/focused-but-clean
  * field still follows persisted state normally.
  */
-function applyValue(control: HTMLInputElement | HTMLSelectElement, next: string, previous?: string): void {
+function applyValue(control: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, next: string, previous?: string): void {
   const dirty = document.activeElement === control && previous !== undefined && control.value !== previous;
   if (!dirty) control.value = next;
 }
@@ -131,9 +134,13 @@ let setupKeySave: Promise<boolean> = Promise.resolve(true);
 
 // ------------------------------------------------------------------- tabs
 
+let openSkillsLibrary: () => void = () => undefined;
+
 function showTab(name: string): void {
-  const settings = name !== 'chat' && name !== 'plugins';
-  document.querySelector<HTMLElement>('.app')!.dataset.screen = name === 'plugins' ? 'library' : settings ? 'settings' : 'chat';
+  if (name === 'skills') openSkillsLibrary();
+  const library = name === 'plugins' || name === 'skills' || name === 'pets';
+  const settings = name !== 'chat' && !library;
+  document.querySelector<HTMLElement>('.app')!.dataset.screen = library ? 'library' : settings ? 'settings' : 'chat';
   document.querySelector<HTMLElement>('.sidebar-brand')!.hidden = settings;
   $('sidebarPrimary').hidden = settings;
   $('workspaceSettings').hidden = false;
@@ -217,6 +224,10 @@ $('sessionList').addEventListener('click', event => {
 }, { capture: true });
 $('newChat').addEventListener('click', () => showTab('chat'));
 $('sidebarPlugins').addEventListener('click', () => showTab('plugins'));
+$('sidebarPets').addEventListener('click', () => showTab('pets'));
+$('sidebarSkills').addEventListener('click', () => showTab('skills'));
+$('viewPets').addEventListener('click', () => { ($('viewMenu') as HTMLDetailsElement).open = false; pet.toggle(); });
+api.onPetOverlayOpenOwner(screen => showTab(screen));
 $('addProject').addEventListener('click', () => showTab('chat'));
 $('composerFolder').addEventListener('click', () => $('addProject').click());
 let zoomFactor = 1;
@@ -290,6 +301,98 @@ function toolNames(names: readonly string[]): HTMLElement {
   return row;
 }
 
+function buildCommandAllowlist(): HTMLElement {
+  const section = el('div', 'command-allowlist');
+  const enabled = document.createElement('input');
+  enabled.type = 'checkbox';
+  enabled.id = 'commandAllowlistEnabled';
+  const toggle = el('label', 'tool command-allowlist-toggle');
+  const body = el('span');
+  const description = el('em');
+  description.id = 'commandPolicyDescription';
+  body.append(
+    el('strong', '', () => t('Limit command launches')),
+    description
+  );
+  toggle.append(enabled, body);
+
+  const mode = el('div', 'seg command-policy-mode');
+  mode.id = 'commandPolicyMode';
+  mode.setAttribute('role', 'radiogroup');
+  ui(mode, 'aria-label', () => t('Command policy mode'));
+  for (const [value, text] of [['allow', 'Allowlist'], ['deny', 'Denylist']] as const) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.id = value === 'allow' ? 'commandPolicyAllow' : 'commandPolicyDeny';
+    button.dataset.commandPolicyMode = value;
+    button.setAttribute('role', 'radio');
+    button.setAttribute('aria-checked', String(value === 'allow'));
+    button.classList.toggle('is-sel', value === 'allow');
+    ui(button, 'textContent', () => t(text));
+    button.addEventListener('click', () => {
+      paintCommandPolicyMode(value);
+      if (!applying) void save();
+    });
+    mode.append(button);
+  }
+
+  const label = el('label', 'command-allowlist-label');
+  label.id = 'commandPolicyRulesLabel';
+  label.setAttribute('for', 'commandAllowlistRules');
+  const rules = document.createElement('textarea');
+  rules.id = 'commandAllowlistRules';
+  rules.rows = 5;
+  rules.placeholder = 'git status\ngit diff *\ndotnet build *\ndotnet test *';
+  const help = el('p', 'hint', () => t('Use an exact command or a trailing standalone * for additional arguments. Compound shell syntax is rejected. Allowed programs and their child processes remain trusted; this is not an OS sandbox.'));
+  const error = el('p', 'command-allowlist-error');
+  error.id = 'commandAllowlistError';
+  error.setAttribute('role', 'alert');
+  error.hidden = true;
+  const changed = (): void => { if (!applying) void save(); };
+  enabled.addEventListener('change', changed);
+  rules.addEventListener('change', changed);
+  rules.addEventListener('input', () => readCommandAllowlist());
+  ui(description, 'textContent', () => t(readCommandPolicyMode() === 'deny'
+    ? 'Commands matching any of these rules may not start.'
+    : 'Only commands matching one of these rules may start.'));
+  ui(label, 'textContent', () => t(readCommandPolicyMode() === 'deny'
+    ? 'Blocked commands (one rule per line)'
+    : 'Allowed commands (one rule per line)'));
+  section.append(toggle, mode, label, rules, help, error);
+  return section;
+}
+
+function readCommandPolicyMode(): 'allow' | 'deny' {
+  return document.getElementById('commandPolicyDeny')?.getAttribute('aria-checked') === 'true' ? 'deny' : 'allow';
+}
+
+function paintCommandPolicyMode(mode: 'allow' | 'deny'): void {
+  for (const button of document.querySelectorAll<HTMLButtonElement>('[data-command-policy-mode]')) {
+    const selected = button.dataset.commandPolicyMode === mode;
+    button.setAttribute('aria-checked', String(selected));
+    button.classList.toggle('is-sel', selected);
+  }
+  $('commandPolicyRulesLabel').textContent = t(mode === 'deny'
+    ? 'Blocked commands (one rule per line)'
+    : 'Allowed commands (one rule per line)');
+  $('commandPolicyDescription').textContent = t(mode === 'deny'
+    ? 'Commands matching any of these rules may not start.'
+    : 'Only commands matching one of these rules may start.');
+}
+
+function readCommandAllowlist(): SettingsPatch['commandAllowlist'] | null {
+  const parsed = parseCommandAllowlistText($<HTMLTextAreaElement>('commandAllowlistRules').value);
+  const error = $('commandAllowlistError');
+  const first = parsed.issues[0];
+  error.textContent = first ? t('Line {0}: {1}', [first.line, first.message]) : '';
+  error.hidden = !first;
+  return first ? null : {
+    enabled: $<HTMLInputElement>('commandAllowlistEnabled').checked,
+    mode: readCommandPolicyMode(),
+    rules: parsed.rules
+  };
+}
+
 function buildGroups(): void {
   const permissionGroups = GROUPS.map((group) => {
     const box = document.createElement('input');
@@ -318,6 +421,7 @@ function buildGroups(): void {
       tools.append(label);
     }
     tools.append(toolNames([]));
+    if (group.id === 'run') tools.append(buildCommandAllowlist());
 
     root.append(tools);
     return root;
@@ -471,6 +575,8 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
   const previous: AppState['config'] = requestedSettings
     ? { ...state.config, ...requestedSettings }
     : state.config;
+  const commandAllowlist = readCommandAllowlist();
+  if (!commandAllowlist) return Promise.resolve();
   const capabilities = { ...previous.capabilities };
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-cap]')) {
     const capability = input.dataset.cap as Capability;
@@ -487,6 +593,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
   const patch: SettingsPatch = {
     capabilities,
     readOnly,
+    commandAllowlist,
     tunnel: {
       profileId: previous.tunnel.profileId,
       profileEpoch: previous.tunnel.profileEpoch,
@@ -511,6 +618,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       startAtLogin: $<HTMLInputElement>('startAtLogin').checked,
       minimizeToTray: $<HTMLInputElement>('minimizeToTray').checked,
       developerMode: $<HTMLInputElement>('developerMode').checked,
+      playfulStatus: $<HTMLInputElement>('playfulStatus').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
       theme: over.theme ?? previous.ui.theme,
       appearance: over.appearance ?? previous.ui.appearance
@@ -541,6 +649,7 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
   const base: SettingsPatch = {
     capabilities: previous.capabilities,
     readOnly: previous.readOnly,
+    commandAllowlist: previous.commandAllowlist,
     tunnel: previous.tunnel,
     ui: previous.ui,
     sessions: previous.sessions,
@@ -613,8 +722,13 @@ function isRunning(value: AppState['status']['state']): boolean {
   );
 }
 
+interface SetupConnectionValues { tunnelId: string; hasApiKey: boolean }
+
 /** What still has to happen before connecting can work, in the order of the wizard. */
-function missingStep(next: AppState): { step: string; text: string } | null {
+function missingStep(
+  next: AppState,
+  values: SetupConnectionValues = { tunnelId: next.config.tunnel.tunnelId, hasApiKey: next.hasApiKey }
+): { step: string; text: string } | null {
   const { config } = next;
   // This is the same capability rule as the main-process admission gate. Desktop and
   // clipboard may legitimately be rootless; enabling one must not hide a root still needed
@@ -623,19 +737,34 @@ function missingStep(next: AppState): { step: string; text: string } | null {
     return { step: 'folder', text: t("Choose a folder to share — step 1.") };
   }
   if (config.tunnel.kind === 'openai') {
-    if (!TUNNEL_ID_PATTERN.test(config.tunnel.tunnelId)) {
+    if (!TUNNEL_ID_PATTERN.test(values.tunnelId)) {
       return { step: 'tunnel', text: t("Create a tunnel and paste its ID — step 2.") };
     }
-    if (!(next.secureStorage?.available ?? true) && !next.hasApiKey) {
+    if (!(next.secureStorage?.available ?? true) && !values.hasApiKey) {
       return { step: 'key', text: next.secureStorage?.detail ?? t("Secure credential storage is unavailable.") };
     }
-    if (!next.hasApiKey) {
+    if (!values.hasApiKey) {
       return { step: 'key', text: t("Add a restricted API key — step 3.") };
     }
   } else if (!next.resolvedBinary && config.tunnel.kind === 'cloudflared') {
     return { step: 'connect', text: t("cloudflared was not found on this computer.") };
   }
   return null;
+}
+
+/**
+ * Readiness for a click the user can make now, including a Tunnel ID or API key still typed into
+ * Setup. Persisted state stays authoritative everywhere else; this only keeps Connect enabled so
+ * the click itself can store those drafts (see `persistSetupDraftsForConnection`). Adapted from
+ * @Haz4rdovisk's #345: before, typing both and clicking Connect did nothing, because the values
+ * were only stored on blur and the button was still disabled when the click landed.
+ */
+function currentSetupMissingStep(next: AppState): { step: string; text: string } | null {
+  const key = $<HTMLInputElement>('apiKey');
+  return missingStep(next, {
+    tunnelId: $<HTMLInputElement>('tunnelId').value.trim(),
+    hasApiKey: next.hasApiKey || (next.secureStorage?.available !== false && key.value !== '')
+  });
 }
 
 interface RootRenameState {
@@ -986,6 +1115,18 @@ function paintSetupFields(): void {
     input.classList.toggle('is-empty', !stored && input.value.trim() === '');
     input.setAttribute('aria-required', String(!stored));
   }
+  if (state) paintConnectButtons(state);
+}
+
+/** Connect is enabled from the persisted state or from valid drafts still in the fields. */
+function paintConnectButtons(next: AppState): void {
+  const running = isRunning(next.status.state), disconnecting = next.status.state === 'disconnecting';
+  const missing = currentSetupMissingStep(next);
+  for (const id of ['connectionPopoverToggle', 'wizConnect']) {
+    const button = $<HTMLButtonElement>(id);
+    button.disabled = disconnecting || (!running && missing !== null);
+    button.title = !running && missing ? missing.text : '';
+  }
 }
 
 function apply(next: AppState): void {
@@ -1003,7 +1144,7 @@ function apply(next: AppState): void {
   const busy = disconnecting || status.state === 'starting-server' || status.state === 'connecting-tunnel';
   const failed = status.state === 'auth-failed' || status.state === 'tunnel-unavailable';
   const running = isRunning(status.state);
-  const missing = missingStep(next);
+  const missing = currentSetupMissingStep(next);
 
   // ---- theme
   const appearanceUi = requestedSettings?.ui ?? config.ui;
@@ -1044,7 +1185,7 @@ function apply(next: AppState): void {
 
   // ---- out of date, app or extension
   paintUpdate(next);
-  paintPluginRefreshReminder(next.update.current);
+  paintPluginRefreshReminder(next.connectorSchemas ?? {});
 
   // ---- health numbers and facts
   paintClock();
@@ -1052,6 +1193,7 @@ function apply(next: AppState): void {
 
   // ---- permissions
   $('readOnlyBtn').classList.toggle('is-on', config.readOnly);
+  $('readOnlyBtn').setAttribute('aria-pressed', String(config.readOnly));
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-cap]')) {
     const cap = input.dataset.cap as Capability;
     const supported = (next.platform?.desktopAutomation ?? true) || !DESKTOP_CAPABILITIES.includes(cap) || cap === 'screen' || cap === 'control';
@@ -1062,6 +1204,22 @@ function apply(next: AppState): void {
     config.multiAgent.enabled,
     previousState?.config.multiAgent.enabled
   );
+  applyChecked(
+    $<HTMLInputElement>('commandAllowlistEnabled'),
+    config.commandAllowlist.enabled,
+    previousState?.config.commandAllowlist.enabled
+  );
+  const previousCommandPolicyMode = previousState?.config.commandAllowlist.mode;
+  const focusedCommandPolicyMode = (document.activeElement as HTMLElement | null)?.dataset.commandPolicyMode;
+  if (!focusedCommandPolicyMode || previousCommandPolicyMode === undefined || focusedCommandPolicyMode === previousCommandPolicyMode) {
+    paintCommandPolicyMode(config.commandAllowlist.mode);
+  }
+  applyValue(
+    $<HTMLTextAreaElement>('commandAllowlistRules'),
+    config.commandAllowlist.rules.join('\n'),
+    previousState?.config.commandAllowlist.rules.join('\n')
+  );
+  readCommandAllowlist();
   paintGroups();
   paintDesktopAccess(next);
 
@@ -1105,6 +1263,7 @@ function apply(next: AppState): void {
   applyChecked($<HTMLInputElement>('startAtLogin'), config.ui.startAtLogin === true, previousState?.config.ui.startAtLogin);
   applyChecked($<HTMLInputElement>('autoConnect'), config.ui.autoConnect, previousState?.config.ui.autoConnect);
   applyChecked($<HTMLInputElement>('developerMode'), config.ui.developerMode === true, previousState?.config.ui.developerMode);
+  applyChecked($<HTMLInputElement>('playfulStatus'), config.ui.playfulStatus === true, previousState?.config.ui.playfulStatus);
   applyChecked(
     $<HTMLInputElement>('minimizeToTray'),
     config.ui.minimizeToTray,
@@ -1176,7 +1335,7 @@ function apply(next: AppState): void {
   ui(chatgptNote, 'textContent', () => status.lastRequestAt === null
       ? t("ChatGPT has not called this app yet.")
       : status.lastToolCallAt === null
-        ? t("ChatGPT connected {0} but has never run a tool. Check Developer mode in ChatGPT → Settings → Security and login.", [ago(status.lastRequestAt)])
+        ? t("ChatGPT connected {0} but has never run a tool. Check that the CoS app is enabled in ChatGPT → Plugins.", [ago(status.lastRequestAt)])
         : unverified.length > 0
           ? // One connector working is not the whole setup. Naming the missing one is the
             // difference between "something is off" and knowing what to go and create.
@@ -1220,6 +1379,17 @@ function apply(next: AppState): void {
     node.classList.toggle('is-done', done.has(name));
     node.classList.toggle('is-current', name === current);
   }
+  // Progress over the steps this setup actually shows (the browser step is hidden when unused).
+  const shown = order.filter(name => !step(name).hidden);
+  const finished = shown.filter(name => done.has(name)).length;
+  const progress = $('setupProgress');
+  progress.setAttribute('aria-valuemax', String(shown.length));
+  progress.setAttribute('aria-valuenow', String(finished));
+  progress.classList.toggle('is-complete', finished === shown.length);
+  ui($('setupProgressText'), 'textContent', () => finished === shown.length
+    ? t('All {0} steps done', [shown.length])
+    : t('{0} of {1} steps done', [finished, shown.length]));
+  $('setupProgressFill').style.width = `${shown.length ? Math.round(finished / shown.length * 100) : 0}%`;
 
   // Setup that is finished should stop reading like a to-do list: the instructions
   // collapse away so the page fits without scrolling, and come back on request.
@@ -1303,7 +1473,7 @@ function connectorCards(next: AppState, desktopExpanded: boolean): HTMLElement[]
     card.append(head, el('p', 'hint', () => t(surface.cardSummary)));
 
     if (!surface.available) {
-      card.append(el('p', 'hint', surface.detail));
+      card.append(el('p', 'hint', () => t(surface.detail)));
       return card;
     }
 
@@ -1331,7 +1501,7 @@ function connectorCards(next: AppState, desktopExpanded: boolean): HTMLElement[]
       );
     }
 
-    if (surface.detail && surface.state === 'error') card.append(el('p', 'hint is-warn', surface.detail));
+    if (surface.detail && surface.state === 'error') card.append(el('p', 'hint is-warn', () => t(surface.detail)));
 
     // Published is only half the story. "Live" says this app is serving the connector;
     // it says nothing about whether the user ever created it in ChatGPT, and with two
@@ -1388,12 +1558,12 @@ function facts(next: AppState): HTMLElement[] {
     if (status.lastRequestAt !== null) {
       rows.push([
         'ChatGPT ran a tool',
-        () => status.lastToolCallAt === null ? t("never — check Developer mode") : ago(status.lastToolCallAt),
+        () => status.lastToolCallAt === null ? t("never — check the app in ChatGPT → Plugins") : ago(status.lastToolCallAt),
         status.lastToolCallAt === null
       ]);
     }
     if (health?.clientVersion) rows.push(['Tunnel client', () => health.clientVersion!]);
-    if (status.localUrl) rows.push(['Local server', () => status.localUrl!.replace(/^https?:\/\//, '')]);
+    if (status.localUrl) rows.push(['Local server', () => displayLocalServer(status.localUrl!)]);
   } else {
     rows.push(['Route to OpenAI', () => t('not running')]);
   }
@@ -1660,6 +1830,12 @@ async function dropFolders(event: DragEvent): Promise<void> {
 
 async function toggleConnection(): Promise<void> {
   if (!state || state.status.state === 'disconnecting') return;
+  if (!isRunning(state.status.state) && !(await persistSetupDraftsForConnection())) {
+    const missing = state ? missingStep(state) : null;
+    if (missing) { showTab('setup'); step(missing.step).scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+    return;
+  }
+  if (!state) return;
   // Mirrors the button label exactly, so a click always does what it says.
   const next = await run(isRunning(state.status.state) ? api.disconnect() : api.connect());
   if (next) apply(next);
@@ -1673,7 +1849,7 @@ async function runChecks(): Promise<void> {
   try {
     const result = await run(api.runDiagnostics());
     if (!result) return;
-    $('checksSummary').textContent = result.summary;
+    ui($('checksSummary'), 'textContent', () => t(result.summary));
     $('checkList').replaceChildren(
       ...result.checks.map((check) => {
         const li = el(
@@ -1690,7 +1866,7 @@ async function runChecks(): Promise<void> {
           check.status === 'pass' ? '✓' : check.status === 'fail' ? '!' : check.status === 'skipped' ? '–' : '…'
         );
         const body = el('div');
-        body.append(el('strong', '', check.name), el('p', '', check.detail));
+        body.append(el('strong', '', () => t(check.name)), el('p', '', () => t(check.detail)));
         li.append(mark, body);
         return li;
       })
@@ -1759,7 +1935,7 @@ $('wizExpand').addEventListener('click', () => {
   showAllSteps = $('wizard').classList.contains('is-tidy');
   if (state) apply(state);
 });
-$('updateGet').addEventListener('click', () => void run(api.openLink(RELEASES_PAGE)));
+$('updateGet').addEventListener('click', () => void run(api.downloadUpdate()));
 
 /**
  * Install the update that is already downloaded.
@@ -1797,7 +1973,7 @@ for (const id of ['copyLog', 'copyLogText']) {
     const text = await run(api.getLogText());
     if (text === null) return;
     const copied = await run(api.writeClipboard(text));
-    if (copied) toast('Activity copied');
+    if (copied) toast(t('Activity copied'));
   });
 }
 
@@ -1805,15 +1981,15 @@ $('copyLogJson').addEventListener('click', async () => {
   const text = await run(api.getLogJson());
   if (text === null) return;
   const copied = await run(api.writeClipboard(text));
-  if (copied) toast('Activity JSON copied');
+  if (copied) toast(t('Activity JSON copied'));
 });
 
 // The API key is written on blur so it is not saved keystroke by keystroke.
 for (const id of ['tunnelId', 'apiKey']) $(id).addEventListener('input', paintSetupFields);
-$('apiKey').addEventListener('blur', () => {
+function storeSetupApiKeyDraft(): Promise<boolean> {
   const input = $<HTMLInputElement>('apiKey');
   const submitted = input.value;
-  if (submitted === '') return;
+  if (submitted === '') return Promise.resolve(true);
   const owner = state?.config.tunnel.profileId;
   setupKeySave = (async () => {
     const next = await run(api.setApiKey(submitted, owner));
@@ -1824,17 +2000,37 @@ $('apiKey').addEventListener('blur', () => {
         if (input.value === submitted) input.value = '';
         apply(next);
       }
-      toast('API key stored');
+      toast(t('API key stored'));
     }
     return next !== null;
   })();
-});
+  return setupKeySave;
+}
+$('apiKey').addEventListener('blur', () => { void storeSetupApiKeyDraft(); });
+
+/**
+ * Store the Tunnel ID and API key still typed into Setup before connecting. Blur and change are
+ * conveniences; a Connect click must work without them.
+ */
+async function persistSetupDraftsForConnection(): Promise<boolean> {
+  if (!state) return false;
+  await settingsSaveQueue;
+  if (!state) return false;
+  if ($<HTMLInputElement>('tunnelId').value.trim() !== state.config.tunnel.tunnelId) await save();
+  await settingsSaveQueue;
+  if (!state || $<HTMLInputElement>('tunnelId').value.trim() !== state.config.tunnel.tunnelId) return false;
+  // A blur right before the click may already own this write; drain it, then store a newer draft.
+  await setupKeySave;
+  if ($<HTMLInputElement>('apiKey').value !== '' && !(await storeSetupApiKeyDraft())) return false;
+  await setupKeySave;
+  return state !== null && missingStep(state) === null;
+}
 
 $('removeApiKey').addEventListener('click', async () => {
   const next = await run(api.setApiKey('', state?.config.tunnel.profileId));
   if (next) {
     apply(next);
-    toast('API key removed');
+    toast(t('API key removed'));
   }
 });
 
@@ -1843,6 +2039,7 @@ for (const id of [
   'startAtLogin',
   'minimizeToTray',
   'developerMode',
+  'playfulStatus',
   'privacyScreenshots',
   'tunnelKind',
   'tunnelId',
@@ -1885,6 +2082,8 @@ buildGroups();
 initSidebarResize();
 initUsage();
 initPlugins(apply);
+initPets(api, pet);
+openSkillsLibrary = initSkillsLibrary(api);
 initBrowserPreferences();
 initChat({ save: () => save(), state: () => state });
 

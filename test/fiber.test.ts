@@ -278,6 +278,9 @@ interface TurnEvidence {
 interface TurnFixture {
   id: string;
   messages: Message[];
+  renderer?: 'search';
+  viewItems?: any[];
+  viewStatus?: string;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
   rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string; v5?: boolean }>;
@@ -312,6 +315,48 @@ async function scan(
   const document = window.document;
 
   for (const turn of turnSections) {
+    if (turn.renderer === 'search') {
+      const container = document.createElement('div');
+      container.setAttribute('data-turn-key', turn.id);
+      const user = document.createElement('div');
+      user.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:0:user`);
+      const userItem = turn.viewItems?.find(item => item?.type === 'user-message');
+      if (typeof userItem?.messageId === 'string') user.setAttribute('data-chatgpt-search-message-ids', userItem.messageId);
+      if (turn.staleStamp !== undefined) user.setAttribute('data-clf-fiber-turn', turn.staleStamp);
+      if (turn.rect) user.getBoundingClientRect = () => {
+        if (turn.rect === 'throw') throw new Error('unavailable geometry');
+        return turn.rect as DOMRect;
+      };
+      const viewTurn = {
+        items: turn.viewItems ?? [],
+        messageIds: (turn.viewItems ?? []).map(item => item?.messageId).filter((id): id is string => typeof id === 'string'),
+        status: turn.viewStatus ?? 'complete'
+      };
+      (user as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+        memoizedProps: { conversationId: THREAD },
+        return: { memoizedProps: { conversationId: THREAD, turn: viewTurn }, return: null }
+      } satisfies Fiber;
+
+      const assistant = document.createElement('div');
+      assistant.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:2:assistant`);
+      const assistantItem = turn.viewItems?.find(item => item?.type === 'assistant-message');
+      if (typeof assistantItem?.messageId === 'string') assistant.setAttribute('data-chatgpt-search-message-ids', assistantItem.messageId);
+      for (const entry of turn.rendered ?? []) {
+        const block = document.createElement('div');
+        block.setAttribute('data-markdown-text-style', 'assistant-message');
+        if (typeof entry === 'string') block.textContent = entry;
+        else {
+          block.innerHTML = entry.html;
+          if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
+          if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
+          if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
+        }
+        assistant.append(block);
+      }
+      container.append(user, assistant);
+      document.body.append(container);
+      continue;
+    }
     const section = document.createElement('section');
     section.setAttribute('data-testid', 'conversation-turn-2');
     if (turn.id) section.setAttribute('data-turn-id', turn.id);
@@ -399,13 +444,13 @@ async function scan(
     observer.disconnect();
   }
   const stamps = elements.map((row) => row.getAttribute('data-clf-fiber'));
-  const messageStamps = [...document.querySelectorAll('.markdown')].map(node => node.getAttribute('data-clf-fiber-message'));
+  const messageStamps = [...document.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"]')].map(node => node.getAttribute('data-clf-fiber-message'));
   const thoughtStamps = [...document.querySelectorAll('[data-clf-fiber-thought], .group\\/tool-message, div:has(> [data-testid="cot-v5-tool-icon-pile"])')]
     .filter(node => node.closest('[data-testid^="conversation-turn-"]'))
     .map(node => node.getAttribute('data-clf-fiber-thought'));
   const imageStamps = [...document.querySelectorAll('.group\\/imagegen-image img')]
     .map(node => node.getAttribute('data-clf-fiber-image'));
-  const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
+  const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-chatgpt-search-unit-key]')].map((section) =>
     section.getAttribute('data-clf-fiber-turn')
   );
   dom.window.close();
@@ -431,6 +476,38 @@ const rowInTurn = (messages: Message[], turnMessages: Message[], collapsed = 0) 
 // --------------------------------------------------------------------- tests
 
 describe('reading a row out of the page', () => {
+  it('reads the 2026-09 search-unit turn.items model without inventing request identity', async () => {
+    const result = await scan([], [{
+      id: 'search-turn-one',
+      messages: [],
+      renderer: 'search',
+      viewItems: [
+        { type: 'user-message', messageId: 'search-user', message: 'New renderer question', sentAtMs: 1_790_000_000_000 },
+        { type: 'chatgpt-reasoning-group', items: [{
+          type: 'mcp-tool-call', callId: 'search-call',
+          invocation: { server: APP, tool: `${LINK}/read`, arguments: { secret: 'must-not-cross-worlds' } }
+        }] },
+        { type: 'assistant-message', messageId: 'search-assistant', content: 'New renderer answer', completed: true,
+          phase: 'final_answer', sentAtMs: 1_790_000_001_000, turnExchangeId: 'exchange-search' }
+      ],
+      viewStatus: 'complete',
+      rendered: ['New renderer answer']
+    }]);
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({
+      turnId: 'search-turn-one',
+      conversationId: THREAD,
+      endMessageId: 'search-assistant',
+      requests: [],
+      calls: [{ messageId: 'search-call', tool: 'read', order: 0, answered: true, requestId: null, createTime: null }]
+    });
+    expect(result.turns[0]!.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ rawMessageId: 'search-user', role: 'user', rawText: 'New renderer question' }),
+      expect.objectContaining({ rawMessageId: 'search-assistant', role: 'assistant', rawText: 'New renderer answer' })
+    ]));
+    expect(JSON.stringify(result.turns)).not.toMatch(/must-not-cross-worlds|arguments/);
+  });
+
   it.each(['exact', 'missing', 'duplicate', 'cycle', 'different-request', 'tool-boundary', 'foreign-tool'])(
     'follows an exact result parent through the native intermediate message (%s)', async mode => {
       const asked = request('linked-request', 'read');
@@ -872,6 +949,18 @@ describe('the calls a turn says it made', () => {
     const expected = mode === 'native' || mode === 'scoped' ? `${result.scanToken}:0:anchor-message` : null;
     expect(result.messageStamps).toEqual(mode === 'duplicate' ? [null, null] : [expected]);
     expect(result.turns[0]!.messages[0]!.rawText).toBe('Public prose');
+  });
+
+  it('carries the server-resolved model of a reply, and only a plain slug', async () => {
+    const resolved = authored('resolved', 'Answer');
+    resolved.metadata = { ...resolved.metadata, resolved_model_slug: 'gpt-5-6-thinking', model_slug: 'gpt-5-6' };
+    const fallback = authored('fallback', 'Answer two');
+    fallback.metadata = { ...fallback.metadata, model_slug: 'gpt-6-pro' };
+    const hostile = authored('hostile', 'Answer three');
+    hostile.metadata = { ...hostile.metadata, resolved_model_slug: 'gpt-6 <img src=x>' };
+    const result = await scan([], [{ id: 'model-turn', messages: [resolved, fallback, hostile], conversationProps: { conversationId: THREAD } }]);
+    const byId = Object.fromEntries(result.turns[0]!.messages.map((row: any) => [row.rawText, row.resolvedModel]));
+    expect(byId).toEqual({ Answer: 'gpt-5-6-thinking', 'Answer two': 'gpt-6-pro', 'Answer three': undefined });
   });
 
   it.each(['exact', 'missing-scope', 'foreign', 'conflicting-scope', 'unknown', 'wrong-type', 'wrong-prefix', 'conflicting-id', 'private', 'tool', 'duplicate'])('joins typed preambles at native Fiber depths (%s)', async mode => {

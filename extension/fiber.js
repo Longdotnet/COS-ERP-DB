@@ -70,14 +70,17 @@
   const MAX_CALLS = 200;
   /** Public generated-image descriptors retained per turn. Pixels never cross this boundary. */
   const MAX_GENERATED_IMAGES = 200;
-  /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
+  /** ChatGPT's own turn anchors, which is where a turn's message model hangs. */
   // Shell anchors and typed items adapted from @ehkogh's #318. Keep one wire format.
+  const LEGACY_TURN_SECTION = 'section[data-testid^="conversation-turn"]';
   const SHELL_TURN = '[data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key]';
-  const TURN_SECTION = `section[data-testid^="conversation-turn"], ${SHELL_TURN}`;
+  const SEARCH_TURN_ANCHOR = '[data-chatgpt-search-unit-key$=":user"]';
+  const SEARCH_TURN_UNIT = '[data-chatgpt-search-unit-key]';
+  const TURN_SECTION = `${LEGACY_TURN_SECTION}, ${SHELL_TURN}, ${SEARCH_TURN_ANCHOR}`;
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
-  const MARKDOWN = '.markdown, [data-content-search-unit-key$=":assistant"] [data-markdown-text-style="assistant-message"]';
+  const MARKDOWN = '.markdown, [data-markdown-text-style="assistant-message"]';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents, div:has(> [data-testid="cot-v5-tool-icon-pile"])';
-  const GENERATED_IMAGE = '[class~="group/imagegen-image"] img';
+  const GENERATED_IMAGE = '[class~="group/imagegen-image"] img, [class~="group/generated-image-preview"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
   const MAX_RENDERED_HTML = 120_000;
   // A 15k–20k-token compaction answer is routinely 60k–90k characters. Capping public
@@ -147,6 +150,11 @@
   /** A short, plain string or null. Never a number, object, or anything with a toString. */
   function str(value) {
     return typeof value === 'string' && value.length > 0 ? value.slice(0, MAX_TEXT) : null;
+  }
+
+  /** A model slug such as `gpt-5-6-thinking`, or null. Slugs are short ids, never prose. */
+  function modelSlugOf(value) {
+    return typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(value) ? value : null;
   }
 
   function num(value) {
@@ -543,6 +551,8 @@
       const parentId = meta ? str(meta.parent_id) : null;
       const workingTurnId = meta ? str(meta.working_turn_id) : null;
       const turnExchangeId = meta ? str(meta.turn_exchange_id) : null;
+      // The server's own answer to "which model produced this": the only per-reply model proof.
+      const resolvedModel = meta ? modelSlugOf(meta.resolved_model_slug) || modelSlugOf(meta.model_slug) : null;
       const createTime = authoredTime(message);
       const authoredId = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, createTime);
       // Two messages of one branch sharing a creation millisecond would collide on that
@@ -592,7 +602,8 @@
         stable,
         rawText,
         order: index,
-        createTime
+        createTime,
+        ...(resolvedModel ? { resolvedModel } : {})
       });
       logicalIds.add(logicalId);
     }
@@ -655,7 +666,7 @@
    * uploads and every other role/channel is private or unknown. Only the provider message UUID,
    * sediment file id and bounded geometry cross worlds; no signed URL or arbitrary metadata does.
    */
-  function generatedImagesOf(sections, messages, exactImageNodes) {
+  function generatedImagesOf(sections, messages, exactImageNodes, shellImages = new Map()) {
     const out = [];
     const seen = new Set();
     if (!Array.isArray(messages)) return out;
@@ -712,8 +723,24 @@
       for (const node of nodes) {
         try {
           const url = new URL(node.currentSrc || node.src, location.href);
-          if (url.origin !== location.origin || url.pathname !== '/backend-api/estuary/content') continue;
-          const assetId = url.searchParams.get('id');
+          if (url.origin !== location.origin) continue;
+          let assetId = url.pathname === '/backend-api/estuary/content' ? url.searchParams.get('id') : null;
+          if (url.protocol === 'blob:') {
+            // Current image previews use blob pixels. Only the mounted typed item
+            // and its exact per-image control can identify those pixels; a blob URL
+            // or a nearby gallery alone is not an asset identity.
+            let control = null;
+            for (let at = fiberOf(node), up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+              const props = at.memoizedProps;
+              if (props?.imageId && !control) control = props;
+              if (shellImages.has(props?.item)) {
+                if (control?.imageId === props.item.id && control.isComplete === true && control.isPreview === false)
+                  assetId = shellImages.get(props.item);
+                break;
+              }
+              if (props?.entry) break;
+            }
+          }
           if (!assetId || !descriptorsByAsset.has(assetId)) continue;
           const list = nodesByAsset.get(assetId) || [];
           list.push(node);
@@ -909,6 +936,7 @@
         stable: assistantCandidates[c].stable,
         order: assistantCandidates[c].order,
         createTime: assistantCandidates[c].createTime,
+        ...(assistantCandidates[c].resolvedModel ? { resolvedModel: assistantCandidates[c].resolvedModel } : {}),
         rawText: assistantCandidates[c].rawText,
         renderedHtml: ''
       });
@@ -1500,6 +1528,93 @@
     } catch { /* Optional metadata must not cost the mounted transcript. */ }
     return [];
   }
+
+  /** The September 2026 search-unit `turn.items[]` view model on this Fiber branch. */
+  function turnViewOf(fiber) {
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const turn = props.turn;
+      if (turn && typeof turn === 'object' && Array.isArray(turn.items)) return turn;
+    }
+    return null;
+  }
+
+  /** Projects only public user/final assistant bytes from the typed search-unit turn model. */
+  function messagesFromTurnView(turn) {
+    if (!turn || typeof turn !== 'object' || !Array.isArray(turn.items)) return null;
+    const out = [], seen = new Set();
+    for (const item of turn.items) {
+      if (!item || typeof item !== 'object' || out.length >= MAX_CALLS) continue;
+      if (item.type === 'user-message') {
+        const id = str(item.messageId) || str(item.serverMessageId);
+        const body = typeof item.message === 'string' ? item.message.slice(0, MAX_RENDERED_TEXT) : '';
+        if (!id || seen.has(id) || !body) continue;
+        seen.add(id);
+        out.push({
+          id, author: { role: 'user' }, recipient: 'all',
+          ...(num(item.sentAtMs) !== null ? { create_time: item.sentAtMs / 1000 } : {}),
+          content: { content_type: 'text', parts: [body] }, metadata: {}
+        });
+        continue;
+      }
+      if (item.type !== 'assistant-message') continue;
+      const id = str(item.messageId) || str(item.latestMessageId);
+      if (!id || seen.has(id)) continue;
+      const body = typeof item.content === 'string' ? item.content.slice(0, MAX_RENDERED_TEXT) : '';
+      const phase = str(item.phase), complete = item.completed === true;
+      const terminal = complete && phase === 'final_answer' && turn.status === 'complete';
+      const exchange = str(item.turnExchangeId);
+      seen.add(id);
+      out.push({
+        id, author: { role: 'assistant' }, recipient: 'all',
+        ...(phase === 'final_answer' ? { channel: 'final' } : {}),
+        ...(num(item.sentAtMs) !== null ? { create_time: item.sentAtMs / 1000 } : {}),
+        status: complete ? 'finished_successfully' : 'in_progress', end_turn: terminal,
+        content: { content_type: 'text', parts: body ? [body] : [] },
+        metadata: { message_type: 'next', ...(exchange ? { turn_exchange_id: exchange } : {}) }
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Reads only allowlisted MCP call identity from the typed search-unit view.
+   * Invocation arguments/results never cross the MAIN-world boundary.
+   */
+  function viewCallsOf(fiber) {
+    const turn = turnViewOf(fiber);
+    if (!turn) return [];
+    const out = [], seen = new Set(), duplicated = new Set();
+    const visit = items => {
+      if (!Array.isArray(items) || out.length >= MAX_CALLS) return;
+      for (const item of items) {
+        if (!item || typeof item !== 'object' || out.length >= MAX_CALLS) continue;
+        if (item.type === 'chatgpt-reasoning-group') { visit(item.items); continue; }
+        if (item.type !== 'mcp-tool-call') continue;
+        const invocation = item.invocation && typeof item.invocation === 'object' ? item.invocation : null;
+        const app = invocation ? str(invocation.server) : null;
+        const tool = invocation ? toolName(str(invocation.tool)) : null;
+        const id = str(item.callId);
+        if (!app || !ourApp(app) || !tool || !id) continue;
+        if (seen.has(id)) duplicated.add(id);
+        seen.add(id);
+        out.push({
+          messageId: id,
+          tool,
+          order: out.length,
+          answered: turn.status === 'complete',
+          requestId: null,
+          createTime: null
+        });
+      }
+    };
+    visit(turn.items);
+    const kept = duplicated.size ? out.filter(call => !duplicated.has(call.messageId)) : out;
+    for (let at = 0; at < kept.length; at++) kept[at].order = at;
+    return kept;
+  }
   /** Exact local/server pair only; a route or the latest cached chat is not a join. */
   function shellConversation(queries, localId, evidence) {
     if (evidence.conflict || !localId?.startsWith('local-chatgpt:')) return evidence;
@@ -1713,7 +1828,8 @@
       if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; break; }
     }
     if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_ROWS) return null;
-    const messages = [], calls = [], slots = [], seen = new Set(), callSources = new Map(), executionIds = [];
+    const messages = [], calls = [], slots = [], seen = new Set(), callSources = new Map(), executionIds = [], images = new Map();
+    let lastAnswer = null;
     const remember = id => { if (!id || seen.has(id)) return false; seen.add(id); return true; };
     let work = 0;
     for (const [index, item] of entry.turn.items.entries()) {
@@ -1724,6 +1840,7 @@
         if (!remember(id) || (user && item.serverMessageId && item.messageId && item.serverMessageId !== item.messageId)) return null;
         const role = user ? 'user' : 'assistant', text = user ? item.message : item.content;
         const final = !user && item.phase === 'final_answer';
+        if (final) lastAnswer = item;
         const completed = final && item.completed === true && entry.turn.status === 'complete';
         messages.push({ id, author: { role }, content: { content_type: 'text', parts: [typeof text === 'string' ? text : ''] },
           channel: user ? null : final ? 'final' : 'commentary', end_turn: completed,
@@ -1732,6 +1849,18 @@
         const nodes = [...section.querySelectorAll('[data-content-search-unit-key]')].filter(node =>
           node.closest('[data-turn-key]') === section && node.getAttribute('data-content-search-unit-key') === key);
         if (nodes.length === 1) slots.push({ node: nodes[0], id });
+      } else if (item?.type === 'generated-image') {
+        lastAnswer = item;
+        const id = str(item.chatGptMessageId);
+        const asset = typeof item.src === 'string' && /^sediment:\/\/(file_[A-Za-z0-9_-]{8,100})$/.exec(item.src)?.[1];
+        if (!id || !asset || !Array.isArray(entry.turn.messageIds) || !entry.turn.messageIds.includes(id)) continue;
+        images.set(item, asset);
+        // Typed generated outputs are public tool media, never assistant prose.
+        // Multiple assets may share their owning provider message.
+        messages.push({ id, author: { role: 'tool' }, recipient: 'all', channel: 'final',
+          status: item.status === 'completed' && item.isPreview !== true ? 'finished_successfully' : 'in_progress',
+          content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
+            asset_pointer: item.src, width: item.width, height: item.height }] } });
       } else {
         const steps = item?.type === 'chatgpt-reasoning-group' && Array.isArray(item.items) ? item.items : [item];
         for (const step of steps) {
@@ -1753,13 +1882,27 @@
         }
       }
     }
-    return { entry, messages, calls, slots, callSources, executionIds };
+    // Media may share a provider message with other media, never an authored row
+    // or local call. Keep malformed cross-kind identities out of the whole scan.
+    if ([...images.keys()].some(item => seen.has(item.chatGptMessageId))) return null;
+    // Image-only answers have no assistant final item. Both the selected public
+    // images and the containing turn must finish; previews/retries cannot settle it.
+    const imageAnswer = lastAnswer?.type === 'generated-image';
+    const imageEnd = imageAnswer && entry.turn.status === 'complete' && images.has(lastAnswer) &&
+      entry.turn.items.filter(item => item?.type === 'generated-image').every(item =>
+        images.has(item) && item.status === 'completed' && item.isPreview !== true)
+      ? lastAnswer.chatGptMessageId : null;
+    return { entry, messages, calls, slots, callSources, executionIds, images,
+      endMessageId: imageAnswer ? imageEnd : turnEndMessageId(messages) };
   }
   function turnsOf(scanToken) {
     const out = [];
     let sections;
     try {
-      sections = [...document.querySelectorAll(TURN_SECTION)].filter(section => !section.closest(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`));
+      sections = [...document.querySelectorAll(TURN_SECTION)].filter(section => {
+        if (section.matches?.(SEARCH_TURN_ANCHOR) && section.closest?.(SHELL_TURN)) return false;
+        return !section.closest(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`);
+      });
     } catch {
       return out;
     }
@@ -1775,10 +1918,19 @@
     const groups = [];
     for (let at = 0; at < sections.length; at++) {
       const section = sections[at];
+      if (section.matches?.(SEARCH_TURN_ANCHOR)) {
+        const container = section.closest?.('[data-turn-key]');
+        const id = str(container?.getAttribute?.('data-turn-key')) || str(section.getAttribute('data-chatgpt-search-message-ids'));
+        let members = [section];
+        try { if (container) members = [...container.querySelectorAll(SEARCH_TURN_UNIT)]; } catch { members = [section]; }
+        if (!members.includes(section)) members.unshift(section);
+        groups.push({ turnId: id, sections: members, fiberSection: section, search: true });
+        continue;
+      }
       const id = section.matches?.(SHELL_TURN) ? str(section.querySelector('[data-content-search-turn-key]')?.getAttribute('data-content-search-turn-key')) : str(section.getAttribute('data-turn-id'));
       const previous = groups[groups.length - 1];
       if (id && previous && previous.turnId === id) previous.sections.push(section);
-      else groups.push({ turnId: id, sections: [section] });
+      else groups.push({ turnId: id, sections: [section], fiberSection: section, search: false });
     }
     // Keep the latest user/assistant boundary even while reading older history.
     // Visible groups share the remaining slots; no additional scan lifecycle.
@@ -1804,20 +1956,22 @@
     const responseBudget = { remaining: MAX_RESPONSE_TEXT };
     for (const at of [...selected].sort((a, b) => a - b)) {
       const group = groups[at];
-      const section = group.sections[0];
+      const section = group.fiberSection || group.sections[0];
       let entry = null;
       try {
         const fiber = fiberOf(section);
         if (!fiber) continue;
         const shell = section.matches?.(SHELL_TURN) ? shellTurnSource(fiber, section, group.turnId) : null;
         if (section.matches?.(SHELL_TURN) && !shell) continue;
-        const messages = shell ? shell.messages : turnMessagesOf(fiber);
+        const viewTurn = group.search ? turnViewOf(fiber) : null;
+        const messages = shell ? shell.messages : viewTurn ? messagesFromTurnView(viewTurn) : turnMessagesOf(fiber);
         const codeReceipts = codeModeReceipts(messages || []);
         const codeModeCalls = (messages || []).filter(message => message && message.author &&
           message.author.role === 'assistant' && message.recipient === 'functions.exec').slice(0, MAX_CALLS)
           .map(message => ({ messageId: str(message.id), requestId: str(message.metadata && message.metadata.request_id),
             answered: codeReceipts.get(message.id) === true }));
-        const calls = shell ? shell.calls : callsOf(messages, codeReceipts);
+        const legacyCalls = shell ? shell.calls : callsOf(messages, codeReceipts);
+        const calls = legacyCalls.length ? legacyCalls : group.search ? viewCallsOf(fiber) : legacyCalls;
         const queries = shell ? shellQueries(fiber) : [];
         const conversation = shell ? shellConversation(queries, shell.entry.conversationId, conversationEvidenceOf(fiber)) : conversationEvidenceOf(fiber);
         const metadata = shell ? shellRequestMetadata(fiber, queries, shell, conversation) : messages;
@@ -1837,9 +1991,9 @@
         const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget, exactAnchors, conversation.conversationId);
         const nativeActivities = shell ? shellPublicActivity(shell, metadata, renderedMessages, turnBudget, section, exactAnchors) : nativeActivitiesOf(group.sections, messages, exactThoughtRows);
         responseBudget.remaining -= before - turnBudget.remaining;
-        const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes);
+        const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes, shell?.images);
         const activities = nativeActivities.events;
-        const endMessageId = turnEndMessageId(messages);
+        const endMessageId = shell ? shell.endMessageId : turnEndMessageId(messages);
         // The shell supplies the completed final item's own exact message id,
         // without the classic thought-parent/timestamp tuple. Preserve that
         // identity for handoff capture; streaming and cancelled items stay weak.
@@ -1888,6 +2042,24 @@
           const running = shell.entry.turn.status === 'in_progress' ? location.pathname : null;
           if (running && section.getAttribute('data-clf-shell-running') !== running) section.setAttribute('data-clf-shell-running', running);
           else if (!running) section.removeAttribute('data-clf-shell-running');
+          /*
+           * Whether this is a temporary chat, said by the page's own state rather than read off
+           * an icon.
+           *
+           * `temporaryChatReady()` proves the mode from the checked glyph in the toolbar, which
+           * is the only evidence a document has while nothing is mounted. Once a turn exists,
+           * React holds the answer directly — measured on 2026-09-25 across both kinds of chat:
+           * `entry.isTemporaryChat` is true on `/c/<id>?temporary-chat=true` and false on an
+           * ordinary chat, at every depth it appears. A layout that stops drawing that glyph
+           * therefore stops proving the mode, while this keeps proving it.
+           *
+           * Stamped with the pathname for the same reason the running hint is: a stamp left on a
+           * section from another route must not answer for this one. Absent state leaves no
+           * stamp at all, so the glyph remains the proof where React says nothing.
+           */
+          const temporary = shell.entry.isTemporaryChat === true ? location.pathname : null;
+          if (temporary && section.getAttribute('data-clf-temporary-chat') !== temporary) section.setAttribute('data-clf-temporary-chat', temporary);
+          else if (!temporary) section.removeAttribute('data-clf-temporary-chat');
         }
         if (!conversation.conflict) for (const [node, id] of exactAnchors) {
           desiredMessageStamps.set(node, `${scanToken}:${index}:${encodeURIComponent(id)}`);
@@ -1910,8 +2082,12 @@
       // content.js will simply leave local turn ownership unset when the page turn id is null.
       if (entry) out.push(entry);
     }
-    for (let at = 0; at < sections.length; at++) {
-      const section = sections[at];
+    const cleanupSections = new Set();
+    try {
+      for (const section of document.querySelectorAll(`${LEGACY_TURN_SECTION}, ${SHELL_TURN}, ${SEARCH_TURN_UNIT}, [data-clf-fiber-turn]`)) cleanupSections.add(section);
+    } catch { for (const section of sections) cleanupSections.add(section); }
+    for (const group of groups) for (const section of group.sections) cleanupSections.add(section);
+    for (const section of cleanupSections) {
       try {
         if (!section || !section.getAttribute) continue;
         for (const node of section.querySelectorAll(`[data-clf-fiber-message], [data-content-search-unit-key], [data-markdown-text-style="assistant-message"], ${MARKDOWN}`)) {
@@ -1934,9 +2110,17 @@
           if (wantedImage === undefined) {
             if (currentImage !== null) node.removeAttribute('data-clf-fiber-image');
           } else if (currentImage !== wantedImage) node.setAttribute('data-clf-fiber-image', wantedImage);
+          const blobSource = wantedImage !== undefined && (node.currentSrc || node.src)?.startsWith('blob:')
+            ? node.currentSrc || node.src : null;
+          if (blobSource === null) node.removeAttribute('data-clf-fiber-image-source');
+          else if (node.getAttribute('data-clf-fiber-image-source') !== blobSource)
+            node.setAttribute('data-clf-fiber-image-source', blobSource);
         }
-        if (!desiredTurnStamps.has(section)) section.removeAttribute('data-clf-shell-running');
-        for (const stamped of [section, ...section.querySelectorAll('[data-content-search-unit-key]')]) {
+        if (!desiredTurnStamps.has(section)) {
+          section.removeAttribute('data-clf-shell-running');
+          section.removeAttribute('data-clf-temporary-chat');
+        }
+        for (const stamped of [section, ...section.querySelectorAll('[data-content-search-unit-key], [data-chatgpt-search-unit-key]')]) {
           const wanted = desiredTurnStamps.get(stamped);
           const current = stamped.getAttribute('data-clf-fiber-turn');
           if (wanted === undefined) {
@@ -1962,6 +2146,7 @@
   function scan(nonce) {
     // The existing scan also refreshes mounted-picker evidence; no new poll timer.
     try { pickerSnapshot(); } catch { /* An unknown picker cannot affect recording. */ }
+    try { temporaryModeSnapshot(); } catch { /* Unknown mode leaves no stamp, never a false one. */ }
     // The request nonce already uniquely names this scan across the two worlds. Reuse it as
     // the ephemeral frame token rather than minting a second random value: every DOM stamp
     // can then prove both which descriptor index it names and which exact scan produced it.
@@ -2009,6 +2194,33 @@
     post({ source: REPLY, nonce, scanToken, v: VERSION, scanOk, rows, turns }, location.origin);
   }
 
+  /**
+   * Whether this document is a temporary chat, from React's own state rather than an icon.
+   *
+   * The newer shell draws the header toggle with inline paths instead of the `#chat-temp-checked`
+   * sprite `temporaryChatReady()` looked for, so an empty temporary chat stopped proving its mode
+   * at all (measured 2026-09-26, English and German). The toggle's owner carries
+   * `isTemporaryChat` a few Fibers up — true on `/?temporary-chat=true`, false after switching it
+   * off — which is the same state the mounted-turn stamp reads. Only a single consistent answer
+   * from visible header buttons stamps the document, with the pathname it was made on.
+   */
+  function temporaryModeSnapshot() {
+    const answers = new Set();
+    const buttons = [...document.querySelectorAll('button')].filter(button => button.getClientRects().length > 0 &&
+      !button.closest(`${OWN_SURFACES},form,[data-turn-key],[data-testid^="conversation-turn"],nav,aside`)).slice(0, 40);
+    for (const button of buttons) {
+      let at = fiberOf(button);
+      for (let up = 0; at && up < 12; up++, at = at.return) {
+        const props = at.memoizedProps;
+        if (props && typeof props === 'object' && typeof props.isTemporaryChat === 'boolean') { answers.add(props.isTemporaryChat); break; }
+      }
+    }
+    const root = document.documentElement;
+    if (answers.size === 1 && answers.has(true)) {
+      if (root.getAttribute('data-clf-temporary-page') !== location.pathname) root.setAttribute('data-clf-temporary-page', location.pathname);
+    } else root.removeAttribute('data-clf-temporary-page');
+  }
+
   /** Picker data is account-evaluated state, never a scraped English announcement.
    * Copy only selection metadata; no conversation, account object or callbacks cross worlds. */
   function pickerSnapshot() {
@@ -2054,17 +2266,24 @@
     const machine = node.getAttribute('data-selected-reasoning-effort');
     // The reported alternate trigger exposes a locale-independent selected effort.
     // Unknown explicit values invalidate proof rather than falling back to its caption.
-    const effort = machine !== null ? (['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(machine) ? machine : null)
-      : ({ instant: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high',
-        'extra high': 'xhigh', max: 'max', ultra: 'ultra', pro: 'pro' })[String(node.textContent || '').trim().toLowerCase()];
-    if (!effort) return null;
-    let model = null;
+    const captionEffort = ({ instant: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high',
+      'extra high': 'xhigh', max: 'max', ultra: 'ultra', pro: 'pro' })[String(node.textContent || '').trim().toLowerCase()];
+    let model = null, lane = null;
     for (let fiber = fiberOf(node), up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
+      // The shell picker's selected lane carries the visible effort name: the machine
+      // attribute reports its transport value (medium/max) for Pro/Extra High lanes.
+      const sel = fiber.memoizedProps?.selectedPowerSelection ?? fiber.memoizedProps?.selectedLabelCandidate;
+      if (lane === null && sel) lane = { model: sel.model,
+        effort: ({ instant:'none', minimal:'minimal', low:'low', medium:'medium', high:'high',
+          'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[String(sel.labels?.effort ?? sel.sliderLabel ?? '').trim().toLowerCase()] ?? null };
       const current = fiber.memoizedProps?.currentModelId;
       if (current === undefined) continue;
       if (typeof current !== 'string' || !/^[a-zA-Z0-9._-]{1,80}$/.test(current) || (model && model !== current)) return null;
       model = current;
     }
+    const effort = (lane && lane.model === model && lane.effort) ||
+      (machine !== null ? (['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(machine) ? machine : null) : captionEffort);
+    if (!effort) return null;
     return model ? { id: model, effort } : null;
   }
   function readPickerSnapshot(node) {
@@ -2120,19 +2339,23 @@
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
       const group = value => typeof value === 'string' && /^[\p{L}\p{N}._ -]{1,80}$/u.test(value) && value.trim() === value ? value : null;
       const label = value => typeof value === 'string' && value.trim() && value.length <= 80 ? value.trim() : null;
-      const effort = value => ({ none:'none', instant:'none', minimal:'minimal', min:'low', low:'low', standard:'medium', medium:'medium', extended:'high', high:'high', xhigh:'xhigh', max:'max', ultra:'ultra', pro:'pro' })[value] || null;
+      const effort = value => ({ none:'none', instant:'none', minimal:'minimal', min:'low', low:'low', standard:'medium', medium:'medium', extended:'high', high:'high', xhigh:'xhigh', 'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[value] || null;
+      // The machine reasoningEffort is a lane's transport setting, not its identity: the
+      // Pro and Extra High lanes still report medium/max. The lane's visible label is what
+      // the picker offers, matching readPickerSnapshot's modelLane/thinkingEffort mapping.
+      const laneEffort = c => effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ?? effort(c?.reasoningEffort);
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
       const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
       const choices = p.powerSelections.map(c => ({ bucket: c?.powerSettingIndex, id: id(c?.model),
-        label: label(c?.modelLabel), familyId: id(c?.model), familyLabel: label(c?.modelLabel), effort: effort(c?.reasoningEffort),
+        label: label(c?.modelLabel), familyId: id(c?.model), familyLabel: label(c?.modelLabel), effort: laneEffort(c),
         available: p.modelSelectionDisabled !== true && c?.disabled !== true &&
           (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }));
       if (!version || !versions.length || versions.some(v => !v.id || !v.label) || !choices.length ||
           choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length || !versions.some(v => v.id === version)) return null;
-      const matches = choices.filter(c => c.id === id(selected.model) && c.effort === effort(selected.reasoningEffort));
+      const matches = choices.filter(c => c.id === id(selected.model) && c.effort === laneEffort(selected));
       if (matches.length !== 1 || (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)) return null;
       return { version, currentBucket: matches[0].bucket, versions, choices };
     }
@@ -2162,11 +2385,65 @@
     return result;
   }
 
+  /**
+   * The newer shell moved plugin management out of the settings dialog onto a full page,
+   * `/settings/plugins-settings/plugin_<app>`, and ChatGPT now drops the old `#settings/Plugins`
+   * hash entirely. Measured 2026-09-27: the page has no tab panel, no `reportEntity` card and no
+   * `actions` prop; the connector object (with its `actions`) sits a few Fibers above each
+   * management button, and only the Refresh-tools button's own wrapper carries a `loading`
+   * state besides the row's "Actions" menu trigger (`aria-haspopup`). Delete and Uninstall are
+   * `danger*` coloured; either marker disqualifies a control in any language. Every CoS connector refresh on the new layout failed with "the connector settings
+   * card could not be read", so ChatGPT kept whatever tool list it had before an update.
+   */
+  function pagePluginSnapshot(appId) {
+    const buttons = [...document.querySelectorAll('main button')].slice(0, 200);
+    let connector = null, control = null;
+    for (const button of buttons) {
+      if (!button.getClientRects().length) continue;
+      let fiber = fiberOf(button), loading = false, unsafe = false, owner = null;
+      for (let up = 0; fiber && up < 16; up++, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        if (!props || typeof props !== 'object') continue;
+        if (up <= 2) {
+          if (own.call(props, 'loading')) loading = true;
+          if (own.call(props, 'aria-haspopup') || (typeof props.color === 'string' && /danger|destructive/i.test(props.color))) unsafe = true;
+        }
+        if (props.connector && typeof props.connector === 'object') { owner = props.connector; break; }
+      }
+      if (!owner || owner.id !== appId) continue;
+      if (connector && connector !== owner) return null;
+      connector = owner;
+      // Never a destructive control, whatever its wrapper looks like.
+      if (loading && !unsafe && !/\b(?:delete|remove|uninstall|disconnect)\b/i.test(button.textContent || '')) {
+        if (control && control !== button) return null;
+        control = button;
+      }
+    }
+    if (!connector || !Array.isArray(connector.actions) || typeof connector.name !== 'string') return null;
+    const externalPlugins = connector.name === 'Chat On Steroids Plugins';
+    if ((!connector.actions.length && !externalPlugins) || connector.actions.length > (externalPlugins ? 257 : 16)) return null;
+    const budget = { bytes: 280000, nodes: 20000 };
+    // Measured 2026-09-27: this page sends `description_model: ""` rather than null, so `??`
+    // read every declaration as empty and no refresh could ever match the published schema.
+    const tools = connector.actions.map(action => ({ name: action.name, description: copySchema(action.description_model || action.description, budget), inputSchema: copySchema(action.params, budget) }));
+    if (tools.some(tool => !NAME.test(tool.name) || typeof tool.description !== 'string' || !tool.inputSchema || tool.inputSchema.type !== 'object') ||
+        new Set(tools.map(tool => tool.name)).size !== tools.length) return null;
+    if (control && control.getAttribute('data-clf-plugin-refresh') !== appId) control.setAttribute('data-clf-plugin-refresh', appId);
+    // `settled`: the actions arrive in the same response as the connector itself, so an empty
+    // list here is the installed state (a stale Plugins connector), not a list still loading.
+    const tunnelId = typeof connector.tunnel_id === 'string' && /^tunnel_[a-zA-Z0-9]{8,80}$/.test(connector.tunnel_id) ? connector.tunnel_id : null;
+    return { appId, connectorName: connector.name.slice(0, 100), versionId: str(connector.app_metadata?.version_id), tools, refreshAvailable: !!control, tunnelId, settled: true };
+  }
+
   function pluginSnapshot() {
+    const pageRoute = /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname);
+    if (pageRoute && !location.hash) return pagePluginSnapshot(pageRoute[1]);
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
     if (!route) return null;
-    const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel =>
-      panel.getAttribute('aria-labelledby')?.endsWith('-trigger-Plugins') && !panel.hidden);
+    // The hash already names one exact installed connector settings route. Provider tab labels
+    // are localized, so the remaining DOM proof is simply one visible tabpanel for that route;
+    // ambiguity still fails closed rather than guessing between multiple mounted panels.
+    const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel => !panel.hidden);
     if (panels.length !== 1) return null;
     const buttons = [...panels[0].querySelectorAll('button')].slice(0, 100);
     let result = null, control = null, observedActions = null, observedCard = null;

@@ -119,6 +119,23 @@ it('excludes GPT-5.5 from the composer slider without excluding future observed 
   expect(confirmedComposerModel()).toEqual({ model: 'future', reasoningEffort: 'high' });
 });
 
+it('disambiguates duplicate account model labels by their observed lane', async () => {
+  dom = new JSDOM(await readFile('src/renderer/index.html', 'utf8'));
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
+  const models = [
+    { id: 'gpt-5-6', label: '5.6', efforts: ['none'] },
+    { id: 'gpt-5-6-thinking', label: '5.6', efforts: ['medium', 'high'] },
+    { id: 'gpt-5-5-instant', label: '5.5', efforts: ['none'] },
+    { id: 'gpt-5-5-thinking', label: '5.5', efforts: ['medium', 'high'] }
+  ];
+  Object.assign(dom.window, { api: { getChatModels: async () => ({ ok: true, data: { state: 'ready', requestedAt: 1, observedAt: 2, models } }) } });
+  const { initChatModels, applyChatModels } = await import('../src/renderer/chat-models.js');
+  initChatModels(); applyChatModels({ multiAgent: {}, goal: {} } as Config); await Promise.resolve();
+  const labels = [...dom.window.document.querySelectorAll<HTMLOptionElement>('#workerModel option')].map(option => option.textContent);
+  expect(labels).toEqual(['5.6 · Instant', '5.6 · Reasoning', '5.5 · Instant', '5.5 · Reasoning']);
+  expect([...dom.window.document.querySelectorAll<HTMLOptionElement>('#workerModel option')].map(option => option.value)).toEqual(models.map(model => model.id));
+});
+
 it('binds composer selection to the selected session across delayed catalog, user edits and A-B-A navigation', async () => {
   dom = new JSDOM(await readFile('src/renderer/index.html', 'utf8'));
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
@@ -211,7 +228,15 @@ it('uses observed account choices, preserves unverified defaults, and clears inc
   const select = (id: string) => dom.window.document.getElementById(id) as HTMLSelectElement;
   expect(select('workerModel').value).toBe('unseen');
   expect(select('workerModel').selectedOptions[0]!.disabled).toBe(true);
+  expect(select('workerModel').selectedOptions[0]!.textContent).toBe('unseen');
+  expect(dom.window.document.getElementById('workerModelVerification')!.textContent).toBe('Unverified');
+  expect(dom.window.document.getElementById('helperModelVerification')!.hasAttribute('hidden')).toBe(true);
   expect(select('helperModel').value).toBe('first');
+  // Selects without the badge still say so in the option itself.
+  applyChatModels({ multiAgent: { defaultModel: 'unseen', defaultReasoning: 'high' }, goal: { helperModel: 'first', helperReasoning: 'ultra' } } as Config);
+  await Promise.resolve();
+  expect(select('helperReasoning').value).toBe('ultra');
+  expect(select('helperReasoning').selectedOptions[0]!.textContent).toBe('ultra · not verified');
   expect([...select('composerModel').options].map(row => row.value)).toEqual(['first', 'second']);
   select('composerModel').value = 'first'; select('composerModel').dispatchEvent(new dom.window.Event('change'));
   expect([...select('composerReasoning').options].map(row => row.value)).toEqual(['high']);
@@ -239,7 +264,7 @@ it('offers only observed models, prefers supported GPT-6 High, and replaces a re
   expect(select('composerReasoning').value).toBe('high');
   expect(dom.window.document.getElementById('composerModelChoices')!.textContent).not.toContain('default');
   const reload = dom.window.document.getElementById('refreshComposerModels')!;
-  expect(reload.querySelector('svg')).not.toBeNull();
+  expect(reload.querySelector('.ico.ph-arrow-clockwise')).not.toBeNull();
   expect(reload.textContent).toBe('');
   expect(reload.getAttribute('aria-label')).toBe('Reload ChatGPT models');
   const slider = dom.window.document.querySelector<HTMLInputElement>('#composerPowerChoices input')!;
@@ -412,4 +437,32 @@ it.each(['5.6', 'gpt-5.6-sol', 'GPT-5.6 Sol', 'gpt-5-6-thinking'])('keeps saved 
     expect((dom.window.document.getElementById('workerReasoning') as HTMLSelectElement).value).toBe('high');
   };
   check(); receive({ state: 'ready', models: [...models].reverse() }); check();
+});
+
+it('offers ChatGPT’s current model only when no account list is readable, and only on an explicit choice (#104)', async () => {
+  dom = new JSDOM(await readFile('src/renderer/index.html', 'utf8'));
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document);
+  let receive!: (catalog: any) => void;
+  Object.assign(dom.window, { api: {
+    getChatModels: async () => ({ ok: true, data: { state: 'pending', requestedAt: 1, observedAt: null, models: [] } }),
+    onChatModelsChanged: (listener: typeof receive) => { receive = listener; } } });
+  const { initChatModels, applyChatModels, composerSendModel, confirmedComposerModel, ensureComposerModel } = await import('../src/renderer/chat-models.js');
+  initChatModels(); applyChatModels({ multiAgent: {}, goal: {} } as Config); await Promise.resolve();
+  const button = () => dom.window.document.querySelector<HTMLButtonElement>('[data-use-current-model]');
+  // Still reading: nothing is offered, and nothing is sent without a choice.
+  expect(button()).toBeNull();
+  expect(composerSendModel()).toBeNull();
+  // A Go/Free account has no picker, so discovery ends without any list.
+  receive({ state: 'unavailable', requestedAt: 1, observedAt: 2, models: [], error: 'ChatGPT’s native model picker could not be read.' });
+  expect(button(), 'offered once no list is readable').not.toBeNull();
+  expect(composerSendModel(), 'never chosen silently').toBeNull();
+  button()!.click();
+  expect(composerSendModel()).toEqual({ model: null, reasoningEffort: null });
+  expect(await ensureComposerModel()).toEqual({ model: null, reasoningEffort: null });
+  expect(confirmedComposerModel(), 'the confirmed-pair contract is unchanged').toBeNull();
+  expect(dom.window.document.getElementById('composerModelLabel')!.textContent).toBe('ChatGPT’s current model');
+  // A readable list takes over again at once.
+  receive({ state: 'ready', requestedAt: 3, observedAt: 4, models: [{ id: 'gpt-6', label: 'GPT-6', efforts: ['high'] }] });
+  expect(composerSendModel()).toEqual({ model: 'gpt-6', reasoningEffort: 'high' });
+  expect(button()).toBeNull();
 });

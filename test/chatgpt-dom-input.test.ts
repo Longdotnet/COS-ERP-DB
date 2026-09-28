@@ -10,6 +10,7 @@ interface DomApi {
   generating(): boolean;
   sendButton(): HTMLButtonElement | null;
   temporaryChatReady(): boolean;
+  confirmTemporaryChatIntroduction(): void;
   errors(): Array<{ text: string; recoverable: boolean; blocking?: boolean }>;
   captureComposerDraft(text: string, current?: () => boolean): { current(): boolean; clear(): Promise<boolean>; dispose(): void; attachments(nodes: Element[]): void };
   visibleModelSelection(): { model: string; reasoningEffort?: string } | null;
@@ -19,6 +20,10 @@ interface DomApi {
   send(options?: { acceptanceTimeoutMs?: number; stillCurrent?: () => boolean; beforeSend?: () => Promise<boolean> }): Promise<boolean>;
   selectModelSettings(model: string | null, effort: string | null, current?: () => boolean): Promise<boolean>;
   uploadImages(images: Array<{ name: string; dataUrl: string }>, current?: () => boolean, draft?: ReturnType<DomApi['captureComposerDraft']>, files?: File[]): Promise<boolean>;
+  messages(): Array<{ id: string; role: 'user' | 'assistant'; text: string; turnId: string | null }>;
+  turns(): Array<{ id: string | null; role: string; node: HTMLElement; nodes: HTMLElement[] }>;
+  toolBlocks(turn: ReturnType<DomApi['turns']>[number]): HTMLElement[];
+  hideActivity(turn: ReturnType<DomApi['turns']>[number], covered: HTMLElement[]): void;
 }
 let dom: JSDOM;
 let document: Document;
@@ -47,6 +52,32 @@ function user(text: string) {
   message.textContent = text;
   section.append(message); document.body.append(section);
 }
+
+it('reads the September search-unit renderer without legacy message attributes', () => {
+  const turn = document.createElement('div');
+  turn.setAttribute('data-turn-key', 'search-turn');
+  const userUnit = document.createElement('div');
+  userUnit.setAttribute('data-chatgpt-search-unit-key', 'search-turn:0:user');
+  userUnit.setAttribute('data-chatgpt-search-message-ids', 'search-user');
+  const userText = document.createElement('div');
+  userText.className = 'whitespace-pre-wrap';
+  userText.textContent = 'Search unit question';
+  userUnit.append(userText);
+  const assistantUnit = document.createElement('div');
+  assistantUnit.setAttribute('data-chatgpt-search-unit-key', 'search-turn:2:assistant');
+  assistantUnit.setAttribute('data-chatgpt-selection-message-id', 'search-assistant');
+  const prose = document.createElement('div');
+  prose.setAttribute('data-markdown-text-style', 'assistant-message');
+  prose.textContent = 'Search unit answer';
+  assistantUnit.append(prose);
+  turn.append(userUnit, assistantUnit);
+  document.body.append(turn);
+
+  expect(api.messages()).toEqual([
+    expect.objectContaining({ id: 'search-user', role: 'user', text: 'Search unit question', turnId: 'search-turn' }),
+    expect.objectContaining({ id: 'search-assistant', role: 'assistant', text: 'Search unit answer', turnId: 'search-turn' })
+  ]);
+});
 
 describe('one native HTML edit for prepared text', () => {
   beforeEach(() => {
@@ -195,6 +226,36 @@ describe('native Project entry readiness', () => {
     expect(clicks).toBe(1);
   });
 
+  it('lets a large source chat take longer than the transition deadline to load (#212)', async () => {
+    // The published reproduction: a source ready at 13 s failed against the old shared 12 s.
+    const link = sourceLink();
+    box.textContent = '';
+    box.remove();
+    let clicks = 0;
+    link.addEventListener('click', event => {
+      event.preventDefault(); clicks++;
+      dom.window.setTimeout(() => { dom.reconfigure({ url: projectUrl }); box.replaceWith(box.cloneNode(true)); }, 2_000);
+    });
+    const entered = api.enterProject(entry);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(clicks).toBe(0);
+    document.querySelector('form')!.prepend(box);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await entered).toBe(true);
+    expect(clicks).toBe(1);
+  });
+
+  it('still gives up on a native transition that does not arrive within its own deadline', async () => {
+    const link = sourceLink();
+    let clicks = 0;
+    link.addEventListener('click', event => { event.preventDefault(); clicks++; });
+    box.textContent = '';
+    const entered = api.enterProject(entry);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(clicks).toBe(1);
+    expect(await entered).toBe(false);
+  });
+
   it.each(['missing', 'draft', 'cancelled', 'foreign-route'])('never clicks an unready or retired source: %s', async reason => {
     const link = sourceLink();
     box.textContent = reason === 'draft' ? 'Keep my draft' : '';
@@ -206,7 +267,7 @@ describe('native Project entry readiness', () => {
     if (reason === 'cancelled') current = false;
     if (reason === 'foreign-route') dom.reconfigure({ url: 'https://chatgpt.com/c/bbbbbbbb-1111-4222-8333-444444444444' });
     if (reason !== 'missing') document.querySelector('form')!.prepend(box);
-    await vi.advanceTimersByTimeAsync(12_000);
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(await entered).toBe(false);
     expect(clicks).not.toHaveBeenCalled();
     if (reason === 'draft') expect(box.textContent).toBe('Keep my draft');
@@ -467,6 +528,55 @@ function upload() {
   return input;
 }
 describe('native image readiness', () => {
+  it.each(['wrong filename', 'multiple actions', 'outside attachments'])('rejects a shell attachment lookalike: %s', variant => {
+    const holder = document.createElement('div'); holder.setAttribute('data-composer-attachments', '');
+    holder.innerHTML = '<div role="button" aria-label="app.webp"><img alt="app.webp"><button aria-label="Remover app.webp"></button></div>';
+    if (variant === 'wrong filename') holder.querySelector('img')!.alt = 'other.webp';
+    if (variant === 'multiple actions') holder.firstElementChild!.append(document.createElement('button'));
+    if (variant === 'outside attachments') holder.removeAttribute('data-composer-attachments');
+    document.querySelector('form')!.append(holder);
+    expect(api.hasComposerAttachments()).toBe(false);
+  });
+  it('recognizes the shell image tile by filename and its unique localized remove action', async () => {
+    const input = upload(); input.id = '_r_image_';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    document.execCommand = command => { if (command === 'delete') box.replaceChildren(); return true; };
+    input.addEventListener('change', () => {
+      const holder = document.createElement('div'); holder.setAttribute('data-composer-attachments', '');
+      holder.innerHTML = '<div role="button" aria-label="app.webp"><img alt="app.webp"><button aria-label="Remover app.webp"></button></div>';
+      holder.querySelector('button')!.addEventListener('click', () => holder.remove());
+      document.querySelector('form')!.append(holder);
+    });
+    expect(await api.uploadImages([{ name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' }], () => true, draft)).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(true);
+    expect(await draft.clear()).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(false); draft.dispose();
+  });
+  it.each([false, true])('uses the current composer upload kind with dynamic ids (files=%s)', async files => {
+    const input = upload(); input.id = '_r_photo_';
+    if (files) { input.id = '_r_file_'; input.accept = ''; }
+    const media = document.createElement('input'); media.type = 'file'; media.accept = 'image/*,video/*';
+    input.after(media);
+    const foreign = input.cloneNode() as HTMLInputElement; foreign.id = 'upload-photos';
+    document.body.prepend(foreign);
+    const wrong = vi.fn(); foreign.addEventListener('change', wrong); media.addEventListener('change', wrong);
+    input.addEventListener('change', () => {
+      const tile = document.createElement('button'); tile.setAttribute('aria-label', 'Remove file: app.webp');
+      document.querySelector('form')!.append(tile);
+    });
+    const image = { name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' };
+    const originals = files ? [new dom.window.File(['bytes'], image.name, { type: 'image/webp' })] : [];
+    expect(await api.uploadImages(files ? [] : [image], () => true, undefined, originals)).toBe(true);
+    expect(wrong).not.toHaveBeenCalled();
+  });
+  it.each(['duplicate', 'disabled', 'foreign'])('does not dispatch an upload with %s native ownership', async reason => {
+    const input = upload(); const changed = vi.fn(); input.addEventListener('change', changed);
+    if (reason === 'duplicate') input.after(input.cloneNode());
+    if (reason === 'disabled') input.disabled = true;
+    if (reason === 'foreign') document.body.append(input);
+    expect(await api.uploadImages([{ name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' }])).toBe(false);
+    expect(changed).not.toHaveBeenCalled();
+  });
   it.each(['rename', 'replacement', 'extra file', 'cancel'])('retains exact image upload nodes across %s while processing', async change => {
     const input = upload();
     const tile = document.createElement('button');
@@ -650,10 +760,64 @@ describe('rendered temporary-chat state independent of language', () => {
     document.body.append(control);
     return control;
   }
+  function currentToggle(label: string, active: boolean) {
+    const control = document.createElement('button');
+    control.setAttribute('aria-label', label);
+    const paths = [
+      'M16.8525 7.06128C17.1968 6.93341 17.5801 7.10859 17.708 7.45288Z',
+      'M2.29199 7.45288C2.41986 7.10859 2.80317 6.93341 3.14746 7.06128Z',
+      'M11.957 7.40698C12.1557 7.09821 12.5671 7.00824 12.8756 7.20697Z'
+    ];
+    if (active) paths.push('M9.99902 2.25171C11.8772 2.25171 13.6066 2.88171 14.9531 3.93042Z');
+    control.innerHTML = `<svg viewBox="0 0 20 20">${paths.map(d => `<path d="${d}"></path>`).join('')}</svg>`;
+    document.body.append(control);
+    return control;
+  }
   it.each(['Temporären Chat ausschalten', '一時チャットをオフにする', 'Turn off temporary chat', ''])('reads the checked glyph with arbitrary label %s', label => {
     toggle(label, true);
     expect(api.temporaryChatReady()).toBe(true);
   });
+  it.each(['beliebig', '任意', ''])('reads the current four-path active temporary-chat icon with arbitrary label %s', label => {
+    currentToggle(label, true);
+    expect(api.temporaryChatReady()).toBe(true);
+  });
+  it('does not mistake the current three-path inactive temporary-chat icon for active mode', () => {
+    currentToggle('Temporary chat', false);
+    expect(api.temporaryChatReady()).toBe(false);
+  });
+  it('accepts the current Temporary Chat introduction wording', () => {
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.innerHTML = '<h2>Temporary chat</h2><p>This chat won\'t appear in history.</p><button>Continue</button>';
+    document.body.append(dialog);
+    const clicked = vi.fn();
+    dialog.querySelector('button')!.addEventListener('click', clicked);
+    api.confirmTemporaryChatIntroduction();
+    expect(clicked).toHaveBeenCalledOnce();
+  });
+  /**
+   * The same answer from the page's own state, for a layout that no longer draws the glyph.
+   *
+   * Measured on 2026-09-25 across both kinds of chat: React holds `entry.isTemporaryChat`, true
+   * on `/c/<id>?temporary-chat=true` and false on an ordinary chat. `fiber.js` stamps that onto
+   * the turn with the pathname it was observed on, so a stamp left behind by another route
+   * cannot answer for this one — the same rule the running hint beside it follows.
+   */
+  it('accepts the state a mounted turn published, and only for this route', () => {
+    const shell = document.createElement('main');
+    shell.setAttribute('data-app-shell-main-surface', '');
+    shell.innerHTML = '<div data-thread-find-target="conversation"><div data-turn-key="t-1"></div></div>';
+    document.body.append(shell);
+    const turn = shell.querySelector('[data-turn-key]')!;
+    expect(api.temporaryChatReady(), 'an unstamped turn claimed the mode').toBe(false);
+
+    turn.setAttribute('data-clf-temporary-chat', '/c/somewhere-else');
+    expect(api.temporaryChatReady(), 'a stamp from another route answered for this one').toBe(false);
+
+    turn.setAttribute('data-clf-temporary-chat', dom.window.location.pathname);
+    expect(api.temporaryChatReady()).toBe(true);
+  });
+
   it('does not mistake a hidden checked glyph, English wording or URL intent for active mode', () => {
     dom.reconfigure({ url: 'https://chatgpt.com/?temporary-chat=true' });
     toggle('Turn off temporary chat', false);
@@ -724,5 +888,26 @@ describe('locale-independent provider composer evidence', () => {
     group.firstElementChild!.setAttribute('data-default-action', 'true');
     group.append(group.lastElementChild!.cloneNode(true));
     expect(api.hasComposerAttachments()).toBe(false);
+  });
+
+  it.each(['画像を編集', '分享此图片'])('keeps a localized generated-output action beside a hidden duplicate tool row (%s)', actionLabel => {
+    const section = document.createElement('section');
+    section.setAttribute('data-testid', 'conversation-turn-output-action');
+    section.setAttribute('data-turn', 'assistant');
+    section.setAttribute('data-turn-id', 'output-action');
+    const layout = document.createElement('div');
+    const branch = document.createElement('div');
+    const tool = document.createElement('span'); tool.className = 'tool-message'; tool.textContent = 'Called image tool';
+    const disclosure = document.createElement('button'); disclosure.setAttribute('aria-label', 'Called image tool');
+    const action = document.createElement('button'); action.setAttribute('aria-label', actionLabel);
+    branch.append(tool, disclosure, action); layout.append(branch); section.append(layout); document.body.append(section);
+
+    const turn = api.turns().find(item => item.id === 'output-action')!;
+    const blocks = api.toolBlocks(turn);
+    expect(blocks).toEqual([tool]);
+    api.hideActivity(turn, blocks);
+    expect(tool.getAttribute('data-clf-native-hidden')).toBe('1');
+    expect(disclosure.getAttribute('data-clf-native-hidden')).toBe('1');
+    expect(action.closest('[data-clf-native-hidden]')).toBeNull();
   });
 });

@@ -7,9 +7,19 @@ import { prependUserPrompt } from '../src/shared/user-prompt.js';
 import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/session.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import type { LocalProject } from '../src/shared/projects.js';
-import type { TerminalLiveUpdate } from '../src/shared/terminal-live.js';
-vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({ update: vi.fn() }) }));
+vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({
+  update: vi.fn(), show: vi.fn(), hide: vi.fn(), hasTabs: () => false,
+  tabs: () => [], newTab: () => null, selectTab: vi.fn(), closeTab: vi.fn()
+}) }));
 vi.mock('../src/renderer/pet.js', () => ({ initPet: () => () => {} }));
+vi.mock('../src/renderer/file-code-editor.js', () => ({
+  createProjectDiffViewer: async ({ parent, baseText, currentText }: { parent: HTMLElement; baseText: string; currentText: string }) => {
+    const view = parent.ownerDocument.createElement('pre');
+    view.textContent = `${baseText}\n---\n${currentText}`;
+    parent.append(view);
+    return { destroy: () => view.remove(), language: 'TypeScript' };
+  }
+}));
 import { positionOf, projectTimeline } from '../src/shared/chronology.js';
 
 /**
@@ -155,7 +165,7 @@ async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Pro
   await settle();
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; playfulStatus?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -184,8 +194,9 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       create: false, edit: false, move: false, deleteFile: false, command: false,
       screen: false, control: false, clipboardRead: false, clipboardWrite: false
     },
+    commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
     tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', developerMode: options.developerMode ?? false },
+    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', developerMode: options.developerMode ?? false, playfulStatus: options.playfulStatus ?? false },
     sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
     compaction: { auto: true, autoTokens: 300000 },
     multiAgent: { enabled: false, maxWorkers: 2, allowUnattributedCalls: false, recoverAgentTabs: true },
@@ -323,30 +334,40 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   };
 }
 
-it('shows terminal output while exec_command is still running and retires the ephemeral row after finish', async () => {
-  const app = await boot([]);
-  const sessionId = summary([]).id;
-  const startedAt = Date.now();
-  app.terminal({ sessionId, processId: 4321, command: 'npm run build', cwd: '/repo', phase: 'running',
-    output: 'vite building...\n', truncated: false, startedAt, updatedAt: startedAt });
-  let terminal = app.w.document.querySelector('details.live-terminal') as HTMLDetailsElement;
-  expect(terminal).not.toBeNull();
-  expect(terminal.open).toBe(true);
-  expect(terminal.textContent).toContain('npm run build');
-  expect(terminal.querySelector('.live-terminal-output')?.textContent).toContain('vite building...');
+  it('makes parent and worker session selectors keyboard-focusable and activates them with Enter/Space', async () => {
+  const parent: SessionSummary = { ...summary([]), id: 'parent-session', title: 'Parent', conversationId: 'parent-chat', chatIds: ['parent-chat'] };
+  const worker: SessionSummary = { ...summary([]), id: 'worker-session', title: 'Worker', conversationId: 'worker-chat', chatIds: ['worker-chat'],
+    origin: { kind: 'worker', fromSessionId: parent.id, agentId: 'worker-1', task: 'Inspect' } };
+  const { w } = await boot([], false, [], [], { sessions: [parent, worker] });
+  const parentControl = w.document.querySelector<HTMLElement>(`[data-id="${parent.id}"] [data-session-select]`)!;
+  expect(parentControl.getAttribute('role')).toBe('button');
+  expect(parentControl.tabIndex).toBe(0);
+  parentControl.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await settle();
+  expect(w.document.querySelector(`.sess.is-sel[data-id="${parent.id}"]`)).not.toBeNull();
 
-  app.terminal({ sessionId, processId: 4321, command: 'npm run build', cwd: '/repo', phase: 'running',
-    output: 'vite building...\n✓ built in 5.48s\n', truncated: false, startedAt, updatedAt: startedAt + 100 });
-  terminal = app.w.document.querySelector('details.live-terminal') as HTMLDetailsElement;
-  expect(terminal.querySelector('.live-terminal-output')?.textContent).toContain('✓ built in 5.48s');
-  expect(app.live.events).toHaveLength(0);
-
-  app.terminal({ sessionId, processId: 4321, command: 'npm run build', cwd: '/repo', phase: 'finished',
-    output: 'vite building...\n✓ built in 5.48s\n', truncated: false, startedAt, updatedAt: startedAt + 200, exitCode: 0 });
-  expect(app.w.document.querySelector('.live-terminal-metric')?.textContent).toBe('✓ exit 0');
-  await settle(800);
-  expect(app.w.document.querySelector('details.live-terminal')).toBeNull();
+  (w.document.querySelector(`[data-id="${parent.id}"] .worker-toggle`) as HTMLButtonElement).click();
+  await settle();
+  const workerControl = w.document.querySelector<HTMLElement>(`[data-id="${worker.id}"] [data-session-select]`)!;
+  expect(workerControl.tabIndex).toBe(0);
+  const activate = new w.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+  workerControl.dispatchEvent(activate);
+  expect(activate.defaultPrevented).toBe(true);
+  await settle();
+  expect(w.document.querySelector(`.sess.is-sel[data-id="${worker.id}"]`)).not.toBeNull();
 });
+
+  it('keeps legacy Files, Agents and Review toggles out of the chat while dock controls remain available', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const { w } = await boot([], false, [], [project]);
+  const chat = w.document.querySelector('[data-panel="chat"]')!;
+  expect(chat.querySelectorAll('#filePanelToggle, #agentPanelToggle, .file-panel-toggle')).toHaveLength(0);
+  expect([...chat.children].filter(node => node.tagName === 'BUTTON')).toHaveLength(0);
+  expect(w.document.getElementById('rightDockToggle')).not.toBeNull();
+  expect(w.document.getElementById('terminalToggle')).not.toBeNull();
+  w.document.getElementById('rightDockToggle')!.click();
+    expect(w.document.getElementById('workDockRight')?.hidden).toBe(false);
+  });
 
 it('patches native reactions in place and hides streamed envelopes without changing authored messages', async () => {
   const user: SessionEvent = { kind: 'user_message', seq: 1, origin: 1, time: T0, source: 'extension', messageId: 'reaction-user', message: text('Question') };
@@ -1528,6 +1549,152 @@ it('reorders whole project groups without changing chat selection, ownership or 
   expect(live.sent).toEqual([]);
 });
 
+it('keeps working state per chat and marks only completed background chats as unseen until opened', async () => {
+  const startedAt = Date.now();
+  const chats: SessionSummary[] = [
+    { ...summary([]), id: 'chat-a', title: 'Alpha', conversationId: 'conversation-a', chatIds: ['conversation-a'], updatedAt: startedAt,
+      lastToolCallAt: startedAt, activityExpiresAt: startedAt + 60_000 },
+    { ...summary([]), id: 'chat-b', title: 'Beta', conversationId: 'conversation-b', chatIds: ['conversation-b'], updatedAt: startedAt - 1,
+      lastToolCallAt: startedAt, activityExpiresAt: startedAt + 60_000 }
+  ];
+  const { w } = await boot([], false, [], [], { sessions: chats });
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`.sess[data-id="${id}"]`)!;
+  const refresh = async () => { (w.document.getElementById('chatRefresh') as HTMLButtonElement).click(); await settle(); };
+  let observedAt = Date.now();
+  const nextAt = () => ++observedAt;
+
+  row('chat-a').click();
+  expect(row('chat-a').querySelector('.session-status.is-active')).not.toBeNull();
+  expect(row('chat-b').querySelector('.session-status.is-active')).not.toBeNull();
+
+  const backgroundCompletedAt = nextAt();
+  Object.assign(chats[1]!, {
+    activityExpiresAt: null,
+    lastAssistantFinalAt: backgroundCompletedAt,
+    lastTurnEndAt: backgroundCompletedAt,
+    lastTurnOutcome: 'completed',
+    updatedAt: backgroundCompletedAt
+  });
+  await refresh();
+  expect(row('chat-a').querySelector('.session-status.is-active')).not.toBeNull();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')?.getAttribute('aria-label')).toBe('New response');
+
+  row('chat-b').click();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).not.toBeNull();
+  await settle();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).toBeNull();
+  expect(w.localStorage.getItem('chat-on-steroids.sidebar-completion-seen')).toContain('chat-b');
+
+  const selectedWorkingAt = nextAt();
+  Object.assign(chats[1]!, { lastToolCallAt: selectedWorkingAt, activityExpiresAt: selectedWorkingAt + 60_000, updatedAt: selectedWorkingAt });
+  await refresh();
+  expect(row('chat-b').querySelector('.session-status.is-active')).not.toBeNull();
+  const selectedCompletedAt = nextAt();
+  Object.assign(chats[1]!, {
+    activityExpiresAt: null,
+    lastAssistantFinalAt: selectedCompletedAt,
+    lastTurnEndAt: selectedCompletedAt,
+    lastTurnOutcome: 'completed',
+    updatedAt: selectedCompletedAt
+  });
+  await refresh();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).toBeNull();
+
+  const alphaCompletedAt = nextAt();
+  Object.assign(chats[0]!, {
+    activityExpiresAt: null,
+    lastAssistantFinalAt: alphaCompletedAt,
+    lastTurnEndAt: alphaCompletedAt,
+    lastTurnOutcome: 'completed',
+    updatedAt: alphaCompletedAt
+  });
+  await refresh();
+  expect(row('chat-a').querySelector('.session-status.is-unseen')).not.toBeNull();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).toBeNull();
+});
+
+it('keeps the sidebar working spinner on one continuous phase across activity repaints', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+  try {
+    const chats: SessionSummary[] = [{
+      ...summary([]), id: 'chat-a', title: 'Alpha', conversationId: 'conversation-a', chatIds: ['conversation-a'],
+      updatedAt: 10_000, lastToolCallAt: 10_000, activityExpiresAt: 70_000
+    }];
+    const { w } = await boot([], false, [], [], { sessions: chats });
+    const spinner = () => w.document.querySelector<HTMLElement>('.sess[data-id="chat-a"] .session-status.is-active')!;
+    expect(spinner().style.animationDelay).toBe('-100ms');
+
+    clock.mockReturnValue(10_450);
+    chats[0]!.lastToolCallAt = 10_450;
+    chats[0]!.updatedAt = 10_450;
+    (w.document.getElementById('chatRefresh') as HTMLButtonElement).click();
+    await settle();
+    // The row node was rebuilt, but the spinner resumes the wall-clock phase instead of 0deg.
+    expect(spinner().style.animationDelay).toBe('-550ms');
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+it('keeps unseen completions unread through failed and stale A-to-B-to-A detail loads', async () => {
+  const chats: SessionSummary[] = [
+    { ...summary([]), id: 'chat-a', title: 'Alpha', conversationId: 'conversation-a', chatIds: ['conversation-a'] },
+    { ...summary([]), id: 'chat-b', title: 'Beta', conversationId: 'conversation-b', chatIds: ['conversation-b'] }
+  ];
+  const { w } = await boot([], false, [], [], { sessions: chats });
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`.sess[data-id="${id}"]`)!;
+  let observedAt = Date.now();
+  for (const chat of chats) {
+    const completedAt = ++observedAt;
+    Object.assign(chat, {
+      activeTurnId: null,
+      activityExpiresAt: null,
+      lastAssistantFinalAt: completedAt,
+      lastTurnEndAt: completedAt,
+      lastTurnOutcome: 'completed',
+      updatedAt: completedAt
+    });
+  }
+  (w.document.getElementById('chatRefresh') as HTMLButtonElement).click();
+  await settle();
+  expect(row('chat-a').querySelector('.session-status.is-unseen')).not.toBeNull();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).not.toBeNull();
+
+  type Reply = (value: unknown) => void;
+  const pending: Array<{ id: string; reply: Reply }> = [];
+  const api = (w as any).api;
+  api.getSession = vi.fn((id: string) => new Promise(resolve => pending.push({ id, reply: resolve })));
+  const detail = (sum: SessionSummary) => ({ ok: true, data: { summary: sum, events: [], total: 0, nextFrom: 0 } });
+
+  // A failed current read is not a review receipt.
+  row('chat-b').click();
+  await vi.waitFor(() => expect(pending.map(entry => entry.id)).toEqual(['chat-b']));
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).not.toBeNull();
+  pending[0]!.reply({ ok: false, error: 'B detail unavailable' });
+  await settle();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).not.toBeNull();
+
+  // Returning to A creates a new selection/load generation. Neither the old A response nor
+  // the intervening B response may acknowledge work just because the selected id later matches.
+  row('chat-a').click();
+  await vi.waitFor(() => expect(pending.map(entry => entry.id)).toEqual(['chat-b', 'chat-a']));
+  row('chat-b').click();
+  await vi.waitFor(() => expect(pending.map(entry => entry.id)).toEqual(['chat-b', 'chat-a', 'chat-b']));
+  row('chat-a').click();
+  await vi.waitFor(() => expect(pending.map(entry => entry.id)).toEqual(['chat-b', 'chat-a', 'chat-b', 'chat-a']));
+
+  pending[1]!.reply(detail(chats[0]!));
+  pending[2]!.reply(detail(chats[1]!));
+  await settle();
+  expect(row('chat-a').querySelector('.session-status.is-unseen')).not.toBeNull();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).not.toBeNull();
+
+  pending[3]!.reply(detail(chats[0]!));
+  await settle();
+  expect(row('chat-a').querySelector('.session-status.is-unseen')).toBeNull();
+  expect(row('chat-b').querySelector('.session-status.is-unseen')).not.toBeNull();
+});
+
 it('folds a whole Compact & Resume into one row that says the new chat opened', async () => {
   const { w } = await boot([
     { seq: 1, time: T0, source: 'app', kind: 'session_start', conversationId: 'chat-a', title: 'Loop under test' },
@@ -1639,6 +1806,38 @@ it('keeps Projects and Chats separate while preserving disclosure state through 
   expect(projects.open).toBe(false);
 });
 
+it('reviews only an exact recorded edit without expanding its tool row or querying Git', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const edit = toolCall(2, 'edit-one');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit], true, [], [project]);
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  const reviewCall = vi.fn(() => ok({ callId: edit.call.callId, changeIndex: 0, path: 'src/main.ts', added: 1, removed: 1,
+    baseText: 'before', currentText: 'after' }));
+  app.w.api.getToolEditReview = reviewCall;
+  const row = app.w.document.querySelector<HTMLDetailsElement>('details.tool')!;
+  const review = row.querySelector<HTMLButtonElement>('.tool-open-diff')!;
+  expect(review.getAttribute('aria-label')).toBe('Review this edit');
+  review.click(); await settle();
+  expect(row.open).toBe(false);
+  expect(reviewCall).toHaveBeenCalledWith(expect.any(String), edit.call.callId, 0);
+  expect(app.w.document.querySelector<HTMLElement>('.review-panel .file-changes-view')?.hidden).toBe(false);
+  expect(app.w.document.querySelector('.review-panel .file-preview-meta')?.textContent).toContain('This edit');
+});
+
+it('does not offer a project diff shortcut in an unfiled chat', async () => {
+  const edit = toolCall(2, 'edit-unfiled');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit]);
+  expect(app.w.document.querySelector('.tool-open-diff')).toBeNull();
+});
+
 it('starts in New Chat despite active history and selects only the exact acknowledged send', async () => {
   const app = await boot([], false);
   const { w, live } = app;
@@ -1726,7 +1925,7 @@ it.each([false, true])('dismisses retired delivery errors in selected-chat=%s wi
   const retry = queue.querySelector<HTMLButtonElement>('[aria-label="Retry delivery"]')!;
   expect(retry.classList.contains('delivery-retry')).toBe(true);
   expect(retry.textContent).toBe('');
-  expect(retry.querySelector('use')?.getAttribute('href')).toBe('#i-retry');
+  expect(retry.querySelector('.ico.ph-arrow-clockwise')).not.toBeNull();
   expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).not.toBe('Cancel delivery');
   (queue.querySelector('[title="Dismiss delivery notice"]') as HTMLButtonElement).click();
   await app.append([]);
@@ -1970,6 +2169,43 @@ it('keeps an unfolded tool row as the same open node while the chat keeps append
   expect(group.querySelector('summary')!.title).toContain('4 actions');
 });
 
+it('colors removed lines separately from added lines without changing other tool metrics', async () => {
+  const edit = toolCall(1, 'edit-lines') as Extract<SessionEvent, { kind: 'tool_call' }>;
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', tone: 'good', title: 'Edited 2 files', metric: '+28 −11' };
+  edit.call.changes = [{ path: '/repo/file.ts', added: 28, removed: 11, approximate: false }];
+  const removal = toolCall(2, 'removed-lines') as Extract<SessionEvent, { kind: 'tool_call' }>;
+  removal.call.tool = 'apply_patch';
+  removal.call.summary = { kind: 'delete', tone: 'warn', title: 'Deleted file.ts', metric: '~−7' };
+  removal.call.changes = [{ path: '/repo/removed.ts', added: 0, removed: 7, approximate: true }];
+  const read = toolCall(3, 'read-lines') as Extract<SessionEvent, { kind: 'tool_call' }>;
+  read.call.summary = { kind: 'read', tone: 'neutral', title: 'Read file.ts', metric: '12 lines' };
+
+  const { w } = await boot([edit, removal, read]);
+  const rows = [...w.document.querySelectorAll<HTMLDetailsElement>('details.tool')];
+  expect(rows).toHaveLength(3);
+  expect(rows[0]!.querySelector('summary .metric')?.textContent).toBe('+28 −11');
+  expect(rows[0]!.querySelector('summary .metric-added')?.textContent).toBe('+28');
+  expect(rows[0]!.querySelector('summary .metric-removed')?.textContent).toBe('−11');
+  // The per-call change count beside the title splits the same way.
+  expect(rows[0]!.querySelector('summary .tool-change-count .metric-added')?.textContent).toBe('+28');
+  expect(rows[0]!.querySelector('summary .tool-change-count .metric-removed')?.textContent).toBe('−11');
+  expect(rows[1]!.querySelector('summary .metric')?.textContent).toBe('~−7');
+  expect(rows[1]!.querySelector('summary .metric-removed')?.textContent).toBe('−7');
+  expect(rows[2]!.querySelector('summary .metric')?.textContent).toBe('12 lines');
+  expect(rows[2]!.querySelector('summary .metric-added, summary .metric-removed')).toBeNull();
+
+  rows[0]!.open = true;
+  rows[0]!.dispatchEvent(new w.Event('toggle'));
+  expect(rows[0]!.querySelector('.changes .metric')?.textContent).toBe('+28 −11');
+  expect(rows[0]!.querySelector('.changes .metric-added')?.textContent).toBe('+28');
+  expect(rows[0]!.querySelector('.changes .metric-removed')?.textContent).toBe('−11');
+  rows[1]!.open = true;
+  rows[1]!.dispatchEvent(new w.Event('toggle'));
+  expect(rows[1]!.querySelector('.changes .metric')?.textContent).toBe('+0 −7 (approx.)');
+  expect(rows[1]!.querySelector('.changes .metric-removed')?.textContent).toBe('−7');
+});
+
 it('keeps mixed tool and agent activity in one latest-action disclosure between authored messages', async () => {
   const { w, append } = await boot([
     { seq: 1, time: T0, source: 'extension', kind: 'progress', message: text('Checking the implementation') },
@@ -1980,7 +2216,7 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   const timeline = w.document.getElementById('timeline')!;
   const group = timeline.querySelector<HTMLDetailsElement>('.tool-group')!;
   expect(group.open).toBe(false);
-  expect(group.querySelector('.activity-title')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-title')!.textContent).toBe('Checking the implementation');
   expect(group.querySelector('.agent-communication summary')!.textContent).toContain('Message from worker-2');
   expect(group.querySelector('.agent-avatar')).not.toBeNull();
   expect(group.querySelectorAll('.ev')).toHaveLength(3);
@@ -1990,6 +2226,43 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   ]);
   expect(timeline.querySelectorAll('.tool-group')).toHaveLength(2);
   expect(timeline.children[0]!.className).toContain('ev-progress');
+});
+
+it('folds five consecutive status polls while retaining each exact tool row', async () => {
+  const status = (seq: number): SessionEvent => {
+    const event = toolCall(seq, `status-${seq}`) as Extract<SessionEvent, { kind: 'tool_call' }>;
+    return { ...event, call: { ...event.call, tool: 'agents', summary: { kind: 'agent', tone: 'neutral', title: 'Checked agent status' } } };
+  };
+  const { w, append } = await boot([status(1), status(2), status(3), status(4)]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.querySelector('.routine-activity')).toBeNull();
+  await append([status(5)]);
+  const fold = timeline.querySelector<HTMLDetailsElement>('.routine-activity')!;
+  expect(fold.querySelector('.routine-count')!.textContent).toBe('×5');
+  expect(fold.querySelectorAll('.ev-tool_call')).toHaveLength(5);
+  fold.open = true;
+  fold.dispatchEvent(new w.Event('toggle'));
+  await append([status(6)]);
+  expect(timeline.querySelector('.routine-activity')).toBe(fold);
+  expect(fold.open).toBe(true);
+  expect(fold.querySelectorAll('.ev-tool_call')).toHaveLength(6);
+  expect(fold.querySelector('.routine-count')!.textContent).toBe('×6');
+  const failed = status(7) as Extract<SessionEvent, { kind: 'tool_call' }>;
+  await append([{ ...failed, call: { ...failed.call, outcome: 'tool_rejected', summary: { ...failed.call.summary, tone: 'bad' } } }]);
+  expect(fold.querySelectorAll('.ev-tool_call')).toHaveLength(6);
+  expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(7);
+});
+
+it('keeps an artifact action as the activity title rather than its tool tag', async () => {
+  const shell = toolCall(3, 'shell') as Extract<SessionEvent, { kind: 'tool_call' }>;
+  const { w } = await boot([toolCall(2, 'read'), { ...shell, call: {
+    ...shell.call, tool: 'exec_command', summary: { kind: 'run', tone: 'good', title: 'Ran build checks' },
+    changes: [{ path: 'src/app.ts', added: 2, removed: 1, approximate: true }]
+  } }]);
+  const group = w.document.querySelector('.tool-group')!;
+  expect(group.querySelector('.activity-title')!.textContent).toBe('Ran build checks');
+  expect(group.querySelector('.tool-tag')!.textContent).toBe('shell');
+  expect(group.querySelector('.tool-change-count')!.textContent).toContain('approx.');
 });
 
 it('controls the selected session without submitting another user message', async () => {
@@ -2105,6 +2378,46 @@ it('shows elapsed work for the exact recorded turn without exposing lifecycle ro
   expect(w.document.getElementById('chatState')!.textContent).toBe('Worked for 1m 5s');
 });
 
+
+/**
+ * A chat whose page stopped reporting turns still says it is working.
+ *
+ * Every branch of this caption needs a turn to describe, and a page that stopped reporting
+ * supplies none — so the line either fell silent or went on describing the previous turn as
+ * finished while the chat kept working. Measured on 2026-09-25: a conversation resumed after an
+ * automatic compaction made 650 exactly attributed tool calls over two and a half hours with no
+ * turn reported by its page, and the app said nothing about any of it. The person then sits in
+ * front of a chat that looks idle and waits for work that is already happening.
+ *
+ * The recorded tool clock is what the page is not: `lastToolCallAt` comes from calls the
+ * request-id join has already tied to this exact conversation.
+ */
+it('says a chat is working when its page reports no turn but its tools keep arriving', async () => {
+  const ended: SessionEvent[] = [
+    { seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'page-turn' },
+    { seq: 2, time: T0 + 5_000, source: 'extension', kind: 'turn_end', turnId: 'page-turn', outcome: 'completed' }
+  ];
+  const row = { ...summary(ended), lastToolCallAt: null as number | null };
+  const { w, append } = await boot(ended, true, [], [], { sessions: [row] });
+  // No turn from the page's side, which is the whole subject.
+  (w as any).api.getSessionControls = (id: string) => Promise.resolve({ ok: true,
+    data: { sessionId: id, automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null } });
+  const note = w.document.getElementById('chatState')!;
+
+  // The turn the page did report is over, and nothing has happened since.
+  await append([]);
+  expect(note.textContent).toBe('Worked for 5s');
+
+  row.lastToolCallAt = Date.now() - 20_000;
+  await append([]);
+  expect(note.textContent, 'a blind chat still claimed to be finished').toBe('Working…');
+  expect(note.classList.contains('is-working')).toBe(true);
+
+  // Old enough to be the record of a chat that has since stopped: the caption lets go again.
+  row.lastToolCallAt = Date.now() - 10 * 60_000;
+  await append([]);
+  expect(note.textContent).toBe('Worked for 5s');
+});
 
 it('stops directly from the empty composer without a second Stop menu action', async () => {
   const { w } = await boot([]);
@@ -2832,6 +3145,25 @@ it('shows Loop settling, its real waiting deadline, and generated text in the sa
   controls.automation = 'off'; await append([]);
   expect(row.hidden).toBe(true);
   expect(row.textContent).toBe('');
+});
+
+it('names the wait for this chat’s own sub-agents without inventing a countdown', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  // The wait ends when the last worker stops, which is not a time this page can predict, so
+  // the row says what it is waiting for and shows no timer at all.
+  const controls = { automation: 'loop', objective: 'Continue the task', blocked: '', job: null,
+    goalWait: { reason: 'workers' }, goalDraft: null as unknown };
+  api.getSessionControls = async () => ({ ok: true, data: controls });
+  await append([]);
+  const row = w.document.getElementById('goalLifecycle')!;
+  expect(row.hidden).toBe(false);
+  expect(row.textContent).toContain('Loop · Waiting for this chat’s sub-agents');
+  expect(row.querySelector('[role="timer"]')).toBeNull();
+  expect(row.getAttribute('aria-busy')).toBe('true');
+  api.getSessionControls = async () => ({ ok: true, data: { ...controls, goalWait: null } });
+  await append([]);
+  expect(row.hidden).toBe(true);
 });
 
 it('follows the accepted New Chat receipt while preserving a typed follow-up', async () => {
@@ -3595,4 +3927,36 @@ it('keeps a cancelled automatic draft at its creation time as later messages arr
   await app.append([]);
   expect(timeline.textContent).not.toContain('Unused automatic instruction');
   expect(live.sent).toHaveLength(0);
+});
+
+it('keeps the latest recovery verdict in view until the chat works again', async () => {
+  // 2026-09-26: a stopped prime was explained only by timeline notes that scrolled away.
+  const verdict = 'Could not restart this chat automatically: the browser chat was closed. Send a message here to continue it.';
+  const app = await boot([
+    { seq: 1, time: T0 + 1000, source: 'extension', kind: 'turn_start', turnId: 'stalled' },
+    { seq: 2, time: T0 + 2000, source: 'extension', kind: 'turn_end', turnId: 'stalled', outcome: 'stalled' },
+    { seq: 3, time: T0 + 3000, source: 'app', kind: 'note', message: text(verdict) }
+  ] as SessionEvent[]);
+  const host = app.w.document.getElementById('recoveryStatus')!;
+  expect(host.hidden).toBe(false);
+  expect(host.textContent).toContain('Could not restart this chat automatically');
+  await app.append([{ seq: 4, time: T0 + 4000, source: 'extension', kind: 'turn_start', turnId: 'resumed' } as SessionEvent]);
+  expect(host.hidden).toBe(true);
+});
+
+it('does not show a handoff note as a recovery verdict', async () => {
+  const app = await boot([{ seq: 1, time: T0 + 1000, source: 'app', kind: 'note', continuation: TOKEN, message: text('Compact & Resume abandoned') }] as SessionEvent[]);
+  expect(app.w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
+});
+
+const PLAYFUL_WORDS = /^(Pumping tokens|Juicing context|Bulking output|Repping prompts|Spotting agents|Loading creatine|Chasing gains|Flexing neurons|TRT mode|Testosterone boost|Tren thoughts|Deca stack|Anavar cutting|Dianabol bulking|Winstrol drying|Primobolan polishing|Pissing OpenAI off a little more|Clauding deez nuts|Warming up the GPUs|Deadlifting the context window|Carb-loading tokens|Doing reps on the repo|Hitting a new PR|Skipping leg day|Pre-workout kicking in|Protein-shaking the stack trace|Benching the build|Spotting the next token|Stretching the attention span|Counting macros|Pumping iron and ideas|Cutting the fluff|Going beast mode|One more set|Oiling up the prompt|Flexing for the mirror|Grinding through the backlog|Chugging creatine|No pain, no merge) for /;
+
+it('keeps the plain Working label unless playful status words are turned on', async () => {
+  const { w } = await boot([{ seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'held-turn' }]);
+  expect(w.document.getElementById('chatState')!.textContent).toMatch(/^Working for /);
+});
+
+it('uses a playful work word when it is turned on in Settings', async () => {
+  const { w } = await boot([{ seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'held-turn' }], true, [], [], { playfulStatus: true });
+  expect(w.document.getElementById('chatState')!.textContent).toMatch(PLAYFUL_WORDS);
 });

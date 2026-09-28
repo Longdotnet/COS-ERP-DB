@@ -13,6 +13,7 @@ import {
   previewProjectFile,
   projectFileTarget,
   renameProjectEntry,
+  revalidateProjectFileTarget,
   saveProjectTextFile
 } from '../src/main/project-files.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
@@ -36,6 +37,19 @@ afterEach(async () => {
   vi.restoreAllMocks();
   resetDurableForTests();
   await fs.rm(directory, { recursive: true, force: true });
+});
+
+it('hides repository internals and Finder metadata but keeps ordinary dotfiles', async () => {
+  const projectPath = path.join(approved, 'project');
+  await fs.mkdir(path.join(projectPath, '.git'), { recursive: true });
+  await fs.writeFile(path.join(projectPath, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  await fs.writeFile(path.join(projectPath, '.DS_Store'), 'x');
+  await fs.writeFile(path.join(projectPath, '.gitignore'), 'dist\n');
+  const project = await addProject(projectPath);
+  const names = (await listProjectDirectory(project.id)).entries.map(entry => entry.name);
+  expect(names).toContain('.gitignore');
+  expect(names).not.toContain('.git');
+  expect(names).not.toContain('.DS_Store');
 });
 
 it('lists exactly one project level at a time and previews bounded text', async () => {
@@ -220,6 +234,44 @@ it('rejects traversal and links that leave the LocalProject even when the target
   expect(root.entries.find(entry => entry.name === 'linked-sibling')?.kind).toBe('other');
   await expect(listProjectDirectory(project.id, 'linked-sibling')).rejects.toThrow(/symbolic links|junctions/);
   await expect(projectFileTarget(project.id, 'linked-sibling/secret.txt')).rejects.toThrow(/symbolic links|junctions/);
+});
+
+it('revalidates a create parent when it is replaced by a junction after target resolution', async () => {
+  const projectPath = path.join(approved, 'project');
+  const siblingPath = path.join(approved, 'sibling');
+  const notes = path.join(projectPath, 'notes');
+  const parked = path.join(projectPath, 'notes-original');
+  const target = path.join(notes, 'race.txt');
+  await fs.mkdir(notes);
+  const project = await addProject(projectPath);
+  const lstat = fs.lstat.bind(fs);
+  let targetChecks = 0;
+  vi.spyOn(fs, 'lstat').mockImplementation((async (file: any, options?: any) => {
+    if (String(file) === target && ++targetChecks === 2) {
+      await fs.rename(notes, parked);
+      await fs.symlink(siblingPath, notes, process.platform === 'win32' ? 'junction' : 'dir');
+      throw Object.assign(new Error('Target is still missing'), { code: 'ENOENT' });
+    }
+    return lstat(file, options);
+  }) as typeof fs.lstat);
+
+  await expect(createProjectEntry(project.id, 'notes', 'race.txt', 'file')).rejects.toThrow(/symbolic links|junctions|changed location/);
+  expect(await fs.readdir(siblingPath)).not.toContain('race.txt');
+});
+
+it('rejects a previously resolved mutation target after its parent becomes a junction', async () => {
+  const projectPath = path.join(approved, 'project');
+  const siblingPath = path.join(approved, 'sibling');
+  const notes = path.join(projectPath, 'notes');
+  const parked = path.join(projectPath, 'notes-original');
+  await fs.mkdir(notes);
+  await fs.writeFile(path.join(notes, 'trash-me.txt'), 'safe');
+  const project = await addProject(projectPath);
+  const target = await projectFileTarget(project.id, 'notes/trash-me.txt', { allowRoot: false });
+  await fs.rename(notes, parked);
+  await fs.symlink(siblingPath, notes, process.platform === 'win32' ? 'junction' : 'dir');
+
+  await expect(revalidateProjectFileTarget(target)).rejects.toThrow(/symbolic links|junctions|changed location/);
 });
 
 it('keeps the original bytes when the final replacement cannot be renamed', async () => {

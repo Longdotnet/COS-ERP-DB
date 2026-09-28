@@ -1,4 +1,7 @@
-vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({ update: vi.fn() }) }));
+vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({
+  update: vi.fn(), show: vi.fn(), hide: vi.fn(), newTab: vi.fn(() => null),
+  tabs: vi.fn(() => []), selectTab: vi.fn(), closeTab: vi.fn()
+}) }));
 // Native animation/media APIs are covered by pet DOM and real Electron tests.
 vi.mock('../src/renderer/pet.js', () => ({ initPet: () => () => {} }));
 import { promises as fs } from 'node:fs';
@@ -6,6 +9,7 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_MODEL, DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
+import { DEFAULT_HANDOFF_PROMPT } from '../src/shared/handoff.js';
 import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../src/shared/browser-control.js';
 
 let dom: JSDOM | null = null;
@@ -43,10 +47,11 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
       create: false, edit: false, move: false, deleteFile: false, command: false,
       screen: false, control: false, clipboardRead: false, clipboardWrite: false
     },
+    commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
     tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' },
     sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
-    compaction: { auto: true, autoTokens: 300000 },
+    compaction: { auto: true, autoTokens: 300000, handoffPrompt: DEFAULT_HANDOFF_PROMPT },
     multiAgent: { enabled: false, maxWorkers: 2, allowUnattributedCalls: false, recoverAgentTabs: true },
     goal: {
       enabled: false,
@@ -199,10 +204,11 @@ it('serializes settings intent so rapid toggles and later UI changes cannot undo
       create: true, edit: true, move: true, deleteFile: true, command: true,
       screen: true, control: true, clipboardRead: true, clipboardWrite: true
     },
+    commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
     tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' as 'light' | 'dark' },
     sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
-    compaction: { auto: true, autoTokens: 300000 },
+    compaction: { auto: true, autoTokens: 300000, handoffPrompt: DEFAULT_HANDOFF_PROMPT },
     multiAgent: { enabled: false, maxWorkers: 2, allowUnattributedCalls: false, recoverAgentTabs: true },
     goal: {
       enabled: false,
@@ -268,12 +274,15 @@ it('serializes settings intent so rapid toggles and later UI changes cannot undo
   pending.shift()!({ ok: true, data: current });
   await vi.waitFor(() => expect(calls).toHaveLength(2));
   expect(calls[1].readOnly).toBe(false);
+  // The toggle tells assistive technology which state is saved, not just its colour.
+  expect(w.document.getElementById('readOnlyBtn')?.getAttribute('aria-pressed')).toBe('true');
   expect(calls[1].ui.autoConnect).toBe(false);
 
   current = appState({ ...baseConfig, readOnly: false });
   pending.shift()!({ ok: true, data: current });
   await vi.waitFor(() => expect(calls).toHaveLength(3));
   expect(calls[2].readOnly).toBe(false);
+  expect(w.document.getElementById('readOnlyBtn')?.getAttribute('aria-pressed')).toBe('false');
   expect(calls[2].ui.autoConnect).toBe(true);
 
   current = appState({ ...baseConfig, readOnly: false, ui: { ...baseConfig.ui, autoConnect: true } });
@@ -349,10 +358,11 @@ async function mountChat(
       create: true, edit: true, move: true, deleteFile: true, command: true,
       screen: true, control: true, clipboardRead: true, clipboardWrite: true
     },
+    commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
     tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' as const },
     sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
-    compaction: { auto: true, autoTokens: 300000 },
+    compaction: { auto: true, autoTokens: 300000, handoffPrompt: DEFAULT_HANDOFF_PROMPT },
     multiAgent: { enabled: false, maxWorkers: 2, allowUnattributedCalls: false, recoverAgentTabs: true },
     goal: {
       enabled: false,
@@ -508,6 +518,54 @@ it('keeps project keyboard focus across activity repaint without taking composer
   expect(listSessions).toHaveBeenCalledTimes(reads + 1);
 });
 
+// Adapted from @Haz4rdovisk's #345: typed Setup values used to reach the app only on blur, so a
+// Connect click right after typing did nothing.
+it.each(['wizConnect', 'connectionPopoverToggle'])(
+  'persists valid Setup drafts before %s starts the tunnel',
+  async (buttonId) => {
+    let live: any;
+    const order: string[] = [];
+    const connect = vi.fn(() => {
+      order.push('connect');
+      expect(live.config.tunnel.tunnelId).toBe(`tunnel_${'b'.repeat(32)}`);
+      expect(live.hasApiKey).toBe(true);
+      live.status.state = 'connected';
+      return Promise.resolve({ ok: true as const, data: structuredClone(live) });
+    });
+    const mounted = await mountChat({}, [], {
+      saveSettings: (patch: any) => {
+        order.push('settings');
+        live.config = { ...live.config, ...structuredClone(patch) };
+        return Promise.resolve({ ok: true as const, data: structuredClone(live) });
+      },
+      setApiKey: () => {
+        order.push('key');
+        live.hasApiKey = true;
+        return Promise.resolve({ ok: true as const, data: structuredClone(live) });
+      },
+      connect
+    });
+    live = mounted.state;
+    live.config.tunnel.tunnelId = '';
+    live.hasApiKey = false;
+    mounted.push(structuredClone(live));
+
+    const doc = mounted.window.document;
+    const tunnel = doc.getElementById('tunnelId') as HTMLInputElement;
+    const key = doc.getElementById('apiKey') as HTMLInputElement;
+    expect((doc.getElementById('wizConnect') as HTMLButtonElement).disabled).toBe(true);
+    tunnel.value = `tunnel_${'b'.repeat(32)}`;
+    tunnel.dispatchEvent(new mounted.window.Event('input'));
+    key.value = 'sk-valid-setup-draft';
+    key.dispatchEvent(new mounted.window.Event('input'));
+
+    expect((doc.getElementById(buttonId) as HTMLButtonElement).disabled).toBe(false);
+    (doc.getElementById(buttonId) as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+    expect(order).toEqual(['settings', 'key', 'connect']);
+  }
+);
+
 it('keeps global connection controls in a compact sidebar popover', async () => {
   const mounted = await mountChat({ hasApiKey: true });
   const doc = mounted.window.document;
@@ -622,6 +680,14 @@ it('renders companion diagnostics in the native Advanced connection drawer', asy
   expect(doc.getElementById('connectionPipelineOwner')!.classList.contains('is-done')).toBe(true);
   expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('companion browser');
   expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('fiber v13 · run run-live');
+  const trace = doc.querySelector<HTMLElement>('.connection-pipeline-call')!;
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('tr');
+  expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('yardımcı tarayıcı');
+  expect(trace.title).toContain('doğrulandı');
+  setLanguage('fr');
+  expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('navigateur compagnon');
+  expect(trace.title).toContain('confirmé');
 });
 
 it('uses Internal Chromium as the host source when the optional #237 API is present', async () => {
@@ -823,6 +889,51 @@ it('saves the ChatGPT browser choice from its settings control and restores it o
   expect(browser.value).toBe('edge');
   mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, chatBrowser: 'chrome' } } });
   expect(browser.value).toBe('chrome');
+});
+
+it('loads, explains and saves both command policy modes without losing rules', async () => {
+  const mounted = await mountChat();
+  const w = mounted.window;
+  const rules = w.document.getElementById('commandAllowlistRules') as HTMLTextAreaElement;
+  const enabled = w.document.getElementById('commandAllowlistEnabled') as HTMLInputElement;
+  const allow = w.document.getElementById('commandPolicyAllow') as HTMLButtonElement;
+  const deny = w.document.getElementById('commandPolicyDeny') as HTMLButtonElement;
+  const description = w.document.getElementById('commandPolicyDescription')!;
+  const label = w.document.getElementById('commandPolicyRulesLabel')!;
+  const error = w.document.getElementById('commandAllowlistError')!;
+
+  mounted.state.config.commandAllowlist = { enabled: false, mode: 'deny', rules: ['dotnet *'] };
+  mounted.push(structuredClone(mounted.state));
+  expect(deny.getAttribute('aria-checked')).toBe('true');
+  expect(rules.value).toBe('dotnet *');
+  expect(description.textContent).toContain('may not start');
+  expect(label.textContent).toContain('Blocked commands');
+
+  rules.value = 'git status; whoami';
+  rules.dispatchEvent(new w.Event('input', { bubbles: true }));
+  rules.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(error.hidden).toBe(false);
+  expect(error.textContent).toContain('Line 1');
+  expect(mounted.calls).toHaveLength(0);
+
+  rules.value = 'git status\ngit diff *';
+  rules.dispatchEvent(new w.Event('input', { bubbles: true }));
+  allow.click();
+  await vi.waitFor(() => expect(mounted.calls).toHaveLength(1));
+  expect(mounted.calls[0].commandAllowlist).toEqual({ enabled: false, mode: 'allow', rules: ['git status', 'git diff *'] });
+  expect(description.textContent).toContain('Only commands matching');
+  expect(label.textContent).toContain('Allowed commands');
+
+  deny.click();
+  await vi.waitFor(() => expect(mounted.calls).toHaveLength(2));
+  expect(mounted.calls[1].commandAllowlist).toEqual({ enabled: false, mode: 'deny', rules: ['git status', 'git diff *'] });
+  expect(rules.value).toBe('git status\ngit diff *');
+  enabled.checked = true;
+  enabled.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls).toHaveLength(3));
+  expect(mounted.calls[2].commandAllowlist).toEqual({ enabled: true, mode: 'deny', rules: ['git status', 'git diff *'] });
+  expect(error.hidden).toBe(true);
 });
 
 it('shows the current host Desktop tools without rebuilding permission controls on state pushes', async () => {
@@ -1408,6 +1519,31 @@ it('opens, saves and restores the editable goal prompt', async () => {
   await settle();
   expect(prompt.value).toBe(DEFAULT_GOAL_SYSTEM_PROMPT);
   expect(mounted.calls.at(-1)?.goal.prompt).toBe(DEFAULT_GOAL_SYSTEM_PROMPT);
+});
+
+it('opens, saves and restores the editable handoff prompt', async () => {
+  const mounted = await mountChat({ hasGoalKey: true });
+  const doc = mounted.window.document;
+  const panel = doc.getElementById('handoffPromptPanel')!;
+  const edit = doc.getElementById('handoffPromptEdit') as HTMLButtonElement;
+  const prompt = doc.getElementById('handoffPrompt') as HTMLTextAreaElement;
+
+  expect(panel.hidden).toBe(true);
+  edit.click();
+  expect(panel.hidden).toBe(false);
+  expect(prompt.value).toBe(DEFAULT_HANDOFF_PROMPT);
+
+  prompt.value = 'Keep only continuation-critical state and the exact next action.';
+  prompt.dispatchEvent(new mounted.window.Event('change'));
+  await settle();
+  await settle();
+  expect(mounted.calls.at(-1)?.compaction.handoffPrompt).toBe(prompt.value);
+
+  (doc.getElementById('handoffPromptReset') as HTMLButtonElement).click();
+  await settle();
+  await settle();
+  expect(prompt.value).toBe(DEFAULT_HANDOFF_PROMPT);
+  expect(mounted.calls.at(-1)?.compaction.handoffPrompt).toBe(DEFAULT_HANDOFF_PROMPT);
 });
 
 /**

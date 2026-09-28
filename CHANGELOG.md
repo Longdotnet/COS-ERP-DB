@@ -11,22 +11,130 @@ the app refuses the extension and asks you to reload the matching copy.
 
 ## Unreleased
 
-- Keep fresh background workers rendering while their editor hydrates, including pending initial navigation and exact document retirement.
-- Read live alternate-shell request metadata and public activity before history hydration; place recorded tools beside native prose without a reload.
-- Restore versioned response observers without duplicate active readers and recognize complete identity in native resume streams.
-- Capture completed alternate-shell handoff briefs using their exact native final-message identity; retain cancellation and conversation guards.
-- Keep background chat preparation rendering through its owned same-document navigation, without changing the selected browser tab.
-- Add Japanese interface translations and compact, keyboard-accessible language flags in Setup.
-- Resume new project chats and worker startup when the alternate shell's account picker finishes loading after its first inspection.
-- Capture early request identity from complete v1 stream messages with omitted format headers, preserving exact conversation ownership for worker status and messages.
-- Preserve prepared text, follow-up sends and worker bootstraps in the alternate ChatGPT Markdown editor; hide verified setup frames in its user bubbles.
-- Read exact selected-message request metadata and connector recipient names in the alternate shell, and prevent an older unfinished exchange from keeping its composer busy.
-- Preserve current activity and recovery deadlines when reload republishes an older final answer.
-- Bind a pending new chat to its project before route binding releases its queued observations.
-- Recover the exact missing tab when a sleeping worker is woken, and stop old prime history from blocking current chat recovery.
-- Restart the page-helper warning grace after a long reporting gap or a backward clock adjustment.
-- Record bounded, accurate Compact & Resume marker outcomes without repeating the same notice on every reload.
-- Give observation-journal deliveries and split retries a 60-second durable-write allowance while preserving unacknowledged observations after timeout.
+Draft for 2.1.17 — Workspace and self-updating extension. The release sets the version heading.
+
+A feature update. The app gets a workspace next to your chat, pets on your desktop, and an extension that keeps itself up to date. CoS now speaks German and Brazilian Portuguese.
+
+### New
+
+- **Workspace panels.** Open Files, Terminal, Agents and Review beside your chat, and a Terminal panel along the bottom. Shortcuts: Ctrl+Shift+1–4 for the side panel and Ctrl+` for the bottom Terminal.
+- **Review changes.** See what changed in your project's Git repository, or exactly what one of ChatGPT's edits changed, without leaving the app. You can also compare two branches. Review only reads; it never changes your repository.
+- **The extension updates itself.** After an app update, the extension reloads on its own as soon as no chat is busy. No more trips to `chrome://extensions`.
+- **Download updates in one click.** When a new version is out, the update notice links straight to the right download for your Mac or Linux system.
+- **Desktop pets.** A new Pets page in the sidebar. Turn on Tur Tur Sahur, Hammy the hamster or Capy the capybara, or import your own pet, and it lives on your desktop, reacting to the work CoS is doing. View → Desktop Pets shows or hides them. Pets are off unless you turn one on. If you had the old pet in the message box showing, it moves to your desktop.
+- **A Skills library.** A new Skills page lists your skills. Import a folder, a single SKILL.md or a public skill straight from a GitHub link. Linked skills show when their GitHub source has an update, and installing it is your choice.
+- **18 ready-made skills.** The Skills page recommends skills you can install with one click: code review, systematic debugging, security review, clear writing, data analysis, research with sources, translation, project planning and more. Once installed they are yours to edit or remove.
+- **Optional playful status words.** Turn on Playful status words in the Advanced settings and a busy chat shows rotating gym jokes like "Skipping leg day" instead of "Working". Off by default.
+- **German and Brazilian Portuguese.** Pick them in Appearance → Language.
+- **The extension is translated** into German, Spanish, French, Japanese, Turkish and Chinese, following your browser's language.
+
+### Fixed
+
+- **Usage counts the messages you type in ChatGPT.** Before, only messages sent from the CoS message box were counted, so the weekly numbers stayed near zero.
+- **Goal and Loop no longer leave helper tabs behind.** The temporary chats they use to decide the next step now close when they are done, and they no longer show up in your chat list.
+- **ChatGPT's text blocks show properly.** Rewrites and drafts that ChatGPT puts in a text block appear as a titled block instead of raw `:::writing` code.
+- **Project chats get their real title** instead of "ChatGPT - <project name>".
+- **Pets respond reliably again** after you hide and show them, and they no longer reread your pet library while the mouse moves.
+- **Web Fetch and other Python plugins install without extra setup.** If the `uv` tool they need is missing, CoS downloads a verified copy for itself instead of failing with "runtime uv is unavailable".
+- **Goal and Loop work again when your saved model is gone.** The step that decides what comes next failed when ChatGPT no longer offered the model saved in Settings; it now uses one that is available.
+- **Setup matches ChatGPT's new settings.** ChatGPT no longer has a Developer mode switch; you now create the app from Plugins → Add → Create MCP App. The setup steps and the connection check say so.
+- **Attachments work again with ChatGPT's new message box.** Images and files the app sends to ChatGPT were not attached after ChatGPT's latest change.
+- **Image-only answers finish properly.** When ChatGPT answers with just a generated image, the chat no longer looks busy afterwards.
+- **Workers start even if your saved default model is gone.** If ChatGPT no longer offers the model or thinking level saved in Settings, workers now use one that is available instead of failing.
+- **Worker reports are no longer claimed as delivered too early.** The main chat is told to collect reports it hasn't received yet before it wraps up.
+- **CoS remembers which tabs it closed itself,** even after a browser restart, so a tab you close is never mixed up with one CoS tidied away.
+- **Setup keeps what you typed.** API keys and settings entered during setup are saved when you press Connect.
+- **Messages that were never confirmed are cleared after six hours** instead of lingering in the background.
+- **Desktop control on macOS is more careful.** A click is refused if another window covers that spot, and windows on other Spaces are found more reliably.
+
+### Improved
+
+- **New icons throughout the app,** drawn from one consistent icon set.
+- **Faster start with a long chat history.** CoS no longer rereads every recorded chat when it starts.
+- **Your connection key stays private.** The Workspace health card no longer shows the local server's secret key, so screenshots of it are safe to share.
+- **Long folder paths fit.** Settings no longer scroll sideways when a shared folder has a long path.
+- **Greyed-out panels explain themselves:** Files and Review need a project, Sub-agents an open chat.
+- **The Files panel hides `.git` and `.DS_Store`,** like other editors.
+- **Pets and Skills are fully translated,** and the context counter next to the message box reads well in every language.
+- **A redesigned Usage tab.** Clear cards, a calendar of your activity with day and month labels, a cost chart with dates, and a simple menu to choose which weekday your week starts on.
+- **One tidy title bar on macOS.** The window buttons, the sidebar button and the View menu now share one row instead of two.
+- **Skill cards show their full description.**
+- **A friendlier setup.** Numbered steps and a progress bar show how far along you are.
+- **Languages are sorted sensibly.** Appearance → Language and Setup list each language by its own name in alphabetical order, followed by Japanese and Chinese.
+- **Slim scrollbars** are always visible, so long lists and chats show where you are.
+- **Polished activity timeline, worker panel and model menus.**
+- **The sidebar and side panels slide smoothly** when you open or close them, and the message box grows and shrinks smoothly as you type.
+- **Removed lines show in red** next to edited files; only added lines are green.
+- **Up-to-date cost estimates in Usage.** Prices were rechecked, GPT-6 Sol and GPT-6 Luna were added, and GPT-5.5 chats now get a price instead of "unpriced".
+- **Setup explains that renaming the ChatGPT app breaks tool tracking,** so keep the name CoS suggests.
+
+**After updating:** reload the Chat On Steroids extension in `chrome://extensions` one last time, then refresh your open ChatGPT tabs. From this version on, the extension updates itself.
+
+## [2.1.16] — Fewer stuck chats
+
+A reliability update on top of 2.1.15. It keeps up with ChatGPT's latest changes, and chats get stuck less often. When they do, they recover on their own.
+
+### Fixed
+
+- **Works with ChatGPT's newest conversation view.** Some accounts got yet another new layout this week, and CoS stopped seeing their chats. They are recorded again.
+- **Goal works again with the new Temporary Chat design.** CoS recognizes ChatGPT's updated temporary-chat button and dialog, which Goal uses to decide the next step.
+- **New chats and workers start reliably** even when ChatGPT swaps out the text box while the model is being selected.
+- **Workers get their tools even sooner**, right after their first message is sent.
+- **Chats stay linked after restarting the app.** Tool calls no longer lose track of which chat they belong to.
+- **Messages no longer get stuck in the queue forever.** If ChatGPT never confirms that a message arrived, CoS stops waiting after 15 minutes and lets your next message through. It never sends the same message twice.
+- **Automatic continue works right after a page reload.**
+- **Workers near their context limit are no longer given up too early.**
+- **Compact & Resume works for large Project chats**, which now get enough time to load.
+- **Compact & Resume is more robust.** A handoff that can never be sent gives up after a few attempts instead of reloading the page forever.
+- **Automatic plugin refresh works on ChatGPT's new plugin settings page.** With **Settings → Browser & history → Automatic plugin refresh** turned on, CoS keeps ChatGPT's list of CoS tools up to date again. Before, ChatGPT could keep an old list after an update, and tool calls went missing. It now also works for CoS apps whose tool list in ChatGPT was already out of date.
+- **Goal and Loop settings are saved reliably**, even when you change them while a chat is being compacted and resumed.
+- **The extension keeps working after an update in sandboxed Chrome** (for example Chromium from Snap on Linux).
+
+### New
+
+- **"New response" marker** in the sidebar for chats that finished while you were elsewhere.
+- **Edit the Compact & Resume instructions** in Settings. The default stays exactly as before.
+- **Command allowlist or denylist (optional):** decide which programs Core may start. Off by default.
+- **Wait for sub-agents (optional):** Goal and Loop can wait until a chat's own workers are done. Off by default.
+- **"Use ChatGPT's current model":** if CoS can't read ChatGPT's model list, you can still send with whatever model ChatGPT has selected.
+
+### Improved
+
+- **Fewer "refresh your connectors" reminders.** You're only asked when the tools actually changed, not after every update.
+- **Adding many attachments at once uses much less memory.**
+- **Safer file operations in project folders.**
+- **The app is now available in Portuguese (Portugal).** Pick it in Appearance → Language.
+- **Keyboard navigation in the chat list:** focus a chat and press Enter or Space to open it.
+- **Answers with many sources display faster.**
+- More of the app is translated into Spanish, French, Japanese, Turkish and Chinese.
+
+**After updating:** reload the Chat On Steroids extension in `chrome://extensions`, then refresh your open ChatGPT tabs.
+
+## [2.1.15] — New ChatGPT layout
+
+ChatGPT rolled out a new layout, and it broke parts of Chat On Steroids. This release makes everything work with it again.
+
+### Fixed
+
+- **Starting a new chat works again.** CoS used to open a ChatGPT tab and then never send your message. The first message of a chat started from the app is now sent and confirmed properly.
+- **Your chats are recorded again.** Messages, answers and tool calls show up in the app as they should, including for chats you start directly on chatgpt.com.
+- **Goal and Loop continue automatically again.** CoS reliably notices when ChatGPT has finished an answer, so the next step starts on its own.
+- **Model and reasoning selection works with the new picker.** "Extra High" and "Pro" are read correctly, and a reasoning level your account no longer offers falls back to the closest one instead of failing.
+- **Fewer dead chats.** Errors like "A network error occurred" and "Resume stream unavailable" are recovered automatically, and a chat that shows "could not be loaded" is retried for you.
+- **Workers get their tools right away**, instead of only after their first answer.
+- **Chats that stop now say why**, instead of going quiet.
+- **Fewer lost sessions** when a session file is briefly locked (common on Windows).
+
+### New
+
+- **Sign in with OAuth** when you add your own remote MCP server.
+- **A warning when two connectors share one Secure Tunnel ID.** That setup makes every other tool call fail, and it was hard to spot.
+
+### Updated
+
+- OpenAI's tunnel client is updated to the current version (v0.0.15).
+
+**After updating:** reload the Chat On Steroids extension in `chrome://extensions`, then refresh your open ChatGPT tabs.
 
 ## [2.1.14] — Death to Anthropic and OpenAI. Join the resistance @dummerspast39 x
 

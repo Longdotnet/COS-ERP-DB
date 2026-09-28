@@ -10,7 +10,10 @@ import type { UsageOverview } from '../shared/usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
-import type { SkillSummary, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
+import type { ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot } from '../shared/project-git.js';
+import type { PetLibraryState, PetOverlayControlState, PetRuntimeAsset } from '../shared/pets.js';
+import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
+import type { ToolEditReview } from '../shared/session.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
 import { createDatabaseApi } from './database-api.js';
 /**
@@ -43,6 +46,7 @@ const call = <T>(channel: string, payload?: unknown): Promise<Reply<T>> =>
 export interface SettingsPatch {
   capabilities: Capabilities;
   readOnly: boolean;
+  commandAllowlist: Config['commandAllowlist'];
   tunnel: Config['tunnel'];
   ui: Config['ui'];
   sessions: Config['sessions'];
@@ -85,7 +89,7 @@ export interface SessionDetail {
 
 const api = {
   ...createDatabaseApi(call),
-  terminalCreate: (id: string, projectId: string, cols: number, rows: number) => call<WorkspaceTerminalInfo>('workspaceTerminal:request', { action: 'create', id, projectId, cols, rows }),
+  terminalCreate: (id: string, projectId: string | null, cols: number, rows: number) => call<WorkspaceTerminalInfo>('workspaceTerminal:request', { action: 'create', id, projectId, cols, rows }),
   terminalWrite: (id: string, data: string) => call<void>('workspaceTerminal:request', { action: 'write', id, data }),
   terminalResize: (id: string, cols: number, rows: number) => call<void>('workspaceTerminal:request', { action: 'resize', id, cols, rows }),
   terminalAck: (id: string, count: number) => call<void>('workspaceTerminal:request', { action: 'ack', id, count }),
@@ -113,18 +117,65 @@ const api = {
     return () => ipcRenderer.removeListener('plugins:changed', wrapped);
   },
   chooseFiles: () => call<InputAttachment[]>('sessions:files'),
+  petsList: () => call<PetLibraryState>('pets:list'),
+  petsOverlayState: () => call<PetOverlayControlState>('pets:overlayState'),
+  petsSetOverlayVisible: (visible: boolean) => call<PetOverlayControlState>('pets:overlayVisible', { visible }),
+  petsImport: () => call<PetLibraryState | null>('pets:import'),
+  petsSetEnabled: (id: string, enabled: boolean) => call<PetLibraryState>('pets:enabled', { id, enabled }),
+  petsSetFavorite: (id: string, favorite: boolean) => call<PetLibraryState>('pets:favorite', { id, favorite }),
+  petsDelete: (id: string) => call<PetLibraryState>('pets:delete', { id }),
+  petsAsset: (id: string, preview = false) => call<PetRuntimeAsset>('pets:asset', { id, preview }),
+  onPetOverlayStateChanged: (listener: (state: PetOverlayControlState) => void): (() => void) => {
+    const wrapped = (_event: unknown, state: PetOverlayControlState): void => listener(state);
+    ipcRenderer.on('pet-overlay:stateChanged', wrapped);
+    return () => ipcRenderer.removeListener('pet-overlay:stateChanged', wrapped);
+  },
+  onPetOverlayOpenOwner: (listener: (screen: 'chat' | 'pets') => void): (() => void) => {
+    const wrapped = (_event: unknown, screen: 'chat' | 'pets'): void => listener(screen);
+    ipcRenderer.on('pet-overlay:openOwner', wrapped);
+    return () => ipcRenderer.removeListener('pet-overlay:openOwner', wrapped);
+  },
   listSkills: () => call<SkillSummary[]>('skills:list'),
+  listManagedSkills: () => call<ManagedSkill[]>('skills:managed'),
+  listRecommendedSkills: () => call<Array<{ id: string; name: string; description: string; installed: boolean }>>('skills:recommended'),
+  installRecommendedSkill: (id: string) => call<ManagedSkill[]>('skills:installRecommended', { id }),
+  skillsImport: (kind: 'folder' | 'file') => call<ManagedSkill[] | null>('skills:import', { kind }),
+  skillsImportGithub: (url: string) => call<ManagedSkill[]>('skills:githubImport', { url }),
+  skillsLinkGithub: (id: string, url: string) => call<ManagedSkill[]>('skills:githubLink', { id, url }),
+  skillsCheckGithub: (id: string) => call<GitHubSkillUpdateCheck[]>('skills:githubCheck', { id }),
+  skillsUpdateGithub: (id: string) => call<{ status: 'current' | 'updated'; skills: ManagedSkill[]; warning?: string }>('skills:githubUpdate', { id }),
+  skillsRemove: (id: string) => call<ManagedSkill[]>('skills:remove', { id }),
   skillLibrary: (scope: SkillsDraftScope) => call<SkillLibrary>('skills:library', scope),
   dropFiles: async (files: File[]): Promise<Reply<InputAttachment[]>> => {
     if (!files.length || files.length > 20) return { ok: false, error: 'Attach up to 20 files per message' };
     try {
-      const sources = [];
-      for (const file of files) {
+      const staged: Array<InputAttachment | undefined> = new Array(files.length);
+      const paths: Array<{ index: number; path: string }> = [];
+      const memory: Array<{ index: number; file: File }> = [];
+      for (const [index, file] of files.entries()) {
         const path = webUtils.getPathForFile(file);
         if (!path && file.size > 12 * 1024 * 1024) return { ok: false, error: 'Pasted images must be 12 MB or smaller' };
-        sources.push(path || { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
+        if (path) paths.push({ index, path });
+        else memory.push({ index, file });
       }
-      return await call<InputAttachment[]>('sessions:dropFiles', { files: sources });
+      // Native disk drops carry only paths. Pathless clipboard/paste files have to materialize
+      // bytes in the sandboxed preload; send those one at a time so their ArrayBuffers and IPC
+      // copies do not all coexist in memory while preserving the original file order.
+      if (paths.length) {
+        const reply = await call<InputAttachment[]>('sessions:dropFiles', { files: paths.map(entry => entry.path) });
+        if (!reply.ok) return reply;
+        if (reply.data.length !== paths.length) return { ok: false, error: 'Could not stage the attachments' };
+        for (const [offset, entry] of paths.entries()) staged[entry.index] = reply.data[offset];
+      }
+      for (const entry of memory) {
+        const bytes = new Uint8Array(await entry.file.arrayBuffer());
+        const reply = await call<InputAttachment[]>('sessions:dropFiles', { files: [{ name: entry.file.name, bytes }] });
+        if (!reply.ok) return reply;
+        if (reply.data.length !== 1) return { ok: false, error: 'Could not stage the attachment' };
+        staged[entry.index] = reply.data[0];
+      }
+      if (staged.some(attachment => !attachment)) return { ok: false, error: 'Could not stage the attachments' };
+      return { ok: true, data: staged as InputAttachment[] };
     } catch { return { ok: false, error: 'Could not read the attachment' }; }
   },
   attachText: (text: string) => call<InputAttachment>('sessions:attachText', { text }),
@@ -159,6 +210,7 @@ const api = {
   // installer runs, and the app comes back as the new version. It takes no argument because
   // there is nothing here to choose - the main process knows what is staged.
   installUpdate: () => call<boolean>('update:install'),
+  downloadUpdate: () => call<boolean>('update:download'),
 
   // Sessions, compaction and the browser bridge. Everything here is read-only or a
   // named action; there is still no channel that takes a path or a command.
@@ -183,6 +235,17 @@ const api = {
   deleteProjectFileEntry: (projectId: string, path: string) => call<boolean>('projectFiles:delete', { projectId, path }),
   revealProjectFileEntry: (projectId: string, path = '') => call<boolean>('projectFiles:reveal', { projectId, path }),
   attachProjectFile: (projectId: string, path: string) => call<InputAttachment>('projectFiles:attach', { projectId, path }),
+  getProjectGitSnapshot: (projectId: string, baseRef?: string) => call<ProjectGitSnapshot>('projectGit:snapshot', { projectId, ...(baseRef ? { baseRef } : {}) }),
+  getProjectGitDiff: (projectId: string, path: string, baseRef?: string, expectedRevision?: string) => call<ProjectGitDiff>('projectGit:diff', {
+    projectId, path, ...(baseRef ? { baseRef } : {}), ...(expectedRevision ? { expectedRevision } : {})
+  }),
+  getToolEditReview: (sessionId: string, callId: string, changeIndex: number) =>
+    call<ToolEditReview | null>('sessions:toolEditReview', { sessionId, callId, changeIndex }),
+  onProjectGitChanged: (listener: (event: ProjectGitChanged) => void): (() => void) => {
+    const wrapped = (_event: unknown, change: ProjectGitChanged): void => listener(change);
+    ipcRenderer.on('projectGit:changed', wrapped);
+    return () => ipcRenderer.removeListener('projectGit:changed', wrapped);
+  },
   getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
   getImageStorage: () => call<ImageStorageInfo>('sessions:imageStorage'),
   clearImageStorage: (mode: ImageStorageClearMode) => call<ImageStorageClearResult>('sessions:clearImageStorage', { mode }),

@@ -84,6 +84,8 @@
    * which nothing downstream reads as anything but the turn having taken that much longer.
    */
   const TURN_SETTLE_MS = 4000;
+  /** How long a settled question's generation must hold, cleanly, before it counts as a regeneration. */
+  const SETTLED_REGENERATION_MS = 20_000;
   // While ChatGPT is generating, keep the app-owned transcript close enough to feel like a
   // stream rather than a two-second slideshow. This does not create duplicate rows: /activity
   // is cursor-based, streamBySeq is keyed by canonical seq, and assistant messages additionally
@@ -116,6 +118,33 @@
    * one-frame flash when somebody has explicitly switched Overwrite off.
    */
   const TEST_MODE = typeof globalThis.CLF_TEST_HOOK === 'function';
+  /**
+   * Extension-owned UI strings use the shared page-local catalog when it is present.
+   * Recovery/reinjection tests can execute this file before the helper is installed, so the
+   * English fallback remains a complete, behavior-preserving path.
+   */
+  function t(key, fallback, substitutions) {
+    let translated = '';
+    try {
+      const helper = globalThis.CLF_I18N;
+      if (helper && typeof helper.t === 'function') {
+        translated = helper.t(key, fallback, substitutions);
+      }
+    } catch {
+      // A missing/stale helper must never take the recorder down with presentation.
+    }
+    if (typeof translated === 'string' && translated) return translated;
+    let text = String(fallback || '');
+    const values = Array.isArray(substitutions)
+      ? substitutions
+      : substitutions === undefined || substitutions === null
+        ? []
+        : [substitutions];
+    for (let index = 0; index < values.length; index++) {
+      text = text.split(`$${index + 1}`).join(String(values[index]));
+    }
+    return text;
+  }
   let RENDER_STREAM = TEST_MODE ? false : true;
   let SHOW_TIMES = false;
   let renderPreferenceReady = TEST_MODE;
@@ -282,6 +311,7 @@
   const seenMessages = new Map(); // occurrence -> last observed native reaction
   let reportedConversationTitle = '';
   let reportedModelSelection = '';
+  let bootstrapModelRestoreBusy = false;
   const MAX_SEEN_MESSAGES = 2000;
 
   /**
@@ -455,6 +485,8 @@
    * it observes anything.
    */
   let appActiveTurnId = null;
+  /** The question of the app's newest turn once it has ended — see claimUnrecordedGeneration. */
+  let appSettledQuestionId = null;
   /**
    * When this document first saw ChatGPT generating a turn that nobody has recorded.
    *
@@ -711,7 +743,11 @@
   const pageViewChecks = new Set(); // Existing readiness waits also observe accepted MAIN-world snapshots.
   const sendText = (value) => String(value || '').replace(/\s+/g, '');
   /** Undo page-readback punctuation escapes only; never rewrite authored Send text. */
-  const unescapeMarkdown = (value) => String(value || '').replace(/\\([!-\/:-@\[-`{-~])/g, '$1');
+  // Two escapes, both measured: ASCII punctuation (2026-09-11), and a backslash before a line
+  // break — ChatGPT stores the composer's hard breaks as Markdown `\<newline>`. The second made a
+  // worker's 20k-character bootstrap unrecognisable to its own receipt (2026-09-26, #426): every
+  // hard break kept its backslash, so the page never bound the worker until its turn had ended.
+  const unescapeMarkdown = (value) => String(value || '').replace(/\\\r?\n/g, '\n').replace(/\\([!-\/:-@\[-`{-~])/g, '$1');
   /** The leading continuation marker, as typed or as the composer escaped it. */
   const markedAs = (value) => {
     const text = String(value || '');
@@ -770,6 +806,20 @@
     if (actualMarker && expectedMarker && actualMarker[1] === expectedMarker[1] && actualMarker[2] === expectedMarker[2] &&
         sendText(source.text.slice(actualMarker[0].length)) === sendText(expected.slice(expectedMarker[0].length))) return true;
     return sendText(unescapeMarkdown(source.text)) === sendText(expected);
+  }
+  /** Temporary-planner-only fallback for an accepted user row left on the immediately older Fiber scan. */
+  function acceptedTemporaryDecisionUser(message, decision) {
+    if (!decision?.temporary || !decision.onTarget() || !message || message.role !== 'user' ||
+        message.id !== decision.messageId || !message.node?.isConnected || isStale(message.node) ||
+        retiredMessages.has(message.id) || epoch !== decision.epoch) return false;
+    const stampedNode = sectionOf(message.node) || message.node;
+    const stamp = stampedNode.getAttribute?.('data-clf-fiber-turn') || '';
+    const split = stamp.lastIndexOf(':');
+    // Missing/current scan evidence still fails closed. This exception is only for a syntactically
+    // valid older scan whose native Send receipt already froze the exact message id.
+    if (split <= 0 || !/^\d+$/.test(stamp.slice(split + 1)) || stamp.slice(0, split) === fiberScanToken) return false;
+    return sendText(message.text) === sendText(decision.text) ||
+      sendText(unescapeMarkdown(message.text)) === sendText(decision.text);
   }
   // A first fresh route may await authored evidence. A second route (including an
   // observed return to New Chat) revokes this send; text proof is not its lifetime.
@@ -1433,7 +1483,18 @@
     for (const message of CLF_DOM.messages()) {
       if (message.role === 'user' && message.id && message.text) newest = message.id;
     }
-    if (!newest || newest === openedUserMessageId) {
+    // A question whose turn the app has already ended is not a turn nobody recorded. After a
+    // recovery reload ChatGPT can show Stop for seconds over a turn it has lost, and claiming it
+    // minted a turn with no work that stalled, earned another reload and hid the dead turn from
+    // the automatic Continue (measured 2026-09-26, three rounds in 41 minutes).
+    //
+    // A genuine regeneration of that same question — ChatGPT's own Retry after a lost stream —
+    // is different: its Stop stays, with no failure banner, for as long as it writes. That
+    // is how a Compact & Resume brief is rewritten after "Resume stream unavailable", and
+    // refusing it left the rewritten brief unrecorded. So the settled question needs a clean
+    // page and a much longer settle than an unrecorded question does.
+    const settled = newest === appSettledQuestionId;
+    if (!newest || newest === openedUserMessageId || (settled && CLF_DOM.errors().length > 0)) {
       unrecordedGeneratingSince = 0;
       return null;
     }
@@ -1441,7 +1502,7 @@
       unrecordedGeneratingSince = Date.now();
       return null;
     }
-    return Date.now() - unrecordedGeneratingSince >= TURN_SETTLE_MS ? newest : null;
+    return Date.now() - unrecordedGeneratingSince >= (settled ? SETTLED_REGENERATION_MS : TURN_SETTLE_MS) ? newest : null;
   }
 
   function adoptOpenTurn(open, questionId = null) {
@@ -1688,7 +1749,10 @@
     nativeImageCaptureActiveTasks.clear();
     callsReported.clear();
     requestOwnersConfirmed.clear();
-    pendingStreamOrigins.clear();
+    // Except ids that already name the conversation being entered: see flushStreamRequestOrigins.
+    for (const [requestId, pending] of pendingStreamOrigins) {
+      if (pending.conversationId !== conversationId) pendingStreamOrigins.delete(requestId);
+    }
     requestOwnersPending.clear();
     requestOwnerRetryAt.clear();
     requestOwnerAttempts.clear();
@@ -1919,8 +1983,14 @@
    * gives no evidence for, so it is never made: an unexplained stop stays unknown.
    */
   function endOutcome(turn, nativeFinal = false) {
-    if (stopRequestedAt && !nativeFinal) return { outcome: 'stopped', detail: 'Stop was requested; the native page no longer shows generation.' };
-    if (recoveryStopping && !nativeFinal) return { outcome: 'interrupted', detail: 'Automatic Continue stopped an unchanged silent turn.' };
+    if (stopRequestedAt && !nativeFinal) return {
+      outcome: 'stopped',
+      detail: t('content_turn_stop_requested', 'Stop was requested; the native page no longer shows generation.')
+    };
+    if (recoveryStopping && !nativeFinal) return {
+      outcome: 'interrupted',
+      detail: t('content_turn_auto_continue_stopped', 'Automatic Continue stopped an unchanged silent turn.')
+    };
     // Only this turn's failures. An error inside another turn's section is that turn's,
     // and a toast still on screen from an earlier failure was already on screen when this
     // turn began — neither says anything about how this one ended.
@@ -1935,7 +2005,10 @@
         ...(failure.reason === 'thinking_failed' ? { reason: 'thinking_failed' } : {}) };
     }
     if (turn && CLF_DOM.interrupted(turn)) {
-      return { outcome: 'interrupted', detail: 'ChatGPT marked the turn interrupted' };
+      return {
+        outcome: 'interrupted',
+        detail: t('content_turn_chatgpt_interrupted', 'ChatGPT marked the turn interrupted')
+      };
     }
     // Degraded fallback only. If the MAIN-world Fiber helper has ever answered on this page,
     // its end_turn bit is the authority on successful completion and mere visible prose is
@@ -1955,7 +2028,10 @@
       (/^(?:gpt-?6(?:\.0)?|gpt-?5\.6(?:-sol)?)$/.test(model) && selection?.reasoningEffort === 'pro');
     if (!fiberPresent && !unwitnessedGeneration && model && !pro && answerText(turn).length > 0) return { outcome: 'completed' };
     if (turnStalled()) {
-      return { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
+      return {
+        outcome: 'stalled',
+        detail: t('content_turn_stalled_detail', 'no visible output and no progress for ten minutes')
+      };
     }
     return { outcome: 'unknown' };
   }
@@ -2098,7 +2174,7 @@
         // Rendered inline code can remove Markdown bytes even inside a pre-wrap
         // bubble. Do not publish a broken transport frame while its exact source
         // is pending. A canonical user-authored marker remains literal text.
-        if (!source.canonical && /^\[\[COS_CONTEXT:\d{1,6}\]\]/.test(source.text) && CLF_DOM.userPromptText(source.text) === null) continue;
+        if (!source.canonical && /^\\?\[\\?\[COS\\?_CONTEXT\\?:\d{1,6}\\?\]\\?\]/.test(source.text) && CLF_DOM.userPromptText(source.text) === null) continue;
         const text = source.text;
         const key = occurrenceKey(message.id, text);
         const reaction = CLF_DOM.userMessageReaction(message);
@@ -2202,7 +2278,11 @@
         pageTurn: ended || null
       });
     }
-    if (endedTurnId) emit({ kind: 'turn_end', turnId: endedTurnId, ...result });
+    const nativeEnd = result.outcome === 'completed' ? fiberTurnFor(ended) : null;
+    const imageEnd = nativeEnd?.endMessageId && nativeEnd.images?.some(image =>
+      image.messageId === nativeEnd.endMessageId && image.providerStatus === 'finished_successfully');
+    if (endedTurnId) emit({ kind: 'turn_end', turnId: endedTurnId, ...result,
+      ...(imageEnd ? { providerMessageId: nativeEnd.endMessageId } : {}) });
     // Same moment, the other reader: the goal loop wants this turn's answer while `ended`
     // still names its section. It decides for itself whether the turn is one to answer —
     // and waits for it to hold still first. See noteGoalTurn.
@@ -2329,7 +2409,7 @@
                 : null;
             goalConfig = { ...(goalConfig || {}), ...(switched || {}), objective: stored };
           } else {
-            objectiveError = replyError(reply) || 'the goal could not be saved to this chat';
+            objectiveError = replyError(reply) || t('content_goal_save_failed', 'the goal could not be saved to this chat');
           }
           injectStage();
         });
@@ -2368,7 +2448,7 @@
     // identity or guessing from DOM position.
     const pageTitle = conversationId && CLF_DOM.conversationTitle ? CLF_DOM.conversationTitle() : '';
     const modelSelection = conversationId && CLF_DOM.visibleModelSelection?.();
-    if (modelSelection && !modelCatalogBusy && !desktopInputBusy) {
+    if (modelSelection && !modelCatalogBusy && !desktopInputBusy && !bootstrapModelRestoreBusy) {
       const selectionKey = JSON.stringify(modelSelection);
       if (selectionKey !== reportedModelSelection) {
         reportedModelSelection = selectionKey;
@@ -2431,7 +2511,13 @@
       const bounded = result.outcome === 'unknown'
         ? answerText(ended).length > 0
           ? { outcome: 'completed' }
-          : { outcome: 'interrupted', detail: 'a new user message replaced the unfinished turn' }
+          : {
+            outcome: 'interrupted',
+            detail: t(
+              'content_turn_replaced_by_user_message',
+              'a new user message replaced the unfinished turn'
+            )
+          }
         : result;
       finishGeneration(ended, bounded, false);
     }
@@ -2577,7 +2663,17 @@
       });
     }
 
-    if (generating && turn) {
+    // `turnId` and not `turn`: the report below is about the *absence* of output, and requiring a
+    // mounted assistant section to say so kept it silent in the one state where it is the only
+    // thing left. A turn adopted after a reload frequently has no section of its own — see
+    // seedResumeBaseline, where a page that came back showing only the question deliberately
+    // leaves the adopted turn with no evidence on screen — and the outcome verdict below is
+    // locked behind the Stop control going away. Measured on 2026-09-25: a turn whose generation
+    // died at 19:14 had both paths closed, so nothing was ever said about it; the app reloaded
+    // that chat twelve times over two and a half hours, each reload re-arming this clock and
+    // mounting no section, and the turn was still open three hours later. Nothing in the body
+    // ever read `turn`.
+    if (generating && turnId) {
       // Stay on the generation we opened. ChatGPT can reorder/replace assistant sections
       // while a turn is running; re-reading the newest DOM turn here has reproduced
       // progress from request -7 being filed under the older request -5.
@@ -2591,7 +2687,15 @@
         error => error.reason === 'thinking_failed' && localErrorGeneration(error) === turnId && !isStale(error.node));
       if (!thinkingFailure && !stallReported && Date.now() - lastChangeAt > STALL_MS) {
         stallReported = true;
-        emit({ kind: 'chat_error', text: 'No visible progress for ten minutes. The app could not confirm that this turn finished.', turnId, recoverable: true });
+        emit({
+          kind: 'chat_error',
+          text: t(
+            'content_turn_stalled_error',
+            'No visible progress for ten minutes. The app could not confirm that this turn finished.'
+          ),
+          turnId,
+          recoverable: true
+        });
       }
     }
 
@@ -3240,6 +3344,8 @@
           typeof entry.createTime === 'number' && Number.isFinite(entry.createTime) && entry.createTime > 0
             ? entry.createTime
             : null,
+        ...(entry.role === 'assistant' && typeof entry.resolvedModel === 'string' &&
+          /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(entry.resolvedModel) ? { resolvedModel: entry.resolvedModel } : {}),
         rawText,
         ...(attachments.length ? { attachments } : {}),
         renderedHtml,
@@ -3384,8 +3490,9 @@
       if (!turn || !(turn.images || []).some(entry => nativeImageKey(entry) === nativeImageKey(image))) continue;
       try {
         const url = new URL(node.currentSrc || node.src, location.href);
-        if (url.origin !== location.origin || url.pathname !== '/backend-api/estuary/content' ||
-            url.searchParams.get('id') !== image.assetId || !node.isConnected) continue;
+        const exactUrl = url.pathname === '/backend-api/estuary/content' && url.searchParams.get('id') === image.assetId;
+        const exactBlob = url.protocol === 'blob:' && node.getAttribute('data-clf-fiber-image-source') === url.href;
+        if (url.origin !== location.origin || (!exactUrl && !exactBlob) || !node.isConnected) continue;
       } catch { continue; }
       found.push(node);
     }
@@ -3709,10 +3816,15 @@
     if (batch.length === 0) return;
     try {
       const projectInput = desktopProjectInput;
+      const pendingWorker = !agent && commandAttempt?.phase === 'dispatching' && commandAttempt.agent && commandAttempt.id
+        ? { agent: commandAttempt.agent, commandId: commandAttempt.id }
+        : null;
       const reply = await ask({
         type: 'correlate',
         conversationId: ownerConversation,
         calls: batch,
+        agent: agent || pendingWorker?.agent || null,
+        agentCommandId: agentCommandId || pendingWorker?.commandId || null,
         projectInput
       }, owns);
       if (!owns()) return;
@@ -3746,6 +3858,17 @@
       for (const call of batch) requestOwnersPending.delete(`${ownerConversation}\u0000${call.requestId}`);
     }
   }
+  async function repairFiberReader() {
+    const now = Date.now();
+    if (!fiberRepairing && now - fiberRepairAt >= 5000) {
+      fiberRepairAt = now;
+      fiberRepairing = ask({ type: 'repair_fiber' }).finally(() => {
+        fiberRepairing = null;
+      });
+    }
+    return fiberRepairing ? await fiberRepairing : null;
+  }
+
   async function refreshFiber(settled = null, presentationOnly = false) {
     // A bound chat can briefly lose its /c/<id> route during React/router churn, and a real
     // navigation to a fresh composer has the exact same pathname until ChatGPT assigns the
@@ -3774,14 +3897,7 @@
       // completed repair attempt that still cannot round-trip (or an explicit repair failure)
       // downgrades health; otherwise a transient timeout would flicker Overwrite and could
       // falsely complete interim prose through the degraded DOM fallback.
-      const now = Date.now();
-      if (!fiberRepairing && now - fiberRepairAt >= 5000) {
-        fiberRepairAt = now;
-        fiberRepairing = ask({ type: 'repair_fiber' }).finally(() => {
-          fiberRepairing = null;
-        });
-      }
-      const repair = fiberRepairing ? await fiberRepairing : null;
+      const repair = await repairFiberReader();
       if (repair && repair.ok === true) answer = await askFiber();
       if (answer === null) {
         if (!alive || epoch !== askedEpoch || conversationId !== askedConversation ||
@@ -4210,7 +4326,11 @@
         const message = item.value;
         if (message.role === 'user') {
           if (!message.createTime && !message.attachments?.length && renderedUserTexts.get(message.messageId) === message.rawText) continue;
-          const key = occurrenceKey(message.messageId, message.rawText + (message.attachments?.length ? JSON.stringify(message.attachments) : ''));
+          const sentModel = sendModels.get(message.messageId);
+          // The model is part of the occurrence, so a send-model report that lands after the
+          // first sighting re-emits the same message with it.
+          const key = occurrenceKey(message.messageId, message.rawText + (message.attachments?.length ? JSON.stringify(message.attachments) : '') +
+            (sentModel ? `\u0000${sentModel}` : ''));
           if (message.createTime) {
             if (userAuthoredTimesReported.get(key) === message.createTime) continue;
             userAuthoredTimesReported.set(key, message.createTime);
@@ -4224,8 +4344,13 @@
             messageId: message.messageId,
             text: message.rawText,
             ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+            ...(sentModel ? { model: sentModel } : {}),
             ...(message.createTime ? { time: message.createTime, authoredTime: true, authoredAt: message.createTime } : {})
           });
+          reportedUserMessages.delete(message.messageId);
+          reportedUserMessages.set(message.messageId, { text: message.rawText, createTime: message.createTime || null,
+            conversationId: CLF_DOM.conversationId(), model: sentModel || null });
+          if (reportedUserMessages.size > 256) reportedUserMessages.delete(reportedUserMessages.keys().next().value);
           continue;
         }
         // `endMessageId` identifies the one public assistant message that actually ended the
@@ -4265,7 +4390,7 @@
         // claim is different and fails closed instead of choosing either generation.
         const signature =
           `${state}\u0000${message.rawText}\u0000${message.renderedHtml}\u0000${owner}` +
-          `\u0000${message.createTime || ''}\u0000${message.rawMessageId || ''}`;
+          `\u0000${message.createTime || ''}\u0000${message.rawMessageId || ''}\u0000${message.resolvedModel || ''}`;
         if (priorMessage?.signature === signature) continue;
         messagesReported.set(message.messageId, { signature, owner, conflicted: ownerConflict, text: message.rawText });
         if (state === 'streaming' && owner && priorMessage?.text !== message.rawText && freshPublication) noteTurnProgress(owner);
@@ -4276,6 +4401,7 @@
           kind: 'assistant_message',
           messageId: message.messageId,
           providerMessageId: message.rawMessageId,
+          ...(message.resolvedModel ? { resolvedModel: message.resolvedModel } : {}),
           ...(message.createTime ? { authoredAt: message.createTime } : {}),
           turnId: localOwner || undefined,
           text: message.rawText,
@@ -5083,10 +5209,15 @@
     const projected = entry.displayOutcome && typeof entry.displayOutcome.label === 'string'
       ? entry.displayOutcome.label.slice(0, 120)
       : null;
-    const outcome = projected || (entry.outcome === 'ok' ? 'completed'
-      : entry.outcome === 'tool_rejected' || entry.outcome === 'rejected' ? 'refused'
-      : entry.outcome === 'tool_execution_error' || entry.outcome === 'process_exit_nonzero' ? 'failed'
-      : entry.outcome === 'tool_internal_error' ? 'internal error' : 'unknown');
+    const outcome = projected || (entry.outcome === 'ok'
+      ? t('content_tool_outcome_completed', 'completed')
+      : entry.outcome === 'tool_rejected' || entry.outcome === 'rejected'
+        ? t('content_tool_outcome_refused', 'refused')
+        : entry.outcome === 'tool_execution_error' || entry.outcome === 'process_exit_nonzero'
+          ? t('content_tool_outcome_failed', 'failed')
+          : entry.outcome === 'tool_internal_error'
+            ? t('content_tool_outcome_internal_error', 'internal error')
+            : t('content_tool_outcome_unknown', 'unknown'));
     const duration = typeof entry.durationMs === 'number' && Number.isFinite(entry.durationMs) && entry.durationMs >= 0
       ? ` · ${Math.round(entry.durationMs)} ms` : '';
     const lines = [{ kind: 'meta', text: `${tool} · ${outcome}${duration}` }];
@@ -5099,7 +5230,10 @@
       const path = change.path.length > 1024 ? `${change.path.slice(0, 1023)}…` : change.path;
       lines.push({ kind: 'change', text: path + (counts.length ? `  ${change.approximate === true ? '≈ ' : ''}${counts.join(' ')}` : '') });
     }
-    if (changes.length > 12) lines.push({ kind: 'more', text: `${changes.length - 12} more changed files` });
+    if (changes.length > 12) {
+      const count = changes.length - 12;
+      lines.push({ kind: 'more', text: t('content_tool_more_changed_files', '$1 more changed files', count) });
+    }
     return lines;
   }
 
@@ -5156,8 +5290,8 @@
     if (state !== 'ready') {
       recorded.classList.add('clf-stream-detail-note');
       recorded.textContent = state === 'loading'
-        ? 'Loading recorded details…'
-        : 'Recorded details are unavailable for this activity revision.';
+        ? t('content_tool_details_loading', 'Loading recorded details…')
+        : t('content_tool_details_unavailable', 'Recorded details are unavailable for this activity revision.');
       panel.append(recorded);
       return;
     }
@@ -5165,17 +5299,21 @@
       const heading = document.createElement('h4');
       heading.textContent = title;
       const body = document.createElement('pre');
-      body.textContent = value.text || '(empty)';
+      body.textContent = value.text || t('content_empty', '(empty)');
       recorded.append(heading, body);
       if (value.truncated) {
         const note = document.createElement('div');
         note.className = 'clf-stream-detail-note';
-        note.textContent = `Preview truncated from ${Math.floor(value.chars)} characters.`;
+        note.textContent = t(
+          'content_tool_preview_truncated',
+          'Preview truncated from $1 characters.',
+          Math.floor(value.chars)
+        );
         recorded.append(note);
       }
     };
-    section('Recorded arguments (redacted)', data.args);
-    section('Recorded result (redacted preview)', data.result);
+    section(t('content_tool_recorded_arguments', 'Recorded arguments (redacted)'), data.args);
+    section(t('content_tool_recorded_result', 'Recorded result (redacted preview)'), data.result);
     panel.append(recorded);
   }
 
@@ -5273,7 +5411,9 @@
     const body = document.createElement('span');
     body.className = 'clf-stream-text';
     if (entry.kind === 'tool_call') {
-      body.textContent = entry.summary && entry.summary.title ? entry.summary.title : `Ran ${entry.tool || 'tool'}`;
+      body.textContent = entry.summary && entry.summary.title
+        ? entry.summary.title
+        : t('content_tool_ran', 'Ran $1', entry.tool || 'tool');
       if (entry.summary && entry.summary.detail) {
         const detail = document.createElement('span');
         detail.className = 'clf-tool-detail';
@@ -5283,12 +5423,13 @@
     } else if (entry.kind === 'agent_message') {
       body.textContent = `${entry.from || 'agent'} → ${entry.to || 'agent'}: ${entry.text || ''}`;
     } else if (entry.kind === 'page_tool') {
-      body.textContent = entry.label || 'ChatGPT tool';
+      body.textContent = entry.label || t('content_chatgpt_tool', 'ChatGPT tool');
     } else if (entry.kind === 'turn_start') {
-      body.textContent = 'Turn started';
+      body.textContent = t('content_turn_started', 'Turn started');
     } else if (entry.kind === 'turn_end') {
       const outcome = entry.outcome ? String(entry.outcome).replace(/_/g, ' ') : 'completed';
-      body.textContent = `Turn ${outcome}${entry.detail ? ` · ${entry.detail}` : ''}`;
+      const label = t('content_turn_outcome', 'Turn $1', outcome);
+      body.textContent = `${label}${entry.detail ? ` · ${entry.detail}` : ''}`;
     } else {
       body.textContent = entry.text || '';
     }
@@ -5416,7 +5557,7 @@
         head.replaceChildren(...[...members[members.length - 1].querySelector('summary').childNodes].map(node => node.cloneNode(true)));
         head.dataset.clfSignature = signature;
       }
-      head.title = `${members.length} tool calls`;
+      head.title = t('content_tool_calls_count', '$1 tool calls', members.length);
       reconcileStreamChildren(group.lastElementChild, members);
       children.push(group); i = end;
     }
@@ -6159,7 +6300,11 @@
       if (data.retiredWorker && typeof data.retiredWorker === 'object') {
         const worker = String(data.retiredWorker.id || 'worker');
         const reason = String(data.retiredWorker.reason || 'its sub-agent run ended');
-        localError = `${worker} was retired because ${reason}. This chat can no longer use local tools.`;
+        localError = t(
+          'content_worker_retired',
+          '$1 was retired because $2. This chat can no longer use local tools.',
+          [worker, reason]
+        );
         if (retirementHandledFor !== forId) {
           retirementHandledFor = forId;
           const stop = CLF_DOM.stopButton();
@@ -6292,6 +6437,7 @@
       // reply. Until this document has owned a turn, exact question proof may
       // still restore it through this same feed, even after native completion.
       appActiveTurnId = typeof data.activeTurnId === 'string' && data.activeTurnId ? data.activeTurnId : null;
+      appSettledQuestionId = typeof data.settledQuestionId === 'string' && data.settledQuestionId ? data.settledQuestionId : null;
       if (!generating && pendingTools > 0 && appActiveTurnId === turnId && fiberSettled?.reason === 'thinking_failed') noteTurnProgress();
       const recordedQuestionId = typeof data.recordedQuestionId === 'string' ? data.recordedQuestionId : null;
       if (resumedStoppedTurn && !generating && appActiveTurnId === turnId) adoptOpenTurn(turnId, recordedQuestionId);
@@ -6391,8 +6537,8 @@
     if (phase === 'delivering') {
       return {
         mode: 'busy',
-        label: NATIVE_PHASE_LABELS[phase] || 'Saving…',
-        hint: error || 'The brief is finished; waiting for the app to store it.',
+        label: NATIVE_PHASE_LABELS[phase] || t('content_saving', 'Saving…'),
+        hint: error || t('content_compact_waiting_store', 'The brief is finished; waiting for the app to store it.'),
         action: 'cancel'
       };
     }
@@ -6401,31 +6547,40 @@
       // The ticket is alive but this page's checkpoint failed. Say the failure without
       // declaring the durable job failed; a later generation/reload may pick it up, and the
       // only immediate action offered here is the explicit cancel that closes the ticket.
-      return { mode: 'error', label: 'Paused', hint: error, action: 'cancel' };
+      return { mode: 'error', label: t('content_paused', 'Paused'), hint: error, action: 'cancel' };
     }
 
     if (job && job.busy) {
       if (job.stage === 'opening') {
-        return { mode: 'busy', label: 'Opening…', hint: 'Handoff saved, opening the fresh chat', action: 'cancel' };
+        return {
+          mode: 'busy',
+          label: t('content_opening', 'Opening…'),
+          hint: t('content_compact_opening_fresh', 'Handoff saved, opening the fresh chat'),
+          action: 'cancel'
+        };
       }
       if (job.stage === 'waiting-for-browser') {
         return {
           mode: 'waiting',
-          label: 'Waiting…',
-          hint: job.error || 'The app is trying to open the fresh chat.',
+          label: t('content_waiting', 'Waiting…'),
+          hint: job.error || t('content_compact_app_opening_fresh', 'The app is trying to open the fresh chat.'),
           action: 'cancel'
         };
       }
       if (summary?.state === 'stopped' || summary?.state === 'failed') {
-        return { mode: 'error', label: 'Paused', hint: summary.detail, action: 'cancel' };
+        return { mode: 'error', label: t('content_paused', 'Paused'), hint: summary.detail, action: 'cancel' };
       }
       // The progress of this is local — interrupting, waiting for tools, typing — and only
       // the last stretch is something the app can report. `phase` is what this tab is doing
       // right now; `handoff-pending` is the app saying it has asked and is waiting.
       return {
         mode: 'busy',
-        label: summary?.state === 'writing' ? 'Writing…' : NATIVE_PHASE_LABELS[phase] || 'Waiting…',
-        hint: summary?.state === 'writing' ? 'ChatGPT is writing the handoff' : 'Waiting for the handoff response',
+        label: summary?.state === 'writing'
+          ? t('content_writing', 'Writing…')
+          : NATIVE_PHASE_LABELS[phase] || t('content_waiting', 'Waiting…'),
+        hint: summary?.state === 'writing'
+          ? t('content_compact_chatgpt_writing', 'ChatGPT is writing the handoff')
+          : t('content_compact_waiting_response', 'Waiting for the handoff response'),
         action: 'cancel'
       };
     }
@@ -6437,31 +6592,46 @@
      * is a button that is missing whenever it is wanted.
      */
     if (job && job.stage === 'done') {
-      return { mode: 'done', label: 'Opened', hint: 'The fresh chat is open', action: 'start' };
+      return {
+        mode: 'done',
+        label: t('content_opened', 'Opened'),
+        hint: t('content_compact_fresh_open', 'The fresh chat is open'),
+        action: 'start'
+      };
     }
     if (job && job.stage === 'failed') {
       if (job.error === 'cancelled') {
-        return { mode: 'idle', label: 'Compact', hint: 'Resume cancelled', action: 'start' };
+        return {
+          mode: 'idle',
+          label: t('content_compact', 'Compact'),
+          hint: t('content_compact_resume_cancelled', 'Resume cancelled'),
+          action: 'start'
+        };
       }
-      return { mode: 'error', label: 'Failed', hint: job.error || 'Compaction failed', action: 'start' };
+      return {
+        mode: 'error',
+        label: t('content_failed', 'Failed'),
+        hint: job.error || t('content_compact_failed', 'Compaction failed'),
+        action: 'start'
+      };
     }
     if (pressedAt > 0 && now - pressedAt < PRESS_GRACE_MS) {
-      return { mode: 'busy', label: 'Starting…', hint: '', action: 'none' };
+      return { mode: 'busy', label: t('content_compact_starting', 'Starting…'), hint: '', action: 'none' };
     }
-    if (error) return { mode: 'error', label: 'Failed', hint: error, action: 'start' };
+    if (error) return { mode: 'error', label: t('content_failed', 'Failed'), hint: error, action: 'start' };
     if (disconnected) {
       return {
         mode: 'off',
-        label: 'Compact',
-        hint: 'Browser connection is disconnected in Chat On Steroids.',
+        label: t('content_compact', 'Compact'),
+        hint: t('content_browser_disconnected', 'Browser connection is disconnected in Chat On Steroids.'),
         action: 'none'
       };
     }
     if (!connected) {
       return {
         mode: 'off',
-        label: 'Compact',
-        hint: 'Chat On Steroids is not running on this PC.',
+        label: t('content_compact', 'Compact'),
+        hint: t('content_app_not_running', 'Chat On Steroids is not running on this PC.'),
         action: 'none'
       };
     }
@@ -6470,12 +6640,15 @@
       // still where a goal is written — which is the one thing that can start the chat.
       return {
         mode: 'off',
-        label: 'Compact',
-        hint: 'Nothing to compact yet — send a message, or set a goal and it writes one.',
+        label: t('content_compact', 'Compact'),
+        hint: t(
+          'content_compact_nothing_yet',
+          'Nothing to compact yet — send a message, or set a goal and it writes one.'
+        ),
         action: 'none'
       };
     }
-    return { mode: 'idle', label: 'Compact', hint: '', action: 'start' };
+    return { mode: 'idle', label: t('content_compact', 'Compact'), hint: '', action: 'start' };
   }
 
   /**
@@ -6526,7 +6699,9 @@
     const objective = goal && typeof goal.objective === 'string' ? goal.objective : '';
     // The app's own reason, rather than this tab's guess. Today there is exactly one: a
     // worker chat, where the prime already writes the user's turns.
-    const from = threshold > 0 ? `from ${roundK(threshold)} tokens` : '';
+    const from = threshold > 0
+      ? t('content_tokens_from', 'from $1 tokens', roundK(threshold))
+      : '';
     // Is anything driving this chat at all? A saved goal is enough on its own, but only for a
     // chat that has never moved its own switch — the same rule the app applies.
     const armed = own ? goalOn || loopOn : goalOn || loopOn || Boolean(objective);
@@ -6544,41 +6719,43 @@
       // Two short lines rather than a sentence: this is read while reaching for something
       // else, and the only questions it answers are "is it on" and "at what point".
       tip: [
-        auto ? `Auto-compaction on${from ? `, ${from}` : ''}` : 'Auto-compaction off',
+        auto
+          ? t('content_auto_compaction_on', 'Auto-compaction on$1', from ? `, ${from}` : '')
+          : t('content_auto_compaction_off', 'Auto-compaction off'),
         blocked === 'worker'
-          ? 'Goal off — the prime writes this chat'
+          ? t('content_goal_off_prime_writes', 'Goal off — the prime writes this chat')
           : blocked === 'blocked'
-            ? 'Goal off — this chat is blocked in the app'
+            ? t('content_goal_off_blocked', 'Goal off — this chat is blocked in the app')
             : fresh
             ? !hasKey
-              ? 'No API key — Goal and Loop unavailable'
+              ? t('content_goal_no_api_key_unavailable', 'No API key — Goal and Loop unavailable')
               : objective
-                ? 'Opening this chat on its goal'
-                : 'Add a goal or a loop to start this chat'
+                ? t('content_goal_opening_on_goal', 'Opening this chat on its goal')
+                : t('content_goal_add_to_start', 'Add a goal or a loop to start this chat')
             : position === 'off'
-              ? 'Goal and Loop off'
+              ? t('content_goal_loop_off', 'Goal and Loop off')
               : position === 'loop'
                 ? hasKey
-                  ? 'Loop on — never stops on its own'
-                  : 'Loop on — no API key'
+                  ? t('content_loop_on_never_stops', 'Loop on — never stops on its own')
+                  : t('content_loop_on_no_api_key', 'Loop on — no API key')
                 : hasKey
                   ? objective
-                    ? 'Goal on — chasing this chat’s goal'
-                    : 'Goal on'
-                  : 'Goal on — no API key'
+                    ? t('content_goal_on_chasing', 'Goal on — chasing this chat’s goal')
+                    : t('content_goal_on', 'Goal on')
+                  : t('content_goal_on_no_api_key', 'Goal on — no API key')
       ].join('\n'),
       rows: [
         {
           key: 'autoCompact',
-          label: 'Auto-compaction',
+          label: t('content_auto_compaction', 'Auto-compaction'),
           note:
             blocked === 'worker'
-              ? 'off here: worker chats never auto-compact'
+              ? t('content_auto_compaction_worker_off', 'off here: worker chats never auto-compact')
               : blocked === 'blocked'
-                ? 'off here: this chat is blocked in the app'
+                ? t('content_auto_compaction_blocked_off', 'off here: this chat is blocked in the app')
                 : auto
-                  ? from || 'threshold set in the app'
-                  : 'compact this chat by hand',
+                  ? from || t('content_auto_compaction_threshold_app', 'threshold set in the app')
+                  : t('content_auto_compaction_manual', 'compact this chat by hand'),
           on: auto,
           warn: false,
           disabled: fenced
@@ -6604,16 +6781,28 @@
         : {
             value: position,
             options: [
-              { value: 'off', label: 'Off', hint: 'Nothing is written here on its own.' },
+              {
+                value: 'off',
+                label: t('content_mode_off', 'Off'),
+                hint: t('content_mode_off_hint', 'Nothing is written here on its own.')
+              },
               {
                 value: 'goal',
-                label: 'Goal',
-                hint: `Replies as you until this chat’s goal is reached, then stops. Written with ${modelLabel(goal && goal.model)}.`
+                label: t('content_mode_goal', 'Goal'),
+                hint: t(
+                  'content_mode_goal_hint',
+                  'Replies as you until this chat’s goal is reached, then stops. Written with $1.',
+                  modelLabel(goal && goal.model)
+                )
               },
               {
                 value: 'loop',
-                label: 'Loop',
-                hint: `Replies as you for ever — only this slider ends it. Written with ${modelLabel(goal && goal.model)}.`
+                label: t('content_mode_loop', 'Loop'),
+                hint: t(
+                  'content_mode_loop_hint',
+                  'Replies as you for ever — only this slider ends it. Written with $1.',
+                  modelLabel(goal && goal.model)
+                )
               }
             ],
             // The one line under the slider: what the position it is at actually does. The
@@ -6621,16 +6810,16 @@
             // to the only question somebody reaching for this control has.
             note:
               blocked === 'worker'
-                ? 'the prime writes here'
+                ? t('content_mode_note_prime_writes', 'the prime writes here')
                 : blocked === 'blocked'
-                  ? 'blocked in the app'
+                  ? t('content_mode_note_blocked', 'blocked in the app')
                   : !hasKey
-                  ? 'OpenRouter key required'
+                  ? t('content_mode_note_key_required', 'OpenRouter key required')
                   : position === 'loop'
-                    ? 'replies for ever'
+                    ? t('content_mode_note_loop', 'replies for ever')
                     : position === 'goal'
-                      ? 'replies until goal reached'
-                      : 'no replies written here',
+                      ? t('content_mode_note_goal', 'replies until goal reached')
+                      : t('content_mode_note_off', 'no replies written here'),
             warn: !hasKey || fenced,
             disabled: fenced
           },
@@ -6672,13 +6861,19 @@
           ? [
               {
                 mode: 'goal',
-                label: 'add specific goal',
-                hint: 'Write what this chat has to reach. It then prompts until it is reached, and stops there.'
+                label: t('content_goal_add_specific', 'add specific goal'),
+                hint: t(
+                  'content_goal_add_specific_hint',
+                  'Write what this chat has to reach. It then prompts until it is reached, and stops there.'
+                )
               },
               {
                 mode: 'loop',
-                label: 'add specific loop',
-                hint: 'Write what this chat has to reach. It then prompts for ever — nothing but the Loop slider ends it.'
+                label: t('content_loop_add_specific', 'add specific loop'),
+                hint: t(
+                  'content_loop_add_specific_hint',
+                  'Write what this chat has to reach. It then prompts for ever — nothing but the Loop slider ends it.'
+                )
               }
             ]
           : [
@@ -6688,26 +6883,36 @@
                 // Two links would offer the mode a second time and let a text save masquerade
                 // as a mode switch.
                 mode: driving,
-                label: objective ? 'edit task' : 'add task',
+                label: objective
+                  ? t('content_task_edit', 'edit task')
+                  : t('content_task_add', 'add task'),
                 // Off is not a mode this task could be saved into, so it is not offered as one.
                 // Picking Goal or Loop first is the same order the slider reads in.
                 disabled: position === 'off',
                 hint:
                   position === 'off'
-                    ? 'Pick Goal or Loop above first — Off writes nothing.'
+                    ? t('content_task_pick_mode_first', 'Pick Goal or Loop above first — Off writes nothing.')
                     : objective
-                      ? `Change or clear what this chat has to reach. It runs as ${driving === 'loop' ? 'Loop' : 'Goal'}.`
-                      : `Write what this chat has to reach. It runs as ${driving === 'loop' ? 'Loop' : 'Goal'}.`
+                      ? t(
+                        'content_task_change_hint',
+                        'Change or clear what this chat has to reach. It runs as $1.',
+                        driving === 'loop' ? t('content_mode_loop', 'Loop') : t('content_mode_goal', 'Goal')
+                      )
+                      : t(
+                        'content_task_write_hint',
+                        'Write what this chat has to reach. It runs as $1.',
+                        driving === 'loop' ? t('content_mode_loop', 'Loop') : t('content_mode_goal', 'Goal')
+                      )
               }
             ],
         available: hasKey && !blocked,
         unavailable:
           blocked === 'worker'
-            ? 'A worker chat is already driven by its prime.'
+            ? t('content_task_worker_unavailable', 'A worker chat is already driven by its prime.')
             : blocked === 'blocked'
-              ? 'This chat is blocked in the app. Release it there to drive it again.'
+              ? t('content_task_blocked_unavailable', 'This chat is blocked in the app. Release it there to drive it again.')
               : !hasKey
-              ? 'Add an OpenRouter API key in the app first.'
+              ? t('content_task_api_key_unavailable', 'Add an OpenRouter API key in the app first.')
               : ''
       },
       // The button's old job, kept as a row rather than dropped: pressing the gear must not
@@ -6715,15 +6920,21 @@
       action: {
         label:
           fenced
-            ? 'Compact & resume unavailable'
+            ? t('content_compact_unavailable', 'Compact & resume unavailable')
             : compact.action === 'cancel'
-              ? 'Cancel compaction'
-              : 'Compact & resume now',
+              ? t('content_compact_cancel', 'Cancel compaction')
+              : t('content_compact_resume_now', 'Compact & resume now'),
         hint:
           blocked === 'worker'
-            ? 'Worker chats stay in their existing conversation and are never manually compacted or resumed.'
+            ? t(
+              'content_compact_worker_unavailable_hint',
+              'Worker chats stay in their existing conversation and are never manually compacted or resumed.'
+            )
             : blocked === 'blocked'
-              ? 'A blocked chat is never compacted or resumed: the replacement chat would run without its tools. Release it in the app first.'
+              ? t(
+                'content_compact_blocked_unavailable_hint',
+                'A blocked chat is never compacted or resumed: the replacement chat would run without its tools. Release it in the app first.'
+              )
               : compact.hint,
         action: fenced ? 'none' : compact.action
       }
@@ -6887,7 +7098,11 @@
           ? 'near'
           : 'ok';
     // One compact line is enough in the composer. The meter itself already conveys the rest.
-    const status = `${roundK(tokens)}/${roundK(ceiling)} · autocompact ${context.auto ? 'on' : 'off'}`;
+    const status = t(
+      'content_meter_status',
+      '$1/$2 · autocompact $3',
+      [roundK(tokens), roundK(ceiling), context.auto ? t('content_on', 'on') : t('content_off', 'off')]
+    );
     return { filled, level, status, tip: status };
   }
 
@@ -6914,12 +7129,12 @@
    */
   /** Local phases of a ChatGPT-native compaction, as the button says them. */
   const NATIVE_PHASE_LABELS = {
-    requested: 'Starting…',
-    interrupting: 'Stopping…',
-    settling: 'Settling…',
-    prompting: 'Asking…',
-    waiting: 'Waiting…',
-    delivering: 'Saving…'
+    requested: t('content_compact_starting', 'Starting…'),
+    interrupting: t('content_compact_stopping', 'Stopping…'),
+    settling: t('content_compact_settling', 'Settling…'),
+    prompting: t('content_compact_asking', 'Asking…'),
+    waiting: t('content_waiting', 'Waiting…'),
+    delivering: t('content_saving', 'Saving…')
   };
 
   /**
@@ -6993,7 +7208,7 @@
     cancel.type = 'button';
     cancel.className = 'clf-cancel';
     cancel.textContent = '×';
-    cancel.setAttribute('aria-label', 'Cancel Compact & resume');
+    cancel.setAttribute('aria-label', t('content_compact_cancel_aria', 'Cancel Compact & resume'));
     pill.append(spinner, text, cancel);
 
     const button = document.createElement('button');
@@ -7035,10 +7250,13 @@
     // tool refusals. The word says the state, the hover says where it is undone.
     const blocked = document.createElement('span');
     blocked.className = 'clf-blocked';
-    blocked.textContent = 'Chat blocked';
+    blocked.textContent = t('content_chat_blocked', 'Chat blocked');
     blocked.setAttribute(
       'data-clf-tip',
-      'This chat is blocked in the Chat On Steroids app: its tool calls are refused and Goal, Loop and auto-compaction are off. To release it, open the app’s Chat tab, hover this chat in the sessions list and press its block symbol.'
+      t(
+        'content_chat_blocked_tip',
+        'This chat is blocked in the Chat On Steroids app: its tool calls are refused and Goal, Loop and auto-compaction are off. To release it, open the app’s Chat tab, hover this chat in the sessions list and press its block symbol.'
+      )
     );
     blocked.hidden = true;
 
@@ -7130,7 +7348,7 @@
     root.className = 'clf-menu';
     root.dataset.clfMenu = '1';
     root.setAttribute('role', 'dialog');
-    root.setAttribute('aria-label', 'Chat On Steroids settings');
+    root.setAttribute('aria-label', t('content_settings_aria', 'Chat On Steroids settings'));
     root.hidden = true;
     (document.body || document.documentElement).append(root);
     return root;
@@ -7293,7 +7511,7 @@
       if (where.state === 'moving') {
         // The route names a chat this tab has not observed yet. Neither id is safe to write
         // into, and the next observation is a tick away.
-        objectiveError = 'this chat is still opening — try again';
+        objectiveError = t('content_chat_still_opening', 'this chat is still opening — try again');
         return;
       }
       if (where.state === 'new') {
@@ -7311,7 +7529,7 @@
       }
       const reply = await ask({ type: 'goal_objective', conversationId: where.id, text: goal, mode: which });
       if (!reply || reply.ok !== true) {
-        objectiveError = replyError(reply) || 'the app did not answer';
+        objectiveError = replyError(reply) || t('content_app_did_not_answer_lower', 'the app did not answer');
         return;
       }
       const stored = reply.data && typeof reply.data.objective === 'string' ? reply.data.objective : goal;
@@ -7410,7 +7628,7 @@
       // only thing that knows which instruction the opening message is being written under.
       reply = await ask({ type: 'goal_open', text: goal, mode: pendingObjectiveMode });
       if (!current() || (reply && reply.ok === true) || !openRetryable(reply)) break;
-      setGoalPhase('retrying', replyError(reply) || 'the app did not answer');
+      setGoalPhase('retrying', replyError(reply) || t('content_app_did_not_answer_lower', 'the app did not answer'));
       await sleep(GOAL_RETRY_MS);
       if (!current()) break;
       setGoalPhase('requesting');
@@ -7429,20 +7647,20 @@
       return;
     }
     if (!reply || reply.ok !== true) {
-      objectiveError = replyError(reply) || 'the app did not answer';
+      objectiveError = replyError(reply) || t('content_app_did_not_answer_lower', 'the app did not answer');
       setGoalPhase('requesting', objectiveError);
       return;
     }
     const opening = reply.data && typeof reply.data.reply === 'string' ? reply.data.reply : '';
     if (reply.data && typeof reply.data.model === 'string') goalConfig.model = reply.data.model;
     if (!opening) {
-      setGoalPhase('requesting', 'the model wrote nothing to open with');
+      setGoalPhase('requesting', t('content_goal_opening_empty', 'the model wrote nothing to open with'));
       return;
     }
     setGoalPhase('sending');
     const previousComposer = CLF_DOM.composer()?.textContent || '';
     if (!CLF_DOM.insertPrompt(opening, true)) {
-      setGoalPhase('sending', 'ChatGPT would not replace the New Chat draft');
+      setGoalPhase('sending', t('content_goal_new_chat_draft_refused', 'ChatGPT would not replace the New Chat draft'));
       return;
     }
     const preparedOpening = CLF_DOM.composer()?.textContent || '';
@@ -7464,7 +7682,7 @@
     if (!sendingTarget()) return;
     if (!sent) {
       pendingObjectiveSend = null;
-      setGoalPhase('sending', 'ChatGPT would not send the message');
+      setGoalPhase('sending', t('content_goal_send_failed', 'ChatGPT would not send the message'));
       return;
     }
     openingSend.accepted = true;
@@ -7541,7 +7759,16 @@
     if (goalConfig?.proLoopDelivery && composerChat().state === 'chat') {
       const delivery = document.createElement('button');
       delivery.type = 'button'; delivery.className = 'clf-menu-action';
-      delivery.textContent = `${goalConfig.mode === 'loop' ? 'Loop' : 'Goal'}: ${goalConfig.afterTurn ? 'After this turn + finish' : 'Only finish'}`;
+      delivery.textContent = t(
+        'content_goal_delivery',
+        '$1: $2',
+        [
+          goalConfig.mode === 'loop' ? t('content_mode_loop', 'Loop') : t('content_mode_goal', 'Goal'),
+          goalConfig.afterTurn
+            ? t('content_goal_delivery_after_turn_finish', 'After this turn + finish')
+            : t('content_goal_delivery_only_finish', 'Only finish')
+        ]
+      );
       delivery.disabled = menuBusy || !!goalConfig.blocked;
       delivery.addEventListener('click', event => {
         event.preventDefault(); event.stopPropagation();
@@ -7609,7 +7836,7 @@
     track.className = 'clf-menu-mode-track';
     track.dataset.clfValue = mode.value;
     track.setAttribute('role', 'radiogroup');
-    track.setAttribute('aria-label', 'Goal mode');
+    track.setAttribute('aria-label', t('content_goal_mode_aria', 'Goal mode'));
 
     // Behind the three labels, and the only thing that moves. Its position is the value, so
     // there is nothing to keep in step with the buttons in front of it.
@@ -7706,7 +7933,7 @@
         plus.textContent = objective.summary ? '✎' : '+';
         plus.setAttribute('aria-hidden', 'true');
         const word = document.createElement('span');
-        word.textContent = objectiveBusy ? 'working…' : action.label;
+        word.textContent = objectiveBusy ? t('content_working', 'working…') : action.label;
         link.append(word, plus);
         link.addEventListener('click', (event) => {
           event.preventDefault();
@@ -7724,7 +7951,7 @@
     input.dir = 'auto';
     input.dataset.clfGoalInput = '1';
     input.rows = 3;
-    input.placeholder = 'What does this chat have to reach?';
+    input.placeholder = t('content_goal_placeholder', 'What does this chat have to reach?');
     input.value = menuDraft;
     input.disabled = objectiveBusy;
     input.addEventListener('keydown', (event) => {
@@ -7748,7 +7975,11 @@
     save.dataset.clfGoalMode = objective.mode;
     // Named, not just "Save". This button is the moment the mode is decided, and the two
     // outcomes are a run that may stop and a run that may not.
-    save.textContent = objectiveBusy ? 'Saving…' : objective.mode === 'loop' ? 'Save as loop' : 'Save as goal';
+    save.textContent = objectiveBusy
+      ? t('content_saving', 'Saving…')
+      : objective.mode === 'loop'
+        ? t('content_loop_save', 'Save as loop')
+        : t('content_goal_save', 'Save as goal');
     save.disabled = objectiveBusy || !menuDraft.trim() || objective.savable === false;
     save.addEventListener('click', (event) => {
       event.preventDefault();
@@ -7758,7 +7989,7 @@
     const cancel = document.createElement('button');
     cancel.type = 'button';
     cancel.className = 'clf-menu-goal-cancel';
-    cancel.textContent = 'Cancel';
+    cancel.textContent = t('content_cancel', 'Cancel');
     cancel.disabled = objectiveBusy;
     cancel.addEventListener('click', (event) => {
       event.preventDefault();
@@ -7774,14 +8005,14 @@
     // On the row rather than on Save, for the same reason as the link above: the button this
     // explains is disabled, and a disabled button is deaf to the pointer.
     if (objective.savable === false) {
-      buttons.setAttribute('data-clf-tip', 'Pick Goal or Loop above first — Off writes nothing.');
+      buttons.setAttribute('data-clf-tip', t('content_task_pick_mode_first', 'Pick Goal or Loop above first — Off writes nothing.'));
     }
     buttons.append(save, cancel);
     if (objective.text) {
       const clear = document.createElement('button');
       clear.type = 'button';
       clear.className = 'clf-menu-goal-clear';
-      clear.textContent = 'Clear';
+      clear.textContent = t('content_clear', 'Clear');
       // Deleting the task is an edit like any other, so Off stops it too. Reachable only from
       // an editor that was already open when the handle moved — and letting it through there
       // would delete the sentence from under a slider that says nothing is written here.
@@ -7868,7 +8099,7 @@
     // Never disabled any more: it opens a sheet, and a sheet that explains why compaction is
     // unavailable is exactly what somebody clicking a dead button wanted to be told.
     control.button.disabled = false;
-    control.button.setAttribute('aria-label', 'Chat On Steroids settings');
+    control.button.setAttribute('aria-label', t('content_settings_aria', 'Chat On Steroids settings'));
     control.button.setAttribute('aria-haspopup', 'dialog');
     if (!control.button.hasAttribute('aria-expanded')) control.button.setAttribute('aria-expanded', 'false');
     // The meter only while the button is a button. During a run the control is saying what
@@ -7955,8 +8186,15 @@
     // a row of near-identical worker tabs actually wants from the fold.
     label.textContent =
       bootstrap === 'worker'
-        ? `This is ${bootstrapAgent || agent || 'a worker'} — the instruction this app gave the worker, not something you typed`
-        : 'The handoff brief this app carried over — not something you typed';
+        ? t(
+          'content_bootstrap_worker',
+          'This is $1 — the instruction this app gave the worker, not something you typed',
+          bootstrapAgent || agent || t('content_worker_generic', 'a worker')
+        )
+        : t(
+          'content_bootstrap_handoff',
+          'The handoff brief this app carried over — not something you typed'
+        );
     head.append(label);
     // The first lines of the folded text, clamped. Not only a courtesy: ChatGPT sizes the user
     // bubble to its content, so a summary that was one short sentence made the bubble narrow
@@ -7986,7 +8224,12 @@
    * Only ever this chat's own work: `job` is reported per conversation, so a tab sitting
    * idle beside a chat that is compacting shows nothing.
    */
-  const COMPACT_STEPS = ['Preparing', 'Writing the handoff', 'Saving it', 'Opening the new chat'];
+  const COMPACT_STEPS = [
+    t('content_compact_step_preparing', 'Preparing'),
+    t('content_compact_step_writing', 'Writing the handoff'),
+    t('content_compact_step_saving', 'Saving it'),
+    t('content_compact_step_opening', 'Opening the new chat')
+  ];
 
   /** The exact marked response's observed progress; a sent prompt is not proof of writing. */
   function compactionSummaryProgress() {
@@ -8005,13 +8248,32 @@
       const ended = start && response.find(value => value.kind === 'turn_end' && value.turnId === start.turnId);
       if (ended?.outcome === 'completed') return { state: 'waiting', detail: '' };
       if (ended && ended.outcome !== 'completed') return { state: ended.outcome === 'stopped' ? 'stopped' : 'failed',
-        detail: ended.outcome === 'stopped' ? 'The handoff response was stopped. Cancel compaction to return to this chat.' :
-          ended.detail || 'The handoff response did not complete. Cancel compaction to return to this chat.' };
+        detail: ended.outcome === 'stopped'
+          ? t(
+            'content_compact_handoff_stopped_detail',
+            'The handoff response was stopped. Cancel compaction to return to this chat.'
+          )
+          : ended.detail || t(
+            'content_compact_handoff_incomplete_detail',
+            'The handoff response did not complete. Cancel compaction to return to this chat.'
+          ) };
       const error = start && response.find(value => value.kind === 'chat_error' && value.turnId === start.turnId);
-      if (error) return { state: 'failed', detail: error.text || 'ChatGPT reported a problem while preparing the handoff.' };
+      if (error) return {
+        state: 'failed',
+        detail: error.text || t(
+          'content_compact_handoff_problem',
+          'ChatGPT reported a problem while preparing the handoff.'
+        )
+      };
     }
     if (ownsQuestion && openedUserMessageId === messageId) {
-      if (stopRequestedAt) return { state: 'stopped', detail: 'The handoff response was stopped. Cancel compaction to return to this chat.' };
+      if (stopRequestedAt) return {
+        state: 'stopped',
+        detail: t(
+          'content_compact_handoff_stopped_detail',
+          'The handoff response was stopped. Cancel compaction to return to this chat.'
+        )
+      };
       if (generating && CLF_DOM.generating()) return { state: 'writing', detail: '' };
     }
     return { state: 'waiting', detail: '' };
@@ -8022,13 +8284,18 @@
     if (job && job.busy) {
       const stage =
         job.stage === 'opening'
-          ? 'Opening a fresh chat'
+          ? t('content_stage_opening_fresh_chat', 'Opening a fresh chat')
           : job.stage === 'waiting-for-browser'
-            ? 'Waiting for Chrome'
-            : phase === 'delivering' ? 'Saving the handoff'
-              : summary?.state === 'stopped' ? 'The handoff response was stopped'
-                : summary?.state === 'failed' ? 'The handoff response needs attention'
-                  : summary?.state === 'writing' ? 'ChatGPT is writing the handoff' : 'Waiting for the handoff response';
+            ? t('content_stage_waiting_for_chrome', 'Waiting for Chrome')
+            : phase === 'delivering'
+              ? t('content_stage_saving_handoff', 'Saving the handoff')
+              : summary?.state === 'stopped'
+                ? t('content_stage_handoff_stopped', 'The handoff response was stopped')
+                : summary?.state === 'failed'
+                  ? t('content_stage_handoff_attention', 'The handoff response needs attention')
+                  : summary?.state === 'writing'
+                    ? t('content_compact_chatgpt_writing', 'ChatGPT is writing the handoff')
+                    : t('content_compact_waiting_response', 'Waiting for the handoff response');
       // The prompt's durable position, not this document's memory of typing it. A reload
       // during the compaction turn starts a page whose `phase` is empty while the marked
       // prompt has been with ChatGPT for minutes — and the bar then said "Preparing" about
@@ -8056,17 +8323,37 @@
     const progress = input.progress;
     const frame = (stage, detail = '') => ({ stage, detail, body: '', kind: 'wait' });
     if (progress?.tools?.count > 0 && now - progress.tools.since >= 3000)
-      return frame(progress.tools.count === 1 ? 'Waiting for a local tool to finish' : `Waiting for ${progress.tools.count} local tools to finish`);
+      return frame(
+        progress.tools.count === 1
+          ? t('content_waiting_local_tool', 'Waiting for a local tool to finish')
+          : t('content_waiting_local_tools', 'Waiting for $1 local tools to finish', progress.tools.count)
+      );
     const workers = progress?.workers;
     // Failed workers remain in history and the agent panel. Only live workers
     // explain this wait; a historical failure must not pin it across handoffs.
     if (workers?.active > 0) {
-      const summary = `${workers.finished} finished · ${workers.active} running${workers.failed ? ` · ${workers.failed} failed` : ''}`;
+      const summary = workers.failed
+        ? t(
+          'content_workers_summary_failed',
+          '$1 finished · $2 running · $3 failed',
+          [workers.finished, workers.active, workers.failed]
+        )
+        : t('content_workers_summary', '$1 finished · $2 running', [workers.finished, workers.active]);
       // Running siblings are not proof that the prime is blocked on them.
-      return frame(workers.active === 1 ? `Worker still running: ${workers.names?.[0] || 'Worker'}`
-        : `${workers.active} workers still running`, summary);
+      return frame(
+        workers.active === 1
+          ? t(
+            'content_worker_still_running',
+            'Worker still running: $1',
+            workers.names?.[0] || t('content_worker_label', 'Worker')
+          )
+          : t('content_workers_still_running', '$1 workers still running', workers.active),
+        summary
+      );
     }
-    return input.generating ? frame('Still waiting for the current operation to complete') : null;
+    return input.generating
+      ? frame(t('content_waiting_current_operation', 'Still waiting for the current operation to complete'))
+      : null;
   }
 
   /**
@@ -8078,7 +8365,7 @@
    */
   function modelLabel(id) {
     const name = String(id || '').trim();
-    if (!name) return 'the model';
+    if (!name) return t('content_model_generic', 'the model');
     const tail = name.slice(name.lastIndexOf('/') + 1);
     return tail.split(':')[0] || tail;
   }
@@ -8103,7 +8390,12 @@
    * — and a caption on its own only ever answered "what now". It never answered "how far",
    * so a run that had stopped and a run that was merely slow looked identical for minutes.
    */
-  const GOAL_STEPS = ['Answer settling', 'Reading the chat', 'Writing the reply', 'Sending'];
+  const GOAL_STEPS = [
+    t('content_goal_step_settling', 'Answer settling'),
+    t('content_goal_step_reading', 'Reading the chat'),
+    t('content_goal_step_writing', 'Writing the reply'),
+    t('content_goal_step_sending', 'Sending')
+  ];
 
   /**
    * Which of those a phase is.
@@ -8120,61 +8412,153 @@
     const draft = goal.draft || null;
     const who = modelLabel(draft?.model || goal.model);
     const backend = draft?.backend || goal.backend;
-    const dest = backend === 'chatgpt' ? 'ChatGPT helper' : backend === 'templates' ? 'offline templates'
-      : goal.provider === 'custom' ? 'custom endpoint' : 'OpenRouter';
+    const dest = backend === 'chatgpt'
+      ? t('content_goal_backend_chatgpt_helper', 'ChatGPT helper')
+      : backend === 'templates'
+        ? t('content_goal_backend_offline_templates', 'offline templates')
+        : goal.provider === 'custom'
+          ? t('content_goal_backend_custom_endpoint', 'custom endpoint')
+          : 'OpenRouter';
     const bar = (at, done = false) => ({ steps: GOAL_STEPS, at, done });
-    const failure = goal.error || (draft && draft.stage === 'failed' ? draft.message || draft.error || `${dest} did not answer` : '');
+    const failure = goal.error || (draft && draft.stage === 'failed'
+      ? draft.message || draft.error || t('content_goal_backend_no_answer', '$1 did not answer', dest)
+      : '');
     if (failure) {
       const at = draft && draft.stage === 'failed' ? 2 : (GOAL_STEP_AT[goal.phase] ?? 1);
       if (goal.phase === 'retrying') {
         const seconds = Math.round((goal.retryMs || GOAL_RETRY_MS) / 1000);
-        return { stage: `Retrying Goal in ${seconds} seconds`, detail: failure, body: '', kind: 'goal', ...bar(at) };
+        return {
+          stage: t('content_goal_retrying', 'Retrying Goal in $1 seconds', seconds),
+          detail: failure,
+          body: '',
+          kind: 'goal',
+          ...bar(at)
+        };
       }
-      return { stage: goal.mode === 'loop' ? 'Loop continuation paused' : 'The goal loop stopped', detail: failure, body: '', kind: 'goal-error', ...bar(at) };
+      return {
+        stage: goal.mode === 'loop'
+          ? t('content_loop_continuation_paused', 'Loop continuation paused')
+          : t('content_goal_loop_stopped', 'The goal loop stopped'),
+        detail: failure,
+        body: '',
+        kind: 'goal-error',
+        ...bar(at)
+      };
     }
     // A chat opening on a specific goal. There is no answer to read and no turn to settle,
     // so the first two steps of the ordinary run simply did not happen; saying "sending the
     // answer to OpenRouter" about a chat with no answer in it yet would be describing a
     // different run entirely.
     if (goal.opening) {
-      if (goal.phase === 'sending') return { stage: 'Sending it to ChatGPT', detail: '', body: '', kind: 'goal', ...bar(3) };
-      return { stage: `${who} is writing the first message`, detail: '', body: '', kind: 'goal', ...bar(2) };
+      if (goal.phase === 'sending') return {
+        stage: t('content_goal_sending_to_chatgpt', 'Sending it to ChatGPT'),
+        detail: '',
+        body: '',
+        kind: 'goal',
+        ...bar(3)
+      };
+      return {
+        stage: t('content_goal_writing_first_message', '$1 is writing the first message', who),
+        detail: '',
+        body: '',
+        kind: 'goal',
+        ...bar(2)
+      };
     }
     if (goal.phase === 'done') {
       // The loop's own success condition, and the one state worth spelling out: nothing was
       // typed, and that is the answer rather than a failure to produce one. The bar stops at
       // the reply for the same reason — there was never anything to send.
-      return { stage: 'Goal reached', detail: 'nothing was sent', body: '', kind: 'goal-done', ...bar(2, true) };
+      return {
+        stage: t('content_goal_reached', 'Goal reached'),
+        detail: t('content_goal_nothing_sent', 'nothing was sent'),
+        body: '',
+        kind: 'goal-done',
+        ...bar(2, true)
+      };
     }
     if (goal.phase === 'settling' || (!draft && goal.wait)) {
       const wait = goal.wait;
       const seconds = wait?.until ? Math.max(0, Math.ceil((wait.until - Date.now()) / 1000)) : 0;
-      const detail = seconds ? `Checking again in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : '';
-      const stage = wait?.reason === 'native-busy' ? 'ChatGPT resumed work · waiting before retry' : wait?.reason === 'silence' ? 'Waiting before recovery reload' : wait?.reason === 'quiet' ? 'Waiting for tool inactivity' :
-        wait?.reason === 'tools' ? 'Waiting for running tools' : wait?.reason === 'listening' ? 'Waiting for activity after recovery' : 'Checking the answer is finished';
+      const detail = seconds
+        ? t(
+          'content_goal_checking_again',
+          'Checking again in $1',
+          `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+        )
+        : '';
+      const stage = wait?.reason === 'native-busy'
+        ? t('content_goal_wait_resumed', 'ChatGPT resumed work · waiting before retry')
+        : wait?.reason === 'silence'
+          ? t('content_goal_wait_recovery_reload', 'Waiting before recovery reload')
+          : wait?.reason === 'quiet'
+            ? t('content_goal_wait_tool_inactivity', 'Waiting for tool inactivity')
+            : wait?.reason === 'workers'
+              ? t('content_goal_wait_workers', 'Waiting for this chat’s sub-agents')
+              : wait?.reason === 'tools'
+                ? t('content_goal_wait_running_tools', 'Waiting for running tools')
+                : wait?.reason === 'listening'
+                  ? t('content_goal_wait_recovery_activity', 'Waiting for activity after recovery')
+                  : t('content_goal_checking_finished', 'Checking the answer is finished');
       return { stage, detail, body: '', kind: 'goal', ...bar(0) };
     }
     if (goal.phase === 'sending' && draft && draft.reply) {
-      return { stage: 'Sending it to ChatGPT', detail: '', body: draft.reply, kind: 'goal', ...bar(3) };
+      return {
+        stage: t('content_goal_sending_to_chatgpt', 'Sending it to ChatGPT'),
+        detail: '',
+        body: draft.reply,
+        kind: 'goal',
+        ...bar(3)
+      };
     }
     if (goal.phase === 'requesting' && !draft) {
-      return { stage: `Sending the answer to ${dest}`, detail: who, body: '', kind: 'goal', ...bar(1) };
+      return {
+        stage: t('content_goal_sending_answer_to', 'Sending the answer to $1', dest),
+        detail: who,
+        body: '',
+        kind: 'goal',
+        ...bar(1)
+      };
     }
     if (!draft) return null;
     if (draft.stage === 'no-reply') {
-      return { stage: 'Goal reached', detail: 'nothing was sent', body: '', kind: 'goal-done', ...bar(2, true) };
+      return {
+        stage: t('content_goal_reached', 'Goal reached'),
+        detail: t('content_goal_nothing_sent', 'nothing was sent'),
+        body: '',
+        kind: 'goal-done',
+        ...bar(2, true)
+      };
     }
     if (draft.stage === 'sending') {
-      return { stage: `Sending the answer to ${dest}`, detail: who, body: '', kind: 'goal', ...bar(1) };
+      return {
+        stage: t('content_goal_sending_answer_to', 'Sending the answer to $1', dest),
+        detail: who,
+        body: '',
+        kind: 'goal',
+        ...bar(1)
+      };
     }
     if (draft.stage === 'answering') {
       // Streamed, so the wait has something in it. The text is the message being written for
       // the user, which is exactly the thing worth reading before it is sent.
-      return { stage: `${who} is answering`, detail: '', body: draft.text || '', kind: 'goal', ...bar(2) };
+      return {
+        stage: t('content_goal_answering', '$1 is answering', who),
+        detail: '',
+        body: draft.text || '',
+        kind: 'goal',
+        ...bar(2)
+      };
     }
     if (draft.stage === 'ready') {
       // Written, not yet typed: the third segment is full and the fourth has not started.
-      return { stage: `${who} wrote the next message`, detail: '', body: draft.reply || '', kind: 'goal', ...bar(2, true) };
+      return {
+        stage: t('content_goal_wrote_next_message', '$1 wrote the next message', who),
+        detail: '',
+        body: draft.reply || '',
+        kind: 'goal',
+        ...bar(2, true)
+      };
     }
     return null;
   }
@@ -8233,8 +8617,8 @@
     close.className = 'clf-stage-close';
     close.type = 'button';
     close.textContent = '×';
-    close.title = 'Dismiss';
-    close.setAttribute('aria-label', 'Dismiss Goal status');
+    close.title = t('content_dismiss', 'Dismiss');
+    close.setAttribute('aria-label', t('content_goal_status_dismiss', 'Dismiss Goal status'));
     close.hidden = true;
     close.addEventListener('click', () => {
       // Removing the node alone is not enough: injectStage runs on every activity repaint
@@ -8402,7 +8786,11 @@
       sourceLost: true, sourceError: why }).catch(() => null) : null;
     if (!current()) return;
     if (retired?.ok === true && retired.data?.aborted === true) job = retired.data.job || null;
-    else localError = `${why} The app has not yet confirmed that this failed request was closed.`;
+    else localError = t(
+      'content_compact_failed_request_unconfirmed',
+      '$1 The app has not yet confirmed that this failed request was closed.',
+      why
+    );
   }
 
   async function startCompact(automatic = false) {
@@ -8458,7 +8846,10 @@
       pressedAt = 0;
       nativeBusy = false;
       nativePhase = '';
-      localError = replyError(policy) || 'Could not verify whether this chat may be compacted.';
+      localError = replyError(policy) || t(
+        'content_compact_policy_unverified',
+        'Could not verify whether this chat may be compacted.'
+      );
       renderControl();
       return;
     }
@@ -8489,7 +8880,10 @@
       pressedAt = 0;
       nativeBusy = false;
       nativePhase = '';
-      localError = replyError(filed) || 'The compaction ticket could not be stored.';
+      localError = replyError(filed) || t(
+        'content_compact_ticket_store_failed',
+        'The compaction ticket could not be stored.'
+      );
       renderControl();
       void pullActivity();
       return;
@@ -8503,7 +8897,12 @@
       pressedAt = 0;
       nativeBusy = false;
       nativePhase = sourceSend && job?.busy ? 'waiting' : '';
-      localError = sourceSend ? '' : 'Could not verify the handoff send state. Nothing was stopped.';
+      localError = sourceSend
+        ? ''
+        : t(
+          'content_compact_send_state_unverified',
+          'Could not verify the handoff send state. Nothing was stopped.'
+        );
       renderControl();
       injectStage();
       return;
@@ -8533,9 +8932,19 @@
         nativePhase = '';
         localError = hydrationCurrent()
           ? expectedQuestionId && editableSource()
-            ? 'The original question has not loaded yet. Nothing was compacted; waiting for the source conversation.'
-            : `The ChatGPT message box is not ready (${CLF_DOM.composer() ? 'composer_unavailable' : 'composer_missing'}). Wait for the page to load and retry.`
-          : 'The chat changed while preparing the handoff. Nothing was sent.';
+            ? t(
+              'content_compact_source_not_loaded',
+              'The original question has not loaded yet. Nothing was compacted; waiting for the source conversation.'
+            )
+            : t(
+              'content_chatgpt_message_box_not_ready',
+              'The ChatGPT message box is not ready ($1). Wait for the page to load and retry.',
+              CLF_DOM.composer() ? 'composer_unavailable' : 'composer_missing'
+            )
+          : t(
+            'content_compact_chat_changed_preparing',
+            'The chat changed while preparing the handoff. Nothing was sent.'
+          );
         if (!automatic || !hydrationCurrent()) await retireUnsentCompaction(forId, String(filed.data.token || ''), localError, current);
         if (!current()) return;
         renderControl();
@@ -8579,7 +8988,7 @@
       pressedAt = 0;
       nativeBusy = false;
       nativePhase = '';
-      localError = replyError(reply) || 'The app did not answer.';
+      localError = replyError(reply) || t('content_app_did_not_answer', 'The app did not answer.');
       renderControl();
       void pullActivity();
       return;
@@ -8597,8 +9006,14 @@
       pressedAt = 0;
       localError =
         data.sourceSend && data.sourceSend.state === 'dispatched-unresolved'
-          ? 'The handoff instruction was already submitted here. It will finish on its own, or cancel it.'
-          : 'A compaction is already under way in this chat. Wait for it, or cancel it.';
+          ? t(
+            'content_compact_handoff_already_submitted',
+            'The handoff instruction was already submitted here. It will finish on its own, or cancel it.'
+          )
+          : t(
+            'content_compact_already_underway',
+            'A compaction is already under way in this chat. Wait for it, or cancel it.'
+          );
       renderControl();
       void pullActivity();
       return;
@@ -8629,6 +9044,28 @@
     await startCompact(automatic);
   }
 
+  function resumePendingCompactionFromRepair(expectedConversationId) {
+    const source = job && job.stage === 'handoff-pending' ? job.sourceSend : null;
+    if (!alive || !expectedConversationId || conversationId !== expectedConversationId ||
+        CLF_DOM.conversationId() !== expectedConversationId || !source ||
+        (source.state !== 'not-attempted' && source.state !== 'attempted-unresolved')) return false;
+    // The browser recovery claim proves only that this exact document may be nudged. It does not
+    // own Stop or Send: those remain behind startCompact's source identity, settle and durable WAL
+    // checkpoints. If an attempt is already alive, merely acknowledge the healthy document so the
+    // background worker does not reload it out from under that work.
+    if (!nativeBusy) {
+      localError = '';
+      nativePhase = '';
+      pressedAt = 0;
+      const forId = conversationId, forEpoch = epoch;
+      queueMicrotask(() => {
+        if (alive && conversationId === forId && epoch === forEpoch)
+          void maybeResumePendingCompaction(forId, forEpoch);
+      });
+    }
+    return true;
+  }
+
   /**
    * Brings the conversation to a standstill so its recording can be copied.
    *
@@ -8648,7 +9085,10 @@
       conversationId === forId &&
       epoch === forEpoch &&
       CLF_DOM.conversationId() === forId && sameTurn();
-    if (!forId || !current()) return 'This chat changed before compaction could start.';
+    if (!forId || !current()) return t(
+      'content_compact_chat_changed_before_start',
+      'This chat changed before compaction could start.'
+    );
     if (automatic && CLF_DOM.generating()) {
       // A local result can file the ticket before ChatGPT receives that result. Stopping
       // here used to lose completed work from the brief. Require native receipt first;
@@ -8707,8 +9147,14 @@
         if (!current()) return true;
         return fresh && received();
       }, TOOL_SETTLE_MS);
-      if (!current()) return 'This chat changed while compaction was waiting for tool results.';
-      if (!ready) return 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.';
+      if (!current()) return t(
+        'content_compact_chat_changed_waiting_results',
+        'This chat changed while compaction was waiting for tool results.'
+      );
+      if (!ready) return t(
+        'content_compact_results_unconfirmed',
+        'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.'
+      );
     }
     // INTERRUPTING — stop the turn rather than wait it out. That is the whole request, by
     // hand or automatically: this happens because the turn is long, not because it is
@@ -8720,8 +9166,14 @@
       if (stop) stop.click();
       stopRequestedAt = Date.now();
       const stopped = await waitUntil(() => !current() || !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
-      if (!current()) return 'This chat changed while compaction was stopping the turn.';
-      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+      if (!current()) return t(
+        'content_compact_chat_changed_stopping',
+        'This chat changed while compaction was stopping the turn.'
+      );
+      if (!stopped) return t(
+        'content_compact_stop_failed',
+        'ChatGPT would not stop the current turn. Nothing was compacted.'
+      );
     }
 
     // SETTLING — bounded and fail-closed. A call that is still running at the deadline is
@@ -8758,12 +9210,21 @@
       pendingTools = count;
       return count === 0;
     }, TOOL_SETTLE_MS);
-    if (!current()) return 'This chat changed while compaction was waiting for local tools.';
+    if (!current()) return t(
+      'content_compact_chat_changed_waiting_tools',
+      'This chat changed while compaction was waiting for local tools.'
+    );
     if (unavailable) {
-      return 'Could not verify that local tools had stopped. Nothing was compacted.';
+      return t(
+        'content_compact_tools_stop_unverified',
+        'Could not verify that local tools had stopped. Nothing was compacted.'
+      );
     }
     if (!settled) {
-      return 'Local tools were still running after the settle timeout. Nothing was compacted.';
+      return t(
+        'content_compact_tools_still_running',
+        'Local tools were still running after the settle timeout. Nothing was compacted.'
+      );
     }
     return '';
   }
@@ -8801,8 +9262,12 @@
     };
 
     if (!current()) return;
-    if (!prompt) return void (await abandonBeforeSend('The app did not send the handoff instruction.'));
-    if (!token) return void (await abandonBeforeSend('The app did not send a compaction token, so nothing could be tracked.'));
+    if (!prompt) return void (await abandonBeforeSend(
+      t('content_compact_missing_handoff_instruction', 'The app did not send the handoff instruction.')
+    ));
+    if (!token) return void (await abandonBeforeSend(
+      t('content_compact_missing_token', 'The app did not send a compaction token, so nothing could be tracked.')
+    ));
 
     try {
       nativePhase = 'prompting';
@@ -8817,10 +9282,19 @@
       // the existing DOM waiter; an unavailable host is not a provider rejection.
       const ready = editable() || await waitPageView(editable, () => current() && sameSource(), INTERRUPT_WAIT_MS);
       if (!current()) return;
-      if (!sameSource()) return void (await abandonBeforeSend('The chat changed while preparing the handoff. Nothing was sent.', true));
+      if (!sameSource()) return void (await abandonBeforeSend(
+        t('content_compact_chat_changed_preparing', 'The chat changed while preparing the handoff. Nothing was sent.'),
+        true
+      ));
       if (!ready) {
         const reason = CLF_DOM.composer() ? 'composer_unavailable' : 'composer_missing';
-        return void (await abandonBeforeSend(`The ChatGPT message box is not ready (${reason}). Wait for the page to load and retry.`));
+        return void (await abandonBeforeSend(
+          t(
+            'content_chatgpt_message_box_not_ready',
+            'The ChatGPT message box is not ready ($1). Wait for the page to load and retry.',
+            reason
+          )
+        ));
       }
       const existing = CLF_DOM.composer();
       const occupiedByOtherDraft =
@@ -8830,8 +9304,15 @@
       if (squeeze(existing?.textContent) !== squeeze(prompt) && !CLF_DOM.insertPrompt(prompt, false, reason => { insertionFailure = reason; })) {
         return void (await abandonBeforeSend(
           occupiedByOtherDraft
-            ? 'A draft is already in ChatGPT; clear the message box before requesting the handoff.'
-            : `The browser could not insert the handoff request (${insertionFailure || 'insertion_failed'}). Check that the message box is available and retry.`,
+            ? t(
+              'content_compact_existing_draft',
+              'A draft is already in ChatGPT; clear the message box before requesting the handoff.'
+            )
+            : t(
+              'content_compact_insert_failed',
+              'The browser could not insert the handoff request ($1). Check that the message box is available and retry.',
+              insertionFailure || 'insertion_failed'
+            ),
           // An occupied composer is durable state: ChatGPT restores drafts across reloads. Leaving
           // an automatic ticket open here makes every compaction pickup reload the same draft and
           // hit this same refusal forever. Retire only this provably pre-Send ticket; the draft
@@ -8844,12 +9325,18 @@
       if (!current()) return;
       if (!sameSource()) {
         CLF_DOM.clearPromptExact(prompt);
-        return void (await abandonBeforeSend('The chat changed while preparing the handoff. Nothing was sent.', true));
+        return void (await abandonBeforeSend(
+          t('content_compact_chat_changed_preparing', 'The chat changed while preparing the handoff. Nothing was sent.'),
+          true
+        ));
       }
       const composer = CLF_DOM.composer();
       if (!composer || squeeze(composer.textContent) !== squeeze(prompt)) {
         return void (await abandonBeforeSend(
-          'The message box changed before the handoff instruction could be sent. Its draft was preserved; nothing was compacted.'
+          t(
+            'content_compact_message_box_changed',
+            'The message box changed before the handoff instruction could be sent. Its draft was preserved; nothing was compacted.'
+          )
         ));
       }
       // Claiming the prompt. Nothing has been submitted under this state, and the app knows
@@ -8862,13 +9349,22 @@
         nativeBusy = false;
         nativePhase = 'waiting';
         pressedAt = 0;
-        localError = replyError(permit) || 'The durable handoff attempt is already owned; reconciling ChatGPT’s marked message.';
+        localError = replyError(permit) || t(
+          'content_compact_attempt_owned',
+          'The durable handoff attempt is already owned; reconciling ChatGPT’s marked message.'
+        );
         renderControl();
         return;
       }
       if (!sameSource() || CLF_DOM.composer() !== composer || squeeze(composer.textContent) !== squeeze(prompt)) {
         CLF_DOM.clearPromptExact(prompt);
-        return void (await abandonBeforeSend('The message box changed before the handoff could be sent. Its draft was preserved.', true));
+        return void (await abandonBeforeSend(
+          t(
+            'content_compact_message_box_changed_preserved',
+            'The message box changed before the handoff could be sent. Its draft was preserved.'
+          ),
+          true
+        ));
       }
       rememberUserSend();
       const sent = await sendSubmittedText(current, true, async stillSending => {
@@ -8880,7 +9376,10 @@
         const armed = await ask({ type: 'compact', conversationId: forId, token, sourceDispatch: true });
         if (!current()) return false;
         if (!armed || armed.ok !== true || armed.data?.armed !== true) {
-          localError = 'Nothing was submitted here: the handoff send permission was not confirmed. The existing request will not be sent twice.';
+          localError = t(
+            'content_compact_send_permission_unconfirmed',
+            'Nothing was submitted here: the handoff send permission was not confirmed. The existing request will not be sent twice.'
+          );
           return false;
         }
         return stillSending() && sameSource();
@@ -8889,12 +9388,18 @@
       if (!sent) {
         CLF_DOM.clearPromptExact(prompt);
         if (!attemptCrossed) return void (await abandonBeforeSend(
-          'The handoff request was not submitted because the Send button or message box was not ready. Retry after the page is ready.'
+          t(
+            'content_compact_send_not_ready',
+            'The handoff request was not submitted because the Send button or message box was not ready. Retry after the page is ready.'
+          )
         ));
         nativeBusy = false;
         nativePhase = 'waiting';
         pressedAt = 0;
-        localError ||= 'The send result was ambiguous. Nothing will be sent twice; cancel explicitly if ChatGPT never accepted it.';
+        localError ||= t(
+          'content_compact_send_ambiguous',
+          'The send result was ambiguous. Nothing will be sent twice; cancel explicitly if ChatGPT never accepted it.'
+        );
         renderControl();
         return;
       }
@@ -8902,12 +9407,20 @@
       renderControl();
       void pullActivity();
     } catch (err) {
-      const why = `Could not ask ChatGPT for a handoff: ${(err && err.message) || 'unknown error'}`;
+      const why = t(
+        'content_compact_handoff_request_failed',
+        'Could not ask ChatGPT for a handoff: $1',
+        (err && err.message) || t('content_unknown_error', 'unknown error')
+      );
       if (!attemptCrossed) await abandonBeforeSend(why);
       else {
         CLF_DOM.clearPromptExact(prompt);
         nativePhase = 'waiting';
-        localError = `${why}. The durable attempt will not be sent twice.`;
+        localError = t(
+          'content_compact_attempt_not_repeated',
+          '$1. The durable attempt will not be sent twice.',
+          why
+        );
         renderControl();
       }
     } finally {
@@ -9440,7 +9953,10 @@
         await requestGoalDraft(forTurn, current);
         return;
       }
-      setGoalPhase('settling', 'the answer never stopped changing, so nothing was written');
+      setGoalPhase(
+        'settling',
+        t('content_goal_answer_never_settled', 'the answer never stopped changing, so nothing was written')
+      );
     } finally {
       goalBusy = false;
       renderControl();
@@ -9542,7 +10058,7 @@
       }
       // The phase is kept rather than collapsed into `failed`: it names the step that
       // stopped, so the bar draws the run where it ended instead of back at the beginning.
-      setGoalPhase('requesting', replyError(reply) || 'the app did not answer');
+      setGoalPhase('requesting', replyError(reply) || t('content_app_did_not_answer_lower', 'the app did not answer'));
       // A refused request is not a new pickup episode. Releasing its claim here lets
       // every activity repaint retry immediately, bypassing the existing backoff and
       // even hammering the bridge's own rate limit. Retain custody through the wait;
@@ -9551,7 +10067,7 @@
         reply.status === 429 || (reply.status >= 500 && failure.retryable !== false);
       if (retryable) {
         goalRetryWaitMs = goalRetryWait();
-        setGoalPhase('retrying', replyError(reply) || 'the app did not answer');
+        setGoalPhase('retrying', replyError(reply) || t('content_app_did_not_answer_lower', 'the app did not answer'));
         void retryGoalDraft(forTurn);
       }
       return;
@@ -9619,7 +10135,18 @@
     }
     if (draft.stage === 'failed') {
       goalDraft = null;
-      const why = draft.message || draft.error || `${draft.backend === 'chatgpt' ? 'ChatGPT helper' : draft.backend === 'templates' ? 'Offline templates' : goalConfig && goalConfig.provider === 'custom' ? 'custom endpoint' : 'OpenRouter'} did not answer`;
+      const fallbackDestination = draft.backend === 'chatgpt'
+        ? t('content_goal_backend_chatgpt_helper', 'ChatGPT helper')
+        : draft.backend === 'templates'
+          ? t('content_goal_backend_offline_templates_title', 'Offline templates')
+          : goalConfig && goalConfig.provider === 'custom'
+            ? t('content_goal_backend_custom_endpoint', 'custom endpoint')
+            : 'OpenRouter';
+      const why = draft.message || draft.error || t(
+        'content_goal_backend_no_answer',
+        '$1 did not answer',
+        fallbackDestination
+      );
       const pending = goalConfig && goalConfig.pending;
       let retrying = draft.retryable === true && goalTurnId === draft.turnId;
       // A reload loses the document-local claim while the app keeps both the failed attempt
@@ -9680,7 +10207,10 @@
       if (!CLF_DOM.insertPrompt(draft.reply, 'append')) {
         if (Date.now() - goalTypingSince < GOAL_TYPING_WINDOW_MS) return;
         goalDraft = null;
-        setGoalPhase('sending', 'the message box was in use, so nothing was sent');
+        setGoalPhase(
+          'sending',
+          t('content_goal_message_box_in_use', 'the message box was in use, so nothing was sent')
+        );
         await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
         return;
       }
@@ -9716,7 +10246,7 @@
       if (ownsDraft) goalDraft = null;
       if (!sent) {
         await ask({ type: 'goal_ack', conversationId: target, token: draft.token }).catch(() => undefined);
-        if (ownsDraft) setGoalPhase('sending', 'ChatGPT would not send the message');
+        if (ownsDraft) setGoalPhase('sending', t('content_goal_send_failed', 'ChatGPT would not send the message'));
         return;
       }
       // Sending is the irreversible step. Record it before the fallible ACK hop so a lost
@@ -9814,7 +10344,10 @@
     const reply = await ask({ type: 'compact', conversationId: forId, cancel: true });
     if (!current()) return;
     if (reply && reply.ok === true && reply.data && reply.data.job) job = reply.data.job;
-    else if (!reply || reply.ok !== true) localError = replyError(reply) || 'Could not cancel compaction.';
+    else if (!reply || reply.ok !== true) localError = replyError(reply) || t(
+      'content_compact_cancel_failed',
+      'Could not cancel compaction.'
+    );
     renderControl();
     void pullActivity();
   }
@@ -9823,11 +10356,23 @@
     if (!reply) return '';
     const data = reply.data || {};
     if (data.message) return String(data.message).slice(0, 600);
-    if (data.error === 'session_not_recorded') return 'This chat has no recorded local session yet.';
-    if (data.error === 'compaction_running') return 'Another chat is compacting right now.';
-    if (data.error === 'turn_still_generating') return 'Wait for this ChatGPT turn to finish first.';
+    if (data.error === 'session_not_recorded') return t(
+      'content_error_session_not_recorded',
+      'This chat has no recorded local session yet.'
+    );
+    if (data.error === 'compaction_running') return t(
+      'content_error_compaction_running',
+      'Another chat is compacting right now.'
+    );
+    if (data.error === 'turn_still_generating') return t(
+      'content_error_turn_still_generating',
+      'Wait for this ChatGPT turn to finish first.'
+    );
     if (data.error) return String(data.error).slice(0, 160);
-    if (reply.error === 'app_not_found') return 'Chat On Steroids is not running on this PC.';
+    if (reply.error === 'app_not_found') return t(
+      'content_app_not_running',
+      'Chat On Steroids is not running on this PC.'
+    );
     return reply.error ? String(reply.error).slice(0, 160) : '';
   }
 
@@ -10146,7 +10691,8 @@
    * immediately when the composer already exists, otherwise wake the instant React mounts
    * one, with only a bounded timer as the failure deadline.
    */
-  function waitForComposer(timeoutMs = 12_000) {
+  function waitForComposer(timeoutMs = 12_000, stillCurrent = () => true) {
+    if (!stillCurrent()) return Promise.resolve(null);
     const current = CLF_DOM.composer();
     if (current && current.isConnected) return Promise.resolve(current);
     return new Promise((resolve) => {
@@ -10158,6 +10704,7 @@
         resolve(value);
       };
       const check = () => {
+        if (!stillCurrent()) return finish(null);
         const composer = CLF_DOM.composer();
         if (composer && composer.isConnected) finish(composer);
       };
@@ -10265,13 +10812,33 @@
     // From here onward a competing fresh wake must not supersede this attempt: the bridge may
     // persist this document as owner before the response gets back to us.
     if (attempt) attempt.phase = 'redeeming';
-    const reply = await ask({
+    const redeemEpoch = epoch;
+    const redeemRequest = {
       type: 'redeem',
       id,
       client: RUN_ID,
       ...(fromUrl && OPENED_PROJECT_ENTRY ? { projectEntry: true } : {}),
       ...(openedConversation ? { conversationId: openedConversation } : {})
+    };
+    const redeemStillCurrent = () => alive && epoch === redeemEpoch && !attempt?.cancelled &&
+      (!attempt || commandAttempt === attempt) &&
+      (!fromUrl || markerId() === id) &&
+      (openedConversation ? CLF_DOM.conversationId() === openedConversation : !CLF_DOM.conversationId());
+    const redeemOnce = () => new Promise(resolve => {
+      let done = false;
+      const finish = value => { if (done) return; done = true; clearTimeout(timer); resolve(value); };
+      // The app may have durably assigned this RUN_ID as owner even if the MV3 reply disappears.
+      // Keep retry bounded to the pre-Send handshake; destinationAttempt has its own no-replay fence.
+      const timer = setTimeout(() => finish(null), 30_000);
+      void ask(redeemRequest).then(finish, () => finish(null));
     });
+    let reply = await redeemOnce();
+    for (let retry = 0; retry < 2 && (!reply || (reply.ok !== true && reply.retryable === true)); retry++) {
+      if (!redeemStillCurrent()) break;
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+      if (!redeemStillCurrent()) break;
+      reply = await redeemOnce();
+    }
     if (!reply || reply.ok !== true) {
       // The app could not be reached at all, so there is nothing to acknowledge and nothing
       // to acknowledge it to. Its own deadline ends the command; this page stops here.
@@ -10293,6 +10860,9 @@
     // attempt was started. If the fallback got there first, `boot` is null and the false path
     // above leaves that winning tab alive.
     if (attempt) attempt.phase = 'claimed';
+    if (attempt && boot.type === 'worker' && typeof boot.agent === 'string' && boot.agent && typeof boot.id === 'string') {
+      attempt.agent = boot.agent;
+    }
     reportClaim(true);
 
     const fail = (why) => {
@@ -10307,10 +10877,16 @@
     if (projectEntry) {
       if (!fromUrl || !OPENED_PROJECT_ENTRY || target || openedConversation !== projectEntry.sourceConversationId ||
           markerId() !== id || CLF_DOM.conversationId() !== openedConversation) {
-        return void (await fail('the Project entry no longer matches the source conversation; nothing was sent'));
+        return void (await fail(t(
+          'content_bootstrap_project_source_changed',
+          'the Project entry no longer matches the source conversation; nothing was sent'
+        )));
       }
       if (!(await CLF_DOM.enterProject(projectEntry, () => alive && !attempt?.cancelled))) {
-        return void (await fail('ChatGPT could not open the source Project through its native link; nothing was sent'));
+        return void (await fail(t(
+          'content_bootstrap_project_open_failed',
+          'ChatGPT could not open the source Project through its native link; nothing was sent'
+        )));
       }
       // The provider's own SPA link consumes the opening URL. Carry this claimed command
       // onto the proven Project route, then fence every later await to that navigation epoch.
@@ -10320,7 +10896,10 @@
       history.replaceState(history.state, '', marked.href);
       observe();
     } else if (OPENED_PROJECT_ENTRY) {
-      return void (await fail('the command did not authorize Project entry; nothing was sent'));
+      return void (await fail(t(
+        'content_bootstrap_project_not_authorized',
+        'the command did not authorize Project entry; nothing was sent'
+      )));
     }
     if (fromUrl && openedConversation && !target && !projectEntry) {
       // Current bridges reject this before leasing the command. Keep the page-side half too:
@@ -10330,13 +10909,22 @@
     }
     if (!fromUrl && !target) {
       // Only a command that names a conversation is ever handed to an existing document.
-      return void (await fail('it was offered to a chat that already exists and it does not name one'));
+      return void (await fail(t(
+        'content_bootstrap_missing_target',
+        'it was offered to a chat that already exists and it does not name one'
+      )));
     }
     if (target && openedConversation !== target) {
-      return void (await fail('the page that was opened for it was showing a different conversation'));
+      return void (await fail(t(
+        'content_bootstrap_wrong_conversation',
+        'the page that was opened for it was showing a different conversation'
+      )));
     }
     if (!target && CLF_DOM.conversationId()) {
-      return void (await fail('the marked fresh chat changed before bootstrap send; nothing was sent'));
+      return void (await fail(t(
+        'content_bootstrap_fresh_chat_changed',
+        'the marked fresh chat changed before bootstrap send; nothing was sent'
+      )));
     }
     const sendEpoch = epoch;
     const onTarget = () => (target ? CLF_DOM.conversationId() === target : !CLF_DOM.conversationId()) &&
@@ -10354,8 +10942,14 @@
       if (stillOnTarget()) return false;
       await fail(
         target
-          ? 'the chat this message was for changed before it was sent; nothing was sent'
-          : 'the marked fresh chat changed before bootstrap send; nothing was sent'
+          ? t(
+            'content_bootstrap_target_changed',
+            'the chat this message was for changed before it was sent; nothing was sent'
+          )
+          : t(
+            'content_bootstrap_fresh_chat_changed',
+            'the marked fresh chat changed before bootstrap send; nothing was sent'
+          )
       );
       return true;
     };
@@ -10365,17 +10959,64 @@
     // resource finished loading, not whether this editing host is usable, and waiting on it
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
     const readyComposer = await waitForComposer();
-    if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
+    if (!readyComposer) return void (await fail(t(
+      'content_bootstrap_composer_unavailable',
+      'ChatGPT never exposed a usable composer for bootstrap'
+    )));
     if (await failIfRetargeted()) return;
 
     if ((boot.model || boot.reasoningEffort) && !(await CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, stillOnTarget))) {
-      return void (await fail('The requested model or reasoning is unavailable or could not be confirmed in ChatGPT'));
+      return void (await fail(t(
+        'content_bootstrap_model_unavailable',
+        'The requested model or reasoning is unavailable or could not be confirmed in ChatGPT'
+      )));
+    }
+    // ChatGPT's Chat/Work/model transition can replace the entire home composer after
+    // the picker has already confirmed the requested selection. Do not treat that
+    // transient unmount as a failed bootstrap: reacquire the editing host under the
+    // same route/command fence before inserting authored text. This is deliberately
+    // after selection, because the pre-selection composer is no longer authoritative.
+    if ((boot.model || boot.reasoningEffort) && !(await waitForComposer(12_000, stillOnTarget))) {
+      if (await failIfRetargeted()) return;
+      return void (await fail(t(
+        'content_bootstrap_composer_unavailable',
+        'ChatGPT never re-exposed a usable composer after model selection'
+      )));
     }
     const selectionConfirmedAt = Date.now();
-    const publishBootstrapSelection = (id) => {
+    const publishBootstrapSelection = async (id) => {
       if (CLF_DOM.conversationId() !== id) return;
-      // Accepted Send owns the first turn even when no model was explicitly
-      // selected and no further native mutation will wake a hidden document.
+      if (boot.type === 'resume' && boot.model) {
+        // The New Chat picker proves the model used to submit the first resume turn, but route
+        // creation can immediately remount the composer with the account default. Never turn the
+        // frozen source intent into false destination evidence. Re-prove the exact /c route and,
+        // when ChatGPT reset it, restore the requested pair once for the next turn before
+        // journaling. This best-effort repair cannot replay or alter the already-submitted user
+        // message; failure simply leaves destination selection unknown instead of lying about it.
+        bootstrapModelRestoreBusy = true;
+        try {
+          // Adopt the concrete destination identity without publishing its transient default.
+          observe();
+          const ownsDestination = () => !attempt?.cancelled && sendingBootstrap() &&
+            CLF_DOM.conversationId() === id && conversationId === id;
+          if (!ownsDestination()) return;
+          // Re-run the picker proof on the concrete destination route. The requested model may
+          // be a saved family/display alias, so only the route-stamped native execution id that
+          // ChatGPT exposes after successful selection is valid destination evidence.
+          if (!(await CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, ownsDestination))) return;
+          if (!ownsDestination()) return;
+          const selected = CLF_DOM.visibleModelSelection?.();
+          if (!selected) return;
+          reportedModelSelection = JSON.stringify(selected);
+          emit({ kind: 'model_selection', model: selected.model,
+            ...(selected.reasoningEffort ? { reasoningEffort: selected.reasoningEffort } : {}), time: Date.now() });
+        } finally {
+          bootstrapModelRestoreBusy = false;
+        }
+        return;
+      }
+      // Accepted Send owns the first turn even when no model was explicitly selected and no
+      // further native mutation will wake a hidden document.
       observe();
       if (!boot.model) return;
       // The picker proved this selection before the new worker had a conversation.
@@ -10387,7 +11028,11 @@
     if (await failIfRetargeted()) return;
     let insertionFailure = '';
     if (!CLF_DOM.insertPrompt(boot.text, true, reason => { insertionFailure = reason; })) {
-      return void (await fail(`ChatGPT refused the inserted text${insertionFailure ? ` (${insertionFailure})` : ''}`));
+      return void (await fail(t(
+        'content_bootstrap_insert_refused',
+        'ChatGPT refused the inserted text$1',
+        insertionFailure ? ` (${insertionFailure})` : ''
+      )));
     }
     const sendingBootstrap = submittedSendLifetime(target);
     // Stop/composer-clear may acknowledge acceptance before the authored row mounts.
@@ -10421,14 +11066,20 @@
     const squeeze = (value) => (value || '').replace(/\s+/g, '');
     const expectedText = squeeze(boot.text);
     if (!composer || squeeze(composer.textContent) !== expectedText) {
-      return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
+      return void (await fail(t(
+        'content_bootstrap_composer_replaced',
+        'ChatGPT replaced the composer while inserting the bootstrap'
+      )));
     }
     // The browser opener can focus this fresh tab while the user is typing elsewhere. The
     // point-in-time empty check above is not enough: any edit after insertion must preserve
     // the user's draft and abort, never submit a bootstrap/user-text mixture as a worker task.
     composer = CLF_DOM.composer();
     if (!composer || squeeze(composer.textContent) !== expectedText) {
-      return void (await fail('the composer changed before bootstrap send; the draft was preserved'));
+      return void (await fail(t(
+        'content_bootstrap_composer_changed_before_send',
+        'the composer changed before bootstrap send; the draft was preserved'
+      )));
     }
     if (await failIfRetargeted()) return;
     const resumeMarker = boot.type === 'resume' ? String(boot.text || '').match(CONTINUATION_MARKER) : null;
@@ -10443,7 +11094,10 @@
         await ask({ type: 'compact', token: resumeMarker[2], commandId: boot.id, client: RUN_ID, destinationLost: true });
         return true;
       }
-      await fail('the composer changed during bootstrap authorization; the draft was preserved and nothing was sent');
+      await fail(t(
+        'content_bootstrap_composer_changed_authorizing',
+        'the composer changed during bootstrap authorization; the draft was preserved and nothing was sent'
+      ));
       continuationJournalPending = false;
       return true;
     };
@@ -10468,7 +11122,10 @@
     };
     if (boot.type === 'resume') {
       if (!resumeMarker || resumeMarker[1] !== 'RESUME') {
-        return void (await fail('the resume bootstrap had no valid continuation marker'));
+        return void (await fail(t(
+          'content_bootstrap_resume_marker_invalid',
+          'the resume bootstrap had no valid continuation marker'
+        )));
       }
       continuationJournalPending = true;
       const permit = await ask({ type: 'compact', token: resumeMarker[2], commandId: boot.id, client: RUN_ID, destinationAttempt: true });
@@ -10493,7 +11150,11 @@
     rememberUserSend();
     // The bootstrap's own receipt, which allows for the composer's Markdown escaping — see
     // matchesSubmittedBootstrap. Every other caller keeps the exact comparison.
-    if (!(await sendSubmittedText(() => !attempt?.cancelled && sendingBootstrap(), false, null, null,
+    const authorizeBootstrapSend = () => {
+      if (attempt && boot.type === 'worker') attempt.phase = 'dispatching';
+      return true;
+    };
+    if (!(await sendSubmittedText(() => !attempt?.cancelled && sendingBootstrap(), false, authorizeBootstrapSend, null,
                                   matchesSubmittedBootstrap))) {
       // Once send() was invoked, a missing/cleared draft cannot prove that no click
       // happened. Only the exact pre-click check above may release the dispatch.
@@ -10502,7 +11163,10 @@
         // replay an ambiguous click or let ordinary events create its shadow session.
         return;
       }
-      return void (await fail('ChatGPT did not accept the bootstrap send'));
+      return void (await fail(t(
+        'content_bootstrap_send_not_accepted',
+        'ChatGPT did not accept the bootstrap send'
+      )));
     }
     agent = boot.agent || null;
     agentCommandId = agent && typeof boot.id === 'string' ? boot.id : null;
@@ -10531,8 +11195,8 @@
     // send immediately with the already-proven target. Fresh worker/resume commands still need
     // the loop below because ChatGPT has not assigned their new conversation id yet.
     if (target) {
-      publishBootstrapSelection(target);
       const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: target, agent, client: RUN_ID });
+      await publishBootstrapSelection(target);
       await clearAcknowledgedBootstrap(acknowledged);
       return;
     }
@@ -10546,8 +11210,8 @@
       () => !attempt?.cancelled && sendingBootstrap(), 40000);
     if (!found || !sendingBootstrap()) return;
     if (boot.type === 'resume') rememberResumeGoalPending(found, boot.id);
-    publishBootstrapSelection(found);
     const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+    await publishBootstrapSelection(found);
     await clearAcknowledgedBootstrap(acknowledged);
     } finally { bootstrapDraft.dispose(); }
   }
@@ -10592,6 +11256,44 @@
       later(tick, ms);
     };
     later(tick, ms);
+  }
+
+  /**
+   * Presses ChatGPT's own Retry when a conversation route shows its "could not be loaded"
+   * surface instead of the chat. Seen live after a reload that landed mid-turn: the model went
+   * on calling tools server-side while this page showed nothing, so the turn could never be
+   * seen to end. The surface must hold for LOAD_FAILURE_SETTLE_MS first — the shell passes
+   * through empty states while it mounts — and later presses back off to once a minute, and stay
+   * there: measured the same day, presses in the first half-minute after a reload could fail while
+   * a press a minute later restored the chat, so a schedule that gave up after a few minutes left
+   * the tab dead. One press of the page's own Retry a minute costs one request.
+   */
+  const LOAD_FAILURE_SETTLE_MS = 5_000;
+  const LOAD_FAILURE_BACKOFF_MS = [0, 15_000, 30_000, 60_000];
+  let loadFailureSince = 0;
+  let loadFailureRetries = 0;
+  let loadFailureRoute = null;
+  function recoverConversationLoad(now = Date.now()) {
+    const route = CLF_DOM.conversationId();
+    if (route !== loadFailureRoute) {
+      loadFailureRoute = route;
+      loadFailureSince = 0;
+      loadFailureRetries = 0;
+    }
+    const retry = CLF_DOM.conversationLoadFailure ? CLF_DOM.conversationLoadFailure() : null;
+    if (!retry) {
+      loadFailureSince = 0;
+      if (CLF_DOM.turns().length) loadFailureRetries = 0;
+      return false;
+    }
+    if (!loadFailureSince) loadFailureSince = now;
+    const wait = LOAD_FAILURE_SETTLE_MS +
+      LOAD_FAILURE_BACKOFF_MS[Math.min(loadFailureRetries, LOAD_FAILURE_BACKOFF_MS.length - 1)];
+    if (now - loadFailureSince < wait) return false;
+    loadFailureRetries++;
+    loadFailureSince = now;
+    retry.click();
+    return true;
   }
 
   let activityTimer = null;
@@ -10713,7 +11415,12 @@
     const route = CLF_DOM.conversationId();
     const pendingEpoch = epoch, calls = [];
     for (const [requestId, pending] of pendingStreamOrigins) {
-      if (!alive || pending.epoch !== epoch || Date.now() >= pending.deadline || (route && route !== pending.conversationId)) {
+      // Retired by its exact conversation, not by the document epoch. A new chat started from a
+      // tab that showed another chat publishes its request id before it has a /c/ route, and the
+      // move from that chat to the new one advances the epoch — which discarded an id naming the
+      // new chat exactly and left page-started chats Unattributed (#393, 2026-09-26). A route to
+      // any other conversation still retires it, and so does its deadline.
+      if (!alive || Date.now() >= pending.deadline || (route && route !== pending.conversationId)) {
         pendingStreamOrigins.delete(requestId);
         continue;
       }
@@ -10734,8 +11441,34 @@
     }
     flushStreamRequestOrigins();
   }
+  // User message id -> the model its send request named (usage.js). Bounded; newest wins.
+  const sendModels = new Map();
+  // User messages already reported, so a late send-model report can complete them in place.
+  const reportedUserMessages = new Map();
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-send-model') return;
+    const model = typeof event.data.model === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(event.data.model) ? event.data.model : null;
+    const ids = Array.isArray(event.data.messageIds) ? event.data.messageIds.slice(0, 8) : [];
+    if (!model) return;
+    for (const id of ids) {
+      if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) continue;
+      sendModels.delete(id); sendModels.set(id, model);
+      if (sendModels.size > 256) sendModels.delete(sendModels.keys().next().value);
+      // Only within the conversation it was reported in: a report that arrives after the user
+      // moved to another chat must not file the message there.
+      const reported = reportedUserMessages.get(id);
+      if (reported && reported.model !== model && reported.conversationId === CLF_DOM.conversationId()) {
+        reported.model = model;
+        emit({ kind: 'user_message', messageId: id, text: reported.text, model,
+          ...(reported.createTime ? { time: reported.createTime, authoredTime: true, authoredAt: reported.createTime } : {}) });
+      }
+    }
+  });
   window.addEventListener('message', (event) => {
     if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-request-origin') return;
+    // A Goal/Loop helper page records nothing (see emit/flush). Its request origins would
+    // otherwise open an empty "ChatGPT session" for every temporary decision chat.
+    if (temporaryPlannerPage()) return;
     const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed)) return;
     const raw = Array.isArray(event.data.requestIds) ? event.data.requestIds : [];
@@ -10799,9 +11532,11 @@
       const userTurn = CLF_DOM.turns().find(candidate => candidate.role === 'user' &&
         (candidate.nodes || [candidate.node]).some(node => node?.contains(messages[userIndex].node)));
       const user = stampedFiberTurn(userTurn, [...fiberTurns.values()], fiberScanToken);
-      if (!user || user.conversationConflict || user.conversationId !== turn.conversationId ||
-          !(user.messages || []).some(message => message.role === 'user' &&
-            (message.rawMessageId === decision.messageId || message.messageId === decision.messageId))) return;
+      if (user) {
+        if (user.conversationConflict || user.conversationId !== turn.conversationId ||
+            !(user.messages || []).some(message => message.role === 'user' &&
+              (message.rawMessageId === decision.messageId || message.messageId === decision.messageId))) return;
+      } else if (!acceptedTemporaryDecisionUser(messages[userIndex], decision)) return;
     } else if (turn.conversationId !== decision.conversationId) return;
     const terminal = (turn.messages || []).filter(message => message.role === 'assistant' &&
       (message.rawMessageId === turn.endMessageId || message.messageId === turn.endMessageId));
@@ -10854,9 +11589,21 @@
     const latest = CLF_DOM.turns().at(-1);
     if (latest?.role === 'assistant') {
       if (!await refreshFiber({ pageTurnId: latest.id, pageTurn: latest.node || latest.nodes?.[0] }) || !safe()) return false;
-      const current = CLF_DOM.turns().at(-1);
-      const native = current?.role === 'assistant' ? fiberTurnFor(current) : null;
-      if (!native) return false;
+      let current = CLF_DOM.turns().at(-1);
+      let native = current?.role === 'assistant' ? fiberTurnFor(current) : null;
+      // A successful page-model scan can still omit the latest React turn while a
+      // reloaded document is hydrating. Repair that reader join once, then require
+      // fresh exact native evidence before allowing either Stop or Send.
+      if (!native) {
+        const repair = await repairFiberReader();
+        if (repair?.ok !== true || !safe()) return false;
+        current = CLF_DOM.turns().at(-1);
+        if (current?.role !== 'assistant' ||
+            !await refreshFiber({ pageTurnId: current.id, pageTurn: current.node || current.nodes?.[0] }) || !safe()) return false;
+        current = CLF_DOM.turns().at(-1);
+        native = current?.role === 'assistant' ? fiberTurnFor(current) : null;
+        if (!native) return false;
+      }
       // A known native final vetoes Continue even while delivery to the app is pending.
       if (native?.endMessageId) { await flush(); return false; }
     }
@@ -10930,7 +11677,10 @@
           const permit = await ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, recoveryAction: 'stop' });
           if (permit?.data?.ok !== true || !safe() || !await recoveryPageUnfinished(safe) || !safe()) return false;
           if (!await stopAutomationGeneration(safe)) return false;
-          if (generating) finishGeneration(currentAssistantTurn(), { outcome: 'interrupted', detail: 'Automatic Continue stopped an unchanged silent turn.' }, false);
+          if (generating) finishGeneration(currentAssistantTurn(), {
+            outcome: 'interrupted',
+            detail: t('content_turn_auto_continue_stopped', 'Automatic Continue stopped an unchanged silent turn.')
+          }, false);
           await flush();
           if (!safe()) return false;
           const stopped = await ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, recoveryAction: 'stopped' });
@@ -10969,7 +11719,15 @@
       if (!composer && onTarget() && CLF_DOM.generating() && await confirmedProviderTerminal() && onTarget() && CLF_DOM.generating()) {
         // Only after readiness expires, re-prove the exact terminal: a Retry or
         // new user turn must never become authority to reload the page.
-        emit({ kind: 'chat_error', turnId, recoverable: true, text: 'ChatGPT finished its answer but its composer is still stuck on Stop. Recovering this page before delivering the queued message.' });
+        emit({
+          kind: 'chat_error',
+          turnId,
+          recoverable: true,
+          text: t(
+            'content_delivery_composer_stuck',
+            'ChatGPT finished its answer but its composer is still stuck on Stop. Recovering this page before delivering the queued message.'
+          )
+        });
         await flush();
         return false; // No claim, insertion or Send: queued input survives recovery.
       }
@@ -10983,39 +11741,98 @@
       // This exact claimed bootstrap owns replacement text; existing chats and
       // attachment drafts remain protected. Re-evaluate after model selection,
       // since React can hydrate that autosaved text while the picker is open.
-      if ((!ownsFreshPage() && (composer.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.');
+      /*
+       * The one draft this may overwrite is its own.
+       *
+       * Refusing to clobber typing is right, but the guard could not tell the user's draft from the
+       * residue of a previous attempt by this same delivery: insert the text, fail to press Send,
+       * release the claim — and from then on the composer holds exactly what the next attempt would
+       * type, so every attempt refuses. Measured on 2026-09-26: a recovery ticket claimed 181 times
+       * against its own 352 characters, alternating `After-turn pickup was withdrawn before Send.`
+       * and this refusal, for thirteen hours. Its original Send failed because the send control was
+       * unfindable on the new composer shell; the deadlock outlived that cause by a whole day.
+       *
+       * Byte-identical text is not a draft to protect — inserting would produce it again. Compared
+       * with the same `sendText` normaliser the pre-Send check below uses, so the two agree on what
+       * "the same message" means. Attachments still block regardless: an attachment draft is not
+       * something this delivery could have produced.
+       */
+      const ownResidue = sendText(composer.textContent) === sendText(input.text);
+      if ((!ownsFreshPage() && (composer.textContent || '').trim() && !ownResidue) || CLF_DOM.hasComposerAttachments()) return fail(t(
+        'content_delivery_existing_draft',
+        'ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.'
+      ));
       if (message.directTurn) {
         // The offer only wakes this document. The just-committed outbox claim
         // authorizes interrupting this exact tool-free turn, like handoff's Stop
         // then normal Send. A changed question, tool call or lost claim forbids it.
-        if (input.directTurn?.id !== message.directTurn.id || pendingTools > 0) return fail('The turn changed before direct delivery.');
+        if (input.directTurn?.id !== message.directTurn.id || pendingTools > 0) return fail(t(
+          'content_delivery_turn_changed',
+          'The turn changed before direct delivery.'
+        ));
         if (CLF_DOM.generating()) {
-          if (turnId !== input.directTurn.id || !requestNativeStop(onTarget)) return fail('The current answer could not be stopped.');
+          if (turnId !== input.directTurn.id || !requestNativeStop(onTarget)) return fail(t(
+            'content_delivery_stop_failed',
+            'The current answer could not be stopped.'
+          ));
         }
         const idle = await waitPageView(() => !CLF_DOM.generating() && !generating && CLF_DOM.composerVisible(),
           () => onTarget() && pendingTools === 0, INTERRUPT_WAIT_MS);
-        if (!idle || !onTarget()) return fail('The chat changed or did not stop. The message was not sent.');
+        if (!idle || !onTarget()) return fail(t(
+          'content_delivery_chat_changed_or_busy',
+          'The chat changed or did not stop. The message was not sent.'
+        ));
         // Publish the native stopped/completed boundary before final Send policy.
         await flush();
-        if (!onTarget()) return fail('The chat changed before direct delivery.');
+        if (!onTarget()) return fail(t(
+          'content_delivery_chat_changed',
+          'The chat changed before direct delivery.'
+        ));
       }
       const temporary = input.lifetime === 'temporary-planner';
-      if (temporary && temporaryPlannerPage() && !CLF_DOM.temporaryChatReady()) {
+      // On the newer shell an empty temporary chat is proven only by the page-model stamp, and
+      // nothing else scans a document with no conversation yet: ask for one before judging.
+      const temporaryProven = async () => { await askFiber(); return CLF_DOM.temporaryChatReady(); };
+      if (temporary && temporaryPlannerPage() && !(await temporaryProven())) {
         CLF_DOM.confirmTemporaryChatIntroduction();
-        await waitPageView(() => CLF_DOM.temporaryChatReady(), onTarget, 3000);
+        await waitPageView(temporaryProven, onTarget, 3000);
       }
-      if (temporary && (!temporaryPlannerPage() || !CLF_DOM.temporaryChatReady())) return fail('Temporary Chat was not confirmed. Open the helper tab and complete its Temporary Chat introduction.');
+      if (temporary && (!temporaryPlannerPage() || !CLF_DOM.temporaryChatReady())) return fail(t(
+        'content_delivery_temporary_chat_unconfirmed',
+        'Temporary Chat was not confirmed. Open the helper tab and complete its Temporary Chat introduction.'
+      ));
       const providerLimitation = () => CLF_DOM.errors().find(error => error.blocking === true)?.text;
       const limitation = providerLimitation();
       if (limitation) return fail(limitation);
-      if (!(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(providerLimitation() || 'Requested model or reasoning could not be confirmed');
+      if (!(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(
+        providerLimitation() || t(
+          'content_delivery_model_unconfirmed',
+          'Requested model or reasoning could not be confirmed'
+        )
+      );
       // Native picker closure can precede re-enabling the same editor. Wait before
       // its one insertion; a disabled editing host is not a rejected helper prompt.
-      if (!await waitPageView(writableComposer, () => onTarget() && !CLF_DOM.generating(), 15000)) return fail('The ChatGPT editor did not become writable before sending.');
-      if (!onTarget() || CLF_DOM.generating() || (!ownsFreshPage() && (CLF_DOM.composer()?.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('The ChatGPT composer changed before sending');
+      if (!await waitPageView(writableComposer, () => onTarget() && !CLF_DOM.generating(), 15000)) return fail(t(
+        'content_delivery_editor_not_writable',
+        'The ChatGPT editor did not become writable before sending.'
+      ));
+      // Same allowance as the draft check above, for the same reason: text this delivery itself left
+      // behind is not a composer that "changed". Re-read rather than reusing `ownResidue`, because
+      // model selection and the writability wait sit between the two and can replace the editor.
+      if (!onTarget() || CLF_DOM.generating() ||
+          (!ownsFreshPage() && (CLF_DOM.composer()?.textContent || '').trim() &&
+            sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) ||
+          CLF_DOM.hasComposerAttachments()) return fail(t(
+        'content_delivery_composer_changed',
+        'The ChatGPT composer changed before sending'
+      ));
       let insertionFailure = '';
       if (!CLF_DOM.insertPrompt(input.text, ownsFreshPage(), reason => { insertionFailure = reason; }))
-        return fail(`ChatGPT did not accept the text${insertionFailure ? ` (${insertionFailure})` : ''}`);
+        return fail(t(
+          'content_delivery_text_not_accepted',
+          'ChatGPT did not accept the text$1',
+          insertionFailure ? ` (${insertionFailure})` : ''
+        ));
       const sendingTarget = submittedSendLifetime(target, forEpoch);
       draft = CLF_DOM.captureComposerDraft(input.text, () => sendAttempted ? sendingTarget() : onTarget());
       const files = [];
@@ -11025,16 +11842,28 @@
           if (!onTarget()) return false;
           const response = await ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, attachmentId: attachment.id, offset });
           const chunk = response?.data?.chunk;
-          if (typeof chunk !== 'string' || chunk.length > 699052) return fail('Attachment transfer failed. The message was not sent.');
+          if (typeof chunk !== 'string' || chunk.length > 699052) return fail(t(
+            'content_delivery_attachment_transfer_failed',
+            'Attachment transfer failed. The message was not sent.'
+          ));
           const bytes = Uint8Array.from(atob(chunk), char => char.charCodeAt(0));
-          if (bytes.length !== Math.min(524288, attachment.size - offset)) return fail('Attachment transfer was incomplete.');
+          if (bytes.length !== Math.min(524288, attachment.size - offset)) return fail(t(
+            'content_delivery_attachment_transfer_incomplete',
+            'Attachment transfer was incomplete.'
+          ));
           parts.push(bytes);
         }
         files.push(new File(parts, attachment.name, { type: attachment.mimeType }));
       }
-      if (!(await CLF_DOM.uploadImages(input.images, onTarget, draft, files))) return fail('Attachment upload was not confirmed. Check the unsent draft and any file error in ChatGPT before trying again.');
+      if (!(await CLF_DOM.uploadImages(input.images, onTarget, draft, files))) return fail(t(
+        'content_delivery_attachment_upload_unconfirmed',
+        'Attachment upload was not confirmed. Check the unsent draft and any file error in ChatGPT before trying again.'
+      ));
       await Promise.resolve();
-      if (!onTarget() || !draft.current() || sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) return fail('The composer changed; your draft was preserved');
+      if (!onTarget() || !draft.current() || sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) return fail(t(
+        'content_delivery_draft_preserved',
+        'The composer changed; your draft was preserved'
+      ));
       const previousUserId = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id;
       rememberUserSend();
       const submittedText = sendText(CLF_DOM.composer()?.textContent);
@@ -11045,6 +11874,12 @@
       // The legacy wire field also binds unfiled reserved openings before recorder evidence.
       if (input.opening || input.projectId) desktopProjectInput = { id: input.id, owner: input.owner };
       let receipt = null;
+      // This text was inserted by the app, and the newer shell stores inserted text
+      // Markdown-escaped — hard breaks as `\<newline>`. Measured 2026-09-26 on a chat started
+      // from the app: its first row read back `[[COS_CONTEXT:19956]]\ You are…`, the raw
+      // comparison never matched, and that first turn got no ACK, no turn start and no turn end
+      // for Goal or Loop to act on. The bootstrap comparison is exact either way (raw, then one
+      // unescape); a person's own sends keep the raw comparison in matchesUserSendReceipt.
       if (!(await sendSubmittedText(sendingTarget, false, async sendCurrent => {
         // Preserve the outbox's revocable claim until the actual native Send is ready.
         if (input.recovery && !await recoveryPageUnfinished(() => sendCurrent() && onTarget() && draft.current())) return false;
@@ -11056,12 +11891,12 @@
       }, (user, conversation) => {
         if ((!conversation && !temporary) || (target && !onTarget())) return false;
         const users = CLF_DOM.messages().filter(row => row.role === 'user');
-        if ((!target && users.length !== 1) || users.at(-1)?.id !== user.id || user.id === previousUserId || !matchesSubmittedUser(user, submittedText)) return false;
+        if ((!target && users.length !== 1) || users.at(-1)?.id !== user.id || user.id === previousUserId || !matchesSubmittedBootstrap(user, submittedText)) return false;
         // Freeze only identity while native Send still holds the proven row. React
         // may replace it before this async operation resumes; do not rediscover it.
         receipt = { conversation, user: { id: user.id } };
         return true;
-      }))) return false;
+      }, matchesSubmittedBootstrap))) return false;
       if (!receipt || !sendingTarget()) return false;
       // Native Send listeners refresh the receipt; pin only that witnessed object.
       const witnessedSendReceipt = userSendReceipt;
@@ -11071,7 +11906,22 @@
         decision.messageId = receipt.user.id;
         decision.conversationId = deliveredConversation;
         decision.epoch = epoch;
-        decision.onTarget = () => alive && epoch === decision.epoch && CLF_DOM.conversationId() === deliveredConversation;
+        // The newer shell gives a temporary chat a real /c/<id> route shortly after Send
+        // (measured 2026-09-26: `/c/6ab7e420…?temporary-chat=true`). A decision pinned to the
+        // route-less page it was sent from then counted as off target for good, so the plan
+        // ChatGPT wrote was never collected and the planner timed out. A temporary decision binds
+        // once to the first concrete route after its own Send; any later move still leaves it.
+        let boundConversation = deliveredConversation;
+        decision.onTarget = () => {
+          if (!alive || epoch !== decision.epoch) return false;
+          const route = CLF_DOM.conversationId();
+          if (temporary && boundConversation === null && route) {
+            boundConversation = route;
+            decision.conversationId = route;
+            if (desktopDecisionSession?.temporary) desktopDecisionSession.conversationId = route;
+          }
+          return route === boundConversation;
+        };
         desktopDecisionSession = { conversationId: deliveredConversation, temporary };
         completeDesktopDecision();
       }
@@ -11112,13 +11962,17 @@
   let pluginRefreshBusy = false;
   function ownsPluginRefreshPage(id) {
     const url = new URL(location.href);
-    return alive && !generating && !CLF_DOM.generating() && url.pathname === '/' &&
-      /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash) && url.searchParams.get('cos-plugin-refresh') === id;
+    // Either settings route (see background.js pluginSettingsRoute). The newer path-routed page
+    // is owned so that its unreadable card is reported, not left as a silent, reopened request.
+    const route = (url.pathname === '/' && /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash)) ||
+      /^\/(?:settings\/plugins-settings(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?|plugins\/plugin_asdk_app_[a-zA-Z0-9_-]+)$/.test(url.pathname);
+    return alive && !generating && !CLF_DOM.generating() && route && url.searchParams.get('cos-plugin-refresh') === id;
   }
-  function waitPageView(read, current, milliseconds) {
+  // `tickMs` re-reads on a clock too, for a read that waits on time rather than on the DOM.
+  function waitPageView(read, current, milliseconds, tickMs = 0) {
     return new Promise(resolve => {
-      let busy = false, dirty = false, done = false;
-      const finish = value => { if (done) return; done = true; pageViewChecks.delete(check); observer.disconnect(); clearTimeout(timer); resolve(value); };
+      let busy = false, dirty = false, done = false, tick = null;
+      const finish = value => { if (done) return; done = true; pageViewChecks.delete(check); observer.disconnect(); clearTimeout(timer); if (tick) clearInterval(tick); resolve(value); };
       const check = async () => {
         if (done) return;
         if (!current()) return finish(null);
@@ -11130,8 +11984,33 @@
       };
       const observer = new MutationObserver(check); observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
       pageViewChecks.add(check);
-      const timer = setTimeout(() => finish(null), milliseconds); void check();
+      const timer = setTimeout(() => finish(null), milliseconds);
+      if (tickMs > 0) tick = setInterval(() => void check(), tickMs);
+      void check();
     });
+  }
+  /**
+   * Measured 2026-09-27 on ChatGPT's plugin page: the connector and its tools render about
+   * 100 ms before the "Refresh tools" control, and the page keeps loading for a moment after
+   * both. A read in that gap reported "no Refresh control", which the app records as needing
+   * manual action and never retries. On that page a view is accepted only once its refresh
+   * control (or its absence) has held for a while.
+   */
+  const PLUGIN_PAGE_SETTLE_MS = 1500, PLUGIN_PAGE_ABSENT_MS = 4000;
+  function settledPluginView() {
+    let seen, since = 0;
+    return next => {
+      if (!next?.settled) return next;
+      const control = next.refresh || null;
+      if (control !== seen) { seen = control; since = Date.now(); return null; }
+      return Date.now() - since >= (control ? PLUGIN_PAGE_SETTLE_MS : PLUGIN_PAGE_ABSENT_MS) ? next : null;
+    };
+  }
+  // The App Id a management page shows, under the old hash or the newer path route.
+  function pluginViewAppId(href) {
+    const url = new URL(href);
+    return (url.pathname === '/' && /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.hash)?.[1]) ||
+      (!url.hash && /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname)?.[1]) || null;
   }
   async function refreshManagedPlugin(request) {
     if (pluginRefreshBusy || !request || !/^[a-f0-9-]{36}$/i.test(request.id) || !ownsPluginRefreshPage(request.id)) return false;
@@ -11143,26 +12022,35 @@
     const schemaKey = tools => Array.isArray(tools) ? canonical(tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })).sort((a, b) => a.name.localeCompare(b.name))) : null;
     try {
       const current = () => ownsRequest() && CLF_DOM.pluginManagementIdle();
-      if (new URL(location.href).hash === '#settings/Plugins') {
+      const listUrl = new URL(location.href);
+      const pathList = listUrl.pathname === '/settings/plugins-settings' && !listUrl.hash;
+      if (pathList || (listUrl.pathname === '/' && listUrl.hash === '#settings/Plugins')) {
         if (request.appId) {
-          const url = new URL(location.href); url.hash = `settings/Plugins/plugin_${request.appId}`;
+          const url = new URL(location.href);
+          if (pathList) url.pathname = `/settings/plugins-settings/plugin_${request.appId}`;
+          else url.hash = `settings/Plugins/plugin_${request.appId}`;
           if (!current()) return false;
           location.assign(url.href); return true;
         }
         const buttons = await waitPageView(() => CLF_DOM.pluginInstalledButtons(request.connectorName), current, 8000);
         if (!buttons || !current()) return false;
-        if (buttons.length !== 1) { await fail('Installed connector identity is unavailable or ambiguous'); return false; }
+        if (buttons.length !== 1) {
+          await fail(t(
+            'content_connector_identity_ambiguous',
+            'Installed connector identity is unavailable or ambiguous'
+          ));
+          return false;
+        }
         buttons[0].click();
         // The provider's installed-row navigation drops the query marker. This
         // already-owned discovery may learn its resulting exact App Id, but cannot
         // claim Refresh until the management document has its marker again.
         const discovered = await waitPageView(async () => {
-          const url = new URL(location.href);
-          const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.hash);
+          const href = location.href, appId = pluginViewAppId(href);
           const next = await CLF_DOM.pluginRefreshView(request.connectorName, request.tools);
-          return route && next?.appId === route[1] ? url.href : null;
+          return appId && next?.appId === appId ? href : null;
         }, () => alive && epoch === requestEpoch && !generating && !CLF_DOM.generating() &&
-          new URL(location.href).origin === 'https://chatgpt.com' && location.pathname === '/' && CLF_DOM.pluginManagementIdle(), 8000);
+          new URL(location.href).origin === 'https://chatgpt.com' && CLF_DOM.pluginManagementIdle(), 8000);
         if (!discovered || !alive || epoch !== requestEpoch || location.href !== discovered) return false;
         const url = new URL(discovered); url.searchParams.set('cos-plugin-refresh', request.id);
         history.replaceState(history.state, '', url.href); return true;
@@ -11170,34 +12058,77 @@
       // Identity and Refresh paint before the tool declarations. A partial settings
       // panel is neither an old schema nor permission to click; wait on the existing
       // DOM observer and leave an unclaimed request available if hydration times out.
+      const settle = settledPluginView();
       const view = await waitPageView(async () => {
         const next = await CLF_DOM.pluginRefreshView(request.connectorName, request.tools, request.appId);
-        const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(new URL(location.href).hash);
-        return route && next?.appId === route[1] && Array.isArray(next.tools) && next.tools.length > 0 ? next : null;
-      }, current, 8000);
-      if (!view) return false;
+        const appId = pluginViewAppId(location.href);
+        return settle(appId && next?.appId === appId && Array.isArray(next.tools) && (next.tools.length > 0 || next.settled === true) ? next : null);
+      }, current, 12000, 250);
+      if (!view) {
+        // Say so. `pluginSnapshot()` refuses for two different reasons — the page has not
+        // rendered the card yet, and the page renders a card this build cannot read — and
+        // returning false told the app neither. On 2026-09-11 that cost thirty hours: the
+        // durable row carried no `error` at all, so nothing anywhere named a cause while the
+        // request was retried. Reporting is not terminal — `failPluginRefresh` records the
+        // reason and leaves maintenance free to reobserve — so the only thing silence bought
+        // was the absence of a diagnosis.
+        //
+        // Gated on still owning the page. `waitPageView` also yields null when it stops
+        // because this document is no longer the one the request belongs to, and a navigation
+        // is not the page failing to render a card — blaming it for one would put a false
+        // cause in the durable row, which is the opposite of the point.
+        if (current()) await fail(t(
+          'content_connector_settings_unreadable',
+          'The connector settings card could not be read on the page this request owns'
+        ));
+        return false;
+      }
       if (!current()) return false;
-      if (request.appId && view.appId !== request.appId) { await fail('Exact connector settings could not be verified'); return false; }
-      const ownedEpoch = epoch, appId = view.appId;
-      const stillCurrent = () => current() && epoch === ownedEpoch && new URL(location.href).hash === `#settings/Plugins/plugin_${appId}`;
+      if (request.appId && view.appId !== request.appId) {
+        await fail(t(
+          'content_connector_settings_unverified',
+          'Exact connector settings could not be verified'
+        ));
+        return false;
+      }
+      const ownedEpoch = epoch, appId = view.appId, tunnelId = view.tunnelId || undefined;
+      const stillCurrent = () => current() && epoch === ownedEpoch && pluginViewAppId(location.href) === appId;
       const before = schemaKey(view.tools), expected = schemaKey(request.tools);
       if (before === expected) {
-        return (await ask({ type: 'plugin_refresh', action: 'current', id: request.id, appId, connectorName: request.connectorName, tools: view.tools }))?.data?.ok === true && stillCurrent();
+        return (await ask({ type: 'plugin_refresh', action: 'current', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }))?.data?.ok === true && stillCurrent();
       }
       if (!view.refresh || view.refresh.disabled) {
-        const error = 'Connector schema differs, but ChatGPT exposes no Refresh control. Recreate or republish this custom app to load the current tool schema.';
-        return (await ask({ type: 'plugin_refresh', action: 'manual', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, error }))?.data?.ok === true && stillCurrent();
+        const error = t(
+          'content_connector_schema_no_refresh',
+          'Connector schema differs, but ChatGPT exposes no Refresh control. Recreate or republish this custom app to load the current tool schema.'
+        );
+        return (await ask({ type: 'plugin_refresh', action: 'manual', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId, error }))?.data?.ok === true && stillCurrent();
       }
-      const claimed = await ask({ type: 'plugin_refresh', action: 'claim', id: request.id, appId, connectorName: request.connectorName, tools: view.tools });
-      if (!claimed?.data?.ok || !stillCurrent() || view.refresh.isConnected === false || view.refresh.disabled) { await fail('Connector refresh claim or page ownership was not confirmed'); return false; }
+      const claimed = await ask({ type: 'plugin_refresh', action: 'claim', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId });
+      if (!claimed?.data?.ok || !stillCurrent() || view.refresh.isConnected === false || view.refresh.disabled) {
+        await fail(t(
+          'content_connector_refresh_claim_unconfirmed',
+          'Connector refresh claim or page ownership was not confirmed'
+        ));
+        return false;
+      }
       view.refresh.click(); // the durable main-process attempt owns this one click
       const after = await waitPageView(async () => {
         const next = await CLF_DOM.pluginRefreshView(request.connectorName, request.tools, appId);
         return next && before !== expected && schemaKey(next.tools) === expected ? next : null;
       }, stillCurrent, 12000);
-      if (!after) { await fail('Refresh was requested, but a changed matching schema was not observed'); return false; }
+      if (!after) {
+        await fail(t(
+          'content_connector_refresh_schema_unchanged',
+          'Refresh was requested, but a changed matching schema was not observed'
+        ));
+        return false;
+      }
       return (await ask({ type: 'plugin_refresh', action: 'complete', id: request.id, appId, tools: after.tools, versionId: after.versionId }))?.data?.ok === true;
-    } catch { await fail('Connector refresh could not be verified'); return false; }
+    } catch {
+      await fail(t('content_connector_refresh_unverified', 'Connector refresh could not be verified'));
+      return false;
+    }
     finally { pluginRefreshBusy = false; }
   }
   function inputReuseSafe() {
@@ -11349,17 +12280,26 @@
         return true;
       }
       if (message.type === 'clf-recorder-ping') {
-        sendResponse({ ok: true, recorderVersion: RECORDER_VERSION });
+        // `busy`: this page is mid-turn or mid-handoff, so the extension must not reload under it.
+        sendResponse({ ok: true, recorderVersion: RECORDER_VERSION,
+          busy: Boolean(generating || CLF_DOM.generating() || desktopInputBusy || pluginRefreshBusy || modelCatalogBusy || pendingTools > 0) });
         return false;
       }
       if (message.type === 'clf-repair-check') {
         void inspectRepairPage(message).then(sendResponse).catch(() => sendResponse({ safe: false }));
         return true;
       }
+      if (message.type === 'clf-resume-compaction') {
+        sendResponse({ accepted: resumePendingCompactionFromRepair(message.conversationId) });
+        return false;
+      }
       // Popup diagnostics. Ids and counters only — no prose, no transcript, no page text.
       if (message.type === 'clf-page-status') {
         sendResponse({
           ok: true,
+          // ChatGPT's own account that a response is streaming right now, as opposed to the
+          // recorder's `generating`, which also holds while a turn waits on a local tool.
+          streaming: CLF_DOM.generating(),
           recorderVersion: RECORDER_VERSION,
           runId: RUN_ID,
           conversationId,
@@ -11415,7 +12355,11 @@
       if (message.type === 'clf-close-temporary-planner') {
         const users = CLF_DOM.messages().filter(row => row.role === 'user');
         const exact = desktopDecision?.id === message.id && desktopDecision?.owner === message.owner;
-        sendResponse({ safe: temporaryPlannerPage() && location.href.includes(`cos-input=${message.id}`) &&
+        // ChatGPT moves a sent temporary chat to /c/<id>?temporary-chat=true, dropping the
+        // cos-input marker; the exact decision this page still holds proves the same helper.
+        const routedHelper = exact && desktopDecision.temporary === true && /^\/c\/[0-9a-f-]{36}$/i.test(location.pathname) &&
+          new URL(location.href).searchParams.get('temporary-chat') === 'true';
+        sendResponse({ safe: temporaryPlannerPage() && (location.href.includes(`cos-input=${message.id}`) || routedHelper) &&
           !generating && !CLF_DOM.generating() && pendingTools === 0 && !CLF_DOM.hasComposerAttachments() &&
           !(CLF_DOM.composer()?.textContent || '').trim() &&
           (users.length === 0 || (exact && users.length === 1 && matchesSubmittedUser(users[0], desktopDecision.text))) });
@@ -11510,6 +12454,7 @@
   watchTranscript();
 
   every(OBSERVE_MS, () => {
+    recoverConversationLoad();
     observe();
     syncTheme();
     injectControl();

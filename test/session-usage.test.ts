@@ -44,6 +44,23 @@ describe('verified native message counts', () => {
     expect(result.tokens).toBe(0);
   });
 
+  it('proves a page-typed send by the model ChatGPT resolved for its own reply, and only that reply', async () => {
+    const reply = (resolvedModel: string | undefined, extra = {}) =>
+      ({ kind: 'assistant_message', time: now, final: true, message: { text: '' }, ...(resolvedModel ? { resolvedModel } : {}), ...extra });
+    store.readEvents.mockResolvedValue([
+      // Counted: the first reply after the send names a known model.
+      message('typed-56', undefined, now), reply('gpt-5-6-thinking'), reply('gpt-6-pro'),
+      message('typed-6', undefined, now), reply(undefined), reply('gpt-6-astra'),
+      // Not counted: an unknown slug, a reply after the next send, and an injected app message.
+      message('typed-other', undefined, now), reply('gpt-5-4-auto-thinking'),
+      message('no-reply', undefined, now), message('input:injected', undefined, now, { inputDelivery: 'confirmed' }), reply('gpt-6-pro'),
+      // An explicit but unrecognised own model abstains instead of borrowing the reply's.
+      message('own-unknown', 'gpt-6-pro-future', now), reply('gpt-6-pro')
+    ]);
+    const result = await usage.usageOverview();
+    expect(usageMessageTotals(result.messages, 1)).toMatchObject({ gpt56: 1, gpt6: 1 });
+  });
+
   it('uses the original timestamp and an inclusive midnight boundary, excluding older and future sends', async () => {
     const saturday = new Date(2026, 8, 19).getTime();
     store.readEvents.mockResolvedValue([
@@ -453,4 +470,13 @@ describe('model attribution and equivalent cost', () => {
     expect(usageEstimate(rows.slice(-1), DEFAULT_USAGE_FORMULA).unpricedTokens).toBe(1e6);
     expect(rows[0]!.model).toBe('5.6');
   });
+});
+
+it('prices ChatGPT 5.5 IDs as GPT-5.5 and knows the GPT-6 Sol and Luna rates, without guessing plain gpt-6', async () => {
+  const { DEFAULT_USAGE_FORMULA: formula, usageRate } = await import('../src/shared/usage.js');
+  for (const id of ['5.5', 'gpt-5-5', 'gpt-5-5-instant', 'gpt-5-5-thinking']) expect(usageRate(id, formula)).toBe(0.5);
+  expect(usageRate('gpt-6-sol', formula)).toBe(0.2);
+  expect(usageRate('gpt-6-luna', formula)).toBe(0.01);
+  // Which API model ChatGPT's plain GPT-6 corresponds to is not established; it stays user-priced.
+  expect(usageRate('gpt-6', formula)).toBeUndefined();
 });
