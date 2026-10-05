@@ -54,6 +54,19 @@ it.each([118, 257])('accepts %s declarations for the Plugins connector including
   const view = await api.pluginRefreshView('Chat On Steroids Plugins');
   expect(view?.tools).toHaveLength(count);
 });
+it('reads a Plugins catalog that fits the publication budget even with long schemas', async () => {
+  // Measured 2026-10-01: Unity's 82 tools are ~116 KB of JSON, well within the 250,000-byte
+  // publication budget, but the page reader's worst-case accounting (3 per character) came to
+  // 287,483 against 280,000, so every Plugins refresh failed with an unreadable settings card.
+  const { api, props } = page();
+  props.connector.name = 'Chat On Steroids Plugins';
+  props.actions = Array.from({ length: 82 }, (_, i) => ({ name: `manage_tool_${i}`, description: `Tool ${i}. ${'Detailed usage notes. '.repeat(40)}`, description_model: null,
+    params: { type: 'object', properties: { action: { type: 'string', description: 'What to do. '.repeat(25) }, target: { type: 'string' } }, required: ['action'] } })) as any;
+  expect(JSON.stringify(props.actions).length).toBeGreaterThan(100_000);
+  expect(JSON.stringify(props.actions).length).toBeLessThan(250_000);
+  const view = await api.pluginRefreshView('Chat On Steroids Plugins');
+  expect(view?.tools).toHaveLength(82);
+});
 it.each([['Chat On Steroids Plugins', 258], ['Chat On Steroids Core', 17]] as const)('retains the %s observation count guard', async (connector, count) => {
   const { api, props } = page();
   props.connector.name = connector;
@@ -155,4 +168,19 @@ it('reports the page connector tunnel and a settled empty Plugins list', async (
   expect((await api.pluginRefreshView('Chat On Steroids Core', [tool])).tunnelId).toBeNull();
   connector.name = 'Chat On Steroids Plugins'; connector.actions = [];
   expect(await api.pluginRefreshView('Chat On Steroids Plugins')).toMatchObject({ tools: [], settled: true });
+});
+it.each([
+  ['Chat On Steroids Plugins (Windows)', 257, true],
+  ['Chat On Steroids Core (Windows)', 17, false],
+  ['Chat On Steroids Plugins Backup', 17, false]
+] as const)('applies the Plugins connector\'s limits to %s by its kind, whatever the computer', async (connector, count, accepted) => {
+  // One ChatGPT account on two computers: this computer's Plugins connector carries its suffix
+  // and still holds every enabled external plugin's tools.
+  const { api, props } = page();
+  props.connector.name = connector;
+  props.actions = Array.from({ length: count }, (_, i) => ({ name: `tool_${i}`, description: `Tool ${i}`, description_model: null,
+    params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }));
+  const view = await api.pluginRefreshView(connector);
+  if (accepted) expect(view?.tools).toHaveLength(count);
+  else expect(view).toBeNull();
 });

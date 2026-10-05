@@ -13,7 +13,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { AssetRef, FileChange, ToolOutcome } from '../../shared/session.js';
+import type { AssetRef, FileChange, RunningToolActivity, ToolOutcome } from '../../shared/session.js';
 import type { OutputPublication, ProcessCompletion } from '../codex/unified-exec.js';
 
 export interface CallEvidence {
@@ -46,6 +46,14 @@ export interface CallEvidence {
 export interface CallCaller {
   transportKey: string | null;
   /**
+   * Local Setup profile that owns the MCP endpoint generation which accepted this call.
+   *
+   * This is connection provenance, not a provider account id and not a model argument. A
+   * reconnect after switching Setup profiles gets a new endpoint generation with a different
+   * value; an old endpoint being drained keeps the profile that created it.
+   */
+  setupProfileId?: string | null;
+  /**
    * ChatGPT's own id for this request, from the `x-request-id` header the connector
    * arrives with, trimmed to the part before the `/`.
    *
@@ -72,6 +80,8 @@ export interface CallContext {
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */
   startedAt: number;
+  /** Present-tense caption for the chat while this call runs, with the kind of its finished row. */
+  activity?: Omit<RunningToolActivity, 'since'>;
   /** Stable per-conversation key when the transport offers one, else null. */
   transportKey: string | null;
   /** Resolved agent id in multi-agent mode, else null. */
@@ -158,10 +168,36 @@ export function runningToolCalls(conversationId: string | null = null): number {
   return countFor(running, conversationId);
 }
 
-/** Presentation requires exact ownership; anonymous safety counts are not this chat's work. */
+let requestOwner: (requestId: string) => string | null = () => null;
+
+/** Installs the page's exact proof of a request id. The kernel does, before it dispatches a call. */
+export function setRequestOwner(resolve: (requestId: string) => string | null): void {
+  requestOwner = resolve;
+}
+
+/**
+ * The chat a running call is proven to belong to, or null. The one ownership rule for presentation.
+ *
+ * A call is placed in its chat only after its handler has run, so while it runs it usually names
+ * no chat yet. The page's exact proof of its request id, which ChatGPT reports while it draws the
+ * running call, names it sooner. Anonymous safety counts are never this chat's work.
+ */
+function exactOwner(call: CallContext): string | null {
+  return call.caller.conversationId ?? (call.caller.requestId ? requestOwner(call.caller.requestId) : null);
+}
+
+/** Whether this chat has work running, and since when. Exact ownership only. */
 export function runningToolProgress(conversationId: string): { count: number; since: number } | null {
-  const owned = [...running].filter(call => call.caller.conversationId === conversationId);
+  const owned = [...running].filter(call => exactOwner(call) === conversationId);
   return owned.length ? { count: owned.length, since: Math.min(...owned.map(call => call.startedAt)) } : null;
+}
+
+/** What this chat's calls are doing right now, oldest first. The same exact ownership. */
+export function runningToolActivity(conversationIds: readonly string[]): RunningToolActivity[] {
+  return [...running]
+    .filter(call => { const owner = call.activity ? exactOwner(call) : null; return owner !== null && conversationIds.includes(owner); })
+    .sort((a, b) => a.startedAt - b.startedAt)
+    .map(call => ({ ...call.activity!, since: call.startedAt }));
 }
 
 /** Finished tool work whose unattributed durable record is still landing. */
@@ -268,10 +304,6 @@ export function noteOutcome(outcome: ToolOutcome): void {
   if (store.outcome === null || rank[outcome] > rank[store.outcome]) store.outcome = outcome;
 }
 
-export function noteChange(change: FileChange): void {
-  storage.getStore()?.evidence.changes.push(change);
-}
-
 export function noteChanges(changes: readonly FileChange[], reviews?: readonly { before: string; after: string }[]): void {
   const store = storage.getStore();
   if (!store) return;
@@ -280,10 +312,6 @@ export function noteChanges(changes: readonly FileChange[], reviews?: readonly {
   if (reviews?.length === changes.length) {
     reviews.forEach((review, index) => store.evidence.reviews.push({ changeIndex: offset + index, ...review }));
   }
-}
-
-export function noteAsset(asset: AssetRef): void {
-  storage.getStore()?.evidence.assets.push(asset);
 }
 
 export function noteCount(count: number): void {

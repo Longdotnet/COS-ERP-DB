@@ -23,6 +23,8 @@
 
 import type { Capabilities } from '../../shared/types.js';
 import { desktopAutomationSupported } from '../platform.js';
+import { getConfig } from '../config.js';
+import { CONNECTOR_BRAND, connectorName } from '../../shared/connector-names.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from '../../shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../../shared/browser-control.js';
 
@@ -36,16 +38,7 @@ export type SurfaceId = (typeof SURFACE_IDS)[number];
  * name and the setup cards, and those three drifting apart is how a user ends up with
  * a connector whose name does not match the thing the instructions told them to type.
  */
-/**
- * Fork-facing connector label.
- *
- * The upstream desktop app is intentionally allowed to run beside COS ERP DB. Reusing
- * "Chat On Steroids Core" here makes the two custom apps indistinguishable in ChatGPT and
- * makes it very easy for a conversation to keep calling the upstream tunnel while the fork
- * only observes the browser. Keep the wire/server names stable for protocol compatibility;
- * the user-facing custom-app names must identify this fork.
- */
-export const CONNECTOR_BRAND = 'COS ERP DB';
+export { CONNECTOR_BRAND };
 
 export interface SurfaceDefinition {
   id: SurfaceId;
@@ -137,8 +130,7 @@ const DESKTOP: SurfaceDefinition = {
     'Use for: listing and launching apps, taking background window screenshots, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in native applications, ' +
     'and reading the clipboard or copying and pasting text between programs.',
-  cardSummary:
-    'Browser tabs, DOM, console, network and background screenshots; native apps, input and clipboard where supported.',
+  cardSummary: 'Browser and desktop apps.',
   required: false,
   tools: [...BROWSER_TOOLS, ...WINDOWS_COMPUTER_METHODS, 'read_clipboard', 'write_clipboard', 'observe', 'computer', 'exec']
 };
@@ -157,8 +149,13 @@ export const SURFACES: Record<SurfaceId, SurfaceDefinition> = { core: CORE, desk
 
 export const SURFACE_LIST: readonly SurfaceDefinition[] = [CORE, DESKTOP, PLUGINS];
 
+/**
+ * A surface as this install presents it. The connector name carries this computer's suffix
+ * (Settings › Setup), read at every call so a saved change reaches the Setup cards, the server
+ * instructions and plugin refresh without a restart. `SURFACES` keeps the plain names.
+ */
 export function surfaceDefinition(id: SurfaceId): SurfaceDefinition {
-  return SURFACES[id];
+  return { ...SURFACES[id], connectorName: connectorName(id, getConfig().connectorSuffix) };
 }
 
 /** Platform/capability projection used by setup; each registrar enforces the same split. */
@@ -200,9 +197,4 @@ export function surfaceIsUseful(
     );
   }
   return true;
-}
-
-/** Surfaces worth connecting under these capabilities, in setup order. */
-export function usefulSurfaces(caps: Capabilities): SurfaceDefinition[] {
-  return SURFACE_LIST.filter((surface) => surfaceIsUseful(surface.id, caps));
 }

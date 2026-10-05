@@ -1,10 +1,10 @@
 import { JSDOM } from 'jsdom';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { StoredText } from '../src/shared/session.js';
+import type { MessageReference, StoredText } from '../src/shared/session.js';
 
 let dom: JSDOM;
 let renderedMessage: (html: StoredText | null | undefined, fallback: string) => HTMLElement;
-let renderedMarkdown: (text: string, capture?: StoredText) => HTMLElement;
+let renderedMarkdown: (text: string, capture?: StoredText, references?: readonly MessageReference[]) => HTMLElement;
 
 /** A whole capture, as the store holds one. */
 const whole = (text: string): StoredText => ({ text, truncated: false, chars: text.length });
@@ -35,8 +35,35 @@ describe('captured ChatGPT rendered HTML', () => {
     expect(quote.querySelectorAll('strong')).toHaveLength(2);
     expect(rendered.textContent).not.toContain(':::');
     expect(rendered.textContent).toContain('After the block.');
-    // An unterminated directive is left as text rather than swallowing the rest of the message.
-    expect(renderedMarkdown(':::writing{title="x"}\nno end').textContent).toContain(':::writing');
+    // A block still streaming, or an answer stopped inside it, has no closing `:::` yet. ChatGPT
+    // draws it as the block to the end of the message; it showed here as its raw directive.
+    const open = renderedMarkdown(':::writing{variant="document" title="The Keeper"}\nElias kept the light.\n\nThen Mara came.');
+    expect(open.querySelector('blockquote strong')?.textContent).toBe('The Keeper');
+    expect(open.querySelector('blockquote')?.textContent).toContain('Then Mara came.');
+    expect(open.textContent).not.toContain(':::writing');
+  });
+
+  it('shows the page\'s resolved content for a content-reference reply instead of the raw pointer (#574)', () => {
+    const pointer = '::chatgpt-content-reference{index="0" source_message_id="d2b82e00-509e-4a87-aa93-00bcde251680"}';
+    // The page resolved the pointer: its capture is this message's faithful presentation.
+    const resolved = renderedMarkdown(pointer, whole('<p>Hi! How can I help you today?</p>'));
+    expect(resolved.textContent?.trim()).toBe('Hi! How can I help you today?');
+    expect(resolved.textContent).not.toContain('chatgpt-content-reference');
+    // Without a usable capture the pointer is dropped, and an otherwise empty reply says why.
+    expect(renderedMarkdown(pointer).textContent?.trim()).toBe('This reply points to content from another message that was not recorded.');
+    expect(renderedMarkdown(pointer, whole(`<p>${pointer}</p>`)).textContent).not.toContain('chatgpt-content-reference');
+    expect(renderedMarkdown(`Before\n${pointer}\nAfter`).textContent).toMatch(/Before[\s\S]*After/);
+    expect(renderedMarkdown(`Before\n${pointer}\nAfter`).textContent).not.toContain('chatgpt-content-reference');
+    // Quoted inside code it is text, not a pointer.
+    expect(renderedMarkdown(`Use \`${pointer}\` in docs.`).textContent).toContain('chatgpt-content-reference');
+  });
+
+  it('never shows an unknown ChatGPT directive as raw text', () => {
+    const leaf = '::chatgpt-entity{type="place" id="42"}';
+    expect(renderedMarkdown(leaf, whole('<p>Berlin</p>')).textContent?.trim()).toBe('Berlin');
+    expect(renderedMarkdown(`Intro\n${leaf}`).textContent).not.toContain('::chatgpt-entity');
+    expect(renderedMarkdown(':::canvas{title="Plan"}\nStep one\n:::').textContent).toContain('Step one');
+    expect(renderedMarkdown(':::canvas{title="Plan"}\nStep one\n:::').textContent).not.toContain(':::');
   });
 
   it('renders the recorded native URL token as its authored label and opens it through validated IPC', () => {
@@ -100,6 +127,80 @@ describe('captured ChatGPT rendered HTML', () => {
       'https://example.com/later'
     ]);
   });
+  it('draws an inline content-reference directive as the source pill ChatGPT rendered for it', () => {
+    // Live shape: the directive ends a sentence; the page renders a pill with the source, its URL and a count.
+    const source = 'Splitting prefill and decode uses the hardware better. :chatgpt-content-reference{index="0"}\n\nThe file is written.';
+    const pill = (href: string, name: string, more: string) => `<span data-state="closed"><span><a data-testid="chatgpt-citation" aria-label="${name}: A paper title, ${href}, 2 additional sources" href="${href}"><span><span><img alt="" src="https://icons.example/x.png"></span><span>${name}</span></span><span aria-hidden="true">${more}</span></a></span></span>`;
+    const capture = whole(`<p>Splitting prefill and decode uses the hardware better. ${pill('https://arxiv.org/abs/2609.00001', 'arXiv', '+2')}</p><p>The file is written.</p>`);
+    const rendered = renderedMarkdown(source, capture);
+    const link = rendered.querySelector<HTMLAnchorElement>('a.citation-pill')!;
+    expect(link.getAttribute('href')).toBe('https://arxiv.org/abs/2609.00001');
+    expect(link.textContent).toBe('arXiv+2');
+    // The card shows what the page recorded: the source's title, and that two more were not recorded.
+    const card = rendered.querySelector<HTMLElement>('.citation-card')!;
+    card.parentElement!.dispatchEvent(new window.FocusEvent('focusin'));
+    expect(card.querySelector('a.citation-card-title')?.textContent).toBe('A paper title');
+    expect(card.querySelector('.citation-card-note')?.textContent).toBe('2 more sources were not recorded with this reply.');
+    expect(card.querySelector('.citation-card-nav')).toBeNull();
+    expect(rendered.querySelector('img')).toBeNull();
+    expect(rendered.textContent).not.toContain('chatgpt-content-reference');
+    expect(rendered.textContent).not.toMatch(/[\uE000\uE001]/);
+    // Prose that no longer matches proves nothing: the directive is dropped, never shown raw or guessed.
+    const stale = renderedMarkdown(source, whole(capture.text.replace('Splitting', 'Merging')));
+    expect(stale.querySelector('a')).toBeNull();
+    expect(stale.textContent).not.toContain('chatgpt-content-reference');
+    const unrecorded = renderedMarkdown(source);
+    expect(unrecorded.textContent).toContain('uses the hardware better.');
+    expect(unrecorded.textContent).not.toContain('chatgpt-content-reference');
+    // A literal example in code stays literal.
+    expect(renderedMarkdown('`:chatgpt-content-reference{index="0"}`').querySelector('code')?.textContent).toBe(':chatgpt-content-reference{index="0"}');
+  });
+
+  it('draws a recorded reference by its index, and shows ChatGPT’s source card on hover, paging through every source', () => {
+    vi.useFakeTimers();
+    const source = 'First claim. :chatgpt-content-reference{index="1"}\n\nSecond claim. :chatgpt-content-reference{index="7"}';
+    const references = [{ index: 1, sources: [
+      { title: 'A report', url: 'https://news.example.com/report', source: 'Example News', date: Date.UTC(2026, 8, 28, 12), snippet: 'A short summary.' },
+      { title: 'Project details', url: 'https://scans.example.org/project', source: 'Example Scans' },
+      { title: 'A release', url: 'https://www.wire.example.com/release' }
+    ] }];
+    const rendered = renderedMarkdown(source, undefined, references);
+    document.body.append(rendered);
+    const pill = rendered.querySelector<HTMLAnchorElement>('a.citation-pill')!;
+    expect(pill.textContent).toBe('Example News+2');
+    expect(pill.getAttribute('href')).toBe('https://news.example.com/report');
+    // An index the reply does not hold proves nothing and is dropped.
+    expect(rendered.querySelectorAll('a.citation-pill')).toHaveLength(1);
+    expect(rendered.textContent).not.toContain('chatgpt-content-reference');
+    const card = rendered.querySelector<HTMLElement>('.citation-card')!;
+    expect(card.hidden).toBe(true);
+    // It holds buttons and a link, so it is not a tooltip.
+    expect(card.hasAttribute('role')).toBe(false);
+    pill.parentElement!.dispatchEvent(new window.Event('pointerenter'));
+    vi.advanceTimersByTime(200);
+    expect(card.hidden).toBe(false);
+    const read = () => [card.querySelector('.citation-card-count')?.textContent, card.querySelector('.citation-card-site')?.textContent,
+      card.querySelector('a.citation-card-title')?.getAttribute('href'), card.querySelector('.citation-card-detail')?.textContent ?? ''];
+    expect(read()).toEqual(['1/3', 'Example News', 'https://news.example.com/report', expect.stringContaining('A short summary.')]);
+    const [previous, next] = card.querySelectorAll<HTMLButtonElement>('.citation-card-step');
+    // Paging keeps the clicked arrow itself, focused: rebuilding it moved focus away and closed the card.
+    next!.focus(); next!.click(); next!.click();
+    expect(read()).toEqual(['3/3', 'wire.example.com', 'https://www.wire.example.com/release', '']);
+    expect(card.querySelectorAll('.citation-card-step')[1]).toBe(next);
+    expect(document.activeElement).toBe(next);
+    previous!.click();
+    expect(read()[0]).toBe('2/3');
+    // Focus leaving for the page while the pointer is on the card (a click on its words) keeps it open.
+    next!.dispatchEvent(new window.FocusEvent('focusout', { bubbles: true, relatedTarget: null }));
+    vi.advanceTimersByTime(50);
+    expect(card.hidden).toBe(false);
+    pill.parentElement!.dispatchEvent(new window.Event('pointerleave'));
+    vi.advanceTimersByTime(250);
+    expect(card.hidden).toBe(true);
+    rendered.remove();
+    vi.useRealTimers();
+  });
+
   it('shows exact uploaded-file citation names as text and omits missing or stale file references', () => {
     const marker = '\uE200filecite\uE202turn0file0\uE201';
     const source = 'See the plan. ' + marker + '\n\nContinue here.';

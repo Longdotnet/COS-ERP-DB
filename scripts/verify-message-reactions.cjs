@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
+const { fixtureConfigSource } = require('./fixtures/app-defaults.cjs');
 if (!process.versions.electron) {
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
   const run = require('node:child_process').spawnSync(require('electron'), [__filename], { env, encoding: 'utf8', windowsHide: true });
@@ -17,9 +18,10 @@ app.whenReady().then(async () => {
     const question = {kind:'user_message',seq:1,origin:1,time:1,source:'extension',messageId:'user',message:text('That actually worked 😂'),inputDelivery:'confirmed'};
     const answer = {kind:'assistant_message',seq:2,origin:2,time:2,source:'extension',messageId:'answer',message:text('Yes, it did. The reaction stays under your message.'),final:true};
     window.rows=[question,answer];
-    const config={roots:[{name:'fixture',path:'C:/fixture'}],readOnly:true,capabilities:{read:true,browse:true},tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
+    ${fixtureConfigSource()}
+    const config = fixtureConfig({roots:[{name:'fixture',path:'C:/fixture'}],readOnly:true,capabilities:{read:true,browse:true},tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
       ui:{theme:'dark',autoConnect:false},sessions:{record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000},
-      compaction:{auto:false,autoTokens:300000},multiAgent:{enabled:false,maxWorkers:2},goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}};
+      compaction:{auto:false,autoTokens:300000},multiAgent:{enabled:false,maxWorkers:2},goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}});
     const state={config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,status:{state:'disconnected',surfaces:[]},bridge:{running:false,paired:false,present:false},update:{current:'fixture',latest:null,stage:'idle'}};
     const summary={id:'fixture',title:'Message reactions',conversationId:'fixture-chat',chatIds:['fixture-chat'],startedAt:1,updatedAt:2,
       events:2,userMessages:1,toolCalls:0,estimatedTokens:20,contextTokens:20,errors:0,agents:[],origin:null};
@@ -27,10 +29,10 @@ app.whenReady().then(async () => {
     window.api=new Proxy({getState:()=>ok(state),getLog:()=>ok([]),listProjects:()=>ok([]),
       listSessions:()=>ok({sessions:[summary],activeId:null,pressure:[],blocked:[]}),
       getSession:()=>ok({summary,events:structuredClone(window.rows),total:2,nextFrom:100}),
-      getSessionControls:()=>ok({automation:'off',blocked:'',job:null}),listInputs:()=>ok([]),listPausedHelpers:()=>ok([]),
+      getSessionControls:()=>ok({automation:'off',blocked:'',job:null}),listInputs:()=>ok([]),runningTools:()=>ok([]),listPausedHelpers:()=>ok([]),
       onSessionChanged:fn=>{window.changed=fn;return ()=>{}},getSwarm:()=>ok({running:false,agents:[]}),
       getChatModels:()=>ok({state:'unknown',models:[]})},{get:(target,key)=>key in target?target[key]:()=>ok(null)});
-    window.reaction=(value)=>{question.reaction=value;question.seq++;window.changed()};
+    window.reaction=(value)=>{question.reaction=value;question.seq++;window.changed({sessionIds:[summary.id]})};
     await import('/main.ts');window.ready=true;
   `;
   const server = await createServer({ configFile:false, root:path.join(root,'src/renderer'), server:{host:'127.0.0.1',port:0,hmr:false},

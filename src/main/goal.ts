@@ -28,7 +28,8 @@
  * ## What is sent
  *
  * Authored user messages, ChatGPT commentary and final answers, in order, plus
- * the Compact & Resume bootstrap that the replacement chat actually received. No tool calls,
+ * the Compact & Resume bootstrap that the replacement chat actually received. Of tool calls
+ * only a count per turn, so work that ran is not mistaken for a claim: no tool names,
  * no arguments, no results, no file contents. The goal model is deciding whether the user's
  * request has been satisfied, and the conversation is the only evidence it needs for that;
  * the rest is this machine's business and does not leave it.
@@ -42,7 +43,7 @@
  */
 
 import { requestBrowserDecision, authorizeBrowserHelperRetry } from './session/input.js';
-import { goalErrorMessage } from '../shared/goal-errors.js';
+import { goalErrorKey, goalErrorMessage } from '../shared/goal-errors.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
 import { planProgressText, type TaskProgressUpdate } from '../shared/task-progress.js';
 import { TaskRequestError } from './task-request.js';
@@ -50,13 +51,15 @@ import { GOAL_MARKER_INSTRUCTION, templateGoalDecision } from '../shared/goal-te
 import type { GoalBackend } from '../shared/types.js';
 import { createHash } from 'node:crypto';
 import { getConfig } from './config.js';
-import { getChatModels } from './chat-models.js';
+import { getChatModels, refreshForUnoffered } from './chat-models.js';
+import { resolveChatModel } from '../shared/chat-models.js';
 import type { ReasoningEffort } from '../shared/session.js';
 import { writeDurableNow, writeDurableSnapshotSoon, writeDurableSoon } from './durable.js';
 import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { findSessionByConversation, getSession, readEvents, readHandoff, readRecentEvents, turnHasMcpCall } from './session/store.js';
 import { foldProgress } from '../shared/session.js';
+import { modelFacingText } from '../shared/content-reference.js';
 import { supportsFinishAutomation } from '../shared/finish.js';
 
 /** A finish-only preference has authority only while the finish tool is available. */
@@ -143,6 +146,9 @@ export function goalProviderKey(kind: GoalProviderKind): Promise<string | null> 
 
 /** How many messages of history the goal model is given, newest kept. */
 const MAX_CONTEXT_MESSAGES = 120;
+/** Recent CoS calls read to count per turn; a busy turn can make hundreds. */
+const MAX_TOOL_CALLS_COUNTED = 500;
+const HOLD_TOOLS = new Set(['session_finish', 'keep_astra_on_forever']);
 /** …and how many characters of them, so one 200k-character answer cannot be the whole prompt. */
 const MAX_CONTEXT_CHARS = 120_000;
 /** The per-message cut. Long enough to carry an answer's substance, short enough to fit many. */
@@ -282,11 +288,6 @@ const LOOP_RESPONSE_FORMAT = {
   }
 } as const;
 
-/** The persisted instruction used for the next draft. Exported for focused contract tests. */
-export function goalSystemPrompt(): string {
-  return getConfig().goal.prompt;
-}
-
 /** The persisted driver instruction, used instead of the gate once a chat carries a goal. */
 export function goalObjectivePrompt(): string {
   return getConfig().goal.objectivePrompt;
@@ -337,6 +338,7 @@ export interface GoalDraftView {
   error: string | null;
   /** Plain explanation for both browser and desktop presentation. */
   message?: string;
+  messageKey?: string | null;
   /**
    * Whether this failure is one the same request could still answer.
    *
@@ -1128,11 +1130,6 @@ export function moveGoalSwitch(fromConversationId: string, toConversationId: str
   return true;
 }
 
-export function goalSettings(): { enabled: boolean; mode: GoalMode; model: string; reasoning: string } {
-  const goal = getConfig().goal;
-  return { enabled: goal.enabled, mode: goal.mode, model: goal.model, reasoning: goal.reasoning };
-}
-
 export function goalBackendFor(mode: GoalMode): GoalBackend {
   const settings = getConfig().goal;
   return mode === 'loop' ? settings.loopBackend ?? 'chatgpt' : settings.backend ?? 'chatgpt';
@@ -1172,13 +1169,24 @@ function view(draft: GoalDraft): GoalDraftView {
     // is history, and a page that polls again must not find a message to type a second time.
     reply: draft.stage === 'ready' && !draft.acknowledged ? draft.reply : '',
     error: draft.error,
-    ...(draft.error ? { message: goalErrorMessage(draft.error) } : {}),
+    ...(draft.error ? { message: goalErrorMessage(draft.error), messageKey: goalErrorKey(draft.error) } : {}),
     retryable: draft.stage === 'failed' && retryableGoalFailure(draft.error ?? '')
   };
 }
 
+/**
+ * A failure nothing will fix on its own: no credit, a rejected key, an unknown model. The page does
+ * not retry it, so it is the chat's Goal state until a newer draft replaces it. Hiding it once the
+ * page acknowledged it left only the still-owed reply, which read as "Answer settling" forever (#584).
+ */
+function settledFailure(draft: GoalDraft): boolean {
+  return draft.stage === 'failed' && draft.error !== null && !retryableGoalFailure(draft.error);
+}
+
 function expireDraftPayload(draft: GoalDraft): void {
   if (draft.settledAt === 0 || Date.now() - draft.settledAt <= DRAFT_TTL_MS) return;
+  // Its reason stays on screen; there is no payload to expire.
+  if (settledFailure(draft)) { draft.acknowledged = true; return; }
   // The TTL is for the *payload*, not the idempotency key. A ready draft can have crossed
   // ChatGPT's irreversible send boundary while its local ACK was lost. Keep this turn's token
   // as a spent tombstone until a genuinely newer generation supersedes it.
@@ -1204,8 +1212,18 @@ export function goalViewFor(conversationId: string, clientId?: string): GoalDraf
   // here only so the turn it belongs to cannot be drafted a second time, and reporting it
   // would leave the page polling fast and the panel above the composer describing something
   // that finished minutes ago.
-  if (draft.acknowledged) return null;
+  if (draft.acknowledged && !settledFailure(draft)) return null;
   return view(draft);
+}
+
+/**
+ * The run's outcome for the app window: an acknowledged "goal met" decision, until a newer turn
+ * replaces it. goalViewFor() hides it from the page once acted on, but the window must not fall
+ * back to "Pursuing goal" for a run that ended (found on Windows, 2026-10-04).
+ */
+export function goalOutcomeFor(conversationId: string): GoalDraftView | null {
+  const draft = drafts.get(conversationId);
+  return draft?.acknowledged && draft.stage === 'no-reply' ? view(draft) : null;
 }
 
 export async function retryGoalBrowserHelper(sourceSessionId: string, inputId: string): Promise<boolean> {
@@ -1626,7 +1644,10 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
     : GOAL_REFERENCE_CONTRACT;
   if (request.backend === 'chatgpt') {
     const protocol = request.mode === 'loop' ? LOOP_OUTPUT_PROTOCOL : GOAL_OUTPUT_PROTOCOL;
-    const introduction = 'Return one JSON object: {"action":"stop" or "continue","reply":"the message"}. ' + referenceContract;
+    // ChatGPT offers connected apps, this one included, in every chat, the helper's too. A helper that
+    // called a tool ran it on this machine without any chat to answer for it (2026-10-02, live).
+    const introduction = 'Return one JSON object: {"action":"stop" or "continue","reply":"the message"}. ' + referenceContract +
+      ' Do not call any tools, apps or connectors; decide from the transcript alone.';
     const replacement = 'Use this complete source transcript as reference data.';
     const render = (messages: ChatMessage[], direction = replacement): string => [...request.system, protocol,
       introduction, direction, '<conversation>', ...messages.map(message => JSON.stringify(message)), '</conversation>', request.trailer].join('\n\n');
@@ -1755,13 +1776,19 @@ export function goalHelperSelection(): { model: string | null; reasoningEffort: 
   let reasoningEffort: ReasoningEffort | null = settings.helperReasoning ?? 'high';
   const models = getChatModels().models;
   if (!models.length) return { model, reasoningEffort };
-  const matching = (id: string) => models.filter(choice => choice.id === id || choice.aliases?.includes(id));
   const notes: string[] = [];
-  if (model && matching(model).length !== 1) { notes.push(`model "${model}"`); model = null; }
-  if (reasoningEffort && !(model ? matching(model) : models).some(choice => choice.efforts.includes(reasoningEffort!))) {
+  // A saved display label resolves to its unique observed family — the same rule the
+  // Settings selects apply before showing the badge. Exact ids and lane aliases keep
+  // their lane; a resolved label canonicalizes to the family. An ambiguous label stays rejected.
+  const resolved = model ? resolveChatModel(models, model) : undefined;
+  if (model && !resolved) { notes.push(`model "${model}"`); model = null; }
+  else if (resolved && resolved.id !== model && !resolved.aliases?.includes(model)) model = resolved.id;
+  const offered = model ? (resolved ? [resolved] : models.filter(choice => choice.id === model || choice.aliases?.includes(model))) : models;
+  if (reasoningEffort && !offered.some(choice => choice.efforts.includes(reasoningEffort!))) {
     notes.push(`reasoning "${reasoningEffort}"`); reasoningEffort = null;
   }
   const key = notes.join(',');
+  if (key) refreshForUnoffered(`goal helper ${key}`);
   if (key && key !== helperFallbackLogged) {
     helperFallbackLogged = key;
     logWarn(`goal: the saved helper ${notes.join(' and ')} is not offered by this ChatGPT account; using ChatGPT's current selection`);
@@ -2435,13 +2462,24 @@ async function committedResumeHandoffId(
 export async function conversationMessages(sessionId: string, deliveredInput: readonly string[] = [], excludedInputIds: ReadonlySet<string> = new Set()): Promise<ChatMessage[]> {
   const recentLimit = MAX_CONTEXT_MESSAGES * 2;
   const { listInputs } = await import('./session/input.js');
-  const [recent, userReferences, inputs] = await Promise.all([
+  const [recent, userReferences, inputs, toolCalls] = await Promise.all([
     readRecentEvents(sessionId, recentLimit, {
       kinds: ['user_message', 'assistant_message', 'progress']
     }),
     readRecentEvents(sessionId, MAX_CONTEXT_MESSAGES, { kinds: ['user_message'] }),
-    listInputs()
+    listInputs(),
+    readRecentEvents(sessionId, MAX_TOOL_CALLS_COUNTED, { kinds: ['tool_call'] })
   ]);
+  // Only how many CoS calls each turn made. Without it the helper cannot tell "ran the
+  // command" from "said it did" and keeps asking for the same work again.
+  const callsByTurn = new Map<string, number>();
+  for (const call of toolCalls) {
+    // Hold calls are waiting, not work, exactly as the finish boundary counts them.
+    if (call.kind === 'tool_call' && call.source === 'mcp' && call.turnId && !HOLD_TOOLS.has(call.call.tool)) {
+      callsByTurn.set(call.turnId, (callsByTurn.get(call.turnId) ?? 0) + 1);
+    }
+  }
+  const lastAnswerOfTurn = new Map<string, number>();
   const automaticIds = new Set(inputs.filter(input => input.sessionId === sessionId && input.finishOwner).map(input => input.id));
   // Assistant traffic must not evict the user's middle corrections before selection.
   const events = [...new Map([...recent, ...userReferences].map(event => [event.seq, event])).values()]
@@ -2458,7 +2496,7 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
         ? { role: 'user', origin: 'automatic', content: '[Automatic continuation; not a new human requirement]\n' + content }
         : { role: 'user', content };
     } else if ((event.kind === 'assistant_message' && (event.final || event.messageId)) || (event.kind === 'progress' && event.source === 'extension')) {
-      const content = clip(event.message.text);
+      const content = clip(event.kind === 'assistant_message' ? modelFacingText(event.message.text, event.renderedHtml) : event.message.text);
       if (content) next = { role: 'assistant', content };
     }
     if (!next) continue;
@@ -2476,6 +2514,12 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
       if (key) byStableMessage.set(key, ordered.length);
       ordered.push(next);
     }
+    const turn = next.role === 'assistant' && 'turnId' in event && typeof event.turnId === 'string' ? event.turnId : null;
+    if (turn && callsByTurn.has(turn)) lastAnswerOfTurn.set(turn, Math.max(lastAnswerOfTurn.get(turn) ?? -1, existingAt ?? ordered.length - 1));
+  }
+  for (const [turn, at] of lastAnswerOfTurn) {
+    const count = callsByTurn.get(turn)!;
+    ordered[at] = { ...ordered[at]!, content: `${ordered[at]!.content}\n\n[Chat On Steroids: ${count} tool call${count === 1 ? '' : 's'} ran in this turn. Arguments and results are not shown.]` };
   }
   for (const text of deliveredInput.slice(-5)) {
     const content = clip(userPromptText(text) ?? text, MAX_USER_MESSAGE_CHARS);
@@ -2757,13 +2801,24 @@ let modelCache: { at: number; keyScope: string; models: GoalModel[] } | null = n
  * exists than the one already chosen. Paged, because the listing is several hundred long and
  * nobody scrolls that.
  */
-export async function listGoalModels(offset = 0, limit = MODEL_PAGE_SIZE): Promise<{ models: GoalModel[]; total: number; selectedModel?: GoalModel }> {
+export async function listGoalModels(
+  offset = 0,
+  limit = MODEL_PAGE_SIZE,
+  query = ''
+): Promise<{ models: GoalModel[]; total: number; selectedModel?: GoalModel }> {
   const selectedId = getConfig().goal.model;
   const models = await allGoalModels();
+  const needle = query.trim().toLowerCase();
+  const visible = needle
+    ? models.filter(model => model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle))
+    : models;
   const from = Math.max(0, Math.floor(offset));
   const count = Math.max(1, Math.min(100, Math.floor(limit)));
+  // Keep the selected model's metadata independent from the search result. A saved model can be
+  // outside both the current page and the active filter, but its reasoning options still belong
+  // to the selected configuration rather than to the query.
   const selectedModel = models.find(model => model.id === selectedId);
-  return { models: models.slice(from, from + count), total: models.length, ...(selectedModel ? { selectedModel } : {}) };
+  return { models: visible.slice(from, from + count), total: visible.length, ...(selectedModel ? { selectedModel } : {}) };
 }
 
 async function allGoalModels(): Promise<GoalModel[]> {

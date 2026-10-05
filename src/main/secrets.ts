@@ -13,6 +13,7 @@ import path from 'node:path';
 import { safeStorage } from 'electron';
 import type { SecureStorageInfo } from '../shared/types.js';
 import { logError, logWarn } from './logger.js';
+import { afterKeychainRead, beforeKeychainRead } from './keychain-notice.js';
 
 const FILE_NAME = 'secrets.bin';
 const LINUX_BASIC_TEXT_PREFIX = Buffer.from('v10', 'ascii');
@@ -83,9 +84,26 @@ export function secureStorageCiphertextIsProtected(
   return platform !== 'linux' || !encrypted.subarray(0, LINUX_BASIC_TEXT_PREFIX.length).equals(LINUX_BASIC_TEXT_PREFIX);
 }
 
+/**
+ * Every safeStorage call goes through here. The first one sets up Electron's encryptor, which on
+ * macOS reads the key from the Keychain, and after an update that read waits on the password
+ * prompt; keychain-notice.ts lets the window say so before it starts.
+ */
+async function keychain<T>(operation: () => Promise<T>, ok: (result: T) => boolean = () => true): Promise<T> {
+  await beforeKeychainRead();
+  try {
+    const result = await operation();
+    void afterKeychainRead(ok(result));
+    return result;
+  } catch (error) {
+    void afterKeychainRead(false);
+    throw error;
+  }
+}
+
 export async function secureStorageStatus(platform: NodeJS.Platform = process.platform): Promise<SecureStorageInfo> {
   try {
-    if (!(await safeStorage.isAsyncEncryptionAvailable())) {
+    if (!(await keychain(() => safeStorage.isAsyncEncryptionAvailable(), available => available))) {
       return {
         available: false,
         detail:
@@ -99,7 +117,7 @@ export async function secureStorageStatus(platform: NodeJS.Platform = process.pl
     if (platform === 'linux') {
       // Probe the provider Electron actually chose, not only the desktop/backend label above.
       // The probe contains no credential and is never persisted.
-      const probe = await safeStorage.encryptStringAsync(LINUX_STORAGE_PROBE);
+      const probe = await keychain(() => safeStorage.encryptStringAsync(LINUX_STORAGE_PROBE));
       if (!secureStorageCiphertextIsProtected(probe, platform)) {
         return {
           available: false,
@@ -157,7 +175,7 @@ async function loadAll(): Promise<Record<string, string>> {
       rotationPending = false;
       return {};
     }
-    const decrypted = await safeStorage.decryptStringAsync(blob);
+    const decrypted = await keychain(() => safeStorage.decryptStringAsync(blob));
     const parsed = parseSecretStore(decrypted.result);
     // `deleteAllSecrets()` is allowed to race a Keychain decrypt without waiting for a prompt or
     // unavailable provider. Once deletion starts, plaintext from the older generation must never
@@ -208,7 +226,7 @@ async function writeAll(values: Record<string, string>): Promise<void> {
   if (!(await isEncryptionAvailable())) {
     throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
   }
-  const blob = await safeStorage.encryptStringAsync(JSON.stringify(values));
+  const blob = await keychain(() => safeStorage.encryptStringAsync(JSON.stringify(values)));
   if (!secureStorageCiphertextIsProtected(blob)) {
     throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
   }
@@ -248,10 +266,25 @@ async function rotateIfNeeded(): Promise<void> {
   });
 }
 
+/**
+ * API keys never contain whitespace or invisible characters, but a copied key can carry one that
+ * trim() keeps, such as a soft hyphen (U+00AD) or NEL (U+0085). OpenRouter then reads
+ * "Bearer \u00ADsk-…" as "Missing Authentication header" (#577). Removing them when a key is
+ * stored and when it is read also heals a key stored before this check existed.
+ */
+const INVISIBLE_IN_KEYS = /[\s\u0085\u00AD\u180E\u200B-\u200F\u2028-\u202F\u205F-\u2064\u2066-\u206F\uFEFF]/g;
+function isApiKey(key: SecretKey): boolean {
+  return key === 'openaiApiKey' || key === 'openRouterApiKey' || key === 'customProviderApiKey' || key.startsWith('setup:');
+}
+export function cleanApiKey(value: string): string {
+  return value.replace(INVISIBLE_IN_KEYS, '');
+}
+
 export async function getSecret(key: SecretKey): Promise<string | null> {
   const all = await readAll();
-  const value = all[key];
+  const stored = all[key];
   await rotateIfNeeded();
+  const value = stored && isApiKey(key) ? cleanApiKey(stored) : stored;
   return value && value.length > 0 ? value : null;
 }
 
@@ -275,7 +308,7 @@ export function setSecret(key: SecretKey, value: string): Promise<void> {
       throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
     }
     const all = { ...current };
-    const trimmed = value.trim();
+    const trimmed = isApiKey(key) ? cleanApiKey(value) : value.trim();
     if (trimmed === '') {
       delete all[key];
     } else {

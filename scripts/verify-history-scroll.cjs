@@ -47,10 +47,11 @@ app.whenReady().then(async () => {
       errors:0,estimatedTokens:0,contextTokens:0,agents:[],origin:null};
     window.fixture={history,session,inputs:[],reads:[],listReads:0,
       add:event=>{add(event);session.events=history.length;session.updatedAt++;},
-      signal:()=>{if(!sessionChanged)throw new Error('onSessionChanged was not registered');sessionChanged();}};
+      // Every synthetic write belongs to this one session, so its push names that owner.
+      signal:()=>{if(!sessionChanged)throw new Error('onSessionChanged was not registered');sessionChanged({sessionIds:[session.id]});}};
     window.api=new Proxy({
       listSessions:()=>{fixture.listReads++;return ok({sessions:[session],activeId:null,blocked:[],pressure:[]})},
-      listProjects:()=>ok([]),listInputs:()=>ok(fixture.inputs),listPausedHelpers:()=>ok([]),
+      listProjects:()=>ok([]),listInputs:()=>ok(fixture.inputs),runningTools:()=>ok([]),listPausedHelpers:()=>ok([]),
       onSessionChanged:handler=>{sessionChanged=handler;return()=>{if(sessionChanged===handler)sessionChanged=null;}},
       getSession:(_id,options)=>{
         fixture.reads.push(options);
@@ -222,6 +223,7 @@ app.whenReady().then(async () => {
     const last=timeline.lastElementChild;
     const gap=pending.getBoundingClientRect().top-last.getBoundingClientRect().bottom;
     const before=pending.getBoundingClientRect().top,scrollBefore=pane.scrollTop;
+    pane.dispatchEvent(new WheelEvent('wheel',{deltaY:-80}));
     pane.scrollTop=Math.max(0,scrollBefore-80);await frame();
     const movement=pending.getBoundingClientRect().top-before;
     const pendingBeforeDelivery=pending.getBoundingClientRect().top;

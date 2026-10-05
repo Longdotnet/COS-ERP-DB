@@ -5,6 +5,64 @@ import type { SessionSummary } from '../src/shared/session.js';
 
 let dom: JSDOM;
 afterEach(() => dom?.window.close());
+
+it('highlights only round workers in the existing overview and loads history on selection', async () => {
+  dom = new JSDOM('<main></main>');
+  Object.assign(globalThis, { document: dom.window.document });
+  const load = vi.fn().mockResolvedValue({ events: [] });
+  const panel = createAgentPanel({ host: document.querySelector('main')!, load, render: () => [], openMain: vi.fn(), working: () => false });
+  const workers = ['one', 'two', 'three'].map(id => ({ id, title: id, updatedAt: 1 } as SessionSummary));
+  panel.update('prime', workers);
+  panel.showWorkers(['one', 'one', 'three', 'foreign']);
+  const highlighted = () => [...document.querySelectorAll<HTMLElement>('.is-round-worker')].map(row => row.dataset.workerSession);
+  expect(highlighted()).toEqual(['one', 'three']);
+  expect(document.activeElement).toBe(document.querySelector('.is-round-worker'));
+  expect(load).not.toHaveBeenCalled();
+  panel.update('prime', [workers[1]!, workers[2]!]);
+  expect(highlighted()).toEqual(['three']);
+  (document.querySelector('.is-round-worker') as HTMLButtonElement).click();
+  await Promise.resolve(); await Promise.resolve();
+  expect(load).toHaveBeenCalledWith('three');
+  (document.querySelector('.agent-back') as HTMLButtonElement).click();
+  expect(highlighted()).toEqual(['three']);
+  panel.update('other-prime', workers); panel.update('prime', workers); panel.show();
+  expect(highlighted()).toEqual([]);
+});
+
+it.each(['hide', 'empty', 'parent'] as const)('retires pending worker history across %s and return to the same worker', async boundary => {
+  dom = new JSDOM('<main></main>');
+  Object.assign(globalThis, { document: dom.window.document });
+  let resolve!: (value: { events: [] }) => void;
+  const load = vi.fn(() => new Promise<{ events: [] }>(done => { resolve = done; })), render = vi.fn(() => []);
+  const panel = createAgentPanel({ host: document.querySelector('main')!, load, render, openMain: vi.fn(), working: () => false });
+  const worker = { id: 'worker', title: 'Worker', updatedAt: 1 } as SessionSummary;
+  panel.update('prime', [worker]);
+  const pending = panel.open('worker');
+  if (boundary === 'hide') panel.hide();
+  else panel.update(boundary === 'empty' ? 'prime' : 'another-prime', []);
+  panel.update('prime', [worker]); panel.show();
+  resolve({ events: [] }); await pending;
+  expect(render).not.toHaveBeenCalled();
+  expect(document.querySelectorAll('.agent-panel-row')).toHaveLength(1);
+});
+
+it('does not re-open the dock on worker refresh or allow retired full-chat navigation', async () => {
+  dom = new JSDOM('<main></main>');
+  Object.assign(globalThis, { document: dom.window.document });
+  const worker = { id: 'worker', title: 'Worker', updatedAt: 1 } as SessionSummary;
+  const onShow = vi.fn(), openMain = vi.fn();
+  const panel = createAgentPanel({ host: document.querySelector('main')!, load: async () => ({ events: [] }),
+    render: () => [], working: () => false, openMain, onShow });
+  panel.update('prime', [worker]); await panel.open(worker.id);
+  onShow.mockClear();
+  panel.update('prime', [{ ...worker, updatedAt: 2 }]);
+  await Promise.resolve(); await Promise.resolve();
+  expect(onShow).not.toHaveBeenCalled();
+  const oldFullChat = [...document.querySelectorAll('button')].find(button => button.textContent === 'Open full chat')!;
+  panel.update('another-prime', []); panel.update('prime', [worker]);
+  oldFullChat.click();
+  expect(openMain).not.toHaveBeenCalled();
+});
 it('keeps Prime selection independent and rejects late results after parent navigation', async () => {
   dom = new JSDOM('<main></main><button></button>');
   Object.assign(globalThis, { document: dom.window.document });
@@ -18,6 +76,7 @@ it('keeps Prime selection independent and rejects late results after parent navi
   const worker = { id: 'worker-session', title: 'Worker', updatedAt: 1 } as SessionSummary;
   panel.update('prime-session', [worker]); toggle.click();
   expect(host.textContent).toContain('History · 1');
+  expect(host.textContent).not.toContain('0 failed');
   // A worker with no conversation or model yet still gets its row (undefined === undefined once threw here).
   expect(host.querySelectorAll('.agent-panel-row')).toHaveLength(1);
   const opening = panel.open(worker.id);
@@ -28,6 +87,34 @@ it('keeps Prime selection independent and rejects late results after parent navi
   expect(host.querySelector('aside')!.hidden).toBe(true);
   await panel.open(worker.id);
   expect(load).toHaveBeenCalledTimes(1);
+});
+
+it('translates the optional failed suffix in the History heading', async () => {
+  dom = new JSDOM('<main></main><button></button>', { url: 'https://local.test/' });
+  Object.assign(globalThis, { window: dom.window, document: dom.window.document, Node: dom.window.Node });
+  const host = document.querySelector('main')!, toggle = document.querySelector('button')!;
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  const panel = createAgentPanel({
+    host,
+    toggle,
+    load: async () => ({ events: [] }),
+    render: () => [],
+    openMain: vi.fn(),
+    working: () => true,
+    agent: () => ({ state: 'failed', task: 'Placeholder failure', conversationId: 'placeholder-failed' })
+  });
+  panel.update('prime', [{
+    id: 'worker',
+    title: 'worker-1',
+    conversationId: 'placeholder-failed',
+    startedAt: 1,
+    updatedAt: 2,
+    origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-1', task: 'Placeholder failure' }
+  } as SessionSummary]);
+  toggle.click();
+  expect(host.textContent).toContain('Verlauf · 1 · 1 fehlgeschlagen');
+  setLanguage('en');
 });
 
 it('renders a selected worker and offers an explicit full-chat navigation', async () => {
@@ -100,6 +187,51 @@ it('shows the worker task and only a model observed for its current conversation
   expect(card.dataset.state).toBe('working');
 });
 
+it('shows latest recorded worker activity and action count without loading worker history', () => {
+  dom = new JSDOM('<main></main><button></button>');
+  Object.assign(globalThis, { document: dom.window.document });
+  const host = document.querySelector('main')!, toggle = document.querySelector('button')!;
+  const load = vi.fn(async () => ({ events: [] }));
+  const now = Date.now();
+  const panel = createAgentPanel({
+    host,
+    toggle,
+    load,
+    render: () => [],
+    openMain: vi.fn(),
+    working: () => true
+  });
+  const worker = {
+    id: 'worker',
+    title: 'worker-2',
+    conversationId: 'chat-worker',
+    startedAt: now - 90_000,
+    updatedAt: now,
+    toolCalls: 1_200,
+    lastToolCallAt: now - 1_000,
+    lastToolActivity: { kind: 'read', title: 'Read src/main/agents.ts' },
+    origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-2', task: 'Inspect activity' }
+  } as SessionSummary;
+
+  panel.update('prime', [worker]);
+  toggle.click();
+  expect(load).not.toHaveBeenCalled();
+  expect(host.querySelector('.agent-card-activity')?.textContent).toBe('Read src/main/agents.ts');
+  expect((host.querySelector('.agent-card-activity') as HTMLElement)?.dataset.kind).toBe('read');
+  expect(host.querySelector('.agent-card-meta')?.textContent).toContain('1.2k actions');
+
+  panel.update('prime', [{
+    ...worker,
+    updatedAt: now + 1,
+    toolCalls: 1_201,
+    lastToolCallAt: now + 1,
+    lastToolActivity: { kind: 'run', title: 'Ran npm test' }
+  }]);
+  expect(load).not.toHaveBeenCalled();
+  expect(host.querySelector('.agent-card-activity')?.textContent).toBe('Ran npm test');
+  expect(host.querySelector('.agent-card-meta')?.textContent).toContain('1.2k actions');
+});
+
 it('uses the exact broker worker state and reused assignment over stale session metadata', () => {
   dom = new JSDOM('<main></main><button></button>');
   Object.assign(globalThis, { document: dom.window.document });
@@ -113,7 +245,7 @@ it('uses the exact broker worker state and reused assignment over stale session 
   const card = host.querySelector<HTMLElement>('.agent-panel-row')!;
   expect(card.dataset.state).toBe('failed');
   expect(card.querySelector('.agent-card-task')!.textContent).toBe('Review the final package');
-  expect(host.textContent).toContain('History · 1');
+  expect(host.textContent).toContain('History · 1 · 1 failed');
 });
 
 it('groups a failed broker worker under History even with recent session activity', () => {
@@ -126,5 +258,68 @@ it('groups a failed broker worker under History even with recent session activit
     updatedAt: Date.now(), origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-2', task: 'Review' } } as SessionSummary]);
   toggle.click();
   expect(host.textContent).toContain('Active · 0');
-  expect(host.textContent).toContain('History · 1');
+  expect(host.textContent).toContain('History · 1 · 1 failed');
+});
+
+it('adds failures to the existing History heading without a standalone summary row', () => {
+  dom = new JSDOM('<main></main><button></button>');
+  Object.assign(globalThis, { document: dom.window.document });
+  const host = document.querySelector('main')!, toggle = document.querySelector('button')!;
+  const panel = createAgentPanel({
+    host,
+    toggle,
+    load: async () => ({ events: [] }),
+    render: () => [],
+    openMain: vi.fn(),
+    working: worker => worker.id === 'fallback-running',
+    agent: worker => worker.id === 'active' ? { state: 'active', task: 'Run tests', conversationId: 'chat-active' }
+      : worker.id === 'done' ? { state: 'sleeping', task: 'Review code', conversationId: 'chat-done' }
+        : worker.id === 'failed' ? { state: 'failed', task: 'Check build', conversationId: 'chat-failed' }
+          : null
+  });
+  panel.update('prime', [
+    { id: 'active', title: 'worker-1', conversationId: 'chat-active', startedAt: 1, updatedAt: 2,
+      origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-1', task: 'Run tests' } },
+    { id: 'fallback-running', title: 'worker-2', conversationId: 'chat-fallback', startedAt: 1, updatedAt: 2,
+      origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-2', task: 'Inspect current work' } },
+    { id: 'done', title: 'worker-3', conversationId: 'chat-done', startedAt: 1, updatedAt: 2,
+      origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-3', task: 'Review code' } },
+    { id: 'failed', title: 'worker-4', conversationId: 'chat-failed', startedAt: 1, updatedAt: 2,
+      origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-4', task: 'Check build' } }
+  ] as SessionSummary[]);
+  toggle.click();
+  expect(host.querySelector('.agent-panel-summary')).toBeNull();
+  expect(host.textContent).toContain('Active · 2');
+  expect(host.textContent).toContain('History · 2 · 1 failed');
+  expect(host.textContent).not.toContain('4 workers · 2 running · 1 done · 1 failed');
+});
+
+
+it('shows bounded worker health in the overview without changing lifecycle ownership', () => {
+  dom = new JSDOM('<main></main><button></button>');
+  Object.assign(globalThis, { document: dom.window.document });
+  const host = document.querySelector('main')!, toggle = document.querySelector('button')!;
+  const panel = createAgentPanel({
+    host,
+    toggle,
+    load: async () => ({ events: [] }),
+    render: () => [],
+    openMain: vi.fn(),
+    working: () => false,
+    agent: () => ({ state: 'detached', task: 'Inspect the build', conversationId: 'chat-worker' })
+  });
+  panel.update('prime', [{
+    id: 'worker',
+    title: 'worker-1 · Inspect the build',
+    conversationId: 'chat-worker',
+    startedAt: Date.now() - 5_000,
+    updatedAt: Date.now(),
+    activeTurnId: null,
+    origin: { kind: 'worker', fromSessionId: 'prime', agentId: 'worker-1', task: 'Inspect the build' }
+  } as SessionSummary]);
+  toggle.click();
+  const card = host.querySelector<HTMLElement>('.agent-panel-row')!;
+  expect(card.dataset.health).toBe('degraded');
+  expect(card.querySelector('.agent-card-health')?.textContent).toBe('Degraded');
+  expect(card.querySelector<HTMLElement>('.agent-card-health')?.getAttribute('title')).toBeNull();
 });

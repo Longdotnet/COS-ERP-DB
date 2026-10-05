@@ -1,0 +1,28 @@
+name: Welcome
+
+# A short, friendly hello on someone's first issue, with what a good report needs. First pull
+# requests are welcomed by the scheduled PR triage (scripts/pr-triage.mjs), which needs no
+# pull_request_target.
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  welcome:
+    if: github.repository == 'totec448-spec/chat-on-steroids'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d # v3.1.0
+        with:
+          issue_message: |
+            Thanks for your first issue, and welcome! 👋 Two things help us most:
+            - the app and extension versions (click the connection dot at the bottom left of the app), and your OS and browser;
+            - the steps that lead to the problem, and what you expected instead.
+
+            If we need more details we will ask here. Screenshots are welcome; please blur names, chat text and paths.

@@ -8,12 +8,13 @@ import type { SessionControlsView } from '../main/bridge.js';
 import type { InputAttachment } from '../shared/input.js';
 import type { UsageOverview } from '../shared/usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
-import type { LocalProject } from '../shared/projects.js';
+import type { LocalProject, ProjectColor } from '../shared/projects.js';
 import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
 import type { ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot } from '../shared/project-git.js';
 import type { PetLibraryState, PetOverlayControlState, PetRuntimeAsset } from '../shared/pets.js';
 import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
-import type { ToolEditReview } from '../shared/session.js';
+import type { RunningToolActivity, SessionChange, ToolEditReview } from '../shared/session.js';
+import type { RunningExecProcess } from '../shared/background-exec.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
 import { createDatabaseApi } from './database-api.js';
 /**
@@ -54,6 +55,10 @@ export interface SettingsPatch {
   multiAgent: Config['multiAgent'];
   goal: Config['goal'];
   mcp: Config['mcp'];
+  /** Optional so callers that save other sections never have to carry it. */
+  controlApi?: Config['controlApi'];
+  /** This computer's connector name suffix; omitted by callers that do not edit it. */
+  connectorSuffix?: string;
 }
 
 /** One page of the model catalogue, as the model picker asks for it. */
@@ -68,6 +73,8 @@ export interface SessionList {
   activeId: string | null;
   /** ChatGPT conversation ids the user has blocked from using local tools. */
   blocked: string[];
+  /** ChatGPT conversation ids explicitly trusted for strict allowlisting. */
+  trusted?: string[];
   pressure: Array<TokenPressure & { id: string }>;
   /** Total retained sessions, not merely the current IPC page. */
   total: number;
@@ -120,6 +127,11 @@ const api = {
   petsList: () => call<PetLibraryState>('pets:list'),
   petsOverlayState: () => call<PetOverlayControlState>('pets:overlayState'),
   petsSetOverlayVisible: (visible: boolean) => call<PetOverlayControlState>('pets:overlayVisible', { visible }),
+  /** The selected language's texts for the stopped-chat desktop notices (#855). */
+  setStopNoticeTexts: (texts: Record<string, string>) => call<void>('ui:stopNoticeTexts', texts),
+  setMainTexts: (texts: Record<string, string>) => call<void>('ui:mainTexts', texts),
+  /** The interface language, kept by the app for the browser extension. */
+  setUiLanguage: (language: string) => call<void>('ui:language', language),
   petsImport: () => call<PetLibraryState | null>('pets:import'),
   petsSetEnabled: (id: string, enabled: boolean) => call<PetLibraryState>('pets:enabled', { id, enabled }),
   petsSetFavorite: (id: string, favorite: boolean) => call<PetLibraryState>('pets:favorite', { id, favorite }),
@@ -130,6 +142,13 @@ const api = {
     ipcRenderer.on('pet-overlay:stateChanged', wrapped);
     return () => ipcRenderer.removeListener('pet-overlay:stateChanged', wrapped);
   },
+  /** True right before a Keychain read that may wait on the macOS password prompt; false once it settled. */
+  onKeychainWaiting: (listener: (waiting: boolean) => void): (() => void) => {
+    const wrapped = (_event: unknown, waiting: boolean): void => listener(waiting === true);
+    ipcRenderer.on('keychain:waiting', wrapped);
+    return () => ipcRenderer.removeListener('keychain:waiting', wrapped);
+  },
+  keychainNoticeReady: () => call<void>('keychain:noticeReady'),
   onPetOverlayOpenOwner: (listener: (screen: 'chat' | 'pets') => void): (() => void) => {
     const wrapped = (_event: unknown, screen: 'chat' | 'pets'): void => listener(screen);
     ipcRenderer.on('pet-overlay:openOwner', wrapped);
@@ -195,17 +214,25 @@ const api = {
   setGoalKey: (value: string) => call<AppState>('secret:set', { value, key: 'openRouterApiKey' }),
   // The same, for a custom provider endpoint. Optional: keyless local servers need nothing stored.
   setCustomProviderKey: (value: string) => call<AppState>('secret:set', { value, key: 'customProviderApiKey' }),
-  listGoalModels: (offset: number) => call<GoalModelPage>('goal:models', { offset }),
+  listGoalModels: (offset: number, query = '') => call<GoalModelPage>('goal:models', { offset, query }),
   pickBinary: () => call<AppState>('binary:pick'),
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
+  saveDiagnosticsReport: () => call<{ saved: false } | { saved: true; name: string }>('diagnostics:saveReport'),
   requestDesktopAccessibility: () => call<AppState>('desktop:requestAccessibility'),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
   getLogJson: () => call<string>('log:json'),
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
-  openLink: (url: string) => call<boolean>('link:open', { url }),
+  exportMarkdown: (request: { id: string; scope: 'answer' | 'session'; turnId?: string; target: 'clipboard' | 'file' }) =>
+    call<{ done: 'copied' } | { done: 'saved'; name: string } | { done: 'cancelled' }>('sessions:exportMarkdown', request),
+  // `external`: the system's own browser even for a page the CoS browser would open.
+  openLink: (url: string, options: { external?: boolean } = {}) => call<boolean>('link:open', { url, ...(options.external ? { external: true } : {}) }),
+  showCosBrowser: () => call<boolean>('cosBrowser:show'),
+  openChatGpt: () => call<boolean>('chatgpt:open'),
+  signOutChatGpt: () => call<boolean>('chatgpt:signOut'),
+  openSetupBrowser: (browser: 'chrome' | 'edge' | 'brave', page: 'extensions' | 'chatgpt') => call<boolean>('browser:setupOpen', { browser, page }),
   // Applies the update this app has already downloaded and verified: the app quits, the
   // installer runs, and the app comes back as the new version. It takes no argument because
   // there is nothing here to choose - the main process knows what is staged.
@@ -219,6 +246,7 @@ const api = {
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
+  setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
   listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
   watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
   onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {
@@ -269,6 +297,7 @@ const api = {
     return () => ipcRenderer.removeListener('chatModels:changed', wrapped);
   },
   getSessionControls: (id: string) => call<SessionControlsView>('sessions:controls', { id }),
+  cancelRecovery: (id: string) => call<boolean>('sessions:cancelRecovery', { id }),
   setSessionAutomation: (id: string, automation: SessionControlsView['automation'], afterTurn?: boolean) => call<SessionControlsView>('sessions:automation', { id, automation, afterTurn }),
   setSessionObjective: (id: string, text: string, mode: 'goal' | 'loop') => call<SessionControlsView>('sessions:objective', { id, text, mode }),
   compactSession: (id: string) => call<SessionControlsView>('sessions:compact', { id }),
@@ -278,6 +307,16 @@ const api = {
   retryInputBrowser: (id: string) => call<InputEntry | null>('sessions:retryBrowser', { id }),
   listInputs: () => call<InputEntry[]>('sessions:outbox'),
   listPausedHelpers: () => call<Array<{ id: string; sourceSessionId: string }>>('sessions:pausedHelpers'),
+  runningTools: (conversationIds: string[]) => call<RunningToolActivity[]>('sessions:runningTools', { conversationIds }),
+  runningProcesses: (sessionId: string) => call<RunningExecProcess[]>('sessions:runningProcesses', { sessionId }),
+  stopProcess: (sessionId: string, processId: number, incarnation: number) =>
+    call<boolean>('sessions:stopProcess', { sessionId, processId, incarnation }),
+  onBackgroundProcessesChanged: (listener: () => void): (() => void) => {
+    const wrapped = (): void => listener();
+    ipcRenderer.on('sessions:backgroundExecChanged', wrapped);
+    return () => ipcRenderer.removeListener('sessions:backgroundExecChanged', wrapped);
+  },
+  livePreview: (conversationIds: string[]) => call<string | null>('sessions:livePreview', { conversationIds }),
   retryHelper: (id: string, sourceSessionId: string) => call<boolean>('sessions:retryHelper', { id, sourceSessionId }),
   editQueuedInput: (id: string, text: string, afterTurn?: boolean) => call<boolean>('sessions:editInput', { id, text, afterTurn }),
   reorderQueuedInputs: (sessionId: string, ids: string[]) => call<boolean>('sessions:reorderInputs', { sessionId, ids }),
@@ -290,6 +329,8 @@ const api = {
   // to own is refused until it is released. Returns the whole blocked set, so one press
   // repaints without a second read.
   setSessionBlocked: (id: string, blocked: boolean) => call<string[]>('sessions:block', { id, blocked }),
+  setSessionTrusted: (id: string, expectedConversationId: string, trusted: boolean) =>
+    call<string[]>('sessions:trust', { id, expectedConversationId, trusted }),
   deleteSession: (id: string) => call<boolean>('sessions:delete', { id }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),
 
@@ -317,8 +358,9 @@ const api = {
     ipcRenderer.on('log:entry', wrapped);
     return () => ipcRenderer.removeListener('log:entry', wrapped);
   },
-  onSessionChanged: (listener: () => void): (() => void) => {
-    const wrapped = (): void => listener();
+  /** `change` names changed transcript owners; without it only catalog/controls changed. */
+  onSessionChanged: (listener: (change?: SessionChange) => void): (() => void) => {
+    const wrapped = (_event: unknown, change?: SessionChange): void => listener(change);
     ipcRenderer.on('session:changed', wrapped);
     return () => ipcRenderer.removeListener('session:changed', wrapped);
   },

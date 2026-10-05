@@ -21,6 +21,7 @@
  *   sessions/<id>/handoffs/<id>.json
  */
 
+import { modelFacingText } from '../../shared/content-reference.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { isProModel } from '../../shared/chat-models.js';
 import { constants as fsConstants, promises as fs } from 'node:fs';
@@ -42,7 +43,7 @@ import type {
 import { continuationMarkerOf, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, storedTextTokens, workSequence } from '../../shared/session.js';
 import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, positionOf, projectTimeline,
   recordedRequestTurn, responseTurnId, type Chronological, type TimelineTurns } from '../../shared/chronology.js';
-import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle } from './title.js';
+import { automaticTitle, firstTitleMessage, legacyContextTitle, legacyLabelPending, projectPageTitle, providerTitleIgnored, refreshUserTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
@@ -320,6 +321,7 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     userMessages: 0,
     toolCalls: 0,
     lastToolCallAt: null,
+    lastToolActivity: null,
     lastAssistantFinalAt: null,
     lastTurnEndAt: null,
     lastFinishReportAt: null,
@@ -414,6 +416,24 @@ function enqueueSessionOperation<T>(entry: OpenSession, label: string, operation
     (err: Error) => logError(`session ${label} failed: ${err.message}`)
   );
   return work;
+}
+
+/**
+ * Serializes an external durable policy mutation against session ownership changes.
+ *
+ * `rebindSession()` uses the same per-session queue. Callers that need to validate the current
+ * ChatGPT conversation and then await a different durable store (for example trusted-chats)
+ * must keep that validation and write in one fence, otherwise Compact & Resume can commit A -> B
+ * between them and turn stale intent for A into authority inherited by B.
+ *
+ * The summary is read-only by contract; mutate session state only through store primitives.
+ */
+export async function withSessionMutationFence<T>(
+  id: string,
+  operation: (summary: Readonly<SessionSummary>) => Promise<T>
+): Promise<T> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'external policy fence', () => operation(entry.summary));
 }
 
 /**
@@ -827,6 +847,7 @@ async function rebuildSummaryFromHistory(
         userMessages: rebuilt.userMessages,
         toolCalls: rebuilt.toolCalls,
         lastToolCallAt: rebuilt.lastToolCallAt,
+        lastToolActivity: rebuilt.lastToolActivity,
         lastAssistantFinalAt: rebuilt.lastAssistantFinalAt,
         lastTurnEndAt: rebuilt.lastTurnEndAt,
         lastFinishReportAt: rebuilt.lastFinishReportAt,
@@ -1001,7 +1022,16 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   if (event.kind === 'user_message') summary.userMessages += 1;
   if (event.kind === 'tool_call') {
     summary.toolCalls += 1;
-    summary.lastToolCallAt = Math.max(summary.lastToolCallAt ?? 0, event.time);
+    const priorToolAt = summary.lastToolCallAt ?? 0;
+    summary.lastToolCallAt = Math.max(priorToolAt, event.time);
+    // Attribution repair can append an older call after newer activity. Keep the projection
+    // aligned with lastToolCallAt rather than letting append order make an old action look latest.
+    if (event.time >= priorToolAt) {
+      summary.lastToolActivity = {
+        kind: event.call.summary.kind,
+        title: event.call.summary.title.slice(0, 200)
+      };
+    }
     if (event.call.endsActivity === true) {
       summary.lastFinishReportAt = Math.max(summary.lastFinishReportAt ?? 0, event.time);
     }
@@ -1270,6 +1300,7 @@ export function upsertMessageEvent(
               authoredAt: authoredTimeOf(previous) ?? event.authoredAt,
               providerMessageId: event.providerMessageId ?? previous.providerMessageId,
               resolvedModel: event.resolvedModel ?? previous.resolvedModel,
+              references: event.references ?? previous.references,
               // `final` is a compatibility mirror of state, not an independent truth.
               state: event.state === 'final' || event.final === true ? 'final' : 'streaming',
               final: event.state === 'final' || event.final === true,
@@ -1342,7 +1373,8 @@ export function upsertMessageEvent(
             previous.final === nextEvent.final &&
             previous.goalEligible === nextEvent.goalEligible &&
             previous.providerMessageId === nextEvent.providerMessageId &&
-            previous.resolvedModel === nextEvent.resolvedModel)) &&
+            previous.resolvedModel === nextEvent.resolvedModel &&
+            JSON.stringify(previous.references) === JSON.stringify(nextEvent.references))) &&
         (nextEvent.kind !== 'user_message' || previous.kind !== 'user_message' ||
           (nextEvent.reaction === previous.reaction && nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.wireTokenEstimate === previous.wireTokenEstimate && nextEvent.inputDelivery === previous.inputDelivery && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.retiredImageAssetIds) === JSON.stringify(previous.retiredImageAssetIds) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
         (previous.turnId ?? undefined) === settledTurnId &&
@@ -1801,7 +1833,56 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
     return event.kind === 'assistant_message' || event.kind === 'page_tool';
   })) return null;
   return { messageId, turnId: final.turnId ?? null, completedAt, contentSeq: seq,
-    text: final.kind === 'turn_end' ? '' : final.message.text };
+    text: final.kind === 'turn_end' ? '' : modelFacingText(final.message.text, final.renderedHtml) };
+}
+
+/**
+ * The recorder's answer to one exact authored Compact & Resume request (#787).
+ *
+ * The interval runs from the durable handoff user anchor to the next native question. It is
+ * complete only when exactly one local generation answered it, its latest lifecycle boundary is
+ * a completed `turn_end` and it holds exactly one nonempty final. Assistant ids inside that
+ * generation may change (ChatGPT remounts a long answer under another id); a second
+ * generation in the same interval is Retry/regenerate reusing the question and is ambiguous.
+ * Anything short of that is `pending`; nothing here picks the newest or the mounted answer.
+ */
+export async function readHandoffResponse(sessionId: string, conversationId: string, anchorMessageId: string, token: string): Promise<
+  { status: 'complete'; text: string; messageId: string } | { status: 'pending' | 'ambiguous' }
+> {
+  const pending = { status: 'pending' } as const, ambiguous = { status: 'ambiguous' } as const;
+  const entry = await ensureOpen(sessionId);
+  await flushSession(sessionId);
+  const revision = entry.nextSeq;
+  if (entry.summary.conversationId !== conversationId) return pending;
+  const anchor = entry.messages.get(`user_message\u0000${anchorMessageId}`);
+  const marker = anchor?.kind === 'user_message' ? continuationMarkerOf(anchor.message.text) : null;
+  if (!anchor || marker?.kind !== 'HANDOFF' || marker.token !== token) return pending;
+  const events = await readRecentEventsFromDisk(sessionId, MAX_EVENT_TAIL, {
+    kinds: ['turn_start', 'turn_end', 'user_message', 'assistant_message'], after: positionOf(anchor), orderByOrigin: true
+  });
+  if (entry.nextSeq !== revision || events.length >= MAX_EVENT_TAIL) return pending;
+  const turns = entry.summary.timelineTurns;
+  const next = events.findIndex(event => event.kind === 'user_message' && !injectedUserMessage(event, turns));
+  const interval = next < 0 ? events : events.slice(0, next);
+  const generations = new Set<string>();
+  for (const event of interval) {
+    if (event.kind === 'user_message') continue;
+    if (event.turnId) generations.add(responseTurnId(turns, event.turnId));
+    else if (event.kind !== 'assistant_message' || event.final) return ambiguous;
+  }
+  if (generations.size > 1) return ambiguous;
+  const [generation] = generations;
+  const boundary = interval.filter(event => event.kind === 'turn_start' || event.kind === 'turn_end').at(-1);
+  if (!generation || boundary?.kind !== 'turn_end' || boundary.outcome !== 'completed') return pending;
+  const finals = interval.filter((event): event is Extract<SessionEvent, { kind: 'assistant_message' }> =>
+    event.kind === 'assistant_message' && event.final === true && !!event.messageId && !!event.message.text.trim());
+  if (finals.length > 1) return ambiguous;
+  const final = finals[0];
+  if (!final) return pending;
+  const text = final.message.truncated
+    ? final.message.assetId ? await readOverflowText(sessionId, final.message.assetId) : null
+    : final.message.text;
+  return text?.trim() ? { status: 'complete', text, messageId: final.messageId! } : pending;
 }
 
 /** Recorded local execution, not a native tool label or a request-id sighting alone. */
@@ -2220,6 +2301,7 @@ export async function rewriteUnattributedToolCalls(
       userMessages: 0,
       toolCalls: 0,
       lastToolCallAt: null,
+      lastToolActivity: null,
       lastAssistantFinalAt: null,
       lastTurnEndAt: null,
       lastFinishReportAt: null,
@@ -2281,6 +2363,14 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         !/^[a-zA-Z0-9 ._-]{1,80}$/.test(selected.model) || !Number.isFinite(selected.observedAt))) {
       delete publicSummary.selectedModel;
     }
+    const lastToolActivity = publicSummary.lastToolActivity;
+    if (lastToolActivity !== undefined && lastToolActivity !== null && (
+      typeof lastToolActivity !== 'object' ||
+      typeof lastToolActivity.title !== 'string' ||
+      lastToolActivity.title.length === 0 ||
+      lastToolActivity.title.length > 200 ||
+      !/^(?:edit|create|delete|move|read|search|browse|run|process|screen|input|clipboard|session|agent|other)$/.test(lastToolActivity.kind)
+    )) delete publicSummary.lastToolActivity;
     const finish = publicSummary.finishTurn;
     if (finish !== undefined && finish !== null && (!finish || typeof finish !== 'object' ||
         typeof finish.turnId !== 'string' || !Number.isFinite(finish.startedAt) ||
@@ -2317,6 +2407,7 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
           typeof publicSummary.lastToolCallAt === 'number' && Number.isFinite(publicSummary.lastToolCallAt)
             ? publicSummary.lastToolCallAt
             : null,
+        lastToolActivity: publicSummary.lastToolActivity ?? null,
         lastAssistantFinalAt:
           typeof publicSummary.lastAssistantFinalAt === 'number' && Number.isFinite(publicSummary.lastAssistantFinalAt)
             ? publicSummary.lastAssistantFinalAt
@@ -2445,7 +2536,9 @@ async function readCatalogSummary(id: string): Promise<SessionSummary | null> {
     const metadata = await fs.stat(path.join(dir, 'meta.json'));
     const checkpoint = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.json'), 'utf8'));
     if (checkpoint && checkpoint.historySeq !== null && checkpoint.canonicalProjectionCurrent && checkpoint.tokenEstimateCurrent &&
-        !checkpoint.outcomeCountersMissing && !checkpoint.activityBoundaryMissing && checkpoint.summary.finishTurn !== undefined && !legacyContextTitle(checkpoint.summary)) {
+        !checkpoint.outcomeCountersMissing && !checkpoint.activityBoundaryMissing && checkpoint.summary.finishTurn !== undefined && !legacyContextTitle(checkpoint.summary) &&
+        // Old Plan helpers and project page titles are repaired by the full read below, once.
+        !legacyLabelPending(checkpoint.summary)) {
       const mutations = await Promise.all(['events.jsonl', 'messages.json', 'messages'].map(async name => {
         try { return (await fs.stat(path.join(dir, name))).mtimeMs; }
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0; throw error; }
@@ -3021,6 +3114,7 @@ export async function renameSession(id: string, title: string, source: SessionSu
       if (conversationId && entry.summary.conversationId !== conversationId) return;
       if (!automaticTitle(entry.summary, firstTitleMessage(entry.messages.values()))) return;
       if (source === 'fallback' && entry.summary.titleSource === 'provider') return;
+      if (source === 'provider' && (providerTitleIgnored(entry.summary) || projectPageTitle(title))) return;
     }
     if (entry.summary.title === title.slice(0, 120) && entry.summary.titleSource === source) return;
     entry.summary.title = title.slice(0, 120);
@@ -3725,7 +3819,30 @@ export async function readHandoff(sessionId: string, handoffId: string): Promise
   try {
     const raw = await fs.readFile(path.join(sessionDir(sessionId), 'handoffs', `${handoffId}.json`), 'utf8');
     const parsed = JSON.parse(raw) as Handoff;
-    return typeof parsed?.text === 'string' ? parsed : null;
+    if (typeof parsed?.text !== 'string') return null;
+    // Legacy files had no version/provenance and remain readable. New files fail closed if
+    // identity metadata is malformed; recovery must never repair a transaction from guessed
+    // provenance.
+    if (parsed.version !== undefined || parsed.provenance !== undefined) {
+      const provenance = parsed.provenance;
+      if (
+        parsed.version !== 1 ||
+        parsed.id !== handoffId ||
+        parsed.sessionId !== sessionId ||
+        !provenance ||
+        (provenance.sourceConversationId !== null &&
+          (typeof provenance.sourceConversationId !== 'string' ||
+            provenance.sourceConversationId.length === 0 ||
+            provenance.sourceConversationId.length > 256)) ||
+        (provenance.sourceGeneration !== null &&
+          (!Number.isSafeInteger(provenance.sourceGeneration) || provenance.sourceGeneration < 1)) ||
+        (provenance.sourceTurnId !== null &&
+          (typeof provenance.sourceTurnId !== 'string' || provenance.sourceTurnId.length > 256)) ||
+        (provenance.continuationId !== null &&
+          (typeof provenance.continuationId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(provenance.continuationId)))
+      ) return null;
+    }
+    return parsed;
   } catch {
     return null;
   }

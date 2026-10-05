@@ -79,12 +79,43 @@ it('reports only app reachability from compatible health and pairing', () => {
   (popup!.window as any).paintHeader({ connected: true, paired: true, compatible: true, port: 8765 });
   expect(document.getElementById('state')!.textContent).toBe('App reachable · Port 8765');
   expect(document.getElementById('state')!.textContent).not.toContain('Connected');
+  const hint = document.getElementById('appHint') as HTMLElement;
+  expect(hint.hidden).toBe(true);
   (popup!.window as any).paintHeader({ connected: false });
   expect(document.getElementById('state')!.textContent).toBe('App not reachable');
+  // Unreachable is the state people report as "it doesn't work": say what to do, right there.
+  expect(hint.hidden).toBe(false);
+  expect(hint.textContent).toBe('Make sure Chat On Steroids is open on this computer. The companion connects on its own.');
   expect(document.getElementById('unpairBtn')).toBeNull();
   (popup!.window as any).paintHeader({ connected: true, paired: false, disconnected: true, compatible: true, port: 8765 });
   expect(document.getElementById('retryBtn')!.textContent).toBe('Connect');
   expect((document.getElementById('retryBtn') as HTMLButtonElement).hidden).toBe(false);
+  expect(hint.hidden).toBe(true);
+  (popup!.window as any).paintHeader({ connected: true, paired: true, compatible: true, port: 8765 });
+  expect(hint.hidden).toBe(true);
+});
+
+it('requests cookie permission from the transfer click and reports denial without sending a session', async () => {
+  const document = openPopup();
+  const win = popup!.window as any;
+  win.chrome.permissions = { request: async () => false };
+  const sent: any[] = [];
+  win.chrome.runtime.sendMessage = async (message: any) => {
+    sent.push(message);
+    return message.type === 'status' ? { connected: true, paired: true, compatible: true,
+      signInOffer: { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } } : null;
+  };
+  await win.refresh();
+  expect(document.getElementById('signInTransfer')!.hidden).toBe(false);
+  document.getElementById('signInTransferBtn')!.click();
+  await expect.poll(() => document.getElementById('signInTransferResult')!.textContent).toContain('not allowed');
+  expect(sent.some(message => message.type === 'cos_sign_in_transfer')).toBe(false);
+  expect((document.getElementById('signInTransferBtn') as HTMLButtonElement).disabled).toBe(false);
+  win.chrome.runtime.sendMessage = async () => null;
+  await win.refresh();
+  expect(document.getElementById('signInTransfer')!.hidden).toBe(false);
+  expect(document.getElementById('signInTransferResult')!.textContent).toContain('not allowed');
+  expect((document.getElementById('signInTransferBtn') as HTMLButtonElement).disabled).toBe(true);
 });
 
 it('keeps reconnect visible without opening Advanced after an explicit disconnect', () => {

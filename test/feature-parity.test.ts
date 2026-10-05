@@ -23,9 +23,12 @@ describe('portable browser-backed feature parity', () => {
       expect(config.multiAgent).toEqual({
         enabled: true,
         maxWorkers: 2,
+        globalMaxWorkers: 0,
         allowUnattributedCalls: true,
+        strictChatAllowlist: false,
         recoverAgentTabs: false,
-        waitForSubAgents: false
+        waitForSubAgents: false,
+        endSleepingWorkerProcesses: false
       });
       expect(browserExtensionRequired(config)).toBe(true);
     }

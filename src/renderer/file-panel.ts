@@ -5,8 +5,8 @@ import type { ProjectDirectoryListing, ProjectFileEntry, ProjectFileKind, Projec
 import type { ProjectGitChange, ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot, ProjectGitStatus } from '../shared/project-git.js';
 import { safeExternalLink } from '../shared/external-link.js';
 import { marked } from 'marked';
-import { t, ui } from './i18n.js';
-import { el, icon, run, toast } from './dom.js';
+import { currentLanguage, t, ui } from './i18n.js';
+import { disclosureChevron, el, icon, run, toast } from './dom.js';
 import { attachWorkPanelResize } from './work-panel-resize.js';
 import { sanitizeHtmlTree } from './sanitize-html.js';
 import type { ProjectCodeEditor, ProjectDiffViewer } from './file-code-editor.js';
@@ -253,12 +253,12 @@ export function createFilePanel(options: FilePanelOptions) {
   const changesHeaderTitle = el('strong', 'file-changes-header-title', () => t('Working tree'));
   const changesHeaderContent = el('div', 'file-changes-header-content');
   changesHeaderContent.append(backToFiles, changesHeaderTitle);
-  const branchArrow = el('span', 'file-branch-arrow', '→');
+  const branchArrow = el('span', 'file-branch-arrow'); branchArrow.append(icon('i-arrow-right'));
   const branchTrigger = el('button', 'file-branch-trigger') as HTMLButtonElement;
   branchTrigger.type = 'button';
   branchTrigger.setAttribute('aria-haspopup', 'dialog');
   branchTrigger.setAttribute('aria-expanded', 'false');
-  branchTrigger.append(el('span', 'file-branch-trigger-label', () => t('Working tree')), icon('i-chev'));
+  branchTrigger.append(el('span', 'file-branch-trigger-label', () => t('Working tree')), disclosureChevron('ico'));
   const branchStats = el('span', 'file-branch-stats');
   if (options.reviewOnly) changesHeaderContent.append(branchArrow, branchTrigger, branchStats);
   changesHeader.append(changesHeaderContent);
@@ -956,7 +956,7 @@ export function createFilePanel(options: FilePanelOptions) {
     const value = previewValue;
     const head = viewerHeader(value);
     const meta = el('div', 'file-preview-meta');
-    meta.append(el('span', '', `${value.path} · ${humanBytes(value.bytes)} · ${new Date(value.modifiedAt).toLocaleString()}`));
+    meta.append(el('span', '', `${value.path} · ${humanBytes(value.bytes)} · ${new Date(value.modifiedAt).toLocaleString(currentLanguage())}`));
     let content: HTMLElement;
     let viewerHost: HTMLElement | null = null;
     let languageLabel: HTMLElement | null = null;
@@ -1086,7 +1086,7 @@ export function createFilePanel(options: FilePanelOptions) {
         statusMark.setAttribute('aria-hidden', 'true');
         const names = el('span', 'file-change-names');
         if (change.previousPath) {
-          names.append(el('span', 'file-change-previous', change.previousPath), el('span', 'file-change-arrow', '→'));
+          names.append(el('span', 'file-change-previous', change.previousPath), icon('i-arrow-right', 'ico file-change-arrow'));
         }
         names.append(el('span', 'file-change-path', change.path));
         const stats = changeStats(change);
@@ -1185,7 +1185,7 @@ export function createFilePanel(options: FilePanelOptions) {
     if (historical && reviewSource && reviewSource.indices.length > 1) {
       const previous = actionButton(() => t('Previous edited file'), 'i-back', () => void selectReview(reviewSource!.cursor - 1));
       previous.disabled = reviewSource.cursor === 0;
-      const next = actionButton(() => t('Next edited file'), 'i-chev', () => void selectReview(reviewSource!.cursor + 1));
+      const next = actionButton(() => t('Next edited file'), 'i-arrow-right', () => void selectReview(reviewSource!.cursor + 1));
       next.disabled = reviewSource.cursor === reviewSource.indices.length - 1;
       actions.append(previous, el('span', 'file-review-counter', `${reviewSource.cursor + 1}/${reviewSource.indices.length}`), next);
     }
@@ -1307,7 +1307,7 @@ export function createFilePanel(options: FilePanelOptions) {
 
   async function openReview(projectId: string, sessionId: string, callId: string, indices: number[]): Promise<boolean> {
     const projectGeneration = generation;
-    if (project?.id !== projectId || !indices.length || indices.length > 8 ||
+    if (project?.id !== projectId || !indices.length || indices.length > 32 ||
         indices.some(index => !Number.isSafeInteger(index) || index < 0 || index >= 64)) return false;
     if (editingPath && !(await leaveEditorIfNeeded())) return false;
     if (project?.id !== projectId || generation !== projectGeneration) return false;
@@ -1346,8 +1346,8 @@ export function createFilePanel(options: FilePanelOptions) {
     if (!branchStats.hidden && gitSnapshot?.state === 'ready') {
       const additions = gitSnapshot.changes.reduce((sum, change) => sum + (change.additions ?? 0), 0);
       const deletions = gitSnapshot.changes.reduce((sum, change) => sum + (change.deletions ?? 0), 0);
-      branchStats.append(el('span', 'is-added', `+${additions.toLocaleString()}`),
-        el('span', 'is-deleted', `−${deletions.toLocaleString()}`));
+      branchStats.append(el('span', 'is-added', `+${additions.toLocaleString(currentLanguage())}`),
+        el('span', 'is-deleted', `−${deletions.toLocaleString(currentLanguage())}`));
       branchStats.title = gitSnapshot.truncated ? t('More changes exist than can be shown at once.') :
         t('Committed changes only; local work is excluded');
     }
@@ -1581,7 +1581,13 @@ export function createFilePanel(options: FilePanelOptions) {
   refresh.onclick = () => void (mode === 'changes' ? reconcileGitChanges(true) : refreshAll());
   function closeBranchMenu(restoreFocus = false): void {
     if (!branchMenu) return;
-    branchMenu.remove(); branchMenu = null;
+    const leaving = branchMenu; branchMenu = null;
+    // Leave like the other menus: a short fade while it stops taking input, then removal.
+    leaving.inert = true; leaving.classList.add('is-leaving');
+    const motion = !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches && typeof leaving.animate === 'function';
+    if (motion) void leaving.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(-4px)' }], { duration: 120, easing: 'ease-in' })
+      .finished.catch(() => undefined).then(() => leaving.remove());
+    else leaving.remove();
     document.removeEventListener('pointerdown', dismissBranchMenu, true);
     document.removeEventListener('keydown', branchMenuKeydown, true);
     window.removeEventListener('resize', dismissBranchMenuOnResize);

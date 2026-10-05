@@ -142,6 +142,8 @@ export interface FileChange {
   approximate: boolean;
   /** Immutable before/after text from this exact tool call, stored beside its session log. */
   reviewAssetId?: string;
+  /** Why no review was kept for this change, so the UI can say so instead of offering nothing. */
+  reviewUnavailable?: 'too-large' | 'not-kept';
 }
 
 /** Historical edit evidence, independent of the current Git working tree. */
@@ -242,6 +244,66 @@ export interface ToolCallRecord {
 }
 
 export type MessageState = 'streaming' | 'final';
+
+/**
+ * A source ChatGPT cites in a reply, as its citation pill holds it: `index` is the position in the
+ * reply's `content_references`, which an inline `:chatgpt-content-reference{index="…"}` names.
+ * The first source is the one the pill shows; the rest are the "+N" its card pages through.
+ */
+export interface MessageReference {
+  index: number;
+  sources: Array<{ title: string; url: string; source?: string; date?: number; snippet?: string }>;
+}
+
+export const MAX_MESSAGE_REFERENCES = 32;
+export const MAX_REFERENCE_SOURCES = 8;
+/**
+ * Characters of titles, links, source names and snippets one reply's references may hold in all.
+ * The per-field limits alone allowed megabytes per message revision; this bounds it whatever they are.
+ */
+export const MAX_REFERENCES_CHARS = 32_000;
+
+/** Revalidates references that crossed from the page: bounded, http(s) links only, anything else dropped. */
+export function messageReferences(value: unknown): MessageReference[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const text = (item: unknown, max: number): string =>
+    typeof item === 'string' ? item.replace(/\s+/g, ' ').trim().slice(0, max) : '';
+  const out: MessageReference[] = [];
+  const indexes = new Set<number>();
+  let budget = MAX_REFERENCES_CHARS;
+  for (const entry of value.slice(0, MAX_MESSAGE_REFERENCES)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { index, sources } = entry as { index?: unknown; sources?: unknown };
+    if (!Number.isInteger(index) || (index as number) < 0 || (index as number) > 9999 || indexes.has(index as number) || !Array.isArray(sources)) continue;
+    const kept: MessageReference['sources'] = [];
+    for (const source of sources.slice(0, MAX_REFERENCE_SOURCES)) {
+      if (!source || typeof source !== 'object') continue;
+      const { title, url, source: name, date, snippet } = source as { title?: unknown; url?: unknown; source?: unknown; date?: unknown; snippet?: unknown };
+      const link = text(url, 2000);
+      if (!/^https?:\/\/[^\s]+$/i.test(link)) continue;
+      const label = text(name, 80), summary = text(snippet, 300), heading = text(title, 300) || link;
+      const size = heading.length + link.length + label.length + summary.length;
+      if (size > budget) break;
+      budget -= size;
+      const published = typeof date === 'number' && Number.isFinite(date) && date > 0 && date < 1e13 ? Math.round(date) : undefined;
+      kept.push({ title: heading, url: link, ...(label ? { source: label } : {}),
+        ...(published ? { date: published } : {}), ...(summary ? { snippet: summary } : {}) });
+    }
+    if (!kept.length) continue;
+    indexes.add(index as number);
+    out.push({ index: index as number, sources: kept });
+  }
+  return out.length ? out : undefined;
+}
+
+/** A tool call still running for a chat, as its live caption names it. */
+export interface RunningToolActivity {
+  /** Present-tense summary built from the call's own arguments, e.g. "Running git status". */
+  title: string;
+  /** The kind its finished row will have, so the live row wears the same icon. */
+  kind: ActivitySummary['kind'];
+  since: number;
+}
 
 /** A persisted launch acknowledgement never proves that its child is still alive. */
 export function toolCallSummary(call: Pick<ToolCallRecord, 'tool' | 'summary'>): ActivitySummary {
@@ -347,6 +409,8 @@ export type SessionEvent =
        * counting sends per model; deliberately not `model`, which drives token attribution.
        */
       resolvedModel?: string;
+      /** Sources the reply cites inline, from ChatGPT's page model. */
+      references?: MessageReference[];
       state?: MessageState;
       /** Compatibility mirror for older consumers; equivalent to state === 'final'. */
       final: boolean;
@@ -416,7 +480,7 @@ export type SessionEvent =
    */
   | (BaseEvent & { kind: 'turn_start'; detail?: string })
   | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed'; providerMessageId?: string })
-  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' })
+  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' | 'stream_gone' })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord; origin?: number })
   /**
    * An app-authored line. `continuation` names the Compact & Resume it is about, so the
@@ -439,6 +503,8 @@ export type SessionEvent =
       messageId: string;
       from: string;
       to: string;
+      /** Prime-family reply address for a cross-family message. */
+      fromRunId?: string;
       message: StoredText;
       delivery: 'sent' | 'delivered';
     })
@@ -461,9 +527,10 @@ export type SessionEventKind = SessionEvent['kind'];
  */
 export const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
 
-/** Page readback may escape ASCII punctuation. Letters and digits cannot be escaped.
+/** Page readback may escape ASCII punctuation. Letters and digits cannot be escaped. A message
+ * that mentions an app is stored as Markdown, so the marker's line ends in a hard break (`\`).
  * Keep this grammar in sync with markedAs() in the unbundled extension/content.js. */
-const CONTINUATION_MARKER_ESCAPED = /^\s*(?:\\?\[){2}CLF\\?-(HANDOFF|RESUME)\\?:((?:[A-Za-z0-9]|\\?[_-]){16,64})(?:\\?\]){2}(?:\s|$)/;
+const CONTINUATION_MARKER_ESCAPED = /^\s*(?:\\?\[){2}CLF\\?-(HANDOFF|RESUME)\\?:((?:[A-Za-z0-9]|\\?[_-]){16,64})(?:\\?\]){2}\\?(?:\s|$)/;
 
 /**
  * Undo one layer of ASCII-punctuation escaping in page readback only. Callers try exact
@@ -471,8 +538,9 @@ const CONTINUATION_MARKER_ESCAPED = /^\s*(?:\\?\[){2}CLF\\?-(HANDOFF|RESUME)\\?:
  */
 export function unescapeMarkdown(value: string): string {
   // A backslash before a line break is the composer's Markdown hard break (see asTyped in
-  // shared/user-prompt.ts); ASCII punctuation is the other escape the page applies.
-  return value.replace(/\\\r?\n/g, '\n').replace(/\\([!-/:-@[-`{-~])/g, '$1');
+  // shared/user-prompt.ts); ASCII punctuation is the other escape the page applies, and an
+  // indented line's first space comes back as `&#x20;` (#821).
+  return value.replace(/\\\r?\n/g, '\n').replace(/\\([!-/:-@[-`{-~])/g, '$1').replace(/(^|\n)&#x20;/g, '$1 ');
 }
 
 /** The continuation marker at the head of `text`, as typed or as the composer escaped it. */
@@ -590,6 +658,13 @@ export interface SessionSummary {
   toolCalls: number;
   /** Start time of the newest exact attributed tool call, independent of later page noise. */
   lastToolCallAt: number | null;
+  /**
+   * Compact projection of the newest recorded tool action.
+   *
+   * The full tool row remains in session history. This exists so overview surfaces can show
+   * useful worker activity without loading each worker transcript.
+   */
+  lastToolActivity?: Pick<ActivitySummary, 'kind' | 'title'> | null;
   /** Observation time of the newest stable final assistant message. */
   lastAssistantFinalAt?: number | null;
   /**
@@ -668,7 +743,51 @@ export interface SessionSummary {
   origin: SessionOrigin | null;
 }
 
+/**
+ * Committed Compact & Resume predecessors for the conversation currently attached to this
+ * session, nearest first. This is pure projection of durable metadata: callers that need an
+ * authorization decision must first obtain the unique authoritative session summary.
+ */
+export function committedResumeAncestorsFromSummary(
+  summary: Pick<SessionSummary, 'conversationId' | 'chatIds' | 'lastCommittedResumeHandoffId'>,
+  conversationId: string
+): string[] {
+  if (!conversationId || summary.conversationId !== conversationId || !summary.lastCommittedResumeHandoffId) return [];
+  const current = summary.chatIds.lastIndexOf(conversationId);
+  if (current !== summary.chatIds.length - 1 || current < 1) return [];
+  return summary.chatIds.slice(0, current).reverse();
+}
+
+/**
+ * What one `session:changed` push says about transcripts. A push without it refreshes only
+ * the session catalog and controls; the selected transcript is reread only for its owner.
+ */
+export interface SessionChange {
+  /** Exact local sessions whose durable transcript projection changed in this burst. */
+  sessionIds?: string[];
+  /** A cross-session mutation without enumerable owners; every open transcript is stale. */
+  allTranscripts?: true;
+}
+
+export interface HandoffProvenance {
+  /** ChatGPT frontend that authored the brief. */
+  sourceConversationId: string | null;
+  /** One-based position of that frontend in the durable session lineage, when known. */
+  sourceGeneration: number | null;
+  /** Exact source turn pinned by the continuation transaction, when one existed. */
+  sourceTurnId: string | null;
+  /**
+   * Non-authority fingerprint of the continuation transaction.
+   *
+   * This is derived from the one-time continuation token. Provenance stores the fingerprint
+   * instead of the raw token because handoffs are readable through ordinary session IPC.
+   */
+  continuationId: string | null;
+}
+
 export interface Handoff {
+  /** New writes are v1. Absent means a legacy handoff written before provenance existed. */
+  version?: 1;
   id: string;
   sessionId: string;
   createdAt: number;
@@ -679,6 +798,8 @@ export interface Handoff {
   sourceTokens: number;
   /** Set when the model stopped early or the pack dropped material. */
   notes: string[];
+  /** Immutable source identity for new versioned handoffs. */
+  provenance?: HandoffProvenance;
 }
 
 // ---------------------------------------------------------------- agents
@@ -891,6 +1012,14 @@ export interface AgentMessage {
   id: string;
   from: string;
   to: string;
+  /**
+   * Prime-family address of the sender when a message crosses between existing prime families.
+   *
+   * Agent ids are only unique inside one family, so a bare `from: "prime"` cannot be replied
+   * to across that boundary. This is routing metadata only; it grants no status or worker access
+   * to the receiving prime.
+   */
+  fromRunId?: string;
   time: number;
   text: string;
   /** When it was last written into a tool result. Re-offered until acknowledged. */

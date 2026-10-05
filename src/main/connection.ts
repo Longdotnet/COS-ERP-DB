@@ -6,6 +6,7 @@
  * Optional tunnel failures stay on their own Settings cards and cannot fail Core.
  */
 
+import { connectorProof } from './connector-proof.js';
 import type { ConnectionStatus, SurfaceStatus, TunnelSettings } from '../shared/types.js';
 import { requiresApprovedFilesystemRoot } from '../shared/capabilities.js';
 import { prewarmComputerHelper } from './computer/index.js';
@@ -13,7 +14,7 @@ import { effectiveCapabilities, getConfig } from './config.js';
 import { logError, logInfo, logWarn } from './logger.js';
 import { lastRequestAt, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from './mcp/server.js';
 import { lastToolCallAt } from './mcp/tools.js';
-import { SURFACE_LIST, surfaceIsUseful, desktopToolNames, type SurfaceId } from './mcp/surfaces.js';
+import { SURFACE_LIST, surfaceDefinition, surfaceIsUseful, desktopToolNames, type SurfaceId } from './mcp/surfaces.js';
 import { getSecret } from './secrets.js';
 import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
@@ -159,7 +160,7 @@ function describeSurfaces(): SurfaceStatus[] {
     const previous = status.surfaces.find((entry) => entry.id === surface.id);
     return {
       id: surface.id,
-      connectorName: surface.connectorName,
+      connectorName: surfaceDefinition(surface.id).connectorName,
       description: surface.description,
       cardSummary: surface.cardSummary,
       optional: !surface.required,
@@ -173,7 +174,10 @@ function describeSurfaces(): SurfaceStatus[] {
       // created the Desktop connector in ChatGPT. Publication is our side of the wire;
       // these two are the only evidence of the other side.
       lastRequestAt: lastRequestAt(surface.id),
-      lastToolCallAt: lastToolCallAt(surface.id)
+      lastToolCallAt: lastToolCallAt(surface.id),
+      // The same evidence from earlier runs, on the tunnel this connector uses now: Setup's
+      // proof that the plugin exists in ChatGPT before it calls again this session.
+      proof: connectorProof(surface.id)
     };
   });
 }
@@ -291,6 +295,11 @@ async function connectImpl(): Promise<void> {
   const generation = ++connectionGeneration;
 
   const config = getConfig();
+  // The endpoint generation belongs to the Setup profile selected when it was created. Keep
+  // this immutable while live config remains dynamic for permissions/roots: a profile switch
+  // commits config before the old endpoint has fully drained, so reading getConfig() inside a
+  // late old-profile call would otherwise relabel that call as the new connection.
+  const setupProfileId = config.tunnel.profileId ?? 'default';
   const caps = effectiveCapabilities(config);
   // A root is required by the capabilities that actually cross the filesystem boundary,
   // not by the mere presence or absence of Desktop. Otherwise enabling screen/clipboard
@@ -305,6 +314,7 @@ async function connectImpl(): Promise<void> {
     const startedEndpoint = await startMcpServer(() => {
       const live = getConfig();
       return {
+        setupProfileId,
         roots: live.roots,
         caps: effectiveCapabilities(live),
         readOnly: live.readOnly,

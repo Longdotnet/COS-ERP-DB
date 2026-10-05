@@ -31,6 +31,18 @@ describe('continuation markers from native readback', () => {
     expect(text.slice(parsed!.marker.length)).toBe('\nKeep C:\\_work and the rest of the brief unchanged.');
   });
 
+  it('reads the marker of a message ChatGPT stored as Markdown because it mentions an app', () => {
+    // Measured 2026-10-01: with the Core mention, every line break of the handoff request came
+    // back as a hard break, `]]\` + newline, and the brief was never captured.
+    const text = `${clean}\\\n\\\nChat On Steroids is preparing a handoff\\-brief. [$chat-on-steroids-core](app://asdk_app_X1)`;
+    const parsed = continuationMarkerOf(text);
+    expect(parsed).toMatchObject({ kind: 'RESUME', token, marker: `${clean}\\\n` });
+    expect(pageMarker(text)?.[2]).toBe(token);
+    expect(continuationMarkerOf(`${clean}\\`)).toMatchObject({ token });
+    expect(continuationMarkerOf(`${clean}\\x`)).toBeNull();
+    expect(pageMarker(`${clean}\\x`)).toBeNull();
+  });
+
   it.each([
     clean.replace('0', '\\0'),
     clean.replace('a', '\\a'),
@@ -52,7 +64,9 @@ describe('page readback unescaping', () => {
     ['[[COS_CONTEXT:34]]\\\nYou are worker-1.\\\nRun it.', '[[COS_CONTEXT:34]]\nYou are worker-1.\nRun it.'],
     ['a\\\r\nb', 'a\nb'],
     ['Keep C:\\_work and \\* unchanged', 'Keep C:_work and * unchanged'],
-    ['no escapes here', 'no escapes here']
+    ['no escapes here', 'no escapes here'],
+    // #821: an indented line's first space reads back as `&#x20;`; one inside a line stays.
+    ['&#x20;Indented\n&#x20; deeper\nkeep &#x20; here', ' Indented\n  deeper\nkeep &#x20; here']
   ])('reads %j as %j in both readers', (raw, typed) => {
     expect(unescapeMarkdown(raw)).toBe(typed);
     expect(pageUnescape(raw)).toBe(typed);

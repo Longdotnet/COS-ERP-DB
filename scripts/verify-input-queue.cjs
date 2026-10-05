@@ -4,23 +4,27 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
-const output = process.argv[2] ? path.resolve(root, process.argv[2]) : path.join(root, '.tmp/message-send-20260918/ui');
+const { fixtureConfigSource, BENIGN_RENDERER_ERRORS } = require('./fixtures/app-defaults.cjs');
+// The first plain argument; switches such as verify-ui's --lang=en-US are not an output folder.
+const outputArg = process.argv.slice(2).find(arg => !arg.startsWith('--'));
+const output = outputArg ? path.resolve(root, outputArg) : path.join(root, '.tmp/message-send-20260918/ui');
 app.setPath('userData', path.join(output, 'runtime'));
 
 app.whenReady().then(async () => {
   const { createServer } = await import('vite');
   const fixture = `
-    addEventListener('error', event => window.fixtureError = event.message);
+    addEventListener('error', event => { if (!${JSON.stringify(BENIGN_RENDERER_ERRORS)}.includes(event.message)) window.fixtureError = event.message; });
     addEventListener('unhandledrejection', event => window.fixtureError = String(event.reason?.stack ?? event.reason));
     const ok = data => Promise.resolve({ok:true,data});
-    const config = {
+    ${fixtureConfigSource()}
+    const config = fixtureConfig({
       roots:[{name:'fixture',path:'C:/fixture'}],readOnly:true,capabilities:{browse:true,search:true,read:true,metadata:true},
       tunnel:{kind:'openai',tunnelId:'',desktopTunnelId:'',binaryPath:''},
       ui:{theme:'dark',autoConnect:false,minimizeToTray:true,privacyScreenshots:false},
       sessions:{record:true,retainDays:30,advisoryTokens:300000,limitTokens:400000},
       compaction:{auto:false,autoTokens:300000},multiAgent:{enabled:false,maxWorkers:2},
       goal:{enabled:false,model:'fixture',reasoning:'default',prompt:'Fixture'}
-    };
+    });
     const state={config,hasApiKey:false,hasGoalKey:false,resolvedBinary:null,bundledTunnelVersion:null,
       status:{state:'disconnected',detail:'',publicUrl:null,localUrl:null,health:null,surfaces:[]},
       bridge:{running:false,paired:false,present:false,port:0},update:{current:'fixture',stage:'idle'}};
@@ -39,7 +43,7 @@ app.whenReady().then(async () => {
         total:live.events.length,nextFrom:(live.events.at(-1)?.seq??-1)+1}),
       getSessionControls:()=>ok({sessionId:session.id,activeTurnId:'fixture-turn',canInject:true,automation:'off',objective:'',...live.controls}),
       getChatModels:()=>ok({state:'ready',observedAt:Date.now(),models:[{id:'gpt-5.6-sol',label:'GPT-5.6 Sol',efforts:['high']}]}),
-      listInputs:()=>ok(structuredClone(live.inputs)),listPausedHelpers:()=>ok([]),
+      listInputs:()=>ok(structuredClone(live.inputs)),runningTools:()=>ok([]),listPausedHelpers:()=>ok([]),
       onSessionChanged:fn=>{live.notify=fn;return ()=>{}},chooseFiles:()=>ok(live.files),
       stopSessionTurn:(id,turnId)=>{live.stops.push({id,turnId});return ok({})},
       editQueuedInput:(id,text)=>{const row=live.inputs.find(r=>r.id===id);if(!row||row.state!=='queued')return ok(false);row.text=text.trim();return ok(true)},

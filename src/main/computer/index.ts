@@ -381,6 +381,8 @@ async function startHelper(): Promise<HelperRuntime> {
           args = [];
         } else {
           host = findWindowsPowerShell() ?? 'powershell.exe';
+          // The helper leaves this app's own windows out of every lookup, as on macOS.
+          env.COS_APP_PID = String(process.pid);
           args = ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', scriptFile!];
         }
         const child = spawn(host, args, {
@@ -1962,18 +1964,6 @@ async function electronClipboard(): Promise<Pick<Electron.Clipboard, 'readText' 
     return clipboard;
   } catch {
     throw new ComputerError('The clipboard is only available while the app is running.');
-  }
-}
-
-/** Confirms the helper can run at all, so the UI can say so before ChatGPT tries. */
-export async function checkAvailable(): Promise<string | null> {
-  try {
-    await listWindows();
-    return null;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logWarn(`computer use unavailable: ${message}`);
-    return message;
   }
 }
 

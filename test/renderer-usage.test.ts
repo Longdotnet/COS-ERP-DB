@@ -5,15 +5,13 @@ import type { UsageOverview } from '../src/shared/usage.js';
 
 let dom: JSDOM;
 /**
- * The renderer prints money through `Intl.NumberFormat(undefined, …)`, on purpose: the amount
- * is read by whoever runs the app, in their own locale. A literal '1.44' in an assertion is
- * therefore not the value under test, it is en-US punctuation — and the suite failed on a
- * de-DE machine, where the same correct render reads '1,44 $'. Ask the same formatter what
- * this number looks like here, so the assertion keeps testing the amount.
+ * The renderer prints money and compact counts in the app's language, like every other number on
+ * the page; the suite runs in English. (They used to follow the system region, which put
+ * "4.082,99 $" and "8,5 Mrd." on an English page.)
  */
-const money = new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const money = new Intl.NumberFormat('en', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
 const usd = (value: number) => money.format(value);
-afterEach(() => { dom?.window.close(); vi.unstubAllGlobals(); vi.resetModules(); });
+afterEach(() => { dom?.window.close(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.resetModules(); });
 
 it('chooses the week start from a weekday menu, keeps exact counts, and restores the weekday after reload', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
@@ -32,6 +30,11 @@ it('chooses the week start from a weekday menu, keeps exact counts, and restores
   const usage = await import('../src/renderer/usage.js'); usage.initUsage();
   const element = (id: string) => dom.window.document.getElementById(id)!;
   const select = element('usageWeekStart') as HTMLSelectElement;
+  const surface = select.closest('.usage-message-surface')!;
+  expect(element('usageMessageCounts').parentElement).toBe(surface);
+  expect(element('modelUsage').parentElement).toBe(surface);
+  expect(element('refreshUsage').closest('.settings-section-head')).not.toBeNull();
+  expect(surface.contains(element('refreshUsage'))).toBe(false);
   const chosen = () => select.selectedOptions[0]!.textContent;
   const choose = (weekday: number) => { select.value = String(weekday); select.dispatchEvent(new dom.window.Event('change')); };
   // Seven named choices, Monday first, instead of a button that cycles silently.
@@ -51,7 +54,7 @@ it('chooses the week start from a weekday menu, keeps exact counts, and restores
   expect(chosen()).toBe('Since Saturday');
   expect(element('usageMessages6').textContent).toBe('16');
   expect(element('usageMessages56').textContent).toBe((1245).toLocaleString('en')); // Never a rounded 1.2K.
-  expect(element('usageMessagePeriod').textContent).toContain(new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' }).format(new Date(2026, 8, 19)));
+  expect(element('usageMessagePeriod').textContent).toContain(new Intl.DateTimeFormat('en', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(2026, 8, 19)));
   expect(select.title).toContain(element('usageMessagePeriod').textContent);
   expect(element('usageLimits').textContent).toBe(quotas);
   expect(dom.window.localStorage.getItem('cos.usage.weekStart')).toBe('6');
@@ -120,7 +123,7 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   const cost = () => dom.window.document.getElementById('usageTotalCost')!.textContent;
   const divisor = field('usageDivisor');
   initUsage(); await refreshUsage();
-  expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain(`capped at ${contextTokenCap.toLocaleString()} tokens`);
+  expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain(`capped at ${contextTokenCap.toLocaleString('en')} tokens`);
   const formulaDetails = dom.window.document.getElementById('usageFormulaDetails') as HTMLDetailsElement;
   expect(formulaDetails.open).toBe(false);
   expect(divisor.closest('details')).toBe(formulaDetails);
@@ -201,7 +204,8 @@ it('combines equivalent recorded names in the table while keeping raw rate edits
   expect(models[0]!.model).toBe('5.6');
 });
 
-it('draws token activity as a Monday-first calendar ending today, with labels and a legend', async () => {
+it.each(['2026-09-28', '2026-10-01', '2027-01-01', '2028-02-29'])('draws an annual Monday-first calendar ending %s, with twelve month labels and a legend', async date => {
+  vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date(`${date}T12:00:00`));
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const key = (ago: number) => { const date = new Date(); date.setDate(date.getDate() - ago); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; };
@@ -212,17 +216,18 @@ it('draws token activity as a Monday-first calendar ending today, with labels an
   const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
   const heat = dom.window.document.getElementById('usageHeatmap')!;
   const cells = [...heat.querySelectorAll('.heat-grid > .heat-cell')] as HTMLElement[];
-  // Twelve whole weeks; the slot for today sits in the last column at its weekday's row.
-  expect(cells).toHaveLength(12 * 7);
+  // A full annual window, even with only two recorded days.
+  expect(cells).toHaveLength(52 * 7);
   const todayRow = (new Date().getDay() + 6) % 7;
-  const today = cells[11 * 7 + todayRow]!;
+  const today = cells[51 * 7 + todayRow]!;
   expect(today.dataset.level).toBe('4');
-  expect(cells.slice(11 * 7 + todayRow + 1).every(cell => cell.classList.contains('is-future'))).toBe(true);
+  expect(cells.slice(51 * 7 + todayRow + 1).every(cell => cell.classList.contains('is-future'))).toBe(true);
   expect(cells.filter(cell => cell.dataset.level && cell.dataset.level !== '0')).toHaveLength(2);
   const cellAt = (cell: HTMLElement) => [cell.style.gridRow, cell.style.gridColumn];
-  expect(cellAt(today)).toEqual([String(todayRow + 2), '13']);
+  expect(cellAt(today)).toEqual([String(todayRow + 2), '53']);
   expect([...heat.querySelectorAll('.heat-day')].map(label => label.textContent)).toEqual(['Mon', 'Wed', 'Fri', 'Sun']);
-  expect(heat.querySelectorAll('.heat-month').length).toBeGreaterThanOrEqual(2);
+  expect(heat.querySelectorAll('.heat-month')).toHaveLength(12);
+  expect(new Set([...heat.querySelectorAll('.heat-month')].map(label => label.textContent)).size).toBe(12);
   expect(heat.querySelector('.heat-legend')!.textContent).toBe('LessMore');
   // The cost chart states its peak and its date range.
   // Today is the peak day and the newest row of the daily breakdown.
@@ -230,4 +235,26 @@ it('draws token activity as a Monday-first calendar ending today, with labels an
   expect(dom.window.document.querySelector('.usage-bars-scale')!.textContent).toBe(todayCost);
   expect(dom.window.document.querySelectorAll('.usage-bar.is-peak')).toHaveLength(1);
   expect(dom.window.document.querySelectorAll('.usage-bars-axis > span')).toHaveLength(2);
+});
+
+it('prints totals and amounts in the app language and follows a language change', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 8.5e9 }];
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 8.5e9, models, days: [{ date: '2026-09-08', tokens: 8.5e9, models }], sessions: 1, limits: [] };
+  Object.assign(dom.window, { api: { getUsage: vi.fn(async () => ({ ok: true, data })), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  initUsage(); await refreshUsage();
+  const processed = () => dom.window.document.querySelector('[data-usage-metric="Processed tokens · est."] strong')!.textContent;
+  const cost = () => dom.window.document.querySelector('#usageTotalCost strong')!.textContent;
+  const compact = (language: string) => new Intl.NumberFormat(language, { notation: 'compact', maximumFractionDigits: 1 }).format(8.5e9);
+  expect(processed()).toBe(compact('en'));
+  const englishCost = cost();
+  setLanguage('de');
+  expect(processed()).toBe(compact('de'));
+  expect(cost()).not.toBe(englishCost);
+  expect(cost()).toMatch(/\$/);
+  setLanguage('en');
+  expect(processed()).toBe(compact('en'));
 });

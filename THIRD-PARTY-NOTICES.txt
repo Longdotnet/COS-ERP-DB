@@ -1637,9 +1637,9 @@ THE SOFTWARE.
 
 
 ================================================================================
-@codemirror/state@6.7.4
+@codemirror/state@6.7.6
 Declared license: MIT
-Package: https://www.npmjs.com/package/@codemirror/state/v/6.7.4
+Package: https://www.npmjs.com/package/@codemirror/state/v/6.7.6
 
 --- LICENSE ---
 MIT License
@@ -2978,6 +2978,36 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ================================================================================
+@koromix/koffi-win32-x64@3.3.2
+Declared license: MIT
+Package: https://www.npmjs.com/package/@koromix/koffi-win32-x64/v/3.3.2
+
+--- koffi/LICENSE.txt (same-version binary distribution) ---
+MIT License
+
+Copyright (C) 2026  Niels Martignène <niels.martignene@protonmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the
+Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
 @lezer/common@1.5.2
 Declared license: MIT
 Package: https://www.npmjs.com/package/@lezer/common/v/1.5.2
@@ -3094,9 +3124,9 @@ THE SOFTWARE.
 
 
 ================================================================================
-@lezer/highlight@1.2.3
+@lezer/highlight@1.2.4
 Declared license: MIT
-Package: https://www.npmjs.com/package/@lezer/highlight/v/1.2.3
+Package: https://www.npmjs.com/package/@lezer/highlight/v/1.2.4
 
 --- LICENSE ---
 MIT License
@@ -3498,9 +3528,9 @@ THE SOFTWARE.
 
 
 ================================================================================
-@modelcontextprotocol/client@2.0.0
+@modelcontextprotocol/client@2.1.0
 Declared license: MIT
-Package: https://www.npmjs.com/package/@modelcontextprotocol/client/v/2.0.0
+Package: https://www.npmjs.com/package/@modelcontextprotocol/client/v/2.1.0
 
 --- LICENSE ---
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
@@ -3722,9 +3752,9 @@ the full license text.
 
 
 ================================================================================
-@modelcontextprotocol/core@2.0.0
+@modelcontextprotocol/core@2.1.0
 Declared license: MIT
-Package: https://www.npmjs.com/package/@modelcontextprotocol/core/v/2.0.0
+Package: https://www.npmjs.com/package/@modelcontextprotocol/core/v/2.1.0
 
 --- LICENSE ---
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
@@ -3946,9 +3976,9 @@ the full license text.
 
 
 ================================================================================
-@modelcontextprotocol/node@2.0.0
+@modelcontextprotocol/node@2.1.0
 Declared license: MIT
-Package: https://www.npmjs.com/package/@modelcontextprotocol/node/v/2.0.0
+Package: https://www.npmjs.com/package/@modelcontextprotocol/node/v/2.1.0
 
 --- LICENSE ---
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
@@ -4170,9 +4200,9 @@ the full license text.
 
 
 ================================================================================
-@modelcontextprotocol/server@2.0.0
+@modelcontextprotocol/server@2.1.0
 Declared license: MIT
-Package: https://www.npmjs.com/package/@modelcontextprotocol/server/v/2.0.0
+Package: https://www.npmjs.com/package/@modelcontextprotocol/server/v/2.1.0
 
 --- LICENSE ---
 The MCP project is undergoing a licensing transition from the MIT License to the Apache License, Version 2.0 ("Apache-2.0"). All new code and specification contributions to the project are licensed under Apache-2.0. Documentation contributions (excluding specifications) are licensed under CC-BY-4.0.
@@ -4510,9 +4540,9 @@ Package: https://www.npmjs.com/package/@types/mute-stream/v/0.0.4
 
 
 ================================================================================
-@types/node@24.13.4
+@types/node@24.19.0
 Declared license: MIT
-Package: https://www.npmjs.com/package/@types/node/v/24.13.4
+Package: https://www.npmjs.com/package/@types/node/v/24.19.0
 
 --- LICENSE ---
     MIT License
@@ -4539,9 +4569,9 @@ Package: https://www.npmjs.com/package/@types/node/v/24.13.4
 
 
 ================================================================================
-undici-types@7.18.2
+undici-types@7.24.6
 Declared license: MIT
-Package: https://www.npmjs.com/package/undici-types/v/7.18.2
+Package: https://www.npmjs.com/package/undici-types/v/7.24.6
 
 --- LICENSE ---
 MIT License
@@ -6791,6 +6821,72 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEAL
 
 
 ================================================================================
+koffi@3.3.2
+Declared license: MIT
+Package: https://www.npmjs.com/package/koffi/v/3.3.2
+
+--- LICENSE.txt ---
+MIT License
+
+Copyright (C) 2026  Niels Martignène <niels.martignene@protonmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the
+Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+
+--- vendor/node-addon-api/LICENSE.md ---
+The MIT License (MIT)
+
+Copyright (c) 2017 [Node.js API collaborators](https://github.com/nodejs/node-addon-api#collaborators)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+--- vendor/node-api-headers/LICENSE ---
+MIT License
+
+Copyright (c) 2021 Node.js
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
 lodash.includes@4.3.0
 Declared license: MIT
 Package: https://www.npmjs.com/package/lodash.includes/v/4.3.0
@@ -7101,9 +7197,9 @@ terms above.
 
 
 ================================================================================
-marked@18.0.13
+marked@18.0.14
 Declared license: MIT
-Package: https://www.npmjs.com/package/marked/v/18.0.13
+Package: https://www.npmjs.com/package/marked/v/18.0.14
 
 --- LICENSE ---
 # License information
@@ -9318,9 +9414,9 @@ ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 
 ================================================================================
-smol-toml@1.8.0
+smol-toml@1.9.0
 Declared license: BSD-3-Clause
-Package: https://www.npmjs.com/package/smol-toml/v/1.8.0
+Package: https://www.npmjs.com/package/smol-toml/v/1.9.0
 
 --- LICENSE ---
 Copyright (c) Squirrel Chat et al., All rights reserved.
@@ -9784,9 +9880,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 ================================================================================
-ws@8.21.3
+ws@8.22.0
 Declared license: MIT
-Package: https://www.npmjs.com/package/ws/v/8.21.3
+Package: https://www.npmjs.com/package/ws/v/8.22.0
 
 --- LICENSE ---
 Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -9846,9 +9942,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 ================================================================================
-zod@4.6.4
+zod@4.6.5
 Declared license: MIT
-Package: https://www.npmjs.com/package/zod/v/4.6.4
+Package: https://www.npmjs.com/package/zod/v/4.6.5
 
 --- LICENSE ---
 MIT License
@@ -206027,3 +206123,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+

@@ -21,6 +21,8 @@ let overwriteEnabled = true;
 let showTimes = false;
 let latest = { status: null, tab: null };
 let openedOnFailure = false;
+let transferringSignIn = false;
+let transferredSignIn = false;
 
 // ------------------------------------------------------------------ formatting
 
@@ -257,6 +259,8 @@ function paintHeader(status) {
           ? t('popup_state_app_reachable_port', 'App reachable · Port $1', status.port)
           : t('popup_state_port_connecting', 'Port $1 · connecting', status.port);
 
+  // The one state with nothing to click at the top: say what to do instead of a grey pill alone.
+  $('appHint').hidden = !(status && !connected && !off);
   $('retryBtn').hidden = ready || incompatible;
   $('retryBtn').textContent = off ? t('popup_connect', 'Connect') : t('popup_try_again', 'Try again');
   return ready;
@@ -445,9 +449,43 @@ async function refresh() {
 
   paintAlert(status, info);
   paintDetails(status, info);
+  $('signInTransfer').hidden = !status?.signInOffer && !transferredSignIn && !$('signInTransferResult').textContent;
+  $('signInTransferBtn').disabled = transferringSignIn || transferredSignIn || !status?.signInOffer;
 }
 
 // -------------------------------------------------------------------- controls
+
+$('signInTransferBtn').addEventListener('click', async () => {
+  const offer = latest.status?.signInOffer;
+  if (!offer || transferringSignIn) return;
+  const section = $('signInTransfer');
+  const result = $('signInTransferResult');
+  transferringSignIn = true;
+  $('signInTransferBtn').disabled = true;
+  section.setAttribute('aria-busy', 'true');
+  result.textContent = '';
+  try {
+    // Request from this user gesture, before any messaging/await can lose Chrome's gesture.
+    const allowed = await chrome.permissions.request({ permissions: ['cookies'] });
+    if (!allowed) {
+      result.textContent = t('popup_sign_in_permission', 'Cookie access not allowed. Click again.');
+      return;
+    }
+    const reply = await chrome.runtime.sendMessage({ type: 'cos_sign_in_transfer', id: offer.id });
+    transferredSignIn = reply?.imported === true;
+    if (transferredSignIn) {
+      // The receipt takes the button's place.
+      $('signInTransferBtn').hidden = true;
+      $('signInTransferDone').hidden = false;
+    } else result.textContent = t('popup_sign_in_failed', 'Transfer failed. Start sign-in again from CoS.');
+  } catch {
+    result.textContent = t('popup_sign_in_failed', 'Transfer failed. Start sign-in again from CoS.');
+  } finally {
+    transferringSignIn = false;
+    section.removeAttribute('aria-busy');
+    $('signInTransferBtn').disabled = transferredSignIn;
+  }
+});
 
 function syncOverwrite() {
   $('overwriteToggle').checked = overwriteEnabled;
@@ -524,4 +562,9 @@ $('timeToggle').addEventListener('change', async () => {
 // A popup is open for seconds at a time and the three stages move within those seconds.
 void loadPreferences().catch(() => undefined);
 void refresh().catch(() => undefined);
+// The app's language arrives with its catalog a moment later; repaint once it is there and on
+// every later change, so the popup reads like the app rather than like Chrome.
+const relocalize = () => { localizeDocument(); void refresh().catch(() => undefined); };
+void globalThis.CLF_I18N.ready?.then(relocalize).catch(() => undefined);
+globalThis.addEventListener?.('clf-i18n-changed', relocalize);
 setInterval(() => void refresh().catch(() => undefined), POLL_MS);

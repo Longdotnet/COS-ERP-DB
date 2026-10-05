@@ -1,16 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { goalErrorMessage } from '../src/shared/goal-errors.js';
+import { readFileSync } from 'node:fs';
+import { goalErrorKey, goalErrorMessage } from '../src/shared/goal-errors.js';
+import de from '../src/renderer/locales/de.json';
 import es from '../src/renderer/locales/es.json';
+import ko from '../src/renderer/locales/ko.json';
 import zhCN from '../src/renderer/locales/zh-CN.json';
 import zhTW from '../src/renderer/locales/zh-TW.json';
 import ja from '../src/renderer/locales/ja.json';
 import tr from '../src/renderer/locales/tr.json';
 import fr from '../src/renderer/locales/fr.json';
+import ptBR from '../src/renderer/locales/pt-BR.json';
+import ptPT from '../src/renderer/locales/pt-PT.json';
 
 describe('Goal failure explanations', () => {
-  it('distinguishes missing tool evidence from a confirmed lost connection or disabled Loop', () => {
+  it('explains that missing tool evidence may be a question or lost connection without disabling Loop', () => {
     const message = goalErrorMessage('loop_mcp_call_missing');
-    expect(message).toContain('cannot tell whether the tool connection was lost');
+    expect(message).toContain('ChatGPT may be asking you something');
+    expect(message).toContain('the tool connection may have been lost');
+    expect(message).toContain('Answer it');
     expect(message).toContain('Loop remains enabled');
     expect(message).not.toMatch(/logged out|sign in|tunnel is off/i);
     expect(goalErrorMessage('goal_reply_not_pending')).not.toContain('No MCP tool call');
@@ -52,7 +59,7 @@ describe('Goal failure explanations', () => {
   });
 
   it('keeps every fixed Goal explanation localizable in every renderer catalog', () => {
-    const catalogs = { es, 'zh-CN': zhCN, 'zh-TW': zhTW, ja, tr, fr } as const;
+    const catalogs: Record<string, Record<string, string>> = { de, es, 'zh-CN': zhCN, 'zh-TW': zhTW, ja, ko, tr, fr, 'pt-BR': ptBR, 'pt-PT': ptPT };
     const codes = [
       'loop_mcp_call_missing', 'goal_reply_not_pending', 'goal_context_too_large', 'reply_too_long',
       'stream_record_too_long', 'response_body_too_large', 'no_api_key', 'auth_rejected', 'out_of_credit',
@@ -74,6 +81,37 @@ describe('Goal failure explanations', () => {
       for (const source of [...fixed, ...parameterized]) {
         expect(Object.hasOwn(catalog, source), `${locale}: ${source}`).toBe(true);
       }
+      expect(catalog[goalErrorMessage('loop_mcp_call_missing')], locale).toContain('ChatGPT');
     }
+  });
+
+  it('gives the page a catalog key for every fixed explanation, in every extension language', () => {
+    const codes = [
+      'out_of_credit', 'auth_rejected', 'no_api_key', 'rate_limited', 'loop_mcp_call_missing',
+      'goal_context_too_large', 'request_failed', 'request_failed: fetch failed', 'request_failed: no_api_key'
+    ];
+    const locales = ['de', 'en', 'es', 'fr', 'ja', 'tr', 'zh_CN', 'zh_TW'];
+    const catalogs = Object.fromEntries(locales.map((locale) => [
+      locale,
+      JSON.parse(readFileSync(new URL(`../extension/_locales/${locale}/messages.json`, import.meta.url), 'utf8')) as Record<string, { message: string }>
+    ]));
+    for (const code of codes) {
+      const key = goalErrorKey(code);
+      expect(key, code).toMatch(/^[a-z_]+$/);
+      expect(catalogs.en?.[`content_goal_error_${key}`]?.message, code).toBe(goalErrorMessage(code));
+      for (const locale of locales) {
+        const message = catalogs[locale]?.[`content_goal_error_${key}`]?.message;
+        expect(message, `${locale}: ${code}`).toBeTruthy();
+        if (code === 'loop_mcp_call_missing') expect(message, `${locale}: ${code}`).toContain('ChatGPT');
+      }
+    }
+    expect(catalogs.de?.content_goal_error_out_of_credit?.message).not.toBe(catalogs.en?.content_goal_error_out_of_credit?.message);
+  });
+
+  it('leaves explanations with dynamic detail untranslated rather than dropping the detail', () => {
+    expect(goalErrorKey('request_failed: goal_browser_send_failed: Temporary Chat was not confirmed.')).toBeNull();
+    expect(goalErrorKey('http_503')).toBeNull();
+    expect(goalErrorKey('invalid_goal_decision_json')).toBeNull();
+    expect(goalErrorKey('something_unknown')).toBeNull();
   });
 });

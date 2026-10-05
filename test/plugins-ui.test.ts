@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
 import { initPlugins, refreshPlugins, applyPluginsState } from '../src/renderer/plugins.js';
+import { setLanguage } from '../src/renderer/i18n.js';
 import type { PluginSnapshot } from '../src/shared/plugins.js';
 import type { AppState } from '../src/shared/types.js';
 
@@ -151,6 +152,26 @@ it('opens a concise tool preview without installing or showing enabled-tool cont
   expect(api.pluginsInstall).not.toHaveBeenCalled();
 });
 
+it('marks the About and Setup disclosures with the chevron, and keeps it through a language change', async () => {
+  // The native marker is hidden, so the chevron is the only sign these rows open.
+  const chevronFirst = (summary: HTMLElement) => summary.firstElementChild!.classList.contains('details-chevron');
+  await refreshPlugins();
+  document.querySelector<HTMLButtonElement>('#pluginsExplore .plugin-catalog-card')!.click();
+  const setup = document.querySelector<HTMLElement>('#pluginDialog .plugin-about > summary')!;
+  expect(setup.textContent).toBe('Setup requirements');
+  expect(chevronFirst(setup)).toBe(true);
+  document.querySelector<HTMLButtonElement>('.plugin-entry')!.click();
+  const about = [...document.querySelectorAll<HTMLElement>('#pluginDialog .plugin-about > summary')].find(node => node.textContent === 'About this plugin')!;
+  expect(chevronFirst(about)).toBe(true);
+  try {
+    setLanguage('pt-BR');
+    expect(about.textContent).toBe('Sobre este plugin');
+    expect(chevronFirst(about)).toBe(true);
+  } finally {
+    setLanguage('en');
+  }
+});
+
 it('opens the full error from the compact card and exposes configuration beside the introduction', async () => {
   const error = 'Connection refused. Start the application and enable its companion integration.';
   state.plugins[0]!.error = error;
@@ -217,4 +238,27 @@ it('keeps a custom remote server without OAuth on its static credential', async 
   [...document.querySelectorAll<HTMLButtonElement>('button')].find(node => node.textContent === 'Install and connect')!.click();
   await tick();
   expect(api.pluginsInstall).toHaveBeenCalledWith({ name: 'My MCP server', source: { kind: 'remote', args: [], url: 'https://mcp.example.org/mcp' }, credentials: { Authorization: 'Bearer x' } });
+});
+
+it('names this computer\'s own Plugins connector everywhere the page tells the user to act on it', async () => {
+  // One ChatGPT account on several computers: this computer's connector carries its suffix,
+  // and an instruction naming the plain one would send the user to the other computer's plugin.
+  const named = 'Chat On Steroids Plugins (Windows)';
+  const withName = (lastRequestAt: number | null) => ({ config: { tunnel: { kind: 'openai', pluginsTunnelId: '' } },
+    status: { surfaces: [{ id: 'plugins', state: 'off', connectorName: named, lastRequestAt, tools: [] }] } }) as unknown as AppState;
+  initPlugins(); await tick();
+  applyPluginsState(withName(null));
+  expect(document.getElementById('pluginsSetupHint')!.textContent).toBe(`Add the ${named} connector in ChatGPT once so it can use your installed plugins.`);
+  expect(document.querySelector('.plugin-refresh-guide')!.textContent).toContain(`refresh ${named} in ChatGPT`);
+  state.plugins[0]!.tools = [{ name: 'remember', exposedName: 'plugin_one_remember', enabled: true }];
+  await refreshPlugins(); document.querySelector<HTMLButtonElement>('.plugin-entry')!.click();
+  const toggle = document.querySelector<HTMLInputElement>('.plugin-tool input')!;
+  toggle.checked = false; toggle.dispatchEvent(new dom.window.Event('change')); await tick();
+  expect(document.querySelector('.toast')!.textContent).toContain(`Refresh the ${named} connector in ChatGPT`);
+  // The name survives a language change, and a later state without a name falls back to the plain one.
+  setLanguage('de');
+  expect(document.querySelector('.plugin-refresh-guide')!.textContent).toContain(named);
+  setLanguage('en');
+  applyPluginsState({ config: { tunnel: { kind: 'openai', pluginsTunnelId: '' } }, status: { surfaces: [] } } as unknown as AppState);
+  expect(document.querySelector('.plugin-refresh-guide strong')!.textContent).toBe('Chat On Steroids Plugins');
 });

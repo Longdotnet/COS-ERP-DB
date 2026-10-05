@@ -257,6 +257,7 @@ interface TurnEvidence {
     stable: boolean;
     order: number;
     createTime?: number | null;
+    references?: Array<{ index: number; sources: Array<{ title: string; url: string; source?: string; date?: number; snippet?: string }> }>;
     rawText: string;
     renderedHtml: string;
   }>;
@@ -282,18 +283,22 @@ interface TurnFixture {
   viewItems?: any[];
   viewStatus?: string;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
-  rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
+  rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string; pillFibers?: Fiber[] }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string; v5?: boolean }>;
   images?: Array<{ assetId: string; clones?: number }>;
   staleStamp?: string;
   conversationProps?: Record<string, unknown>;
   rect?: { top: number; bottom: number; left: number; right: number } | 'throw';
+  /** Mounted on an earlier page ChatGPT keeps undisplayed in the same tab. */
+  keptPage?: boolean;
 }
 
 async function scan(
   fibers: Fiber[],
   turnSections: TurnFixture[] = [],
-  repeatStableScan = false
+  repeatStableScan = false,
+  /** This install's connector names, as the content script passes them with every ask. */
+  apps?: unknown
 ): Promise<{
   rows: Descriptor[];
   version: number;
@@ -379,6 +384,9 @@ async function scan(
         if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
         if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
         if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
+        [...block.querySelectorAll('a[data-testid="chatgpt-citation"]')].forEach((pill, at) => {
+          if (entry.pillFibers?.[at]) (pill as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.pillFibers[at];
+        });
       }
       section.append(block);
     }
@@ -402,7 +410,11 @@ async function scan(
       };
       for (let clone = 0; clone < Math.max(1, entry.clones ?? 1); clone++) add();
     }
-    document.body.append(section);
+    if (turn.keptPage) {
+      const page = document.createElement('div');
+      page.setAttribute('data-app-shell-page-surface', 'true'); page.style.display = 'none';
+      page.append(section); document.body.append(page);
+    } else document.body.append(section);
   }
 
   const elements = fibers.map((fiber) => {
@@ -430,7 +442,7 @@ async function scan(
   // Dispatched rather than posted: jsdom's own postMessage does not set `source`, and the
   // helper refuses any message that did not come from this window.
   window.dispatchEvent(
-    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce }, source: window })
+    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce, ...(apps === undefined ? {} : { apps }) }, source: window })
   );
 
   const data = await reply;
@@ -581,6 +593,27 @@ describe('reading a row out of the page', () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ index: 0, tool: 'search_files', app: APP, answered: true });
+  });
+
+  /**
+   * One ChatGPT account on two computers: each computer's connectors carry its own suffix, and
+   * ChatGPT records every call under the exact name typed (measured 2026-10-04). This page's
+   * install recognizes exactly its own names; the other computer's calls run there.
+   */
+  it.each([
+    ['this install\'s suffixed names', ['Chat On Steroids Core (Windows)', 'Chat On Steroids Desktop (Windows)', 'Chat On Steroids Plugins (Windows)'], 'Chat On Steroids Core (Windows)', true],
+    ['the plain name while this install uses a suffix', ['Chat On Steroids Core (Windows)', 'Chat On Steroids Desktop (Windows)', 'Chat On Steroids Plugins (Windows)'], APP, false],
+    ['another computer\'s suffixed name', ['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins'], 'Chat On Steroids Core (Mac)', false],
+    ['names that are not this app\'s, which are ignored', ['Chat On Steroids Backup', 'x', 'y'], APP, true]
+  ])('recognizes calls by %s', async (_case, apps, app, ours) => {
+    const ask = request('req-1', 'read_file', { app });
+    const { rows } = await scan([row([ask, answer('res-1', 'req-1', 'read_file', app)])], [], false, apps);
+    expect(rows.length === 1 && rows[0]!.app === app && rows[0]!.tool === 'read_file').toBe(ours);
+    // A call still running has no answer yet; the request path alone names the connector, and
+    // only this install's calls count as the turn's evidence.
+    const running = request('req-2', 'read_file', { app });
+    const { turns } = await scan([], [{ id: 'running-turn', messages: [running] }], false, apps);
+    expect(turns[0]!.calls.map(call => call.tool)).toEqual(ours ? ['read_file'] : []);
   });
 
   it('names six sequential calls in the same chat, each as itself', async () => {
@@ -796,12 +829,46 @@ describe('the calls a turn says it made', () => {
     ]);
   });
 
+  it('ignores the turns of an earlier page ChatGPT keeps undisplayed in the same tab', async () => {
+    // Measured 2026-10-01: after a Project resume the tab kept the source chat as a hidden page.
+    // Its turns named the source conversation, the bridge refused every sighting as foreign to
+    // the URL, and the resumed chat's whole answer went unrecorded until a reload.
+    const { turns } = await scan([], [
+      { id: 'source-turn', messages: [authored('source-message', 'Old chat.')], rendered: ['Old chat.'],
+        conversationProps: { conversation: { id: '99999999-8888-4777-8666-555555555555' } }, keptPage: true },
+      { id: 'resumed-turn', messages: [authored('resumed-message', 'New chat.')], rendered: ['New chat.'],
+        conversationProps: { conversation: { id: THREAD } } }
+    ]);
+    expect(turns.map(turn => turn.turnId)).toEqual(['resumed-turn']);
+    expect(turns[0]).toMatchObject({ conversationId: THREAD, conversationConflict: false });
+  });
+
   it('reads the mounted conversation object identity used by helper answers', async () => {
     const { turns } = await scan([], [{
       id: 'helper-final', messages: [authored('helper-message', 'Complete.')],
       rendered: ['Complete.'], conversationProps: { conversation: { id: THREAD } }
     }]);
     expect(turns[0]).toMatchObject({ conversationId: THREAD, conversationConflict: false });
+  });
+
+  it.each([
+    ['at the end', 'Run the review. [$chat-on-steroids-core](app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019)', 'Run the review.'],
+    ['at the start', '[$chat-on-steroids-core](app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019) run echo ok', 'run echo ok'],
+    ['in the middle', 'Ask [$chat-on-steroids-core](app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019) to list files', 'Ask to list files']
+  ])('reads a user message without its ChatGPT app mention %s (#861)', async (_where, stored, authored_) => {
+    const { turns } = await scan([], [{
+      id: 'mention-user', messages: [{ ...authored('mention-user-message', stored), author: { role: 'user' } }],
+      conversationProps: { conversation: { id: THREAD } }
+    }]);
+    expect(turns[0]!.messages[0]).toMatchObject({ role: 'user', rawText: authored_ });
+  });
+
+  it('keeps an ordinary Markdown link a user wrote', async () => {
+    const { turns } = await scan([], [{
+      id: 'link-user', messages: [{ ...authored('link-user-message', 'See [the docs](https://example.com/app) first.'), author: { role: 'user' } }],
+      conversationProps: { conversation: { id: THREAD } }
+    }]);
+    expect(turns[0]!.messages[0]).toMatchObject({ rawText: 'See [the docs](https://example.com/app) first.' });
   });
 
   it('reads the durable server identity instead of the mounted WEB identity', async () => {
@@ -961,6 +1028,32 @@ describe('the calls a turn says it made', () => {
     const result = await scan([], [{ id: 'model-turn', messages: [resolved, fallback, hostile], conversationProps: { conversationId: THREAD } }]);
     const byId = Object.fromEntries(result.turns[0]!.messages.map((row: any) => [row.rawText, row.resolvedModel]));
     expect(byId).toEqual({ Answer: 'gpt-5-6-thinking', 'Answer two': 'gpt-6-pro', 'Answer three': undefined });
+  });
+
+  it('carries the sources behind each citation pill, by the reply and reference index its props name', async () => {
+    // Live shape: the pill's props hold the list its card pages through; a component above it holds
+    // the pill's reference and the reply's references, whose position is the directive's index.
+    const cited = authored('cited', 'Cited answer');
+    const reference = { type: 'grouped_webpages' };
+    const turnContext = { messageId: 'cited', contentReferences: [{ type: 'sources_footnote' }, reference] };
+    const sources = [
+      { kind: 'primary', label: 'Example News', title: 'A report', url: 'https://news.example.com/report', pubDate: 1790553600.5, snippet: '  A short   summary. ' },
+      { kind: 'supporting', label: 'Example Scans', title: 'Project details', url: 'https://scans.example.org/project', pubDate: undefined, snippet: null },
+      { kind: 'supporting', label: 'Hostile', title: 'Script', url: 'javascript:alert(1)' }
+    ];
+    const pill = chain({ reference, turnContext }, 1, null);
+    const withSources: Fiber = { memoizedProps: { sources, attributes: { label: 'Example News' } }, return: pill };
+    const rendered = [{ html: '<p>A claim. <span><a data-testid="chatgpt-citation" href="https://news.example.com/report">Example News</a></span></p>', nativeId: 'cited',
+      pillFibers: [chain(null, 3, withSources)] }];
+    const result = await scan([], [{ id: 'cite-turn', messages: [cited], rendered, conversationProps: { conversationId: THREAD } }]);
+    expect(result.turns[0]!.messages.find(message => message.rawMessageId === 'cited')?.references).toEqual([{ index: 1, sources: [
+      { title: 'A report', url: 'https://news.example.com/report', source: 'Example News', date: 1790553600500, snippet: 'A short summary.' },
+      { title: 'Project details', url: 'https://scans.example.org/project', source: 'Example Scans' }
+    ] }]);
+    // A pill whose props name another reply, or no reference of it, is not this reply's source.
+    const foreign = await scan([], [{ id: 'cite-turn', messages: [cited], conversationProps: { conversationId: THREAD },
+      rendered: [{ ...rendered[0]!, pillFibers: [chain(null, 3, { memoizedProps: { sources }, return: chain({ reference: {}, turnContext }, 1, null) })] }] }]);
+    expect(foreign.turns[0]!.messages.find(message => message.rawMessageId === 'cited')?.references).toBeUndefined();
   });
 
   it.each(['exact', 'missing-scope', 'foreign', 'conflicting-scope', 'unknown', 'wrong-type', 'wrong-prefix', 'conflicting-id', 'private', 'tool', 'duplicate'])('joins typed preambles at native Fiber depths (%s)', async mode => {

@@ -139,6 +139,32 @@ describe('session store', () => {
         reviews: [{ changeIndex: 0, before: '', after: 'x'.repeat(512 * 1024) }]
       }) });
     expect(huge?.changes?.[0]?.reviewAssetId).toBeUndefined();
+    expect(huge?.changes?.[0]?.reviewUnavailable).toBe('too-large');
+    expect(first?.changes?.[0]?.reviewUnavailable).toBeUndefined();
+  });
+
+  it('keeps reviews for every file of a larger patch and says why one was not kept (#563)', async () => {
+    const conversationId = 'conv-many-file-review';
+    const sessionId = await sessionForConversation(conversationId);
+    const files = Array.from({ length: 10 }, (_, index) => `/project/src/file-${index}.ts`);
+    const many = await recordToolCall({ tool: 'apply_patch', args: { patch: 'many' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now(),
+      conversationId, sessionId, evidence: evidence({
+        changes: files.map(path => ({ path, added: 1, removed: 1, approximate: false })),
+        reviews: files.map((_, changeIndex) => ({ changeIndex, before: `a${changeIndex}\n`, after: `b${changeIndex}\n` }))
+      }) });
+    // Before, only the first 8 files of a patch could ever be reviewed.
+    expect(many?.changes?.every(change => change.reviewAssetId && !change.reviewUnavailable)).toBe(true);
+    expect(await readToolEditReview(sessionId!, many!.callId, 9)).toMatchObject({ baseText: 'a9\n', currentText: 'b9\n' });
+    const budget = await recordToolCall({ tool: 'apply_patch', args: { patch: 'budget' },
+      content: [{ type: 'text', text: 'ok' }], outcome: 'ok', durationMs: 1, startedAt: Date.now() + 1,
+      conversationId, sessionId, evidence: evidence({
+        changes: [0, 1, 2, 3, 4].map(index => ({ path: `/project/big-${index}.txt`, added: 1, removed: 0, approximate: false })),
+        reviews: [0, 1, 2, 3, 4].map(changeIndex => ({ changeIndex, before: '', after: 'x'.repeat(480 * 1024) }))
+      }) });
+    expect(budget?.changes?.slice(0, 4).every(change => change.reviewAssetId)).toBe(true);
+    expect(budget?.changes?.[4]).toMatchObject({ reviewUnavailable: 'not-kept' });
+    expect(budget?.changes?.[4]?.reviewAssetId).toBeUndefined();
   });
 
   it('uses original call time and exact conversation for late attribution health proof', async () => {
@@ -678,10 +704,10 @@ describe('session store', () => {
     // A refusal to read is not damage, and may not be answered as "no such session".
     resetSessionStoreForTests();
     const readFile = fs.readFile.bind(fs);
-    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target, ...args) => {
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
       if (String(target).startsWith(path.join(folder, 'meta'))) throw Object.assign(new Error('denied'), { code: 'EACCES' });
-      return readFile(target, ...args);
-    }) as typeof fs.readFile);
+      return (readFile as (...input: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as unknown as typeof fs.readFile);
     try {
       await expect(getSession(session.id)).rejects.toThrow(/EACCES/);
     } finally {
@@ -706,10 +732,10 @@ describe('session store', () => {
 
     const folder = path.join(sessionsRoot(), blocked.id);
     const readFile = fs.readFile.bind(fs);
-    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target, ...args) => {
+    const spy = vi.spyOn(fs, 'readFile').mockImplementation((async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
       if (String(target).startsWith(path.join(folder, 'meta'))) throw Object.assign(new Error('denied'), { code: 'EACCES' });
-      return readFile(target, ...args);
-    }) as typeof fs.readFile);
+      return (readFile as (...input: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as unknown as typeof fs.readFile);
     try {
       expect(await findSessionByConversation('catalog-readable', { requireUnique: true })).not.toBeNull();
       expect(await findSessionByConversation('catalog-blocked', { requireUnique: true })).toBeNull();
@@ -1309,6 +1335,26 @@ describe('session store', () => {
         summary: { title: 'Read a.ts', tone: 'neutral', kind: 'read' }
       }
     });
+    // A repaired historical call can be appended later even though it started earlier. It
+    // counts as an action, but it must not replace the latest-activity projection.
+    await appendEvent(summary.id, {
+      time: toolAt - 5,
+      source: 'mcp',
+      kind: 'tool_call',
+      call: {
+        callId: 'call-tool-clock-older',
+        tool: 'find',
+        attribution: 'request_id',
+        requestId: 'wfr-tool-clock-older',
+        conversationId: 'c-tool-clock',
+        attributionMethod: 'request_id',
+        args: { text: '{"query":"older"}', truncated: false, chars: 17 },
+        result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok',
+        durationMs: 1,
+        summary: { title: 'Searched older history', tone: 'neutral', kind: 'search' }
+      }
+    });
     await appendEvent(summary.id, {
       time: laterAt,
       source: 'extension',
@@ -1316,7 +1362,19 @@ describe('session store', () => {
       message: { text: 'later but not a tool call', truncated: false, chars: 25 }
     });
 
-    expect(await getSession(summary.id)).toMatchObject({ updatedAt: laterAt, lastToolCallAt: toolAt });
+    expect(await getSession(summary.id)).toMatchObject({
+      updatedAt: laterAt,
+      toolCalls: 2,
+      lastToolCallAt: toolAt,
+      lastToolActivity: { kind: 'read', title: 'Read a.ts' }
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    expect(await getSession(summary.id)).toMatchObject({
+      toolCalls: 2,
+      lastToolCallAt: toolAt,
+      lastToolActivity: { kind: 'read', title: 'Read a.ts' }
+    });
   });
 
   /**
@@ -2358,6 +2416,25 @@ describe('handoff storage', () => {
     expect(prompt).toContain('no tool calls');
   });
 
+  it('keeps the thorough default byte for byte and swaps only the length for a shorter brief (#995)', () => {
+    expect(nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'thorough')).toBe(nativeHandoffPrompt('token', true));
+    const short = nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'short');
+    expect(short).not.toMatch(/10,000[–-]30,000|10k[–-]30k|~6,000-token brief is normally too short|Never exceed 30,000/i);
+    expect(short).toMatch(/target roughly 2,000–6,000 tokens/);
+    expect(short).toContain('Length setting: aim for roughly 2,000–6,000 tokens and never exceed 6,000.');
+    // Everything else the brief must carry stays exactly as it was.
+    expect(short).toMatch(/user's messages as the highest-authority source/i);
+    expect(short).toMatch(/PLANNED \/ DECIDED/i);
+    const standard = nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'standard');
+    expect(standard).toMatch(/target roughly 4,000–10,000 tokens/);
+    expect(standard).toContain('never exceed 10,000');
+    // An edited prompt has no default sentence to swap; the code-owned line still sets the length.
+    const custom = 'Carry only the state needed for the next action. Aim for about 20,000 tokens.';
+    const edited = nativeHandoffPrompt('token', true, custom, 'short');
+    expect(edited).toContain(custom);
+    expect(edited).toContain('This replaces any other length target in these instructions.');
+  });
+
   it('honors the tool-detail setting in the handoff brief without claiming to erase seen history', () => {
     expect(nativeHandoffPrompt('token', false)).toContain('omit raw tool-call arguments and result bodies');
     expect(nativeHandoffPrompt('token', false)).toContain('not the history you already saw');
@@ -3214,6 +3291,108 @@ describe('naming the chats this app opened', () => {
     await renameSession(opened.sessionId!, 'Actual request');
     await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Must not win' }]);
     expect((await getSession(opened.sessionId!))?.title).toBe('Actual request');
+  });
+
+  it('names a chat this app opened after the request, not after ChatGPT\'s title for the instructions', async () => {
+    // Live: all 21 app-started chats were called "Coding Agent Instructions" or a variant.
+    const conversationId = 'desktop-provider-title';
+    await noteChatOrigin(conversationId, { kind: 'desktop', fromSessionId: null, agentId: null, task: '' });
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'conversation_title', time: Date.now(), text: 'Coding Agent Instructions' }
+    ]);
+    await upsertMessageEvent(opened.sessionId!, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'desktop-opening', authoredText: 'Fix the flaky bridge test', message: { text: '[[COS_CONTEXT:10]]\nwire', chars: 23, truncated: false } });
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the flaky bridge test');
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Coding Agent Anleitung' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the flaky bridge test');
+    await renameSession(opened.sessionId!, 'My own name');
+    expect((await getSession(opened.sessionId!))?.title).toBe('My own name');
+  });
+
+  it('repairs a stored instructions title of an app-opened chat on cold read', async () => {
+    const session = await createSession({ conversationId: 'desktop-stored-provider', title: 'Temporary' });
+    await upsertMessageEvent(session.id, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'desktop-stored-opening', authoredText: 'Plan the release', message: { text: '[[COS_CONTEXT:10]]\nwire', chars: 23, truncated: false } });
+    await flushSessions(); resetSessionStoreForTests();
+    const metaPath = path.join(sessionsRoot(), session.id, 'meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    Object.assign(meta, { title: 'Coding Agent Instructions', titleSource: 'provider', origin: { kind: 'desktop', fromSessionId: null, agentId: null, task: '' } });
+    await fs.writeFile(metaPath, JSON.stringify(meta));
+    expect((await getSession(session.id))?.title).toBe('Plan the release');
+  });
+
+  it('never takes a project page title as the chat name and repairs one already stored', async () => {
+    const conversationId = 'project-page-title';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: Date.now(), text: 'Fix the homelab backup', messageId: 'project-user' }
+    ]);
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'ChatGPT - Homelab Development' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix the homelab backup');
+    await recordChatObservations(conversationId, [{ kind: 'conversation_title', time: Date.now(), text: 'Homelab Backup Fix' }]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Homelab Backup Fix');
+
+    // Stored by a build before the filter: repaired on the next cold read.
+    const stored = await createSession({ conversationId: 'stored-project-title', title: 'Temporary' });
+    await upsertMessageEvent(stored.id, { kind: 'user_message', source: 'app', time: Date.now(),
+      messageId: 'stored-project-user', authoredText: 'Plan the NAS migration', message: { text: 'Plan the NAS migration', chars: 22, truncated: false } });
+    await flushSessions(); resetSessionStoreForTests();
+    const metaPath = path.join(sessionsRoot(), stored.id, 'meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+    Object.assign(meta, { title: 'ChatGPT - Homelab Development', titleSource: 'provider' });
+    await fs.writeFile(metaPath, JSON.stringify(meta));
+    expect((await getSession(stored.id))?.title).toBe('Plan the NAS migration');
+  });
+
+  it('hides a leftover Plan helper and names a message-less project page chat after its project', async () => {
+    const legacy = async (conversationId: string, patch: Record<string, unknown>) => {
+      const session = await createSession({ conversationId, title: 'Temporary' });
+      await flushSessions(); resetSessionStoreForTests();
+      const metaPath = path.join(sessionsRoot(), session.id, 'meta.json');
+      const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+      Object.assign(meta, patch); delete meta.origin;
+      await fs.writeFile(metaPath, JSON.stringify(meta));
+      return { id: session.id, metaPath };
+    };
+    const planner = await legacy('legacy-planner', { title: 'You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages', titleSource: 'provider' });
+    const project = await legacy('tools-only-project', { title: 'ChatGPT - Homelab Development' });
+    const manual = await legacy('manual-project-name', { title: 'ChatGPT - My own name', titleSource: 'manual' });
+    // The chat list is read first, as in the app: it must already be repaired, without any of these
+    // sessions having been opened.
+    const listed = await listSessions();
+    expect(listed.map(row => row.id)).not.toContain(planner.id);
+    expect(listed.find(row => row.id === project.id)?.title).toBe('Homelab Development');
+    expect(listed.find(row => row.id === manual.id)?.title).toBe('ChatGPT - My own name');
+    expect((await getSession(planner.id))?.origin?.kind).toBe('helper');
+    // Repaired once, on disk: the next cold start serves the fixed labels from the fast path.
+    expect(JSON.parse(await fs.readFile(project.metaPath, 'utf8')).title).toBe('Homelab Development');
+    expect(JSON.parse(await fs.readFile(planner.metaPath, 'utf8')).origin?.kind).toBe('helper');
+    // Hidden, never deleted: the recording stays on disk.
+    await expect(fs.stat(planner.metaPath)).resolves.toBeTruthy();
+  });
+
+  it('repairs those labels on recordings shaped like the real ones from September', async () => {
+    // Real leftovers carry a user message: a Plan helper's is the planner instructions themselves,
+    // and an old project page chat has an ordinary request but no stored title source.
+    const legacy = async (conversationId: string, message: string, patch: Record<string, unknown>) => {
+      const session = await createSession({ conversationId, title: 'Temporary' });
+      await upsertMessageEvent(session.id, { kind: 'user_message', source: 'extension', time: Date.now(),
+        messageId: `${conversationId}-user`, message: { text: message, chars: message.length, truncated: false } });
+      await flushSessions(); resetSessionStoreForTests();
+      const metaPath = path.join(sessionsRoot(), session.id, 'meta.json');
+      const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+      Object.assign(meta, patch); delete meta.origin;
+      if (!('titleSource' in patch)) delete meta.titleSource;
+      await fs.writeFile(metaPath, JSON.stringify(meta));
+      return { id: session.id, metaPath };
+    };
+    const instructions = 'You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages.';
+    const planner = await legacy('sept-planner', instructions, { title: 'You are a task planner, not the executor', titleSource: 'provider' });
+    const project = await legacy('sept-project-page', 'Check the desktop and browser automation', { title: 'ChatGPT - Homelab Development' });
+    const listed = await listSessions();
+    expect(listed.map(row => row.id)).not.toContain(planner.id);
+    expect(listed.find(row => row.id === project.id)?.title).toBe('Check the desktop and browser automation');
+    expect(JSON.parse(await fs.readFile(planner.metaPath, 'utf8')).origin?.kind).toBe('helper');
+    expect(JSON.parse(await fs.readFile(project.metaPath, 'utf8')).title).toBe('Check the desktop and browser automation');
   });
 
   it('repairs a legacy context preview on cold read using durable authored text', async () => {

@@ -5,6 +5,16 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const { build } = require('esbuild');
 
+async function captureOffscreenFrame(win, file) {
+  // This fixture is an offscreen window. Capture the frame from the offscreen renderer's own
+  // paint event instead of asking Viz to copy the hidden surface again with capturePage().
+  // The listener is armed before invalidation, so the saved image belongs to a freshly generated
+  // frame for the current size/zoom/layout rather than whichever surface Viz last exposed.
+  const frame = new Promise(resolve => win.webContents.once('paint', (_event, _dirty, image) => resolve(image)));
+  win.webContents.invalidate();
+  fs.writeFileSync(file, (await frame).toPNG());
+}
+
 app.whenReady().then(async () => {
   const root = path.join(__dirname, '..');
   const output = path.join(root, 'outputs/recovery-layout');
@@ -37,20 +47,23 @@ app.whenReady().then(async () => {
     win.webContents.setZoomFactor(zoom);
     for (const kind of ['thinking-failed', 'unattributed', 'unattributed-wait', 'assistant-error', 'tab-recovery', 'native-busy', 'silence', 'post-reload'])
       for (const next of kind === 'post-reload' ? [null, 'queue', 'goal', 'loop', 'continue'] : kind === 'native-busy' ? [null, 'continue'] : [null]) {
-      const measured = await win.webContents.executeJavaScript(`(() => {
+      const measured = await win.webContents.executeJavaScript(`(async () => {
         document.documentElement.dataset.theme = '${theme}';
         recovery.renderRecoveryCountdowns(document.getElementById('recoveryStatus'), [{ kind: '${kind}', next: ${JSON.stringify(next)}, generating: ${kind === 'post-reload'}, deadline: ${kind === 'unattributed' ? 15000 : 300000} }], 1000);
+        // Measure the resting layout: the dock's entrance animation would otherwise be caught mid-way.
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        await Promise.race([Promise.all(document.getAnimations().filter(animation => animation.effect?.getComputedTiming().endTime !== Infinity).map(animation => animation.finished.catch(() => undefined))), new Promise(resolve => setTimeout(resolve, 1500))]);
         const host = document.getElementById('recoveryStatus'), timer = host.querySelector('.recovery-countdown');
         const h = host.getBoundingClientRect(), t = timer.getBoundingClientRect();
         return { hostWidth: h.width, height: h.height, timerWidth: t.width, text: timer.textContent,
           fits: t.left >= h.left && t.right <= h.right && host.scrollWidth <= host.clientWidth };
       })()`);
       assert.ok(measured.fits, JSON.stringify({ width, zoom, theme, kind, ...measured }));
-      assert.ok(measured.height >= 38 && measured.timerWidth > 0);
+      assert.ok(measured.height >= 38 && measured.timerWidth > 0, JSON.stringify({ width, zoom, theme, kind, next, ...measured }));
       results.push({ width, zoom, theme, kind, next, ...measured });
       if (width === 920 && zoom === 1 && theme === 'dark') {
         await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
-        fs.writeFileSync(path.join(output, `${kind}${next ? '-' + next : ''}.png`), (await win.webContents.capturePage()).toPNG());
+        await captureOffscreenFrame(win, path.join(output, `${kind}${next ? '-' + next : ''}.png`));
       }
     }
   }
@@ -82,7 +95,7 @@ app.whenReady().then(async () => {
         : 'Loop · Continue the requested work and verify the result.';
       return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     })()`);
-    fs.writeFileSync(path.join(output, `${preview.file}.png`), (await win.webContents.capturePage()).toPNG());
+    await captureOffscreenFrame(win, path.join(output, `${preview.file}.png`));
   }
   fs.writeFileSync(path.join(output, 'measurements.json'), JSON.stringify(results, null, 2));
   console.log(`Passed ${results.length} recovery layout cases. Screenshots: ${output}`);

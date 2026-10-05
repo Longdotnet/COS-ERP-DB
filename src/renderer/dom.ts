@@ -10,22 +10,26 @@ import { currentLanguage, t, ui } from './i18n.js';
  * The app's icon vocabulary, drawn with the bundled Phosphor font (icons.css).
  *
  * Call sites name what an icon means (`i-retry`); this map alone decides which glyph draws it.
- * `fill:` selects Phosphor's filled family. The dock toggles reuse the sidebar glyph turned
- * toward the edge they open, so all three panel controls read as one set.
+ * `fill:` selects Phosphor's filled family. The dock toggles use the filled half-square that
+ * shows the edge they open: drawn upright (no rotation), it stays crisp at fractional scales.
  */
 const ICONS: Readonly<Record<string, string>> = {
   'i-agents': 'robot',
+  'i-arrow-down': 'arrow-down',
+  'i-arrow-left': 'arrow-left',
+  'i-arrow-right': 'arrow-right',
   'i-back': 'arrow-left',
   'i-ban': 'prohibit',
   'i-bolt': 'lightning',
   'i-chart': 'chart-line',
   'i-chat': 'chat-circle',
   'i-check': 'check',
-  'i-chev': 'caret-right',
+  'i-check-circle': 'check-circle',
   'i-clock': 'clock',
   'i-copy': 'copy',
   'i-dock-expand': 'corners-out',
   'i-dock-restore': 'corners-in',
+  'i-export': 'download-simple',
   'i-eye': 'eye',
   'i-file': 'file',
   'i-file-text': 'file-text',
@@ -40,9 +44,11 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-monitor': 'monitor',
   'i-more': 'dots-three',
   'i-out': 'arrow-square-out',
-  'i-panel-bottom': 'sidebar-simple ico-turn-bottom',
-  'i-panel-right': 'sidebar-simple ico-turn-right',
+  'i-panel-bottom': 'fill:square-half-bottom',
+  'i-panel-right': 'fill:square-half',
   'i-paw': 'paw-print',
+  'i-page-next': 'caret-right',
+  'i-page-previous': 'caret-left',
   'i-pencil': 'pencil-simple',
   'i-play': 'play',
   'i-plus': 'plus',
@@ -57,6 +63,8 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-sun': 'sun',
   'i-target': 'target',
   'i-terminal': 'terminal-window',
+  'i-zoom-in': 'magnifying-glass-plus',
+  'i-zoom-out': 'magnifying-glass-minus',
   'i-trash': 'trash',
   'i-warning': 'warning',
   'i-x': 'x'
@@ -73,6 +81,25 @@ export function icon(name: string, className = 'ico'): HTMLElement {
   const node = document.createElement('i');
   node.setAttribute('aria-hidden', 'true');
   setIcon(node, name, className);
+  return node;
+}
+
+/**
+ * A disclosure indicator with geometry that rotates around its actual visual center.
+ *
+ * Font carets sit on a text baseline, so their ink appears to jump while rotating even
+ * when the element's box stays put. Keep every animated disclosure on this authored SVG;
+ * directional action icons continue to use the Phosphor icon helper.
+ */
+export function disclosureChevron(className = ''): SVGSVGElement {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  node.setAttribute('class', `disclosure-chevron${className ? ` ${className}` : ''}`);
+  node.setAttribute('viewBox', '0 0 16 16');
+  node.setAttribute('aria-hidden', 'true');
+  node.setAttribute('focusable', 'false');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M6 3.5 10.5 8 6 12.5');
+  node.append(path);
   return node;
 }
 
@@ -96,7 +123,7 @@ export function filterSettingsSections(view: HTMLElement, search: string): void 
   const fold = (text: string) => text.toLocaleLowerCase(currentLanguage());
   const query = fold(search.trim());
   let matches = 0;
-  for (const heading of view.querySelectorAll<HTMLElement>('.settings-section-title')) {
+  for (const heading of view.querySelectorAll<HTMLElement>('.automation-section-head')) {
     const pane = heading.nextElementSibling as HTMLElement | null;
     if (!pane?.classList.contains('pane')) continue;
     const visible = !query || fold(`${heading.textContent} ${pane.textContent}`).includes(query);
@@ -151,7 +178,7 @@ export function shortAgo(atMs: number | null): string {
 
 /** A clock time for one event in a timeline. */
 export function clockTime(atMs: number): string {
-  return new Date(atMs).toLocaleTimeString();
+  return new Date(atMs).toLocaleTimeString(currentLanguage());
 }
 
 /** "1.2k", "3.4M" — for token and character counts that get large. */

@@ -1,0 +1,31 @@
+# Quiet, grouped dependency updates: once a month, one PR for all npm minor and patch updates and
+# one for GitHub Actions. Major versions are left out on purpose; they change behavior and are
+# upgraded deliberately by a maintainer instead of arriving as automatic PRs.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
+      # Native packages pinned by the native source review (docs/licenses/native/sources.json):
+      # a new version needs that review, so it is never bumped automatically.
+      - dependency-name: sharp
+      - dependency-name: '@img/*'
+      # Electron is pinned exactly: the third-party notices name its source tag and
+      # test/packaging.test.ts proves the packaged runners use those bytes. Upgrade it by hand.
+      - dependency-name: electron
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      actions:
+        patterns: ['*']

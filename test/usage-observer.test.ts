@@ -38,7 +38,7 @@ function harness() {
   };
   window.dispatchEvent = (event: { type: string }) => { dispatch(event.type, event); return true; };
   class MessageEvent { constructor(readonly type: string, init: Record<string, unknown>) { Object.assign(this, init); } }
-  const evaluate = (source = script) => runInNewContext(source, { window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder, MessageEvent,
+  const evaluate = (source = script) => runInNewContext(source, { window, document, location: { origin: 'https://chatgpt.com' }, URL, crypto, Date: Clock, TextDecoder, MessageEvent,
     setTimeout: (run: () => void, ms: number) => { timers.set(++timerId, { at: now + ms, run }); return timerId; },
     clearTimeout: (id: number) => timers.delete(id) });
   evaluate();
@@ -88,6 +88,21 @@ function harness() {
     socket: (url = 'wss://ws.chatgpt.com/ws') => new window.WebSocket(url),
     feed,
     feedSse,
+    resume: async (status = 404, conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      endpoint = 'https://chatgpt.com/backend-api/f/conversation/resume', method = 'POST', mime = 'application/json') => {
+      response = { url: endpoint, status, ok: status === 200, clone: () => { throw new Error('Do not read error bodies'); },
+        headers: { get: () => mime } };
+      const starts: unknown[] = [];
+      const listener = (event: any) => { if (event.data?.type === 'cos-resume-request') starts.push(event.data); };
+      window.addEventListener('message', listener);
+      const result = window.fetch(endpoint, { method, body: JSON.stringify({ conversation_id: conversationId, private: 'not projected' }) });
+      const synchronousStarts = starts.length;
+      const returned = await result;
+      expect(returned).toBe(response);
+      await Promise.resolve();
+      window.removeEventListener('message', listener);
+      return { starts, synchronousStarts };
+    },
     openSse: async () => {
       let resolve: (value: unknown) => void = () => {};
       let cancelled = false, clones = 0;
@@ -119,6 +134,44 @@ function harness() {
 }
 
 describe('MAIN-world usage projection', () => {
+  it('H2 observes an exact resume 404 without reading its body and captures request ownership synchronously', async () => {
+    const h = harness();
+    const { starts, synchronousStarts } = await h.resume();
+    expect(synchronousStarts).toBe(1);
+    expect(starts).toEqual([expect.objectContaining({ type: 'cos-resume-request', conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' })]);
+    expect(h.posts.filter(row => row.type === 'cos-resume-response')).toEqual([
+      { type: 'cos-resume-response', id: (starts[0] as any).id, conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', status: 404 }
+    ]);
+    expect(JSON.stringify(starts)).not.toContain('not projected');
+    h.request();
+    expect(h.posts.filter(row => row.type === 'cos-resume-response')).toHaveLength(1);
+  });
+
+  it.each([
+    ['foreign endpoint', 'https://elsewhere.example/backend-api/f/conversation/resume', 'POST', 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ['polling', 'https://chatgpt.com/backend-api/conversation/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', 'GET', 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ['GET resume', 'https://chatgpt.com/backend-api/f/conversation/resume', 'GET', 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ['invalid identity', 'https://chatgpt.com/backend-api/f/conversation/resume', 'POST', 'unknown']
+  ])('H2 ignores %s', async (_name, endpoint, method, conversationId) => {
+    const h = harness();
+    expect((await h.resume(404, conversationId, endpoint, method)).synchronousStarts).toBe(0);
+    expect(h.posts.filter(row => row.type === 'cos-resume-response')).toEqual([]);
+  });
+
+  it('H2 deduplicates a resume response when a provider wrapper delegates through the earlier observer', async () => {
+    const h = harness();
+    h.replaceFetch(true); h.ready();
+    await h.resume();
+    expect(h.posts.filter(row => row.type === 'cos-resume-response' && row.status === 404)).toHaveLength(1);
+  });
+
+  it.each(['application/json', 'text/event-stream; charset=utf-8'])('H2 projects successful SSE headers only for %s', async mime => {
+    const h = harness();
+    await h.resume(200, undefined, undefined, undefined, mime);
+    const [response] = h.posts.filter(row => row.type === 'cos-resume-response');
+    expect(response?.status).toBe(200);
+    expect(response?.streamOpened === true).toBe(mime.startsWith('text/event-stream'));
+  });
   it('keeps one current observer and refreshes a provider-replaced wrapper without extra active readers', async () => {
     const h = harness(), current = h.observer(), fetch = h.currentFetch();
     h.evaluate(); expect(h.observer()).toBe(current); expect(h.currentFetch()).toBe(fetch);
@@ -131,8 +184,9 @@ describe('MAIN-world usage projection', () => {
   it('retires a versioned observer across replacement while preserving provider wrappers and native sockets', async () => {
     const h = harness(), old = h.observer(), socket = h.socket();
     h.replaceFetch(true);
-    h.evaluate(script.replace('const OBSERVER_VERSION = 2;', 'const OBSERVER_VERSION = 3;'));
-    expect(old.current()).toBe(false); expect(h.observer().version).toBe(3);
+    const current = Number(/const OBSERVER_VERSION = (\d+);/.exec(script)![1]);
+    h.evaluate(script.replace(`const OBSERVER_VERSION = ${current};`, `const OBSERVER_VERSION = ${current + 1};`));
+    expect(old.current()).toBe(false); expect(h.observer().version).toBe(current + 1);
     const stream = await h.openSse(); expect(stream.clones).toBe(1); h.hide();
     expect(socket).toBeInstanceOf(h.nativeSocket);
     const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -160,6 +214,9 @@ describe('MAIN-world usage projection', () => {
     await h.feedSse([`data: ${JSON.stringify({ conversation_id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' })}\n\n`], { method: 'POST', body });
     const reports = h.posts.filter(row => row.type === 'cos-send-model');
     expect(reports).toEqual([{ type: 'cos-send-model', model: 'gpt-5-6-thinking', messageIds: [messageId], observedAt: expect.any(Number) }]);
+    // The same request confirms the Send when ChatGPT redraws a new chat without its question (#942).
+    expect(h.posts.filter(row => row.type === 'cos-send-request'))
+      .toEqual([{ type: 'cos-send-request', messageIds: [messageId], observedAt: expect.any(Number) }]);
     expect(JSON.stringify(h.posts)).not.toContain('private prompt');
     // A malformed model or a non-user message proves nothing.
     await h.feedSse([], { method: 'POST', body: JSON.stringify({ model: 'gpt 6 <b>', messages: [{ id: messageId, author: { role: 'user' } }] }) });
@@ -532,5 +589,78 @@ describe('replacing the MAIN-world observer after an extension update', () => {
     const second = h.observer();
     h.evaluate();
     expect(h.observer()).toBe(second);
+  });
+});
+
+describe('Core app identity for mentions (#861)', () => {
+  const hint = (system_hint: string, name: string) => ({ system_hint, name, description: 'x', is_plugin: true });
+  const url = 'https://chatgpt.com/backend-api/system_hints?mode=composer';
+  const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
+  it('reports the one Core app from the page\'s own system hints and repeats it on request', async () => {
+    const h = harness();
+    await h.feed({ system_hints: [hint('plugin:asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', 'COS ERP DB Core'),
+      hint('connector:asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', 'COS ERP DB Core'),
+      hint('plugin:asdk_app_6aa5b67a02148191b8053d85e5731dd3', 'COS ERP DB Desktop'), hint('agent', 'Agent')] }, url);
+    await settle();
+    const expected = { type: 'cos-core-mention', path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', name: 'COS ERP DB Core',
+      candidates: [{ name: 'COS ERP DB Core', path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019' }], pluginList: false };
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([expected]);
+    h.request();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([expected, expected]);
+  });
+  it('reports no mention for two different Core apps', async () => {
+    const h = harness();
+    await h.feed({ system_hints: [hint('plugin:asdk_app_aaaa1111', 'COS ERP DB Core'), hint('plugin:asdk_app_bbbb2222', 'COS ERP DB Core')] }, url);
+    await settle();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([{ type: 'cos-core-mention', path: null, name: null,
+      candidates: [{ name: 'COS ERP DB Core', path: null }], pluginList: false }]);
+  });
+  it('keeps the Core app when another hint list without it answers later', async () => {
+    // Measured live: the page asks for basic, custom_agents and plugins lists in parallel, and only
+    // the plugins list names Core. A later basic answer reset the mention, so the first prompt the
+    // app sent went out without it.
+    const h = harness();
+    await h.feed({ system_hints: [hint('plugin:asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', 'COS ERP DB Core')] }, 'https://chatgpt.com/backend-api/system_hints?exclude_logo=true&mode=plugins');
+    await settle();
+    await h.feed({ system_hints: [hint('agent', 'Agent'), hint('plugin:asdk_app_6aa5b67a02148191b8053d85e5731dd3', 'COS ERP DB Desktop')] }, 'https://chatgpt.com/backend-api/system_hints?exclude_logo=true&mode=basic');
+    await settle();
+    const expected = { type: 'cos-core-mention', path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', name: 'COS ERP DB Core',
+      candidates: [{ name: 'COS ERP DB Core', path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019' }], pluginList: true };
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([expected]);
+    h.request();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention').at(-1)).toEqual(expected);
+  });
+  it('reports every computer\'s Core by name, so this install can pick its own', async () => {
+    // One ChatGPT account on two computers: the page lists both Cores, and this world cannot know
+    // which is this install's. The content script picks by the name the app reports.
+    const h = harness();
+    await h.feed({ system_hints: [hint('plugin:asdk_app_mac1111', 'COS ERP DB Core'),
+      hint('plugin:asdk_app_win2222', 'COS ERP DB Core (Windows)'),
+      hint('plugin:asdk_app_back3333', 'COS ERP DB Core Backup'),
+      hint('plugin:asdk_app_bad4444', 'COS ERP DB Core (Win/VM)')] }, url);
+    await settle();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([{ type: 'cos-core-mention',
+      path: 'app://asdk_app_mac1111', name: 'COS ERP DB Core',
+      candidates: [{ name: 'COS ERP DB Core', path: 'app://asdk_app_mac1111' },
+        { name: 'COS ERP DB Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: false }]);
+  });
+  it('reports the plugins list even without any Core, and only that list', async () => {
+    // Core deleted in ChatGPT: the plugins list (mode=plugins) answers without it, which takes the
+    // proof back. Any other list without Core still says nothing.
+    const h = harness();
+    await h.feed({ system_hints: [hint('agent', 'Agent')] }, 'https://chatgpt.com/backend-api/system_hints?exclude_logo=true&mode=basic');
+    await settle();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([]);
+    await h.feed({ system_hints: [hint('plugin:asdk_app_6aa5b67a02148191b8053d85e5731dd3', 'COS ERP DB Desktop')] },
+      'https://chatgpt.com/backend-api/system_hints?exclude_logo=true&mode=plugins');
+    await settle();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([
+      { type: 'cos-core-mention', path: null, name: null, candidates: [], pluginList: true }]);
+  });
+  it('ignores a system hint list from another origin', async () => {
+    const h = harness();
+    await h.feed({ system_hints: [hint('plugin:asdk_app_aaaa1111', 'COS ERP DB Core')] }, 'https://evil.example/backend-api/system_hints');
+    await settle();
+    expect(h.posts.filter(row => row.type === 'cos-core-mention')).toEqual([]);
   });
 });

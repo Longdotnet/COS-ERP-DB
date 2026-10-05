@@ -126,18 +126,25 @@ export interface TunnelSettings {
   binaryPath: string;
 }
 
-export const CHAT_BROWSERS = ['chrome', 'edge', 'brave'] as const;
+/** `cos` is the built-in CoS browser (src/main/cos-browser), which needs no installed browser. */
+export const CHAT_BROWSERS = ['chrome', 'edge', 'brave', 'cos'] as const;
 export type ChatBrowser = (typeof CHAT_BROWSERS)[number];
 
 export interface UiPrefs {
   /** Recover an unfinished silent executor turn only while Goal and Loop are both off. */
   autoContinue?: boolean;
+  /** Preferred account-observed model for a fresh ordinary chat; omitted keeps the catalog fallback. */
+  defaultChatModel?: string;
+  /** Preferred reasoning for a fresh ordinary chat; omitted keeps the model's normal fallback. */
+  defaultChatReasoning?: ReasoningEffort;
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
   browserBridgePort?: import('./browser-bridge.js').BrowserBridgePort;
   /** Opt-in browser automation for changed connector tool schemas. */
   autoRefreshPlugins?: boolean;
+  /** Opt-in deterministic metadata routing for managed Skills on ordinary user input. */
+  autoSelectSkills?: boolean;
   /** Actual app-owned tabs to retain; active work and drafts stay protected. Omitted uses workers + 2. */
   tabsToKeepOpen?: number;
   finishTool?: boolean;
@@ -147,6 +154,19 @@ export interface UiPrefs {
   developerMode?: boolean;
   /** Rotating joke words instead of "Working" in a chat's status line. Off by default. */
   playfulStatus?: boolean;
+  /** Keep the chat at its end while it grows, here and on ChatGPT, until the reader scrolls up. On unless false. */
+  followOutput?: boolean;
+  /** Add the COS ERP DB Core mention to the user's own prompts sent from the app. On unless false. */
+  mentionCore?: boolean;
+  /** The interface language the window last reported; the browser extension follows it. */
+  language?: import('./ui-language.js').UiLanguage;
+  /**
+   * The extension's own preferences as it last reported them stored. The app keeps them so a
+   * reinstalled extension, which starts with empty storage under a new id, gets them back.
+   */
+  browserPreferences?: { overwrite: boolean; durations: boolean };
+  /** Set once the notice that the CoS browser hid to the tray, still running, was shown. */
+  cosBrowserTrayHint?: boolean;
   minimizeToTray: boolean;
   autoConnect: boolean;
   startAtLogin?: boolean;
@@ -193,6 +213,8 @@ export interface CompactionSettings {
   autoTokens: number;
   /** Editable content instructions for the brief; protocol/recovery framing stays code-owned. */
   handoffPrompt: string;
+  /** How long the brief should be; absent means 'thorough', the shipped 10k–30k rules. */
+  handoffLength?: 'thorough' | 'standard' | 'short';
 }
 
 /**
@@ -299,10 +321,18 @@ export interface MultiAgentSettings {
   defaultModel?: string;
   defaultReasoning?: ReasoningEffort | '';
   enabled: boolean;
-  /** Upper bound on workers the prime agent may create. */
+  /** Upper bound on simultaneous slot-holding workers in one prime family. */
   maxWorkers: number;
+  /**
+   * Optional admission cap shared by every prime family. Zero means no global cap, preserving
+   * the historical per-family-only behavior. This limits worker admission only; it does not
+   * queue ordinary prompts, switch Goal work, or evict workers that are already running.
+   */
+  globalMaxWorkers?: number;
   /** Permit self-contained calls when browser evidence cannot identify their conversation. */
   allowUnattributedCalls: boolean;
+  /** Default-deny local tools to exact trusted conversations. */
+  strictChatAllowlist?: boolean;
   /**
    * Reopen/reload chats that are not Goal/Loop driven — workers, primes, plain chats that have
    * called tools — once when their tab disappears or goes silent. Goal/Loop chats are always
@@ -315,6 +345,12 @@ export interface MultiAgentSettings {
    * context that is about to change. Off by default; a chat with no workers is never held.
    */
   waitForSubAgents?: boolean;
+  /**
+   * Reclaim only terminal processes owned by an exactly identified worker that has remained
+   * sleeping beyond the runtime-retention threshold. Off by default; durable worker/chat
+   * identity and history are never reclaimed by this switch.
+   */
+  endSleepingWorkerProcesses?: boolean;
 }
 
 /** The user's own additions to what each MCP connector tells the model about itself. */
@@ -323,7 +359,24 @@ export interface McpSettings {
   instructions: string;
 }
 
+/** The opt-in local control API for an agent watching this app (`src/main/control-api.ts`). */
+export interface ControlApiSettings {
+  /** Serve the loopback API and write its token to userData. Off unless the user turns it on. */
+  enabled: boolean;
+  /**
+   * Also let a caller with the token send and cancel messages through the outbox. Off unless the
+   * user turns it on, and never on while `enabled` is off: turning the API off revokes it.
+   */
+  allowActions: boolean;
+}
+
 export interface Config {
+  /**
+   * Names this computer's connectors in ChatGPT, for one ChatGPT account used on several
+   * computers: "Windows" makes them "COS ERP DB Core (Windows)" and so on. Empty keeps the
+   * plain names. It belongs to the install, not to a setup profile.
+   */
+  connectorSuffix?: string;
   /** Inactive setups only. Keys remain in encrypted secret slots addressed by profile ID. */
   setupProfiles?: Array<{ id: string; name: string; tunnelId: string; desktopTunnelId: string; pluginsTunnelId: string }>;
   roots: Root[];
@@ -337,6 +390,7 @@ export interface Config {
   commandAllowlist: CommandAllowlistSettings;
   goal: GoalSettings;
   mcp: McpSettings;
+  controlApi: ControlApiSettings;
 }
 
 export type ConnectionState =
@@ -439,6 +493,11 @@ export interface SurfaceStatus {
    */
   lastRequestAt: number | null;
   lastToolCallAt: number | null;
+  /**
+   * The newest of the same evidence from earlier runs of the app, through the tunnel this
+   * connector uses now. Null when there is none, or when it came through another tunnel.
+   */
+  proof?: { requestAt: number | null; toolCallAt: number | null; installedAt?: number | null } | null;
 }
 
 export type SurfaceConnectionState =
@@ -493,6 +552,17 @@ export interface BridgeStatus {
    * this app process, which is why "no extension version" never means "outdated extension".
    */
   extensionVersion: string | null;
+  /**
+   * The extension in the person's own Chrome, Edge or Brave, apart from the CoS browser's copy.
+   * Null until one has spoken to this app process; Setup's first step waits for it.
+   */
+  externalExtension?: {
+    present: boolean; version: string | null; lastSeenAt: number | null; signedIn?: boolean | null;
+    /** Kept across restarts: the version last seen there, and whether ChatGPT last answered signed in. */
+    proof?: { version: string; signedIn: boolean | null } | null;
+  } | null;
+  /** The CoS browser's own copy of the extension, connected right now. */
+  cosExtension?: { present: boolean };
 }
 
 /**
@@ -674,6 +744,8 @@ export interface AppState {
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */
   bundledTunnelVersion: string | null;
   bridge: BridgeStatus;
+  /** Whether the CoS browser holds a ChatGPT sign-in; null while it is not the running browser. */
+  cosBrowserSignedIn?: boolean | null;
   update: UpdateStatus;
   /** Present only on macOS once the in-process native backend has reported its live TCC state. */
   desktopAccess?: MacOSDesktopAccessStatus | null;

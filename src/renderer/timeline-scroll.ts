@@ -1,12 +1,18 @@
+/** Height changes below this are layout rounding at fractional zoom, never new output. */
+export const ROUNDING_PX = 2;
+
 /** Capture the visible logical row for one synchronous reconciliation. No retained
  * state: selection changes and user scrolling naturally get a fresh anchor. */
-export function preserveTimelineViewport(pane: HTMLElement, timeline: HTMLElement, followBottom = true): () => void {
+export function preserveTimelineViewport(pane: HTMLElement, timeline: HTMLElement, followBottom = true, atEnd?: boolean): () => void {
   const previous = pane.scrollTop;
   // Only rounding tolerance belongs here. A small deliberate scroll away from the
   // tail must survive unrelated session/status repaints and later answer growth.
-  const following = followBottom && previous + pane.clientHeight >= pane.scrollHeight - 1;
+  // `atEnd` is the reader's own position when the caller tracks it ("Follow new output"):
+  // growth that reached the pane outside a repaint must not read as having scrolled away.
+  const following = followBottom && (atEnd ?? previous + pane.clientHeight >= pane.scrollHeight - 1);
   const previousReserve = Number.parseFloat(timeline.style.getPropertyValue('--timeline-scroll-reserve')) || 0;
   const previousContentHeight = timeline.getBoundingClientRect().height - previousReserve;
+  const previousScrollContent = pane.scrollHeight - previousReserve;
   const edge = pane.getBoundingClientRect().top;
   const rows = () => [...timeline.querySelectorAll<HTMLElement>('[data-timeline-key]')]
     .filter(row => !row.matches('.tool-group[open]'));
@@ -21,6 +27,15 @@ export function preserveTimelineViewport(pane: HTMLElement, timeline: HTMLElemen
     timeline.style.removeProperty('--timeline-scroll-reserve');
     if (following) {
       const growth = Math.max(0, timeline.getBoundingClientRect().height - previousContentHeight);
+      // Less than this is layout rounding (a badge at a fractional zoom), not output: keep the exact
+      // reserve and position, so nothing on screen moves by a pixel.
+      // Both measures must agree: the reserve is already removed, so scrollHeight is content only.
+      const scrollGrowth = pane.scrollHeight - previousScrollContent;
+      if (growth < ROUNDING_PX && scrollGrowth < ROUNDING_PX && previous + pane.clientHeight >= previousScrollContent + previousReserve - ROUNDING_PX) {
+        if (previousReserve > 0) timeline.style.setProperty('--timeline-scroll-reserve', `${previousReserve}px`);
+        pane.scrollTop = previous;
+        return;
+      }
       const reserve = Math.max(0, previousReserve - growth);
       if (reserve > 0) timeline.style.setProperty('--timeline-scroll-reserve', `${reserve}px`);
       pane.scrollTop = pane.scrollHeight;

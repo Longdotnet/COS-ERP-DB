@@ -13,6 +13,8 @@ if (!process.versions.electron) {
 const { app, BrowserWindow } = require('electron');
 app.whenReady().then(async () => {
   const root = path.join(__dirname, '..');
+  const output = path.join(root, 'outputs/chat-opening-scroll');
+  fs.mkdirSync(output, { recursive: true });
   const built = await require('esbuild').build({ entryPoints: [path.join(root, 'src/renderer/chat.ts')],
     bundle: true, write: false, platform: 'browser', format: 'iife', globalName: 'chat',
     outfile: path.join(root, '.local/opening-fixture.js'),
@@ -21,7 +23,14 @@ app.whenReady().then(async () => {
       build.onLoad({filter:/.*/,namespace:'fixture-url'},()=>({contents:'export default "";',loader:'js'}));
     }}] });
   const code = built.outputFiles.find(file=>file.path.endsWith('.js')).text;
-  const css = fs.readFileSync(path.join(root, 'src/renderer/styles.css'), 'utf8') +
+  // This data-URL fixture has no asset server. Load the two installed icon faces in memory;
+  // only screenshots and a JSON receipt are written, never font files or an exported HTML page.
+  const iconFiles = ['@phosphor-icons/web/regular/Phosphor.woff2', '@phosphor-icons/web/fill/Phosphor-Fill.woff2'];
+  const iconCss = fs.readFileSync(path.join(root, 'src/renderer/icons.css'), 'utf8').replace(/url\('([^']+)'\)/g, (_match, file) => {
+    assert.ok(iconFiles.includes(file), 'Unexpected icon asset');
+    return `url('data:font/woff2;base64,${fs.readFileSync(require.resolve(file)).toString('base64')}')`;
+  });
+  const css = iconCss + fs.readFileSync(path.join(root, 'src/renderer/styles.css'), 'utf8') +
     built.outputFiles.filter(file=>file.path.endsWith('.css')).map(file=>file.text).join('\n');
   const html = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8')
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, '').replace(/<link\b[^>]*>/g, '')
@@ -29,6 +38,9 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({ show: false, width: 1400, height: 900,
     webPreferences: { sandbox: true, backgroundThrottling: false } });
   await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  assert.equal(await win.webContents.executeJavaScript(`Promise.all(['CoS Phosphor','CoS Phosphor Fill']
+    .map(name=>document.fonts.load('16px "'+name+'"'))).then(faces=>faces.every(face=>face.length>0))`), true,
+    'The actual bundled icon faces must load before capturing visual evidence');
   await win.webContents.executeJavaScript(`(() => {
     const ok = data => Promise.resolve({ok:true, data});
     let sessionChanged = null;
@@ -40,14 +52,14 @@ app.whenReady().then(async () => {
       chatIds:[id], startedAt:1, updatedAt:1, endedAt:null, events:history[id].length, userMessages:1,
       toolCalls:0, errors:0, estimatedTokens:0, contextTokens:0, agents:[], origin:null}));
     const reads=[];
-    window.fixture={history,sessions,reads,
+    window.fixture={history,sessions,reads,lists:0,
       addLive:()=>{const seq=history.a.length+1;history.a.push({seq,time:seq,source:'extension',kind:'assistant_message',
         messageId:'a-live',message:{text:'New live row',truncated:false,chars:12},state:'final',final:true});
         const summary=sessions.find(row=>row.id==='a');summary.events=history.a.length;summary.updatedAt++;},
-      signal:()=>{if(!sessionChanged)throw new Error('onSessionChanged was not registered');sessionChanged();}};
+      signal:change=>{if(!sessionChanged)throw new Error('onSessionChanged was not registered');sessionChanged(change);}};
     window.api = new Proxy({
-      listSessions: () => ok({sessions, activeId:null, blocked:[], pressure:[]}),
-      listProjects: () => ok([]), listInputs: () => ok([]), listPausedHelpers: () => ok([]),
+      listSessions: () => {fixture.lists++;return ok({sessions, activeId:null, blocked:[], pressure:[]});},
+      listProjects: () => ok([]), listInputs: () => ok([]), runningTools: () => ok([]), listPausedHelpers: () => ok([]),
       onSessionChanged:handler=>{sessionChanged=handler;return()=>{if(sessionChanged===handler)sessionChanged=null;}},
       getSession: (id, options) => {
         reads.push({id,options});
@@ -69,7 +81,14 @@ app.whenReady().then(async () => {
     chat.initChat({state:()=>null, save:async()=>{}}); chat.chatVisible(true);
     const frame = () => new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
     await frame();
-    const pane = document.getElementById('chatBody'), observations = [];
+    const pane = document.getElementById('chatBody'), observations = [], scrollDelivery = [];
+    let inputAt = null;
+    pane.addEventListener('wheel', () => { inputAt = performance.now(); }, {passive:true});
+    pane.addEventListener('scroll', event => {
+      if (inputAt !== null) scrollDelivery.push({delayMs:performance.now()-inputAt, scrollEventTrusted:event.isTrusted,
+        input:'synthetic wheel followed by programmatic scrollTop', top:pane.scrollTop});
+      inputAt = null;
+    }, {passive:true});
     const select = async id => {
       document.querySelector('#sessionList [data-id="'+id+'"]').click();
       await frame();
@@ -83,24 +102,31 @@ app.whenReady().then(async () => {
       pane.scrollTop=0;
       await select('a');
     }
+    // Model input intent with a synthetic wheel, then let Chromium deliver the real scroll
+    // event caused by scrollTop. Its trust bit is not proof of native wheel input.
+    pane.dispatchEvent(new WheelEvent('wheel',{deltaY:-20}));
     pane.scrollTop=pane.scrollHeight-pane.clientHeight-20;
     await frame();
-    const nearTail=pane.scrollTop, nearTailRefreshes=[];
+    const nearTail=pane.scrollTop, nearTailRefreshes=[], unrelatedReads=[];
     for(let index=0;index<3;index++) {
       fixture.sessions.find(row=>row.id==='b').updatedAt++;
-      const reads=fixture.reads.length;fixture.signal();
-      await waitFor(()=>fixture.reads.length>reads);await frame();
-      nearTailRefreshes.push(pane.scrollTop);
+      const reads=fixture.reads.length, lists=fixture.lists;fixture.signal({sessionIds:['b']});
+      await waitFor(()=>fixture.lists>lists);await frame();
+      nearTailRefreshes.push(pane.scrollTop);unrelatedReads.push(fixture.reads.length-reads);
     }
+    pane.dispatchEvent(new WheelEvent('wheel',{deltaY:-100}));
     pane.scrollTop=700;
     await frame();
-    const readBefore=fixture.reads.length;fixture.addLive();fixture.signal();
+    const readBefore=fixture.reads.length;fixture.addLive();fixture.signal({sessionIds:['a']});
     await waitFor(()=>fixture.reads.length>readBefore&&[...document.querySelectorAll('.ev-assistant_message')].some(row=>row.textContent.includes('New live row')));
     await frame();
-    return {observations,nearTail,nearTailRefreshes, readerAfterRefresh:pane.scrollTop,readBefore,readAfter:fixture.reads.length,
+    return {observations,nearTail,nearTailRefreshes,unrelatedReads,scrollDelivery, readerAfterRefresh:pane.scrollTop,readBefore,readAfter:fixture.reads.length,
       inserted:[...document.querySelectorAll('.ev-assistant_message')].some(row=>row.textContent.includes('New live row'))};
   })()`);
   console.log(JSON.stringify(results, null, 2));
+  fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify(results, null, 2));
+  fs.writeFileSync(path.join(output, 'after-refresh.png'),
+    (await win.webContents.capturePage(undefined, {stayHidden:true,stayAwake:true})).toPNG());
   assert.ok(results.observations[0].height > results.observations[0].viewport * 2, 'Fixture must exercise an overflowing bounded tail');
   for (const row of results.observations) {
     assert.ok(row.viewport > 0, 'Chat must have visible geometry');
@@ -110,6 +136,7 @@ app.whenReady().then(async () => {
   assert.equal(results.inserted, true, 'Live refresh must render the inserted assistant row');
   assert.equal(results.readerAfterRefresh, 700, 'Live refresh preserves deliberate reading');
   assert.deepEqual(results.nearTailRefreshes,[results.nearTail,results.nearTail,results.nearTail], 'Other sessions cannot reclaim a near-tail reading position');
+  assert.deepEqual(results.unrelatedReads,[0,0,0], 'Another session\'s activity refreshes the catalog without rereading this transcript');
   console.log('Chat opening passed: initial open, A/B/A cycles, long first message, near-tail background refresh and live reader position.');
   win.destroy(); app.exit(0);
 }).catch(error => { console.error(error); app.exit(1); });

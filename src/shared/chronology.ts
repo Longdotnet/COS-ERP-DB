@@ -221,6 +221,11 @@ export function projectTimeline<T extends Chronological>(
   });
 }
 
+/** Entries recorded from one read of the page land within this many milliseconds of each other. */
+const SAME_READ_MS = 50;
+/** A call ChatGPT issued reaches this app through the tunnel within this many milliseconds. */
+const CALL_TRANSIT_MS = 1_000;
+
 /** Where an entry sits in the log: its first appearance if it has revisions, else its seq. */
 export function positionOf(entry: Chronological): number {
   return typeof entry.origin === 'number' && Number.isFinite(entry.origin) ? entry.origin : entry.seq;
@@ -294,11 +299,46 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   const rank = (entry: T, ends: T | null): number =>
     entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : entry === ends ? 0.5 : 0;
 
+  /*
+   * A native ChatGPT step (a web search, a round's recap) carries only the moment it was read,
+   * while prose carries the moment ChatGPT opened it — and ChatGPT opens a paragraph before the
+   * steps drawn above it can be read. Compared as they are, a round's recap fell after the paragraph
+   * that follows it and headed the next round. A step read after a paragraph was opened but no later
+   * than its text (the same pass included) is placed just before the paragraph.
+   *
+   * A call carries the moment it reached this app, after its trip through the tunnel. One ChatGPT
+   * issued just before opening the paragraph arrives a moment after it, so a call that arrived
+   * within CALL_TRANSIT_MS of the opening is placed before the paragraph too. A later one stays
+   * below it even when the paragraph was read later still: a hidden tab is read slowly.
+   */
+  const readBefore = new Map<T, number>();
+  const placeBefore = (group: readonly T[]): void => {
+    const paragraphs = group.filter(entry => entry.kind === 'assistant_message' && authoredTimeOf(entry) !== undefined)
+      .sort((a, b) => position(a) - position(b) || a.seq - b.seq);
+    // A call only moves above prose read live: the turn went on after it. A paragraph first seen
+    // after a reload was read long after the work below it.
+    const live = paragraphs.filter(entry => group.some(later => later.kind !== 'turn_end' && later.time > entry.time))
+      .sort((a, b) => authoredTimeOf(a)! - authoredTimeOf(b)!);
+    for (const work of group) {
+      if ((work.kind !== 'page_tool' && work.kind !== 'tool_call') || authoredTimeOf(work) !== undefined) continue;
+      // A step belongs to the paragraph after it on the page, which is read after it: when a whole
+      // turn is read late in one pass, every step still keeps to its own paragraph.
+      const prose = work.kind === 'page_tool'
+        ? paragraphs.find(entry => position(entry) > position(work) && authoredTimeOf(entry)! < work.time && work.time <= entry.time + SAME_READ_MS)
+        : live.find(entry => authoredTimeOf(entry)! < work.time && work.time <= authoredTimeOf(entry)! + CALL_TRANSIT_MS);
+      if (!prose) continue;
+      // One scale for steps and calls alike, so the ones moved before a paragraph keep their order.
+      const opened = authoredTimeOf(prose)!, span = Math.max(prose.time + SAME_READ_MS, opened + CALL_TRANSIT_MS) - opened;
+      // Strictly between anything that happened before the paragraph opened and the paragraph itself.
+      readBefore.set(work, opened - 1 + 0.9 * (work.time - opened) / span);
+    }
+  };
+
   // An entry with no usable time is ordered by its stable position (`origin` for a mutable
   // canonical item, otherwise `seq`) rather than being flung to one end of its turn: a
   // missing timestamp is not evidence about when the thing happened.
   const byTime = (a: T, b: T): number => {
-    const apart = (authoredTimeOf(a) ?? a.time) - (authoredTimeOf(b) ?? b.time);
+    const apart = (readBefore.get(a) ?? authoredTimeOf(a) ?? a.time) - (readBefore.get(b) ?? authoredTimeOf(b) ?? b.time);
     return Number.isFinite(apart) && apart !== 0
       ? apart
       : position(a) - position(b) || a.seq - b.seq;
@@ -337,6 +377,7 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
     const group = groups.get(anchor)!;
     const ends = closing(group);
+    placeBefore(group);
     group.sort((a, b) => rank(a, ends) - rank(b, ends) || byTime(a, b));
     out.push(...group);
   }

@@ -11,8 +11,10 @@ function saveFormula(): void {
   try { localStorage.setItem(FORMULA_KEY, JSON.stringify(formula)); } catch { /* Read-only storage still permits an in-memory comparison. */ }
 }
 
-const count = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
-const money = new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+// In the app's language, like every other number on this page, not the system region's: an English
+// page read "4.082,99 $" and "8,5 Mrd." on a German Mac. Created per call so a language change applies.
+const count = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { notation: 'compact', maximumFractionDigits: 1 }).format(value) };
+const money = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) };
 const featureLabels: Record<string, string> = { deep_research: "Deep research", file_upload: "File uploads", paste_text_to_file: "Pasted text files", image_gen: "Image generation" };
 function usageHint(node: HTMLElement, text: string | (() => string)): void {
   ui(node, 'data-usage-hint', typeof text === 'function' ? text : () => text);
@@ -44,7 +46,7 @@ function paintMessages(): void {
   ui($('usageMessages56'), 'textContent', () => totals.gpt56.toLocaleString(currentLanguage()));
   ui($('usageMessages6'), 'textContent', () => totals.gpt6.toLocaleString(currentLanguage()));
   const period = () => {
-    const format = new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' });
+    const format = new Intl.DateTimeFormat(currentLanguage(), { dateStyle: 'short', timeStyle: 'short' });
     return t('Local time · {0} → {1}', [format.format(from), format.format(through)]);
   };
   ui($('usageMessagePeriod'), 'textContent', period);
@@ -65,7 +67,7 @@ export async function refreshUsage(): Promise<void> {
     paintMessages();
     const summary = $('usageSummary'); summary.replaceChildren();
     for (const [label, number] of [['Processed tokens · est.', value.tokens], ['Peak daily tokens', Math.max(0, ...value.days.map((day) => day.tokens))], ['Conversations', value.sessions], ['Active days', value.days.filter((day) => day.tokens > 0).length]] as const) {
-      const item = el('div'); item.dataset.usageMetric = label; usageHint(item, () => `${Math.round(number).toLocaleString()} ${t(label).toLowerCase()}`); item.append(el('strong', '', count.format(number)), el('span', '', () => t(label))); summary.append(item);
+      const item = el('div'); item.dataset.usageMetric = label; usageHint(item, () => `${Math.round(number).toLocaleString(currentLanguage())} ${t(label).toLowerCase()}`); item.append(el('strong', '', () => count.format(number)), el('span', '', () => t(label))); summary.append(item);
     }
     const limits = $('usageLimits'); limits.replaceChildren();
     const modelRows = value.limits.filter((row) => row.scope === 'model');
@@ -79,9 +81,9 @@ export async function refreshUsage(): Promise<void> {
       const name = el('div'); name.append(el('strong', '', displayName));
       if (entry.scope !== 'model') name.append(el('small', 'muted', () => entry.scope === 'shared' ? t("Shared across all models") : t("Feature quota")));
       const detail = el('div');
-      detail.append(el('b', '', () => stale ? t("Refresh needed") : entry.remaining !== null ? t("{0} remaining", [entry.remaining.toLocaleString()]) : entry.remainingPercent !== null ? t("{0}% remaining", [Math.round(entry.remainingPercent)]) : t("Not reported")));
+      detail.append(el('b', '', () => stale ? t("Refresh needed") : entry.remaining !== null ? t("{0} remaining", [entry.remaining.toLocaleString(currentLanguage())]) : entry.remainingPercent !== null ? t("{0}% remaining", [Math.round(entry.remainingPercent)]) : t("Not reported")));
       const window = () => entry.scope === 'shared' ? '' : entry.windowSeconds === 604800 ? t("Weekly · ") : entry.windowSeconds ? t("{0}h window · ", [Math.round(entry.windowSeconds / 3600)]) : '';
-      detail.append(el('small', 'muted', () => window() + (entry.resetAt ? t("Resets {0}", [new Date(entry.resetAt).toLocaleString()]) : t("Reset not reported"))));
+      detail.append(el('small', 'muted', () => window() + (entry.resetAt ? t("Resets {0}", [new Date(entry.resetAt).toLocaleString(currentLanguage())]) : t("Reset not reported"))));
       if (entry.remainingPercent !== null && !stale) { const progress = document.createElement('progress'); progress.max = 100; progress.value = entry.remainingPercent; ui(progress, 'aria-label', () => t("{0}: {1}% remaining", [displayName(), entry.remainingPercent])); detail.append(progress); }
       row.append(name, detail); limits.append(row);
     }
@@ -122,54 +124,51 @@ function paintCost(): void {
   const costSummary = document.getElementById('usageTotalCost');
   if (costSummary) {
     ui(costSummary.querySelector('strong')!, 'textContent', () => costText(total));
-    ui(costSummary, 'data-usage-hint', () => t('{0} estimated tokens; {1} have no comparison rate. Cached-input equivalent, not a bill.', [Math.round(total.tokens).toLocaleString(), Math.round(total.unpricedTokens).toLocaleString()]));
+    ui(costSummary, 'data-usage-hint', () => t('{0} estimated tokens; {1} have no comparison rate. Cached-input equivalent, not a bill.', [Math.round(total.tokens).toLocaleString(currentLanguage()), Math.round(total.unpricedTokens).toLocaleString(currentLanguage())]));
   }
   const daily = snapshot.days.map(day => ({ ...day, ...usageEstimate(day.models, formula) }));
   for (const [label, number] of [['Processed tokens · est.', total.tokens], ['Peak daily tokens', Math.max(0, ...daily.map(day => day.tokens))]] as const) {
     const item = [...$('usageSummary').children].find(node => (node as HTMLElement).dataset.usageMetric === label) as HTMLElement | undefined;
-    if (item) { item.querySelector('strong')!.textContent = count.format(number); ui(item, 'data-usage-hint', () => `${Math.round(number).toLocaleString()} ${t(label).toLowerCase()}`); }
+    if (item) { ui(item.querySelector('strong')!, 'textContent', () => count.format(number)); ui(item, 'data-usage-hint', () => `${Math.round(number).toLocaleString(currentLanguage())} ${t(label).toLowerCase()}`); }
   }
   const heat = $('usageHeatmap'); heat.replaceChildren();
   const byDay = new Map(daily.map(day => [day.date, day.tokens])); const peak = Math.max(1, ...daily.map(day => day.tokens));
-  // Start at the first recorded day (at least 12 and at most 52 weeks) so a new workspace
-  // is not a year of empty squares.
-  const first = daily.find(day => day.tokens > 0)?.date;
-  const since = first ? Math.floor((Date.now() - new Date(`${first}T00:00:00`).getTime()) / 86_400_000) + 1 : 0;
-  const weeks = Math.min(52, Math.max(12, Math.ceil(since / 7) + 1));
+  // Keep a stable annual window even with sparse history; activity must not change the axis.
+  const weeks = 52;
   // A calendar: one column per week starting on Monday, one row per weekday, today in the
   // last column. Days after today stay as empty slots so the rows keep their weekday.
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const start = new Date(today); start.setDate(start.getDate() - (today.getDay() + 6) % 7 - (weeks - 1) * 7);
-  // One grid: weekday labels in the first column, months in the first row. Squares share
-  // the width, up to a comfortable size, so twelve weeks are not a stamp in a wide card.
+  // Weekday labels and months share the cell grid. CSS owns its responsive width.
   const grid = el('div', 'heat-grid'); grid.setAttribute('role', 'group');
   grid.style.gridTemplateColumns = `var(--heat-label) repeat(${weeks}, minmax(0, 1fr))`;
-  grid.style.maxWidth = `calc(var(--heat-label) + ${weeks} * var(--heat-max))`;
   const place = (node: HTMLElement, row: number, column: string) => { node.style.gridRow = String(row); node.style.gridColumn = column; grid.append(node); };
   for (let row = 0; row < 7; row += 2) {
     const label = el('span', 'heat-day'); label.setAttribute('aria-hidden', 'true');
     ui(label, 'textContent', () => new Date(2026, 8, 21 + row).toLocaleDateString(currentLanguage(), { weekday: 'short' }));
     place(label, row + 2, '1');
   }
-  let lastMonth = -1;
+  // Label each of the twelve months, including a month starting in the current week.
+  // Use UTC calendar ordinals only for day distances, avoiding local DST hour shifts.
+  const ordinal = (date: Date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000;
+  for (let offset = 11; offset >= 0; offset--) {
+    const date = new Date(today.getFullYear(), today.getMonth() - offset, 1);
+    const week = Math.max(0, Math.floor((ordinal(date) - ordinal(start)) / 7));
+    const month = el('span', 'heat-month'); month.setAttribute('aria-hidden', 'true');
+    ui(month, 'textContent', () => date.toLocaleDateString(currentLanguage(), { month: 'short' }));
+    // Reserve at least three columns for the final label without adding implicit grid tracks.
+    const column = Math.min(week, weeks - 3);
+    if (column !== week) month.classList.add('is-end');
+    place(month, 1, `${column + 2} / span 3`);
+  }
   for (let week = 0; week < weeks; week++) {
     const monday = new Date(start); monday.setDate(start.getDate() + week * 7);
-    if (monday.getMonth() !== lastMonth && week < weeks - 1) {
-      lastMonth = monday.getMonth();
-      // A month cut to its last days at the left edge would collide with the next label.
-      const soon = new Date(monday); soon.setDate(monday.getDate() + 14);
-      if (week > 0 || soon.getMonth() === lastMonth) {
-        const month = el('span', 'heat-month'); month.setAttribute('aria-hidden', 'true');
-        ui(month, 'textContent', () => monday.toLocaleDateString(currentLanguage(), { month: 'short' }));
-        place(month, 1, `${week + 2} / span 3`);
-      }
-    }
     for (let row = 0; row < 7; row++) {
       const date = new Date(monday); date.setDate(monday.getDate() + row);
       if (date > today) { place(el('span', 'heat-cell is-future'), row + 2, String(week + 2)); continue; }
       const key = dateKey(date), tokens = byDay.get(key) ?? 0;
       const cell = el('span', 'heat-cell'); cell.dataset.level = String(tokens ? Math.max(1, Math.ceil(tokens / peak * 4)) : 0);
-      const hint = () => t("{0}: {1} estimated tokens", [dayLabel(key), Math.round(tokens).toLocaleString()]); usageHint(cell, hint); ui(cell, 'aria-label', hint);
+      const hint = () => t("{0}: {1} estimated tokens", [dayLabel(key), Math.round(tokens).toLocaleString(currentLanguage())]); usageHint(cell, hint); ui(cell, 'aria-label', hint);
       place(cell, row + 2, String(week + 2));
     }
   }
@@ -178,9 +177,9 @@ function paintCost(): void {
   for (let level = 0; level <= 4; level++) { const swatch = el('span', 'heat-cell'); swatch.dataset.level = String(level); legend.append(swatch); }
   legend.append(el('span', '', () => t('More')));
   heat.append(grid, legend);
-  ui($('usageHeatmapCaption'), 'textContent', () => weeks === 52 ? t("Estimated context processed per tool call · last 52 weeks") : t("Estimated context processed per tool call · last {0} weeks", [weeks]));
-  ui($('usageFormula'), 'textContent', () => t("Final frontend context (capped at {2} tokens for this estimate) × unique tool calls ÷ {0} × each model’s cached-input rate ÷ 1M × {1}.", [formula.divisor, formula.multiplier, snapshot!.contextTokenCap.toLocaleString()]));
-  ui($('usageCost'), 'textContent', () => t("{0} estimated equivalent. {1}This is a comparison, not a bill.", [costText(total), total.unpricedTokens ? t("{0} tokens have no rate. ", [Math.round(total.unpricedTokens).toLocaleString()]) : '']));
+  ui($('usageHeatmapCaption'), 'textContent', () => t("Estimated context processed per tool call · last 52 weeks"));
+  ui($('usageFormula'), 'textContent', () => t("Final frontend context (capped at {2} tokens for this estimate) × unique tool calls ÷ {0} × each model’s cached-input rate ÷ 1M × {1}.", [formula.divisor, formula.multiplier, snapshot!.contextTokenCap.toLocaleString(currentLanguage())]));
+  ui($('usageCost'), 'textContent', () => t("{0} estimated equivalent. {1}This is a comparison, not a bill.", [costText(total), total.unpricedTokens ? t("{0} tokens have no rate. ", [Math.round(total.unpricedTokens).toLocaleString(currentLanguage())]) : '']));
   const modelTable = el('table', 'usage-table'); const modelHead = el('tr');
   for (const title of ['Recorded model / effort', 'Estimated tokens', 'Estimated equivalent']) modelHead.append(el('th', '', () => t(title)));
   modelTable.append(modelHead);
@@ -188,7 +187,7 @@ function paintCost(): void {
     const estimate = usageEstimate(entry.sources, formula); const row = el('tr');
     const name = el('td', '', () => `${entry.model} · ${entry.reasoningEffort ?? t("effort unknown")}${entry.assumed ? t(" (assumed)") : ''}`);
     usageHint(name, () => t("Recorded IDs: {0}", [[...new Set(entry.sources.map(source => source.model))].join(', ')]));
-    row.append(name, el('td', '', Math.round(estimate.tokens).toLocaleString()), el('td', '', () => estimate.unpricedTokens > 0 && estimate.unpricedTokens === estimate.tokens ? t("Rate unknown") : costText(estimate))); modelTable.append(row);
+    row.append(name, el('td', '', () => Math.round(estimate.tokens).toLocaleString(currentLanguage())), el('td', '', () => estimate.unpricedTokens > 0 && estimate.unpricedTokens === estimate.tokens ? t("Rate unknown") : costText(estimate))); modelTable.append(row);
   }
   // The last 30 days as bars, one glance instead of a long table; the table stays one click away.
   const recent = daily.slice(-30);
@@ -199,21 +198,27 @@ function paintCost(): void {
     const bar = el('span', 'usage-bar');
     bar.style.height = `${top > 0 ? Math.max(2, Math.round(day.cost / top * 100)) : 2}%`;
     if (day.cost === top && top > 0) bar.classList.add('is-peak');
-    usageHint(bar, () => `${dayLabel(day.date)} · ${costText(day)} · ${t("{0} estimated tokens", [Math.round(day.tokens).toLocaleString()])}`);
+    usageHint(bar, () => `${dayLabel(day.date)} · ${costText(day)} · ${t("{0} estimated tokens", [Math.round(day.tokens).toLocaleString(currentLanguage())])}`);
     chart.append(bar);
   }
   // Scale and range at a glance: the peak day's amount on top, the first and last day below.
-  const scale = el('div', 'usage-bars-scale', money.format(top));
+  const scale = el('div', 'usage-bars-scale', () => money.format(top));
   const axis = el('div', 'usage-bars-axis');
   if (recent.length) axis.append(el('span', '', () => dayLabel(recent[0]!.date)), el('span', '', () => dayLabel(recent[recent.length - 1]!.date)));
   const breakdown = el('details', 'usage-breakdown');
   breakdown.append(el('summary', '', () => t("Daily breakdown")));
   const table = el('table', 'usage-table'); const head = el('tr');
   head.append(el('th', '', () => t("Day")), el('th', '', () => t("Estimated tokens")), el('th', '', () => t("Cached × {0}", [formula.multiplier]))); table.append(head);
-  for (const day of [...daily].reverse()) { const row = el('tr'); row.append(el('td', '', () => dayLabel(day.date)), el('td', '', Math.round(day.tokens).toLocaleString()), el('td', '', costText(day))); table.append(row); }
+  for (const day of [...daily].reverse()) { const row = el('tr'); row.append(el('td', '', () => dayLabel(day.date)), el('td', '', () => Math.round(day.tokens).toLocaleString(currentLanguage())), el('td', '', () => costText(day))); table.append(row); }
   if (!snapshot.days.length) { const row = el('tr'); const cell = el('td', 'muted', () => t("No recorded tool calls yet.")); cell.setAttribute('colspan', '3'); row.append(cell); table.append(row); }
   breakdown.append(table);
-  $('usageDays').replaceChildren(modelTable, ...(recent.length ? [scale, chart, axis] : []), breakdown);
+  const modelSection = el('section', 'usage-days-model');
+  modelSection.append(el('h3', 'usage-cost-subhead', () => t('By model')), modelTable);
+  const daySection = el('section', 'usage-days-daily');
+  daySection.append(el('h3', 'usage-cost-subhead', () => t('By day')));
+  if (recent.length) daySection.append(scale, chart, axis);
+  daySection.append(breakdown);
+  $('usageDays').replaceChildren(modelSection, daySection);
 }
 export function initUsage(): void {
   try {

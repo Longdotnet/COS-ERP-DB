@@ -1,15 +1,17 @@
 /**
  * Passive, bounded page-response projection.
  *
- * Never reads request headers, cookies, credentials or request bodies. Besides
+ * Never reads request headers, cookies or credentials. Bounded send/resume JSON contributes
+ * only model/message ids or the resume's conversation id. Besides
  * quota metadata, it observes the two opaque identifiers ChatGPT itself puts in the live
  * conversation event stream: `conversation_id` and `metadata.request_id`. The latter can
  * reach the stream tens of seconds before React publishes it, which is the difference between
- * an exact Core caller and CALLER_IDENTITY_REQUIRED. Only that pair crosses worlds.
+ * an exact Core caller and CALLER_IDENTITY_REQUIRED. Resume requests also project their
+ * opaque conversation id and HTTP status; the isolated recorder owns generation eligibility.
  */
 (() => {
   'use strict';
-  const OBSERVER_VERSION = 2;
+  const OBSERVER_VERSION = 3;
   const prior = window.__cosUsageObserver;
   // An extension update re-executes this file in pages that stay open, and the same protocol
   // version used to keep the *old* code running until the tab was reloaded — measured
@@ -87,6 +89,62 @@
     latestOrder = order;
     latest = { type: 'cos-usage', rows, observedAt }; post(latest, location.origin);
   };
+  /**
+   * The Core app's identity, read from the page's own system hint list (#861).
+   *
+   * On some accounts ChatGPT attaches an app to a message only when the message mentions it, so
+   * prompts the app sends carry a mention of Core. Only app ids and names leave this world.
+   *
+   * A computer sharing its ChatGPT account with another names its Core with a suffix
+   * ("COS ERP DB Core (Windows)"), and this world cannot know which one is this install's:
+   * the page may load its hints before the extension has heard from the app. So every Core-like
+   * name is reported with its app id, and the content script picks its own by exact name. A name
+   * that more than one app carries is ambiguous and reported without an id.
+   */
+  const CORE_APP_NAME = 'COS ERP DB Core';
+  const CORE_NAME = /^COS ERP DB Core(?: \([\p{L}\p{N} ._-]{1,32}\))?$/u;
+  let coreMention = null;
+  async function inspectSystemHints(response) {
+    if (!active) return;
+    let url;
+    try { url = new URL(response.url); } catch { return; }
+    if (url.origin !== location.origin || url.pathname !== '/backend-api/system_hints') return;
+    if (!response.ok || !response.headers.get('content-type')?.includes('application/json')) return;
+    const copy = response.clone(), reader = copy.body?.getReader();
+    if (!reader) return;
+    readers.add(reader);
+    const timer = setTimeout(() => void reader.cancel().catch(() => {}), 10000);
+    let bytes = 0, text = ''; const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read(); if (done) break;
+        bytes += value.byteLength; if (bytes > 1024 * 1024) return;
+        text += decoder.decode(value, { stream: true });
+      }
+      const list = JSON.parse(text + decoder.decode())?.system_hints;
+      if (!Array.isArray(list)) return;
+      const byName = new Map();
+      for (const hint of list.slice(0, 2000)) {
+        const id = /^(?:plugin|connector):(asdk_app_[A-Za-z0-9_-]{1,160})$/.exec(typeof hint?.system_hint === 'string' ? hint.system_hint : '')?.[1];
+        if (!id || typeof hint.name !== 'string' || !CORE_NAME.test(hint.name)) continue;
+        if (!byName.has(hint.name)) byName.set(hint.name, new Set());
+        byName.get(hint.name).add(id);
+      }
+      // The page asks for several hint lists (basic, custom agents, plugins) and only the plugins
+      // list names Core, in whatever order they answer. A list without Core says nothing about it;
+      // only two different apps with the same Core name make that name ambiguous.
+      // Only the plugins list (`mode=plugins`, measured live) is complete about plugins: there a
+      // missing Core is news. Any other list without Core still says nothing about it.
+      const pluginList = url.searchParams.get('mode') === 'plugins';
+      if ((!byName.size && !pluginList) || byName.size > 16) return;
+      const candidates = [...byName].map(([name, ids]) => ({ name, path: ids.size === 1 ? `app://${[...ids][0]}` : null }));
+      const plain = candidates.find(candidate => candidate.name === CORE_APP_NAME);
+      // `path`/`name` keep describing the plain Core for a content script from before suffixes.
+      coreMention = { type: 'cos-core-mention', path: plain?.path ?? null, name: plain?.path ? CORE_APP_NAME : null, candidates, pluginList };
+      post(coreMention, location.origin);
+    } catch { /* An unreadable list proves nothing; prompts keep going without a mention. */ }
+    finally { clearTimeout(timer); readers.delete(reader); void reader.cancel().catch(() => {}); }
+  }
   async function inspect(response, observedAt, order) {
     if (!active) return;
     let url;
@@ -314,13 +372,34 @@
       if (url.origin !== location.origin || !/^\/backend-api\/(?:f\/)?conversation$/.test(url.pathname)) return;
       const body = JSON.parse(init.body);
       const model = typeof body?.model === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(body.model) ? body.model : null;
-      const messageIds = (Array.isArray(body?.messages) ? body.messages : []).slice(0, 8)
-        .filter(message => message?.author?.role === 'user' && typeof message.id === 'string' && CONVERSATION.test(message.id))
-        .map(message => message.id);
+      const users = (Array.isArray(body?.messages) ? body.messages : []).slice(0, 8)
+        .filter(message => message?.author?.role === 'user' && typeof message.id === 'string' && CONVERSATION.test(message.id));
+      const messageIds = users.map(message => message.id);
       if (model && messageIds.length) post({ type: 'cos-send-model', model, messageIds, observedAt }, location.origin);
+      // The same request is the one record of a question that ChatGPT cannot redraw away: a new
+      // chat's first question can leave the page before it is read once (#942). Its exact id lets
+      // the isolated world confirm the Send it just clicked. Ids only: the prompt stays here.
+      if (messageIds.length === 1) post({ type: 'cos-send-request', messageIds, observedAt }, location.origin);
     } catch { /* A body this reader does not understand proves nothing. */ }
   }
   const inspectedResponses = new WeakSet();
+  function resumeRequest(args) {
+    try {
+      const init = args[1];
+      const method = String(init?.method || args[0]?.method || 'GET').toUpperCase();
+      const url = new URL(typeof args[0] === 'string' ? args[0] : args[0] instanceof URL ? args[0].href : args[0].url, location.origin);
+      if (method !== 'POST' || url.origin !== location.origin || url.pathname !== '/backend-api/f/conversation/resume' ||
+          typeof init?.body !== 'string' || init.body.length > 16 * 1024) return null;
+      const conversationId = JSON.parse(init.body)?.conversation_id;
+      if (typeof conversationId !== 'string' || !CONVERSATION.test(conversationId)) return null;
+      const request = { id: crypto.randomUUID(), conversationId };
+      // Capture the recorder's owner BEFORE fetch can yield or navigation can replace it.
+      // postMessage is asynchronous and could stamp an old request with a newer epoch.
+      window.dispatchEvent(new MessageEvent('message', { source: window, origin: location.origin,
+        data: { type: 'cos-resume-request', ...request } }));
+      return request;
+    } catch { return null; }
+  }
   const installFetchObserver = () => {
     if (!active || window.fetch === observedFetch || typeof window.fetch !== 'function') return;
     // A page wrapper may still call our earlier wrapper. Capture its downstream
@@ -330,13 +409,26 @@
       // Request order fences late responses, not accounts. No account identity is inferred.
       const observedAt = Date.now(), order = ++requestOrder;
       noteSendModel(args, observedAt);
+      const resume = active ? resumeRequest(args) : null;
       const result = downstreamFetch.apply(this, args);
       if (!active) return result;
       void result.then((response) => {
         if (!active) return;
+        let status = null, streamOpened = false;
+        try {
+          const url = new URL(response.url);
+          if (url.origin === location.origin && url.pathname === '/backend-api/f/conversation/resume') {
+            status = response.status;
+            streamOpened = status === 200 && response.headers.get('content-type')?.includes('text/event-stream');
+          }
+        } catch { /* Unknown response identity cannot report a failure. */ }
+        if (resume) post({ type: 'cos-resume-response', ...resume,
+          status: inspectedResponses.has(response) ? null : status,
+          ...(streamOpened && !inspectedResponses.has(response) ? { streamOpened: true } : {}) }, location.origin);
         if (inspectedResponses.has(response)) return;
         inspectedResponses.add(response);
         void inspect(response, observedAt, order).catch(() => {});
+        void inspectSystemHints(response).catch(() => {});
         let method = 'GET';
         try {
           const explicit = args[1] && typeof args[1].method === 'string' ? args[1].method : null;
@@ -344,7 +436,10 @@
           method = String(explicit || inherited || 'GET').toUpperCase();
         } catch { return; }
         if (method === 'POST') void inspectRequestOrigins(response, observedAt).catch(() => {});
-      }).catch(() => {});
+      }).catch(() => {
+        // Network rejection only retires custody; it cannot prove that the stream is gone.
+        if (resume) post({ type: 'cos-resume-response', ...resume, status: null }, location.origin);
+      });
       return result;
     };
     // ChatGPT installs its own fetch instrumentation after document_start. Keep that owner in
@@ -361,6 +456,7 @@
   const request = (event) => {
     if (!active || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-usage-request') return;
     if (latest) post(latest, location.origin);
+    if (coreMention) post(coreMention, location.origin);
     // Newest first: old evidence must not fill content's 16-ID pending capacity
     // before the current workflow can enter it during document startup.
     for (const { conversationId, requestId, observedAt } of [...origins.values()].slice(-16).reverse())

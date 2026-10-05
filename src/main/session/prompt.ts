@@ -7,8 +7,9 @@ import { resolvePath } from '../sandbox.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt } from '../../shared/user-prompt.js';
 import { selectedSkillInstructions, type SelectedSkill } from './skill-prompt.js';
 import { listSkillLibrary } from '../skill-library.js';
+import type { RoutedSkillSelection } from '../../shared/skill-routing.js';
 
-type PromptScope = { sessionId?: string | null; projectId?: string | null };
+type PromptScope = { sessionId?: string | null; projectId?: string | null; autoSkills?: readonly RoutedSkillSelection[] };
 export type PromptLimits = { maxChars: number; maxBytes: number };
 type ProjectInstructions = { directory: string; text: string; truncated: boolean };
 const limits: PromptLimits = { maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: Infinity };
@@ -114,9 +115,12 @@ export function fitSessionPrompt(text: string, core: string, agents: ProjectInst
 export async function prepareSessionPrompt(text: string, scope: PromptScope = {}, budget = limits, authored = text): Promise<string> {
   const folder = await promptFolder(scope);
   const skillScope = { projectPath: folder?.real ?? null };
-  const library = await listSkillLibrary(skillScope);
+  // Automatic routing has already frozen its decision from the app's published Skill catalog at
+  // admission, so those Skills come from that catalog: only the selected body is read below. Every
+  // other Skill the chat can use is still listed, exactly as without routing.
+  const library = await listSkillLibrary(scope.autoSkills !== undefined ? { ...skillScope, managedFromCatalog: true } : skillScope);
   const core = await currentCoreInstructions(library);
-  const skills = await selectedSkillInstructions(authored, skillScope, library);
+  const skills = await selectedSkillInstructions(authored, skillScope, library, scope.autoSkills);
   fitSessionPrompt(text, core, null, budget); // Only Core/task overflow is mandatory.
   const agents = await projectInstructions(scope);
   if ((await promptFolder(scope))?.real !== folder?.real) throw new Error('The selected project changed during Skill preparation');
@@ -126,7 +130,7 @@ export async function prepareSessionPrompt(text: string, scope: PromptScope = {}
 /** Explicit follow-up selection adds Skills only, never repeats opening setup. */
 export async function prepareSkillFollowup(text: string, authored: string, budget = limits, scope: PromptScope = {}): Promise<string> {
   const folder = await promptFolder(scope);
-  const skills = await selectedSkillInstructions(authored, { projectPath: folder?.real ?? null });
+  const skills = await selectedSkillInstructions(authored, { projectPath: folder?.real ?? null }, undefined, scope.autoSkills);
   if ((await promptFolder(scope))?.real !== folder?.real) throw new Error('The selected project changed during Skill preparation');
   return skills.length ? fitSessionPrompt(text, '', null, budget, skills) : text;
 }
