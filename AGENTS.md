@@ -456,14 +456,20 @@ preserve order and deduplicate; prose/code later in a message is literal. Empty/
 states do not intercept Enter. Draft replacement, navigation, render generations and IME composition retire stale choices.
 
 `skill-library.ts` discovers repository `.agents/skills`, project `.codex/skills`, standard user,
-Codex, system and admin directories only within current approved roots. No new root authority or
-implicit cwd is granted. Depth, directory entries, catalog rows and errors are bounded; package
+Codex, system and admin directories within current approved roots, and the user's own Skill areas
+read-only without approving their homes (below). No new root authority or implicit cwd is granted. Depth, directory entries, catalog rows and errors are bounded; package
 references are not recursively treated as another catalog. External command IDs derive from
 canonical paths and remain stable when similarly named packages appear. `skill-metadata.ts` owns
 bounded YAML/TOML parsing and layered configuration. Invalid policy never enables implicit use.
+`skillLibraryInstructions` writes the model-facing index within `max_context_tokens` (2000 by
+default). Sources take turns (the user's own/repo/managed Skills, `~/.agents`, Codex home, Codex
+plugins, Claude's own, Claude plugins), so one large source cannot crowd the others out. Rows are
+grouped under their folder, written once, as `<entry>: /<id> — description` (descriptions cut at
+110 characters). Each Skill is `<folder>/<entry>/SKILL.md`. Skills that do not fit are counted in
+one closing line saying the user can pick them with `/`.
 `skill-package.ts` stages resource copies and publishes SKILL.md last; the existing serialized
 managed-library owner controls imports and removals. Scripts/assets remain inert resources.
-When `CODEX_HOME` is already inside an approved root and has a plugin cache, that same read-only
+When `CODEX_HOME` has a plugin cache (approved or as a user Skill area), that same read-only
 catalog may project Skills from the last `codex plugin list --json` installed/enabled snapshot.
 Only explicit `skills:library` inspection may create or refresh that runtime snapshot; session
 prompt preparation, follow-up selection and MCP instructions never start or await the CLI.
@@ -480,14 +486,41 @@ proof of the external CLI's current state. CoS does not infer state by enumerati
 marketplace and installed version select exactly
 `plugins/cache/<marketplace>/<plugin>/<version>`. That package must still pass the normal sandbox
 checks plus `plugin.json` (or compatibility `.codex-plugin/plugin.json`) identity validation before
-only its `skills/` root is scanned. Disabled plugins, unlisted stale cache entries, marketplace
-source checkouts and unapproved Codex homes remain invisible. The catalog carries the runtime's
+only its `skills/` root is scanned. Disabled plugins, unlisted stale cache entries and marketplace
+source checkouts remain invisible. The catalog carries the runtime's
 plugin/package source provenance. Plugin skill command identity is based on marketplace + plugin
 and package-relative Skill path so an installed version upgrade does not rename the command.
 The Windows npm shim is not executed through a shell: its JavaScript entry runs through the
 current executable with child-only `ELECTRON_RUN_AS_NODE=1`. A native Codex executable keeps its
 existing environment. This distinction prevents a packaged Electron executable from reopening
 the app instead of running the npm entry; it changes neither installed Electron fuses nor roots.
+
+Claude Code Skills are discovered from files only; no Claude Code process runs. The Claude home is
+`CLAUDE_CONFIG_DIR` or `~/.claude`. Its `skills/` folder is a user root (source `claude-home`) and a
+project's `.claude/skills` is a repo root (source `project-claude`). Plugin Skills (source
+`claude-plugin`) come from `plugins/installed_plugins.json` (v2: `plugins["name@marketplace"]` lists
+installations with `scope`, `installPath`, `version`, and `projectPath` for project/local scope)
+filtered by `enabledPlugins` (`true` only) from the user `settings.json`, overridden by the
+project's `.claude/settings.json` and then `.claude/settings.local.json`. One installation per
+plugin counts: the user-scope one, or a project/local one whose `projectPath` is the current
+project. Its `installPath` must be a readable directory inside `<claude home>/plugins/cache`, a
+present `.claude-plugin/plugin.json` must name the same plugin, and only its `skills/` root is
+scanned. `LibrarySkill.claudePlugin` carries `{ pluginId, pluginName, marketplaceName, version,
+skillPath }`; the command id is `<stem>--claude-<hash>`, hashed from marketplace + plugin +
+package-relative Skill path so a plugin update keeps the command.
+
+`user-skills.ts`: the user's own Skill areas are `claude` (`CLAUDE_CONFIG_DIR` or `~/.claude`),
+`codex` (`CODEX_HOME` or `~/.codex`), `agents` (`~/.agents`) and `admin` (the Codex admin folder).
+Unapproved, they are readable at two levels. **Served** to read tools (`read`, `view_image`, search,
+glob) as `/user-skills/<area>/…`: only `skills/…` and cached plugin packages'
+`plugins/cache/<m>/<p>/<v>/skills/…`. **Discoverable** by the catalog only, never served: those plus
+Claude's `settings.json`, `plugins/installed_plugins.json` and account `.claude.json`, and Codex's home,
+`config.toml`, cached package folders and `plugin.json` manifests. Paths are checked by name and
+after following links; a link may land only in a tree of the same level (`~/.claude/skills/x →
+~/.agents/skills/x` works, links into the home or elsewhere are refused). `resolveIn` refuses
+`/user-skills` unless the call passes `access: 'read'`, so patches, writes, `save_image` and
+command folders never reach it, and it never becomes the chat's workspace. Credentials, history
+and other settings in those homes stay invisible. An approved home keeps its ordinary paths.
 
 Input `authoredSource` identifies which existing field contains the human request: `text`
 by default, `objective` for generated Goal/workflow openings, and `none` for generated
@@ -792,14 +825,20 @@ Null means no project; a broken explicit binding is an error, not a reason to in
 Projects may also store one optional color from the fixed `PROJECT_COLORS` palette. Color is
 sidebar presentation metadata only: changing or removing it never resolves paths, changes the
 project folder, grants permission, rebinds sessions, or changes prompt/workspace
-selection. Legacy rows without color remain unchanged. The sidebar keeps an unset color control
-quiet until hover/focus and opens an explicit keyboard-reachable palette; choosing a swatch (or
-None) calls the same `projects:color` owner rather than cycling through values.
-After a keyboard color save, the repainted color button regains focus only while the same
-selected-chat generation is visible and the user has not focused another control. Leaving and
-returning to that chat invalidates the old focus action. A rejected save uses the same ownership
-check before reopening its palette; it never steals focus from a newer interaction. Completion
-checks both focus notifications and the current active element, including an inactive document.
+selection. Legacy rows without color remain unchanged. A project's color tints its folder icon.
+Every sidebar row (a project or a chat) has one quiet "⋯" button, shown on hover/focus or while its
+menu is open, and a right click on the row opens the same menu (`renderer/row-menu.ts`). The menu
+lives in the document body, outside the sidebar the activity repaints, so a repaint never closes
+it; it finds its row's button again by owner (`data-row-menu`), stays inside the window, opens
+submenus beside their item, and is keyboard-driven (arrows, Right/Left for submenus, Escape gives
+focus back to the button). A project's menu: New chat in this project (`data-new-project`, which
+also shows the chat screen), Color (a submenu: None and the palette as radio items, each calling
+the same `projects:color` owner; choices wait while a save is pending) and Remove. A chat's
+menu: Rename and Open in browser, Block/Release and, in strict mode, Trust/Untrust, then Remove;
+the Unattributed row offers only its app-wide Block/Allow (never in strict mode) and Remove.
+Choosing an item gives focus back to the row's button before the action runs, so a color save's
+repaint keeps it there unless the user moved focus meanwhile; an action that moves focus
+(renaming, a new chat's field) still does.
 
 Removing a project marks the catalog row `ungrouped`. Existing and unloaded sessions, pending
 inputs and workers keep their durable project association; their chats return to the ordinary
@@ -1023,7 +1062,14 @@ materializes that exact desktop session. Another New Chat may be admitted immedi
 delivery remains Queued. The existing browser election and exact claim still own native Send.
 Cancellation revokes both the outbox row and its transient startup controller; shutdown aborts
 startup and explicit retries before they can wake a browser later. Startup failure leaves the
-same queued input and an explicit retry action.
+same queued input and an explicit retry action. An ordinary automatic browser input that was
+never claimed within sixty seconds carries a pre-Send pickup-failure timestamp. The bridge's
+bounded recovery sweep may requeue that same UUID once, after two minutes and before the input is
+thirty minutes old, only when Automatic Continue still allows recovery, its exact session/chat
+binding is idle and no newer user input or competing row exists. Attachments, workflow/automation
+inputs, recovery tickets, authorization and any delivery receipt exclude this path. Historical
+failed rows without the timestamp are never replayed. A failed pickup is distinct from an
+authorized Send with a missing receipt; the latter remains ambiguous and is never retried.
 Explicit withdrawal of an opening also removes its empty, unbound local reservation when Send
 was provably never authorized. The cancelled outbox tombstone survives restart. Timeouts,
 startup failures, ambiguous sends, provider bindings and recorded history never grant deletion.
@@ -1052,6 +1098,18 @@ Browser Send puts a Chat On Steroids Core app mention in front of the text, beca
 leave the mention off the user's own prompts, which on other accounts start plain questions with a
 probe tool call (#952). Workers, Continue recovery, Goal and Loop always keep it, because they need
 the app to answer. A Goal helper decision (`purpose: 'decision'`) never gets it.
+ChatGPT switches its own image tool off for a message that mentions an app (measured
+2026-10-05: per message, also as a follow-up in a chat whose first message had the mention). So a
+person's own message (`authoredSource` text, not `decision`/recovery/`finishOwner`, not a worker or
+helper chat, not combined with a queued checkpoint) that `session/image-request.ts` `asksForImage` reads as asking for a picture is claimed
+with `coreMention: false`, and the page sends it without the mention; every other message keeps the
+setting. `asksForImage` matches the person's prose (no leading `/command`, code or links) in all
+app languages: a creating verb near a picture noun, "a picture of …", drawing verbs, wishes ("I
+want a poster"), verb-last orders, and CJK pairs; an edit of an attached picture or, within 300
+characters, of a picture one of the last two answers made (a finished `native_image` after the second-to-last question, so one failed edit in between still counts). Code,
+container/system images, web and git terms, picture-word identifiers ("image-fixes"), file
+handling, text about pictures (captions, ideas, lists) and charts or tables named first keep the
+mention. A miss leaves things as before; a false alarm drops the mention from one message.
 
 One ChatGPT account used on several computers needs one connector set per computer, and the sets
 cannot share a name. `connectorSuffix` (Settings › Setup, "Several computers, one ChatGPT account";
@@ -1164,6 +1222,23 @@ New work withdraws an unspent ticket/pre-send claim and rearms the model's silen
 sends retain exclusive custody until their exact receipt or proven pre-send failure. Source work,
 document epoch, question, draft and native Send are rechecked across preparation awaits. An
 unclassified `stalled` end alone does not release a message; the refresh receipt is required.
+Every exit of the silence sweep that leaves a chat alone logs its reason once per grant and reason
+(`bridge: silence recovery for <chat> — …`): a Compact & Resume handoff owns it, no tool call is
+recorded for the turn (code-mode calls are often unattributed), a call of this chat or of an
+unknown chat is still running, the chat is blocked, recovery is off for it, its reload already
+happened, the page has not come back yet, or the work is no longer the current turn. A confirmed
+assistant-error reload also logs whether the chat is still under the silence watch, since the
+automatic Continue after it only comes from that watch (#1086: a log that went quiet after the
+reload could not say which of these held).
+
+ChatGPT's own tool approval card ("Allow ChatGPT to use …?", root `data-codex-approval-surface`)
+holds a call before it is sent, so nothing reaches the app and only the user can answer it. The
+page reports it on every `/activity` poll as optional `approval=1|0` (older extensions omit it);
+`src/main/approval-wait.ts` keeps the episode fresh for 75 s. While it stands, silence recovery
+(before the no-recorded-call verdict), `recoveryHeldByCalls`, the worker sleep sweep and the page's
+ten-minute stall clock all wait. The chat gets one `approval-wait:` progress row (texts in
+`src/shared/approval-wait.ts`, translated by the renderer, with Open in browser) and, after 30 s, one
+stop-notice-style desktop notice whose click opens the chat's page. The app never answers the card.
 
 At ordinary silence recovery, a never-offered immediate correction takes priority over generated
 Goal/Loop work and is sent as a normal native user message. Include at most the next eligible
@@ -1214,6 +1289,18 @@ While an exact send receipt still has a bounded evidence reader, the existing ob
 requests canonical MAIN-world text even after native generation stops. Rendered Markdown can
 remove submitted bytes; recognizing the generation must not be a prerequisite for reading the
 source needed to recognize its Send. Route, epoch and stable message identity still decide acceptance.
+Fiber reports ChatGPT's own mark for that storage (`serialization_metadata.render_format === 'markdown'`)
+as `markdown: true` on a user message when its message object carries it (the shell layout builds
+messages without metadata). Recorded `user_message` text is shown the way ChatGPT shows it
+(`shownUserText`): a marked copy is unescaped once, and so is an unmarked copy whose one-step
+unescape equals the text the page renders; a person's literal backslash is rendered and stays.
+Every comparison (receipts, handoff markers) still reads the raw stored text.
+ChatGPT stores text the page inserted Markdown-escaped (`` \`code\` ``, `\#`, `\<newline>`). A Goal
+reply's receipt is therefore marked `inserted` (`rememberUserSend(true)`; the page's own click and
+submit listeners that record the same Send again keep the mark) and is matched like a bootstrap:
+raw, then one unescape. A person's own typing stays an exact raw comparison. Compared raw, a reply
+with `code` never matched, so its turn opened only when the page saw the question before the app
+held it as an anchor; otherwise no turn opened and Goal waited forever (2026-10-05).
 
 Page-reply waits are bounded: reuse/close observations get three seconds; New Chat preparation
 gets fifteen seconds. Missing preparation replies retain the elected tab and grant no fallback.
@@ -1377,7 +1464,10 @@ inventing a native final or turn end. A completed final can start a browser deci
 mode enables after-turn delivery, or when the finish tool is disabled (§17).
 `automaticFinishEnabled()` is shared by generation and queued-input validity: only the effective
 per-chat Goal/Loop switch authorizes an automatic decision.
-A "goal met" decision (`no-reply`) ends the run but keeps the objective and the Goal switch. Once
+A "goal met" decision (`no-reply`) ends the run but keeps the objective and the Goal switch. It
+discharges its turn's reply obligation when it settles, without waiting for the page: nothing is
+left to type, and a page closed meanwhile would otherwise leave the turn owed until the ledger
+TTL. A typed continuation stays owed until the page acknowledges it. Once
 the page acknowledges it, `goalViewFor()` hides it from the page, while `goalOutcomeFor()` keeps it
 in the window's session controls until a newer turn replaces it: the Goal row then reads
 "Goal reached · <objective>" instead of "Pursuing goal", and the lifecycle row does not repeat it.
@@ -1544,7 +1634,12 @@ corresponding Goal attempt. A call started before the end, a new request or a St
 cannot be used as that proof. Finish-only calls do not reopen activity. A canonical native final with a provider message UUID
 settles its already-proven request even when another connector call starts afterwards. The shared
 `readCompletedFinal` check requires request proof preceding that final and still rejects new work
-or newer boundaries. Activity and composer settlement consume this verdict without a competing
+or newer boundaries. The turn's own question (`timelineTurns[turn].questionId`) re-reported
+`authoredNow` after the answer (a new chat's first message seen only after ChatGPT's redraw) is
+not new work; a new question has a new id. When ChatGPT reported a fast answer's end before the
+page opened its turn (#1099), the turn's first page-side `turn_start` after that final and the
+page's later `stalled` end of the same turn do not veto a native final (`final` with a provider
+message id); `failed`, `unknown`, other turns and app reopens still do. Activity and composer settlement consume this verdict without a competing
 timestamp rule; running local tools retain their independent delivery fence. After recorder
 restart, the latest ended boundary can recover its exact request ownership only from the
 durable request-turn index recorded before that boundary. A newer question or canonical final
@@ -2185,6 +2280,26 @@ the chat in `reveals`, under the same holding rule, and focuses its tab or opens
 minimized window). When no such extension is connected, or none takes it within 4 s, the request
 is withdrawn and the app opens the URL through the OS as before.
 
+Core's `save_image` (created only with the create-files permission) saves the original file of an
+image ChatGPT generated in the calling chat (#889); the recording keeps only a preview. The call's
+chat comes from request correlation (waiting up to 20 s), never from the model. Without one the
+refusal names the Core that answered (`connectorName`), since another computer's chat may have
+called it (#1097). The image is the
+latest recorded finished `native_image` of that chat's session, or the `nth` one counting back
+(`nth` 2 is the one before). It is a number on purpose: ChatGPT filled a string argument with the
+picture's `file_…` id and then failed the call internally before it reached the app (2026-10-05). The destination resolves like any write
+(`allowMissing`), must not exist, and gets the image's own extension when it has none; a named
+extension of another format is refused. An extension whose `/status` body says
+`canExportImages: true` receives pending exports in `imageExports: [{ nonce, conversationId,
+messageId, assetId }]` (never the destination). The worker hands each nonce once to the tab
+showing that chat (`clf-image-export`); the page fetches exactly the same-origin URL or page blob
+its fiber-stamped `<img>` already loaded and answers `{ data: base64 }` or `{ error }`
+(`not_open`, `not_rendered`, `fetch_failed`, `not_image`, `too_large`). The worker posts
+`{ nonce, data }` or `{ nonce, error }` to `POST /image-export` (body limit sized for 25 MB). The
+app requires a decodable PNG, JPEG or WebP of at most 25 MB, writes a `.part` file beside the
+destination and hard-links it into place, so an existing name is never replaced, and answers the
+tool within 60 s. No URL, cookie or credential leaves the page.
+
 Browser-only preferences suppress automatic opening as defined by their owner. Background
 operations reuse a suitable existing window unchanged. If a new background window is actually
 authorized, its shared layout policy bounds it to 45% of the work area and 800×600, then
@@ -2278,8 +2393,12 @@ existing Goal reply ledger. The exact final is checked before its one durable St
 again in the native page. Unfinished Continue keeps its Stop claim in the existing outbox.
 Both use the same native Stop/idle helper, then send on that document. There is **no immediate
 reload after Stop**. Undelivered Continue, queued input and Goal/Loop decisions share one
-pickup projection and the 2/5/10/15-minute reload schedule (fifteen repeats), with a twelve-hour
-source lifetime. Native-busy polls do not postpone that schedule. A silence episode retiring
+pickup projection and the bounded 2/5/10-minute reload schedule (three reloads total). The
+attempt count and next deadline are stored with the exact Goal reply or queued input, so an app
+restart cannot reset the limit. After the third uncollected reload, recovery stops and the composer
+shows a persistent stop status while the original obligation remains saved. A queue item can still
+be sent manually; reactivating the same Goal reply does not refund its attempts. The twelve-hour source
+lifetime remains a separate retirement bound. Native-busy polls do not postpone that schedule. A silence episode retiring
 cannot delete a new pickup repair belonging to its durable ticket.
 
 Continue text, source question/work, busy deadline and exclusive send custody live in the
@@ -2466,7 +2585,7 @@ chats retain their no-reload behavior for these blocking notices; no new grant c
 | Page silence | Exactly attributed local MCP in the current source turn plus the model-specific shared silence deadline; native progress renews it but does not grant initial intervention authority. |
 | Assistant error | Exact turn/error, per-turn retry budget and cooldown; repair the broken page without fabricating a new task. |
 | Unattributed | A separate unresolved incident after attribution has landed; re-observe suspects, never assign ownership by proximity. |
-| Queue / Goal watch | One qualified waiting episode for the visible next input or eligible Goal source; the shared 2/5/10/15-minute pickup schedule follows its initial silence/busy wait. |
+| Queue / Goal watch | One qualified waiting episode for the visible next input or eligible Goal source; the shared three-reload 2/5/10-minute pickup schedule follows its initial silence/busy wait, then stops visibly with its durable obligation retained. |
 | Compaction pickup | A durable continuation ticket whose current transport phase allows that pickup. |
 
 An automatic handoff's opened chat holds its attempt for up to 15 minutes, but a page that reports
@@ -2564,12 +2683,12 @@ filed automatically: recovery uses Continue until a canonical final appears.
 Automatic Continue reuses the durable input owner, but its frozen text and source are not
 editable or reorderable as authored tasks. Queue mutation APIs exclude recovery rows; the
 renderer labels them Automatic Continue and preserves cancellation before browser handout.
-Continue, queue and Goal/Loop share pickup gaps of 2/5/10/15 minutes, then retain fifteen until
-expiry, including Pro after its initial ten-minute (Thinking failed: five-minute) silence and
-conditional five-minute wait.
-Reordering, replacing the head on the same
-source and Goal Off cannot reset the backoff. Missing pickup ACK retains its original action
-custody; status polling does not issue a fresh token. Startup restores eligible durable debt
+Continue, queue and Goal/Loop share three pickup reloads after 2, 5 and 10 minutes, then stop
+visibly while retaining the durable obligation. The count survives restart and cannot be reset by
+reordering, replacing the head on the same source or Goal Off/On. A new source turn begins a new
+episode. The initial Pro ten-minute (Thinking failed: five-minute) silence and conditional five-minute wait remain separate.
+Missing pickup ACK retains its original action custody; status polling does not issue a fresh token.
+Startup restores eligible durable debt
 with the normal first grace period. A twelve-hour source age retires automatic pickup authority
 without deleting queued text. Newer questions veto older Goal debt. Fresh
 source/session/stop/block/continuation and listening checks apply again at repair handout.
@@ -2612,11 +2731,13 @@ and terminal custody while changing the provider binding **S: A → B**. Compact
 task and must not turn source A into an independently recoverable chat.
 
 `session/continuation.ts` owns the transaction; `handoff.ts` validates the brief; `bridge.ts`
-and the extension transport it. `resume-gate.ts` is a short pre-commit admission gate, not a
-second continuation owner. Unknown-chat recording honors its existing 60-second claim window
-instead of creating a shadow session after five seconds. Commit/abort releases the wait early;
-one claim window bounds each admission wait even when overlapping claims appear. Known sessions
-remain immediately readable. The ledger phases are:
+and the extension transport it. `resume-gate.ts` is a pre-commit admission gate, not a second
+continuation owner. Opening/pre-dispatch claims expire after 60 seconds. Once destination Send
+crosses its durable dispatch fence, the gate stays armed until that continuation commits, aborts
+or explicitly releases the dispatch, because ChatGPT may already hold the bootstrap in a chat
+whose id is still unavailable. Unknown-chat recording still waits at most one 60-second admission
+window per attempt, so an unrelated chat cannot be blocked forever. Known sessions remain
+immediately readable. The ledger phases are:
 
 ```text
 awaiting-summary -> awaiting-chat -> claimed -> committing -> committed
@@ -2723,8 +2844,11 @@ feed's resume boundary, where A's rows stop. A reloaded source waits for its vis
 editable composer and recorded original question before freezing the source identity or stopping
 the turn. Already observed identities and a real user Send remain cancellation boundaries during
 hydration; an empty loading DOM must not be treated as a different conversation. The source
-rechecks the composer before insertion. Failed manual preparation retires only its exact pre-Send token and
-stores a bounded concrete failure reason. Existing user drafts remain intact. Ambiguous dispatched
+rechecks the composer before insertion. After Compact & Resume's source-send permission round-trip,
+it reacquires the visible editable composer and validates the exact frozen prompt: a React remount alone
+does not invalidate an unchanged draft, while an actual text change still fails closed and preserves the draft.
+Failed manual preparation retires only its exact pre-Send token and stores a bounded concrete failure reason.
+Existing user drafts remain intact. Ambiguous dispatched
 requests retain their existing custody and cannot be sent again merely because a receipt is absent.
 
 An unnamed destination never reports a successful resume ACK, even after a transport banner.
@@ -2983,6 +3107,12 @@ UIs name the wait without inventing a countdown. `prepareNotice` returns before 
 that drafts the automatic decision and **releases** the hold rather than leaving it held, so the
 user's own answer is never stuck behind workers they did not ask about; the durable reply
 obligation survives and the pickup tree collects it later. A notice-only hold is untouched.
+For the window only, `sessionControlsFor` passes the session's `browserRecoveryDismissedAt`: a
+pending turn whose tab the person closed reports `closed` (after `tools`/`workers`), shown without
+spinner or countdown as "Paused until this chat is open in the browser", with the sidebar row's
+"Open this chat in your browser" action (`openSessionChat`) beside it. Recovery waits for that
+page, so "Answer settling" there spun until the obligation's TTL. `/activity` never sees `closed`:
+the page asking is the return that clears the dismissal.
 
 The wait cannot starve the reports it is waiting for: worker reports reach their prime through
 the kernel's caller offer, never through the browser outbox. `/goal/draft` needed no change; it
@@ -3052,7 +3182,7 @@ activation setter records that exemption in the existing reply ledger; browser p
 reply-ID prefixes cannot grant it. Recheck restored automatic debt, provider start and delivery.
 This condition does not change ordinary Goal mode or user-message delivery.
 Automatic tickets retain exact source ownership. Native busy uses the shared one/five-minute
-wait and one Stop claim; uncollected tickets use the shared 2/5/10/15 pickup schedule (§14).
+wait and one Stop claim; uncollected tickets use the shared bounded three-reload 2/5/10 pickup schedule (§14).
 A chat that started its own workers defers that pickup and the automatic decision
 `session_finish` would otherwise draft until the last of them stops, when the switch asks
 for it (§16). The debt is deferred, never spent.
@@ -3214,6 +3344,10 @@ regeneration are documented in `docs/pet/PRODUCTION.md`; pet unit/DOM tests, `sc
 cover this owner without provider conversations.
 `scripts/verify-pet-performance.cjs` measures the production pet in isolated
 Electron with unchanged artwork, process CPU deltas and actual animation wakes.
+On Windows the desktop Pets host must receive a bounded native shape before it is
+shown, and it stays bounded to the visible pet/tray/menu regions while click-through.
+The `pet-overlay:bounds` projection advertises that idle-shape requirement to the
+renderer; Linux/macOS retain their existing full click-through visual-surface contract.
 
 `renderer/main.ts` owns the shell/setup/settings; `chat.ts` owns sessions, composer and timeline.
 Projects, workers, plans, model choice, usage and plugins have focused modules (§4). The renderer
@@ -3275,6 +3409,13 @@ dragging or Alt+Up/Down moves a parent and its worker children within its curren
 unfiled group. A drag beyond the group clamps to its first/last visible slot; it cannot change
 project ownership. Pointer custody defers row replacement during live refresh and revalidates
 membership before saving. Off-page order survives partial list refreshes.
+`renderer/sidebar-pins.ts` keeps pinned chats (#1133) as a bounded localStorage preference (500 ids;
+the oldest gives way, a pin is never refused). A pinned chat leads its own list (main Chats or its
+project) and has its own drag scope `pinned:<scope>`, so manual order is kept inside the pinned and
+unpinned groups and a drag never crosses between them. Only recorded chats are pinnable, never
+workers or unattributed activity. Pinned rows carry a quiet pin mark at rest (it makes way for the
+row's "⋯" on hover, focus or while its menu is open), and Pin chat/Unpin chat is the first item of
+the chat's row menu, keeping keyboard focus on the rebuilt row's menu button.
 The worker drawer is a read-only split view of the selected worker's own recorded conversation;
 opening it never switches the prime composer. Its cards show the scoped worker id, task, observed
 current-conversation model and broker status when known, falling back to recorded session activity.
@@ -3370,6 +3511,34 @@ never become preview text. `session/title.ts` supplies presentation and legacy r
 store serialization protects manual/origin names and current-conversation title observations.
 Apply provider titles after the batch's messages, so a late receipt or title-first batch cannot
 strand a preview. Cold reads repair legacy context previews from canonical authored history.
+The user names a chat in the sidebar (its menu's Rename or a double-click; `sessions:rename { id, title }`,
+title trimmed to one line of at most 120 characters). A non-empty name is a `manual` title; the
+title shown until then moves to `autoTitle { title, source }`, which keeps receiving the
+automatic titles the chat would have accepted (provider titles unless the chat was app-opened,
+first-message fallbacks unless a provider title was seen; worker/helper origins keep their task
+title, also when an origin is stamped later). A blank or null title clears the name: the title
+becomes `autoTitle`, else the first message, and naming authority returns to its source. ChatGPT's
+own title is never changed.
+
+Chat search (#1107) is IPC `sessions:search { query ≤200 }` → `SessionSearchReply { results ≤50,
+indexed, total }`. `session/search.ts` never reads a journal per query: each chat gets
+`<session>/search.txt` (first line the stamp `version:updatedAt:events`, then the user's authored
+words and ChatGPT's answers, overflow text included, capped at 1M characters), built in the
+background newest first, reused while the stamp matches, deleted with the chat. Helper chats are
+left out, as in the sidebar. Every query word must match (title or text, any order, case- and
+accent-folded with `foldCase`, which keeps UTF-16 lengths so ranges index the original; `ß` stays). Title matches rank
+first, then text matches, each newest first. `titleMatches` and `snippet.matches` are UTF-16
+`[start, end)` ranges into `title` and `snippet.text`. While `indexed < total`, text results
+cover only indexed chats and the renderer asks again. `limited: true` means more chats matched than
+`results` holds; the dialog then asks for another word. Search is a dialog (`#searchDialog`, #1117/#1120),
+not a sidebar field: the magnifier at the end of the app name's row, ⌘K (macOS) / Ctrl+K (except
+inside the terminal) and View → Search Chats open it. Empty, it lists up to 30 recent chats (helpers,
+sub-agents and diagnostics rows left out); it keeps one size while typing and fades in and out.
+Opening a text match calls `sessions:locate-match { id, query }` → `SessionSearchLocation | null`
+(the first user/assistant message holding a query word, read from the recording only then); the
+timeline shows it from the loaded page or loads the page around it as history, centered and briefly
+marked. Jump to latest from a history page whose end is not loaded opens the chat at its end. Primary-shortcut labels (`kbd[data-shortcut]`, the sidebar tooltip)
+come from `renderer/shortcuts.ts`: ⌘ on macOS, the localized Ctrl ("Strg") elsewhere.
 
 Captured ChatGPT HTML passes a strict allowlist; authored plain text stays text. Provider
 citation ranges use Unicode code points and map to UTF-16 before slicing. Exact uploaded-file
@@ -3393,8 +3562,9 @@ catalogs (`i18n.ts`, `locales/{es,zh-CN,zh-TW,ja,ko,tr,fr,pt-PT,pt-BR,de,ru,vi}.
 `cos.ui.language`. The main process has no catalogs: the renderer translates the allowlisted
 stopped-chat notice texts (`shared/stop-notice.ts`) and publishes them over `ui:stopNoticeTexts`
 at startup and on each language change; unknown keys are refused and untranslated notices stay English.
-The tray menu, its tooltip and the Session finish notice with its buttons work the same way: the
-allowlisted `shared/main-texts.ts` over `ui:mainTexts`, kept by `main/main-texts.ts`, which repaints the tray.
+The tray menu, its tooltip, the Session finish notice with its buttons and tunnel-loss notices work
+the same way: the allowlisted `shared/main-texts.ts` over `ui:mainTexts`, kept by
+`main/main-texts.ts`, which repaints the tray.
 The renderer also reports the language over `ui:language`; the main process keeps it as `ui.language`
 and hands it to the extension in the `/status` reply (`language`). The extension stores it as
 `appLanguage` and `i18n.js` then reads that catalog itself (content scripts get it from the service
@@ -3676,6 +3846,23 @@ Separate local listener health, public tunnel reachability, ChatGPT connector co
 browser attachment in both status and diagnosis. Stale connect/disconnect results cannot replace
 a newer endpoint. Secret paths/tokens are not public diagnostics.
 
+Each actual tunnel lifetime keeps one in-memory loss-notice budget in `connection.ts`: a connected
+report arms it; the first offline/auth-failed/tunnel-unavailable report starts a 30-second grace
+timer, and only an outage that still has not recovered when that timer fires consumes the budget.
+A connected report cancels a pending timer and keeps the budget armed. Unknown health or
+retry/starting reports neither erase an established outage nor restart its timer. Core, Desktop and
+Plugins OpenAI tunnels are independent; whole-origin transports notify once for their shared Core
+tunnel. Initial failures stay silent. Existing generation and optional-lifetime fences retire the
+notice lifetime too, so Disconnect, shutdown, settings reconnect and retired reports cancel pending
+timers and cannot fire later. Electron `powerMonitor` suspend cancels pending timers without counting
+sleep; resume gives any still-active outage a fresh full grace window. `setConnectionLossNotifier`
+injects presentation from `index.ts`; `connection-loss-notice.ts` owns the testable Electron adapter,
+which skips focused/unsupported/quitting windows, localizes static safe text through `mainText`, and
+opens the app on click. A skipped or failed notice is not retried; notification failures never alter
+tunnel state or recovery. No raw tunnel detail or secret identifier enters the notice.
+`test/connection.test.ts` and `test/connection-notice.test.ts` cover grace/recovery, sleep,
+intentional retirement and notification presentation.
+
 The local control API (`control-api.ts`, Settings → General → For developers, off by default) serves
 `/v1/health` (which also lists the routes this build serves), `/v1/status` and the read routes
 below to a trusted local caller, typically an agent's MCP server watching the app from outside
@@ -3801,11 +3988,24 @@ tooltips. The header states connection status once; no redundant off/verificatio
 appears. Verification/last-seen ages remain in tooltips. Advanced session capture, request IDs
 and runtime diagnostics belong to the companion extension, not this desktop popover. Its only
 action is Connect/Disconnect; opening it does not request companion diagnostics.
-Extension-only Overwrite/Timestamps and the redundant settings link are absent. A red header
-Connect action remains visible while disconnected and disappears only on confirmed connection,
-briefly highlighting the footer status (respecting reduced motion). Setup stays reachable from
-Settings and from Connect when configuration is incomplete. The View menu has its own foreground
-stacking layer; Appearance rows align controls at a shared minimum height and Setup uses a stable
+Extension-only Overwrite/Timestamps and the redundant settings link are absent. The footer
+status is the one connection control (the header has none): connected, a 36px square with a
+green dot; otherwise a capsule that says Connect, Connecting…/Disconnecting…, No internet or
+Failed (the full reason stays in its title and the popover). Opening from the dot or changing
+words is one morph: the width animates while the words cross-fade, centred and never cut; the old
+words fade where they were, clipped to the capsule. A Disconnecting stays on screen at least
+1.1s. Simply disconnected, it is the word alone and a click connects, or opens Setup while a step
+is missing; in every other state a click opens the popover, and a right click always does. Busy
+(connecting or disconnecting) runs a light around the border and a sheen on the words; a
+confirmed connection pulses the dot once as the capsule closes; state changes are announced
+politely (`#connectionAnnounce`). Reduced
+motion drops the transitions; a sidebar narrower than 200px keeps the dot alone. Setup stays
+reachable from Settings and from the capsule when configuration is incomplete. The View menu is
+one icon button (≡) in the title bar opening the row menus' menu (`row-menu.ts`, `view-menu.ts`):
+each action with its icon and this keyboard's shortcut (not the sidebar toggle, which sits beside it), a
+pets label that says what it will do (Show/Hide pets), zoom steps that keep it open with Actual size's value updating
+(a zoom's resize repositions it instead of closing it), and Show browser (the CoS browser) only while the
+built-in browser is the ChatGPT browser. Appearance rows align controls at a shared minimum height and Setup uses a stable
 responsive title/language grid across locales.
 The companion sends a bounded snapshot on the authenticated `/diagnostics` route, outside the
 authority-bearing `/status` response. One pending diagnostic page read is shared; current
@@ -4081,7 +4281,7 @@ hand-editing staged binaries. Native and editor dependencies need actual runtime
 package, and verify that runtime's relevant flow. An installer exit code or version label is
 insufficient. A dirty-tree snapshot request does not authorize exposing all local Git history.
 
-`update.ts` checks immediately and every six hours with one in-flight pass. Download to a
+`update.ts` checks immediately and every six hours with one in-flight pass; opening Settings (`update:refresh`) checks again when the last answer is over ten minutes old. Download to a
 partial file, verify SHA-256 before staging/adoption, and rehash at ordinary quit before handing
 off. Windows NSIS/Linux AppImage can apply automatically; macOS/DEB present the supported manual
 path, development does not stage. Explicit install may relaunch; ordinary quit does not force
@@ -4093,6 +4293,14 @@ is dispatched **at the reviewed version tag**, calls that reusable build in the 
 requires `docs/release-notes/vX.Y.Z.md`, rechecks versions/privacy/hashes and refuses an existing
 release. A tag alone does not build/publish. An unpublished candidate can be built separately,
 but do not mix artifacts from another ref/run into a release.
+
+What's New (#1172) shows a version's highlights once after a real update. `ui.lastSeenVersion`
+is the version this install last started as. Only the main process records it: on a fresh install
+when the config file is missing, and through `ui:whatsNewSeen`, which can only record
+`APP_VERSION`. `whatsNewAction` in `src/shared/whats-new.ts` decides: same version: nothing; a
+newer version (or no recorded one) with an entry: show, then record; anything else, a downgrade
+included: record. Each release PR adds its version's entry to `src/renderer/whats-new.ts`, with
+literal `t()` keys translated into every catalog. `verify-whats-new.cjs` checks it on real pixels.
 
 `verify:notices` checks installed production dependencies against the lockfile and rejects
 missing license material or mismatched reviewed catalog hashes. Custom package updates cannot

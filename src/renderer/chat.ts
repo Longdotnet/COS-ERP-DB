@@ -1,4 +1,5 @@
 import { hasProviderDirective, resolvedCapture, withoutProviderDirectives } from '../shared/content-reference.js';
+import { initChatSearch, type ChatSearch } from './chat-search.js';
 import { createWorkspaceTerminal } from './workspace-terminal.js';
 import { createWorkspaceDocks } from './workspace-docks.js';
 import { currentLanguage, ui, t } from './i18n.js';
@@ -17,6 +18,7 @@ import type { GoalModel } from '../shared/goal-reasoning.js';
 import { renderGoalReasoning } from './goal-reasoning.js';
 import { preserveTimelineViewport, ROUNDING_PX } from './timeline-scroll.js';
 import { createSidebarOrder, SIDEBAR_PROJECT_SCOPE } from './sidebar-order.js';
+import { createSidebarPins, pinnedSortScope } from './sidebar-pins.js';
 import { createSidebarCompletionState } from './sidebar-completion.js';
 import { toolResultText } from './tool-result.js';
 import { renderEditCards } from './tool-artifacts.js';
@@ -77,9 +79,12 @@ import {
 } from '../shared/goal.js';
 import { DEFAULT_HANDOFF_LENGTH, DEFAULT_HANDOFF_PROMPT, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS, type HandoffLength } from '../shared/handoff.js';
 import { browserExtensionRequired, type AppState, type Config } from '../shared/types.js';
-import { $, ago, clockTime, compactNumber, disclosureChevron, el, filterSettingsSections, icon, run, setIcon, toast } from './dom.js';
+import { $, ago, clockTime, compactNumber, disclosureChevron, el, icon, run, setIcon, toast } from './dom.js';
+import { APPROVAL_ANSWERED_TEXT, APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT } from '../shared/approval-wait.js';
+import { openRowMenu, rowMenuOpenFor, toggleRowMenu, type RowMenuItem } from './row-menu.js';
 
 const api = window.api;
+let chatSearch: ChatSearch | null = null;
 
 /** Sprite id per tool-call family. Deliberately reuses the existing icon set. */
 const KIND_ICON: Record<ActivitySummary['kind'], string> = {
@@ -153,6 +158,79 @@ const projectVisibleCounts = new Map<string, number>();
 function projectGroup(id: string | null | undefined): string | null {
   return id && !projects.find(project => project.id === id)?.ungrouped ? id : null;
 }
+/** The row's "⋯" button as the sidebar holds it now; repaints replace it. */
+function rowMenuButton(owner: string): HTMLElement | null {
+  return [...document.querySelectorAll<HTMLElement>('[data-row-menu]')].find(button => button.dataset.rowMenu === owner) ?? null;
+}
+
+/** Projects whose color or removal is being saved: their choices wait for the answer. */
+const savingProjectColor = new Set<string>();
+const removingProject = new Set<string>();
+
+/** A project's menu: a new chat in it, its color (a submenu), and taking it off the sidebar. */
+function projectMenuItems(id: string): RowMenuItem[] {
+  const color = projects.find(row => row.id === id)?.color ?? null;
+  return [
+    { action: 'new-chat', icon: 'i-pencil', label: () => t('New chat in this project'), data: { newProject: id }, run: () => selectNewChat(id) },
+    {
+      action: 'color', icon: 'i-palette', label: () => t('Color'), title: () => t('Change project color'),
+      submenu: () => ([null, ...PROJECT_COLORS] as const).map(choice => ({
+        action: `color-${choice ?? 'none'}`, swatch: choice ?? '', checked: color === choice, disabled: savingProjectColor.has(id),
+        label: () => choice ? projectColorName(choice) : t('None'), run: () => void saveProjectColor(id, choice)
+      }))
+    },
+    {
+      action: 'remove', icon: 'i-trash', danger: true, separated: true, disabled: removingProject.has(id),
+      label: () => t('Remove'), title: () => t('Remove project from sidebar; keep conversations and files'),
+      run: () => void removeProjectFromSidebar(id)
+    }
+  ];
+}
+
+async function saveProjectColor(id: string, choice: ProjectColor | null): Promise<void> {
+  const project = projects.find(row => row.id === id);
+  if (!project || savingProjectColor.has(id) || (project.color ?? null) === choice) return;
+  savingProjectColor.add(id);
+  try {
+    const updated = await run(api.setProjectColor(id, choice));
+    if (!updated) return;
+    // Reject list snapshots captured before this newer catalog commit.
+    ++sessionsLoadGeneration;
+    projects = projects.map(row => row.id === id ? updated : row);
+    paintSessions();
+  } finally { savingProjectColor.delete(id); }
+}
+
+async function removeProjectFromSidebar(id: string): Promise<void> {
+  if (removingProject.has(id)) return;
+  removingProject.add(id);
+  try {
+    const removed = await run(api.removeProject(id));
+    if (!removed) return;
+    // Reject list snapshots captured before this newer catalog commit.
+    ++sessionsLoadGeneration;
+    projects = projects.map(row => row.id === id ? removed : row);
+    expandedProjects.delete(id); projectVisibleCounts.delete(id);
+    if (selectedProjectId === id) {
+      if (!selectedId) {
+        const oldKey = draftKey();
+        const authoredDraft = authoredComposerText();
+        selectedProjectId = null; selectionGeneration++; replaceComposerDraft();
+        // Keep the visible draft and its attachments while moving to unfiled.
+        inputDrafts.set(draftKey(), authoredDraft); inputDrafts.delete(oldKey); newChatTasks.delete(oldKey);
+        skillPicker?.restore();
+        const images = imageDrafts.get(oldKey);
+        if (images) imageDrafts.set(draftKey(), images);
+        else imageDrafts.delete(draftKey());
+        imageDrafts.delete(oldKey);
+        ui($<HTMLTextAreaElement>('chatInput'), 'placeholder', () => t('Ask anything…'));
+      } else selectedProjectId = null;
+    }
+    paintSessions(); void refreshInputQueue();
+    toast(t('Project removed; conversations kept'));
+  } finally { removingProject.delete(id); }
+}
+
 /** A project color as people say it, in the interface language. */
 function projectColorName(color: ProjectColor): string {
   return { blue: t('Blue'), green: t('Green'), amber: t('Amber'), purple: t('Purple'), rose: t('Rose'), teal: t('Teal') }[color];
@@ -175,6 +253,10 @@ function selectedLocalProject(): LocalProject | null {
 const PROJECT_TASK_PAGE_SIZE = 5;
 const PROJECT_TASK_PAGE_INCREMENT = 8;
 let sidebarOrder: ReturnType<typeof createSidebarOrder> | undefined;
+let sidebarPins: ReturnType<typeof createSidebarPins> | undefined;
+/** Only a person's own recorded chats can be pinned; workers live inside their task's row. */
+const pinnable = (entry: SessionSummary): boolean => !!entry.conversationId && entry.origin?.kind !== 'worker';
+const pinnedChat = (entry: SessionSummary): boolean => pinnable(entry) && sidebarPins?.has(entry.id) === true;
 let sidebarCompletion: ReturnType<typeof createSidebarCompletionState> | undefined;
 function draftKey(): string { return selectedId ?? (selectedProjectId ? `project:${selectedProjectId}` : 'new'); }
 let selectionGeneration = 0;
@@ -420,6 +502,16 @@ function sessionBadges(summary: SessionSummary): Badge[] {
   return badges;
 }
 
+/** The chat whose tooltip a click put away, until the pointer leaves its row. */
+let sessionTooltipDismissed: string | null = null;
+
+function placeSessionTooltip(tip: HTMLElement, row: HTMLElement): void {
+  tip.textContent = row.title;
+  const bounds = row.getBoundingClientRect();
+  tip.style.left = `${Math.min(bounds.right + 10, window.innerWidth - 290)}px`;
+  tip.style.top = `${Math.min(bounds.top, window.innerHeight - 110)}px`;
+}
+
 function sessionRow(summary: SessionSummary): HTMLElement {
   const row = el('div', 'sess');
   row.dataset.id = summary.id;
@@ -432,22 +524,45 @@ function sessionRow(summary: SessionSummary): HTMLElement {
   top.tabIndex = 0;
   top.dataset.sessionSelect = '';
   top.dataset.sortHandle = '';
-  const title = el('b', '', () => summary.title || t("Untitled session")); title.dir = 'auto';
-  top.append(title);
+  if (renaming?.id === summary.id) top.append(renameField(summary));
+  else {
+    const title = el('b', '', () => summary.title || t("Untitled session")); title.dir = 'auto';
+    // Double-click names the chat, like the pencil does (#1107).
+    if (summary.conversationId) title.addEventListener('dblclick', (event) => { event.stopPropagation(); startRename(summary); });
+    top.append(title);
+  }
   const badges = sessionBadges(summary);
-  ui(row, 'title', () => [summary.title || t("Untitled session"), ...badges.map((badge) => t(badge.text)), ago(summary.updatedAt)].join(' · '));
+  const pinned = pinnedChat(summary);
+  if (pinned) {
+    row.classList.add('is-pinned');
+    const mark = icon('i-pinned', 'ico sess-pin-mark');
+    top.append(mark);
+  }
+  ui(row, 'title', () => [summary.title || t("Untitled session"), ...(pinned ? [t("Pinned")] : []), ...badges.map((badge) => t(badge.text)), ago(summary.updatedAt)].join(' · '));
   const showTip = () => {
-    document.getElementById('sessionTooltip')?.remove();
-    const tip = el('div', 'session-tooltip', row.title);
-    tip.id = 'sessionTooltip'; tip.setAttribute('role', 'tooltip');
-    const bounds = row.getBoundingClientRect();
-    tip.style.left = `${Math.min(bounds.right + 10, window.innerWidth - 290)}px`;
-    tip.style.top = `${Math.min(bounds.top, window.innerHeight - 110)}px`;
+    if (sessionTooltipDismissed === summary.id) return;
+    // The same chat's tooltip, from before a repaint, stays as it is: recreating it would blink.
+    const current = document.getElementById('sessionTooltip');
+    if (current?.dataset.for === summary.id) { placeSessionTooltip(current, row); return; }
+    current?.remove();
+    // An open row menu is what the pointer is reading; the tooltip would cover it.
+    if (document.querySelector('.row-menu')) return;
+    const tip = el('div', 'session-tooltip');
+    tip.id = 'sessionTooltip'; tip.setAttribute('role', 'tooltip'); tip.dataset.for = summary.id;
+    placeSessionTooltip(tip, row);
     document.body.append(tip);
   };
   row.addEventListener('pointerenter', showTip);
-  row.addEventListener('pointerleave', () => document.getElementById('sessionTooltip')?.remove());
-  row.addEventListener('click', () => document.getElementById('sessionTooltip')?.remove());
+  row.addEventListener('pointerleave', () => {
+    if (sessionTooltipDismissed === summary.id) sessionTooltipDismissed = null;
+    document.getElementById('sessionTooltip')?.remove();
+  });
+  // A pointer's click puts the tooltip away until the pointer leaves the row, through the repaint that
+  // follows. A keyboard's click puts nothing away: no pointer would leave to bring the tooltip back.
+  row.addEventListener('click', () => {
+    if (row.matches(':hover')) sessionTooltipDismissed = summary.id;
+    document.getElementById('sessionTooltip')?.remove();
+  });
   // Unseen is presentation only and is appended last, so every existing lifecycle tone keeps
   // its previous priority (blocked/active/worker finished/failed).
   const status = badges.find((badge) => badge.tone);
@@ -458,50 +573,32 @@ function sessionRow(summary: SessionSummary): HTMLElement {
     ui(indicator, 'aria-label', () => t(status.text));
     top.append(indicator);
   }
-  const actionBar = el('div', 'sess-actions');
-
-  const remove = document.createElement('button');
-  remove.className = 'btn sess-action sess-del';
-  remove.type = 'button';
-  ui(remove, 'title', () => t("Remove this chat and its saved history from the app. The chat stays in ChatGPT."));
-  remove.append(icon('i-trash'));
-  remove.addEventListener('click', (event) => {
-    event.stopPropagation();
-    void deleteSession(summary.id);
-  });
-
-  const actions: HTMLButtonElement[] = [];
+  // One button for the chat's actions, as in ChatGPT; a right click on the row opens the same menu.
+  const owner = `chat:${summary.id}`;
+  const items: RowMenuItem[] = [];
+  const remove: RowMenuItem = {
+    action: 'remove', icon: 'i-trash', danger: true, separated: true, label: () => t('Remove'),
+    title: () => t("Remove this chat and its saved history from the app. The chat stays in ChatGPT."),
+    run: () => void deleteSession(summary.id)
+  };
   if (summary.conversationId === null) {
-    // Strict mode cannot trust an unattributed stream by definition. Do not render an
-    // "Allow" button that the kernel will intentionally ignore; the Settings checkbox
-    // explains that unattributed calls stay blocked until strict mode is turned off.
-    if (deps.state()?.config.multiAgent?.strictChatAllowlist === true) {
-      actionBar.append(remove);
-      row.append(top, actionBar);
-      return row;
+    // Strict mode cannot trust an unattributed stream by definition. Do not offer an "Allow"
+    // that the kernel will intentionally ignore; the Settings checkbox explains that
+    // unattributed calls stay blocked until strict mode is turned off.
+    if (deps.state()?.config.multiAgent?.strictChatAllowlist !== true) {
+      // The same decision as a chat's Block: may this activity use local tools? It has no
+      // conversation to be stored against, so it moves the app-wide switch and nothing else.
+      const blocked = unattributedBlocked();
+      items.push({
+        action: 'block', icon: blocked ? 'i-play' : 'i-ban',
+        label: () => blocked ? t('Allow unattributed calls') : t('Block unattributed calls'),
+        title: () => blocked
+          ? t("Allow unattributed calls: self-contained calls run again even when the app cannot prove which chat sent them")
+          : t("Block unattributed calls: every call the app cannot attribute to a chat is refused and the chat is told to stop"),
+        run: () => void toggleUnattributedBlock(!blocked)
+      });
     }
-    // The same button in the same column as a chat's, because it is the same decision: may
-    // this activity use local tools? It has no conversation to be stored against, so it moves
-    // the app-wide switch — the checkbox on the settings sheet — and nothing else.
-    const blocked = unattributedBlocked();
-    const block = document.createElement('button');
-    block.className = `btn sess-action sess-block${blocked ? ' is-blocked' : ''}`;
-    block.type = 'button';
-    ui(block, 'title', () => blocked
-      ? t("Allow unattributed calls: self-contained calls run again even when the app cannot prove which chat sent them")
-      : t("Block unattributed calls: every call the app cannot attribute to a chat is refused and the chat is told to stop"));
-    block.append(icon(blocked ? 'i-play' : 'i-ban'));
-    block.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void toggleUnattributedBlock(!blocked);
-    });
-    actions.push(block);
-
-    actionBar.append(...actions, remove);
-    row.append(top, actionBar);
-    return row;
-  }
-  if (summary.conversationId) {
+  } else {
     const policyLineage = [
       summary.conversationId,
       ...committedResumeAncestorsFromSummary(summary, summary.conversationId)
@@ -522,59 +619,137 @@ function sessionRow(summary: SessionSummary): HTMLElement {
         if (trustedChats.has(conversationId)) { effectivePolicy = 'trusted'; break; }
       }
     }
+    items.push(
+      { action: 'rename', icon: 'i-pencil', label: () => t('Rename'), title: () => t("Rename this chat in the app. Its title in ChatGPT stays the same."), run: () => startRename(summary) },
+      { action: 'open', icon: 'i-out', label: () => t('Open in browser'), title: () => t("Open this chat in your browser"), run: () => void run(api.openSessionChat(summary.id)) },
+      // ChatGPT opens /c/<id> wherever the chat lives, a project included (#1107).
+      { action: 'copy-link', icon: 'i-copy', label: () => t('Copy link'), title: () => t("Copy this chat's ChatGPT link"),
+        run: async () => { if (await run(api.writeClipboard(`https://chatgpt.com/c/${summary.conversationId}`))) toast(t('Link copied')); } }
+    );
     // The stop this app can actually make. It does not touch the running ChatGPT turn — nothing
     // here can — it takes this chat's tools away, and a model whose every call is refused with
     // an instruction to stop finishes its turn on its own.
     // A resumed row is the only control left for its committed predecessors. Project a source
     // Block onto that row so Release can clear the exact lineage that currently fences tools.
     const blocked = effectivePolicy === 'blocked';
-    const block = document.createElement('button');
-    block.className = `btn sess-action sess-block${blocked ? ' is-blocked' : ''}`;
-    block.type = 'button';
-    ui(block, 'title', () => blocked
-      ? t("Release this chat: its tool calls run again")
-      : t("Block this chat: every tool call it makes is refused and it is told to stop"));
-    block.append(icon(blocked ? 'i-play' : 'i-ban'));
-    block.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void toggleSessionBlock(summary.id, !blocked);
+    items.push({
+      action: 'block', icon: blocked ? 'i-play' : 'i-ban', separated: true,
+      label: () => blocked ? t('Release chat') : t('Block chat'),
+      title: () => blocked
+        ? t("Release this chat: its tool calls run again")
+        : t("Block this chat: every tool call it makes is refused and it is told to stop"),
+      run: () => void toggleSessionBlock(summary.id, !blocked)
     });
-    actions.push(block);
-
     if (strictAllowlist && summary.origin?.kind !== 'worker') {
       // `trustedChats` is the explicit durable registry. A committed resumed chat can be
       // effectively trusted by one of those historical ids, so project the same durable lineage
-      // that main enforces. This only chooses the button state; IPC remains authoritative.
+      // that main enforces. This only chooses the item; IPC remains authoritative.
       const trusted = effectivePolicy === 'trusted';
-      const trust = document.createElement('button');
-      trust.className = `btn sess-action sess-trust${trusted ? ' is-trusted' : ''}`;
-      trust.type = 'button';
-      ui(trust, 'title', () => trusted
-        ? t("Untrust this chat: strict mode refuses its tool calls")
-        : t("Trust this chat: strict mode lets its tool calls run"));
-      trust.append(icon(trusted ? 'i-lock' : 'i-check'));
-      trust.addEventListener('click', (event) => {
-        event.stopPropagation();
-        void toggleSessionTrust(summary.id, summary.conversationId!, !trusted);
+      items.push({
+        action: 'trust', icon: trusted ? 'i-lock' : 'i-check',
+        label: () => trusted ? t('Untrust chat') : t('Trust chat'),
+        title: () => trusted
+          ? t("Untrust this chat: strict mode refuses its tool calls")
+          : t("Trust this chat: strict mode lets its tool calls run"),
+        run: () => void toggleSessionTrust(summary.id, summary.conversationId!, !trusted)
       });
-      actions.push(trust);
     }
-
-    const open = document.createElement('button');
-    open.className = 'btn sess-action sess-open';
-    open.type = 'button';
-    ui(open, 'title', () => t("Open this chat in your browser"));
-    open.append(icon('i-out'));
-    open.addEventListener('click', (event) => {
-      event.stopPropagation();
-      void run(api.openSessionChat(summary.id));
-    });
-    actions.push(open);
+    if (pinnable(summary)) {
+      // First, as in ChatGPT: a pinned chat stays above the unpinned ones of its own list (#1133).
+      items.unshift({
+        action: 'pin', icon: pinned ? 'i-pinned' : 'i-pin',
+        label: () => pinned ? t('Unpin chat') : t('Pin chat'),
+        title: () => pinned ? t("Unpin this chat") : t("Pin this chat to the top of its list"),
+        run: () => {
+          sidebarPins?.toggle(summary.id);
+          paintSessions();
+          // The row moved: keep the keyboard on the same chat's menu button. Its button shows only
+          // while the row has focus, so the row takes focus first.
+          const rebuilt = $('sessionList').querySelector<HTMLElement>(`.sess[data-id="${CSS.escape(summary.id)}"]`);
+          rebuilt?.querySelector<HTMLElement>('.sess-top')?.focus({ preventScroll: true });
+          rowMenuButton(owner)?.focus({ preventScroll: true });
+        }
+      });
+    }
   }
-
-  actionBar.append(...actions, remove);
+  items.push(remove);
+  const more = el('button', 'btn row-menu-button sess-menu') as HTMLButtonElement;
+  more.type = 'button'; more.dataset.rowMenu = owner; more.append(icon('i-more-vertical'));
+  more.setAttribute('aria-haspopup', 'menu'); more.setAttribute('aria-expanded', String(rowMenuOpenFor(owner)));
+  ui(more, 'title', () => t('More options'));
+  ui(more, 'aria-label', () => t('More options'));
+  const menu = (at?: { x: number; y: number }) => ({
+    owner, at, label: () => summary.title || t("Untitled session"), anchor: () => rowMenuButton(owner), items: () => items
+  });
+  more.addEventListener('click', (event) => { event.stopPropagation(); document.getElementById('sessionTooltip')?.remove(); toggleRowMenu(menu()); });
+  row.addEventListener('contextmenu', (event) => { event.preventDefault(); document.getElementById('sessionTooltip')?.remove(); openRowMenu(menu({ x: event.clientX, y: event.clientY })); });
+  const actionBar = el('div', 'sess-actions');
+  actionBar.append(more);
   row.append(top, actionBar);
   return row;
+}
+
+/**
+ * The chat being named in the sidebar (#1107). Kept outside the row because activity repaints the
+ * sidebar many times a second: the field, its text and its caret survive every repaint.
+ */
+let renaming: { id: string; original: string; value: string; start: number; end: number } | null = null;
+
+function startRename(summary: SessionSummary): void {
+  const current = summary.title || '';
+  renaming = { id: summary.id, original: current, value: current, start: 0, end: current.length };
+  document.getElementById('sessionTooltip')?.remove();
+  paintSessions();
+}
+
+function renameField(summary: SessionSummary): HTMLInputElement {
+  const field = document.createElement('input');
+  field.className = 'sess-rename';
+  field.type = 'text';
+  field.maxLength = 120;
+  field.dir = 'auto';
+  field.value = renaming!.value;
+  ui(field, 'aria-label', () => t("Name for this chat"));
+  ui(field, 'placeholder', () => t("Leave empty to use ChatGPT's title"));
+  const own = (): boolean => renaming?.id === summary.id;
+  // The row selects on click and starts a drag on pointer down; typing in its name does neither.
+  for (const type of ['click', 'dblclick', 'pointerdown', 'mousedown']) field.addEventListener(type, (event) => event.stopPropagation());
+  field.addEventListener('input', () => {
+    if (own()) Object.assign(renaming!, { value: field.value, start: field.selectionStart ?? field.value.length, end: field.selectionEnd ?? field.value.length });
+  });
+  field.addEventListener('select', () => {
+    if (own()) Object.assign(renaming!, { start: field.selectionStart ?? 0, end: field.selectionEnd ?? 0 });
+  });
+  field.addEventListener('keydown', (event) => {
+    event.stopPropagation();
+    if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); void finishRename(true); }
+    else if (event.key === 'Escape') { event.preventDefault(); void finishRename(false); }
+  });
+  field.addEventListener('blur', () => {
+    // A repaint replaces the field; only leaving it for something else ends the edit.
+    setTimeout(() => {
+      if (!own() || (document.activeElement as HTMLElement | null)?.classList.contains('sess-rename')) return;
+      void finishRename(true);
+    }, 0);
+  });
+  queueMicrotask(() => {
+    if (!own() || !field.isConnected) return;
+    field.focus({ preventScroll: true });
+    field.setSelectionRange(renaming!.start, renaming!.end);
+  });
+  return field;
+}
+
+async function finishRename(save: boolean): Promise<void> {
+  const edit = renaming;
+  if (!edit) return;
+  renaming = null;
+  const value = edit.value.trim();
+  paintSessions();
+  if (!save || value === edit.original.trim()) return;
+  // Empty asks for the title the app would show without a name: ChatGPT's own.
+  await run(api.renameSession(edit.id, value || null));
+  await loadSessions('changed');
 }
 
 /**
@@ -686,6 +861,7 @@ async function loadSessions(detail: 'reread' | 'changed' = 'reread'): Promise<vo
     detailCursor = null;
   }
   paintSessions();
+  chatSearch?.refresh();
   const row = selectedId === null ? undefined : sessions.find(entry => entry.id === selectedId);
   if (detail === 'reread' || selectedId === null || detailFor !== selectedId || changed.all || changed.ids.has(selectedId) ||
       row?.updatedAt !== detailStamp?.updatedAt || row?.events !== detailStamp?.events) await loadDetail();
@@ -737,7 +913,9 @@ function projectSortEntries(): Array<{ id: string; scope: string }> {
 function paintSessions(): void {
   // Keep the pointer's elected rows alive while asynchronous activity snapshots arrive.
   if (sidebarOrder?.interacting) return;
-  document.getElementById('sessionTooltip')?.remove();
+  // Nor replace the name field mid-word: an input method's composition (Chinese, Japanese,
+  // Korean) lives in that exact node. The edit's end repaints with everything that changed.
+  if (renaming && (document.activeElement as HTMLElement | null)?.classList.contains('sess-rename')) return;
   const projectList = $('projectList'), chatList = $('chatList');
   // Activity replaces sidebar nodes. Keep an actively focused project control (its disclosure
   // or one of its buttons) attached to its exact project, without moving focus from the
@@ -745,7 +923,7 @@ function paintSessions(): void {
   // page on the next repaint, and so did the color button after a pick.
   const focused = document.activeElement;
   const focusedControl = focused instanceof HTMLElement && projectList.contains(focused)
-    ? ['.project-heading', '.project-color', '.project-new', '.project-remove', '.project-show-more'].find(selector => focused.matches(selector))
+    ? ['.project-heading', '.project-menu', '.project-show-more'].find(selector => focused.matches(selector))
     : undefined;
   const focusedProject = focusedControl ? (focused as HTMLElement).closest<HTMLElement>('.project-group')?.dataset.projectId : undefined;
   const children = new Map<string, SessionSummary[]>();
@@ -770,17 +948,22 @@ function paintSessions(): void {
     if (parentRow) { parentRow.append(button); parentRow.title += ` · ${button.title}`; } else target.push(button);
     if (expandedWorkers.has(key)) { const box = el('div', 'worker-group'); box.append(...workers.map(sessionRow)); target.push(box); }
   };
-  const orderedSessions = sidebarOrder
-    ? [...new Set(sessions.map(entry => projectGroup(entry.projectId) ?? ''))].flatMap(scope =>
-      sidebarOrder!.ordered(scope, sessions.filter(entry => (projectGroup(entry.projectId) ?? '') === scope)))
-    : sessions;
+  // Pinned chats lead their own list (#1133); each group keeps its own manual order.
+  const orderedSessions = [...new Set(sessions.map(entry => projectGroup(entry.projectId) ?? ''))].flatMap(scope => {
+    const members = sessions.filter(entry => (projectGroup(entry.projectId) ?? '') === scope);
+    const group = (pinned: boolean) => {
+      const rows = members.filter(entry => pinnedChat(entry) === pinned);
+      return sidebarOrder ? sidebarOrder.ordered(pinnedSortScope(scope, pinned), rows) : rows;
+    };
+    return [...group(true), ...group(false)];
+  });
   for (const entry of orderedSessions) {
     if (entry.origin?.kind === 'worker') continue;
     if (!entry.conversationId && entry.origin?.kind !== 'desktop') { diagnostics.push(entry); continue; }
     const projectId = projectGroup(entry.projectId);
     const target: HTMLElement[] = projectId ? [] : rows;
     const row = sessionRow(entry); target.push(row);
-    row.dataset.sortScope = projectId ?? '';
+    row.dataset.sortScope = pinnedSortScope(projectId ?? '', pinnedChat(entry));
     const workers = children.get(entry.id); if (workers) group(entry.id, workers, row, target);
     if (projectId) {
       const tasks = projectRows.get(projectId) ?? [];
@@ -822,129 +1005,20 @@ function paintSessions(): void {
       section.open = open;
     });
     if (project) {
-      const colorWrap = el('span', 'project-color-wrap');
-      const color = el('button', 'btn project-color') as HTMLButtonElement;
-      color.type = 'button'; color.dataset.color = project.color ?? '';
-      color.setAttribute('aria-haspopup', 'menu'); color.setAttribute('aria-expanded', 'false');
-      ui(color, 'title', () => t('Change project color'));
-      ui(color, 'aria-label', () => t('Change project color'));
-      const menu = el('span', 'project-color-menu'); menu.hidden = true; menu.setAttribute('role', 'menu');
-      ui(menu, 'aria-label', () => t('Change project color'));
-      const closeColorMenu = (restoreFocus = false): void => {
-        menu.hidden = true; color.setAttribute('aria-expanded', 'false');
-        if (restoreFocus) color.focus();
-      };
-      const openColorMenu = (): void => {
-        menu.hidden = false; color.setAttribute('aria-expanded', 'true');
-        const selected = menu.querySelector<HTMLButtonElement>('[aria-checked="true"]') ??
-          menu.querySelector<HTMLButtonElement>('.project-color-choice');
-        selected?.focus();
-      };
-      color.addEventListener('click', event => {
-        event.preventDefault(); event.stopPropagation();
-        if (color.disabled) return;
-        if (menu.hidden) openColorMenu(); else closeColorMenu(true);
+      // One button for the project's actions, as in ChatGPT; a right click on the row opens the same menu.
+      const owner = `project:${id}`;
+      const more = el('button', 'btn row-menu-button project-menu') as HTMLButtonElement;
+      more.type = 'button'; more.dataset.rowMenu = owner; more.append(icon('i-more-vertical'));
+      more.setAttribute('aria-haspopup', 'menu'); more.setAttribute('aria-expanded', String(rowMenuOpenFor(owner)));
+      ui(more, 'title', () => t('More options'));
+      ui(more, 'aria-label', () => t('More options'));
+      const menu = (at?: { x: number; y: number }) => ({
+        owner, at, label: () => projects.find(row => row.id === id)?.name ?? t('Unavailable project'),
+        anchor: () => rowMenuButton(owner), items: () => projectMenuItems(id)
       });
-      let savingColor = false;
-      for (const choice of [null, ...PROJECT_COLORS] as const) {
-        const option = el('button', 'project-color-choice') as HTMLButtonElement;
-        option.type = 'button'; option.dataset.projectColorChoice = choice ?? ''; option.dataset.color = choice ?? '';
-        option.setAttribute('role', 'menuitemradio');
-        option.setAttribute('aria-checked', String((project.color ?? null) === choice));
-        // The menu is named "Change project color"; each choice says the color itself.
-        const label = (): string => choice ? projectColorName(choice) : t('None');
-        ui(option, 'aria-label', label); ui(option, 'title', label);
-        if (!choice) option.textContent = t('None');
-        option.addEventListener('click', async event => {
-          event.preventDefault(); event.stopPropagation();
-          if (savingColor) return;
-          if ((project.color ?? null) === choice) return closeColorMenu(true);
-          savingColor = true;
-          const selectionAtSave = selectedId;
-          const generationAtSave = selectionGeneration;
-          let restoreColorFocus = colorWrap.contains(document.activeElement);
-          // Disabling a focused choice can move focus to body. A later deliberate focus
-          // change belongs to the user, not to the pending save's repaint.
-          const noticeFocus = (event: FocusEvent): void => {
-            if (event.target !== document.body && !colorWrap.contains(event.target as Node)) restoreColorFocus = false;
-          };
-          document.addEventListener('focusin', noticeFocus);
-          color.disabled = true;
-          menu.querySelectorAll<HTMLButtonElement>('.project-color-choice').forEach(button => { button.disabled = true; });
-          let updated: LocalProject | null | undefined;
-          try { updated = await run(api.setProjectColor(id, choice as ProjectColor | null)); }
-          finally { document.removeEventListener('focusin', noticeFocus); }
-          // In an inactive document, activeElement can change without a focusin notification.
-          // Check its current owner as well before replacing the palette or restoring focus.
-          restoreColorFocus = restoreColorFocus &&
-            (document.activeElement === document.body || colorWrap.contains(document.activeElement));
-          if (!updated) {
-            savingColor = false; color.disabled = false;
-            menu.querySelectorAll<HTMLButtonElement>('.project-color-choice').forEach(button => { button.disabled = false; });
-            if (restoreColorFocus && visible && selectedId === selectionAtSave && selectionGeneration === generationAtSave) openColorMenu();
-            return;
-          }
-          ++sessionsLoadGeneration;
-          projects = projects.map(row => row.id === id ? updated : row);
-          paintSessions();
-          if (restoreColorFocus && visible && selectedId === selectionAtSave && selectionGeneration === generationAtSave) {
-            $('projectList').querySelector<HTMLElement>(`.project-group[data-project-id="${id}"] .project-color`)?.focus({ preventScroll: true });
-          }
-        });
-        menu.append(option);
-      }
-      menu.addEventListener('keydown', event => {
-        if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); return closeColorMenu(true); }
-        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
-        const options = [...menu.querySelectorAll<HTMLButtonElement>('.project-color-choice:not(:disabled)')];
-        if (!options.length) return;
-        const current = options.indexOf(document.activeElement as HTMLButtonElement);
-        const delta = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
-        event.preventDefault(); event.stopPropagation();
-        options[(Math.max(0, current) + delta + options.length) % options.length]?.focus();
-      });
-      colorWrap.addEventListener('focusout', () => queueMicrotask(() => {
-        if (!colorWrap.contains(document.activeElement)) closeColorMenu();
-      }));
-      colorWrap.append(color, menu); heading.append(colorWrap);
-      const create = el('button', 'btn project-new'); create.append(icon('i-pencil')); create.setAttribute('type', 'button'); create.dataset.newProject = id;
-      ui(create, 'title', () => t("New chat in this project")); ui(create, 'aria-label', () => t("New chat in this project"));
-      create.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectNewChat(id); }); heading.append(create);
-      const remove = el('button', 'btn project-remove') as HTMLButtonElement;
-      remove.type = 'button'; remove.append(icon('i-trash'));
-      ui(remove, 'title', () => t("Remove project from sidebar; keep conversations and files"));
-      ui(remove, 'aria-label', () => t("Remove project {0}", [project.name]));
-      remove.addEventListener('click', async event => {
-        event.preventDefault(); event.stopPropagation();
-        if (remove.disabled) return;
-        remove.disabled = true;
-        try {
-          const removed = await run(api.removeProject(id));
-          if (!removed) return;
-          // Reject list snapshots captured before this newer catalog commit.
-          ++sessionsLoadGeneration;
-          projects = projects.map(row => row.id === id ? removed : row);
-          expandedProjects.delete(id); projectVisibleCounts.delete(id);
-          if (selectedProjectId === id) {
-            if (!selectedId) {
-              const oldKey = draftKey();
-              const authoredDraft = authoredComposerText();
-              selectedProjectId = null; selectionGeneration++; replaceComposerDraft();
-              // Keep the visible draft and its attachments while moving to unfiled.
-              inputDrafts.set(draftKey(), authoredDraft); inputDrafts.delete(oldKey); newChatTasks.delete(oldKey);
-              skillPicker?.restore();
-              const images = imageDrafts.get(oldKey);
-              if (images) imageDrafts.set(draftKey(), images);
-              else imageDrafts.delete(draftKey());
-              imageDrafts.delete(oldKey);
-              ui($<HTMLTextAreaElement>('chatInput'), 'placeholder', () => t('Ask anything…'));
-            } else selectedProjectId = null;
-          }
-          paintSessions(); void refreshInputQueue();
-          toast(t('Project removed; conversations kept'));
-        } finally { remove.disabled = false; }
-      });
-      heading.append(remove);
+      more.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); toggleRowMenu(menu()); });
+      heading.addEventListener('contextmenu', event => { event.preventDefault(); openRowMenu(menu({ x: event.clientX, y: event.clientY })); });
+      heading.append(more);
     }
     const tasks = projectRows.get(id) ?? [];
     const count = projectVisibleCounts.get(id) ?? PROJECT_TASK_PAGE_SIZE;
@@ -967,9 +1041,37 @@ function paintSessions(): void {
     disclosure.addEventListener('toggle', () => { diagnosticsExpanded = disclosure.open; });
     rows.push(disclosure);
   }
+  // A new node is not :hover until the pointer moves again: the row under it would lose its hover
+  // look for a moment, and a sub-agent arrow would jump back to the menu's column and slide out again.
+  // The row under the pointer is born pointed (until the pointer leaves), keeps its tooltip, and an
+  // arrow that changed turns from where it was.
+  const pointedId = [projectList, chatList].map(list => list.querySelector<HTMLElement>('.sess:hover')?.dataset.id).find(Boolean);
+  const arrowsBefore = new Map([...projectList.querySelectorAll<HTMLElement>('.sess > .worker-toggle'), ...chatList.querySelectorAll<HTMLElement>('.sess > .worker-toggle')]
+    .map(toggle => [toggle.parentElement!.dataset.id, toggle.getAttribute('aria-expanded')]));
   // Both scopes keep the existing sessionList drag/order owner and durable project binding.
   projectList.replaceChildren(...projectSections);
   chatList.replaceChildren(...rows);
+  const pointed = pointedId
+    ? [...projectList.querySelectorAll<HTMLElement>('.sess'), ...chatList.querySelectorAll<HTMLElement>('.sess')].find(row => row.dataset.id === pointedId)
+    : undefined;
+  if (pointed) {
+    pointed.classList.add('is-pointed');
+    pointed.addEventListener('pointerleave', () => pointed.classList.remove('is-pointed'), { once: true });
+  }
+  // The tooltip of the row still under the pointer follows the new row (its text may have changed);
+  // any other tooltip goes with its row.
+  const tooltip = document.getElementById('sessionTooltip');
+  if (tooltip && pointed && tooltip.dataset.for === pointedId) placeSessionTooltip(tooltip, pointed);
+  else tooltip?.remove();
+  for (const list of [projectList, chatList]) {
+    for (const toggle of list.querySelectorAll<HTMLElement>('.sess > .worker-toggle')) {
+      const before = arrowsBefore.get(toggle.parentElement!.dataset.id);
+      const now = toggle.getAttribute('aria-expanded');
+      if (before === undefined || before === now) continue;
+      toggle.querySelector<SVGElement>('.disclosure-chevron')?.animate?.([{ transform: `rotate(${before === 'true' ? 90 : 0}deg)` }, { transform: `rotate(${now === 'true' ? 90 : 0}deg)` }],
+        { duration: 150, easing: 'cubic-bezier(.2, .8, .2, 1)' });
+    }
+  }
   if (focusedProject && focusedControl) projectSections.find(section => section.dataset.projectId === focusedProject)
     ?.querySelector<HTMLElement>(focusedControl)?.focus({ preventScroll: true });
   const workers = sessions.filter(entry => entry.origin?.kind === 'worker' && entry.origin.fromSessionId === selectedId && selectedId !== null);
@@ -1097,7 +1199,7 @@ function paintGoalProgress(): void {
   labels.retrying = t("Provider busy · retry {0}{1}", [progress?.attempt ?? '', progress?.retryAt ? t(' at {0}', [new Date(progress.retryAt).toLocaleTimeString(currentLanguage())]) : '']);
   const mode = $<HTMLSelectElement>('chatAutomation').value === 'loop' ? t('Loop') : t('Goal');
   labels.settling = `${mode} · ${wait?.reason === 'native-busy' ? t('ChatGPT resumed work · waiting before retry') : wait?.reason === 'silence' ? t('Waiting before recovery reload') : wait?.reason === 'quiet' ? t('Waiting for tool inactivity') :
-    wait?.reason === 'workers' ? t('Waiting for this chat’s sub-agents') : wait?.reason === 'tools' ? t('Waiting for running tools') : wait?.reason === 'listening' ? t('Waiting for activity after recovery') : t('Answer settling')}`;
+    wait?.reason === 'workers' ? t('Waiting for this chat’s sub-agents') : wait?.reason === 'tools' ? t('Waiting for running tools') : wait?.reason === 'listening' ? t('Waiting for activity after recovery') : wait?.reason === 'closed' ? t('Paused until this chat is open in the browser') : t('Answer settling')}`;
   // The dock already describes this same silence/listening deadline. Keep the
   // Loop/Goal task controls, but do not present its shared wait as another action.
   const sharedRecoveryWait = phase === 'settling' && wait?.until !== undefined &&
@@ -1107,12 +1209,18 @@ function paintGoalProgress(): void {
   // "Goal reached" is said by the Goal row itself; a second row would only repeat it.
   row.hidden = !phase || sharedRecoveryWait || (phase === 'no-reply' && !error && goalReachedShown());
   if (row.hidden) { row.replaceChildren(); row.setAttribute('aria-busy', 'false'); return; }
-  const busy = ['settling', 'saving', 'preparing', 'generating', 'retrying', 'sending', 'answering', 'browser', 'queued', 'ready'].includes(phase) && !error;
+  const busy = ['settling', 'saving', 'preparing', 'generating', 'retrying', 'sending', 'answering', 'browser', 'queued', 'ready'].includes(phase) && !error &&
+    !(phase === 'settling' && wait?.reason === 'closed');
   row.setAttribute('aria-busy', String(busy));
   const marker = el('span', busy ? 'session-status is-working' : 'session-status');
   const body = el('div', 'queue-label'); body.append(el('span', '', error ? `${labels.failed}: ${localizedGoalError(error)}` : labels[phase] ?? phase));
   if (text && ['generating', 'answering', 'preparing'].includes(phase)) { const preview = el('pre', 'goal-live-preview', text.slice(-8000)); body.append(preview); }
   row.replaceChildren(marker, body);
+  // Nothing settles while the chat is closed; opening it is the way on, as from its sidebar row.
+  if (phase === 'settling' && wait?.reason === 'closed' && selectedId) {
+    const id = selectedId;
+    row.append(dockAction(() => t("Open this chat in your browser"), 'i-out', () => void run(api.openSessionChat(id))));
+  }
   if (phase === 'settling' && wait?.until) {
     const seconds = Math.max(0, Math.ceil((wait.until - Date.now()) / 1000));
     const timer = el('span', 'recovery-countdown', seconds ? t('Check in {0}', [`${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`]) : t('Checking for activity…'));
@@ -2203,16 +2311,80 @@ function distanceFromTail(): number {
   return pane.scrollHeight - reserve - pane.clientHeight - pane.scrollTop;
 }
 
+/**
+ * The chat and Agents & automation share one scroll pane (#chatBody). Reading position, following,
+ * the jump control and history paging belong to the chat alone, so they act only while it shows.
+ */
+function timelineShown(): boolean {
+  return !$('timelineContent').hidden;
+}
+
+/** The chat's own scroll position while another view of the pane is shown. */
+let timelineScrollTop: number | null = null;
+
 function paintJumpLatest(): void {
   const jump = document.getElementById('jumpLatest');
-  if (jump) jump.classList.toggle('is-shown', !!selectedId && distanceFromTail() > JUMP_DISTANCE);
+  if (jump) jump.classList.toggle('is-shown', !!selectedId && timelineShown() && distanceFromTail() > JUMP_DISTANCE);
 }
 
 function jumpToLatest(): void {
   sendAnchor = null; readingAfterSend = false; readerAtEnd = true;
+  // On a page of history (a search result opened there, or reading went far up), the end is not
+  // loaded yet: open the chat at its end again instead of paging down to it one page at a time.
+  const newest = events.reduce((latest, event) => Math.max(latest, event.seq), 0);
+  if (historyBefore !== null && selectedId !== null && detailCursor !== null && newest + 1 < detailCursor) {
+    historyBefore = null;
+    detailFor = null;
+    void loadDetail();
+    return;
+  }
   const pane = $('chatBody');
   $('timelineContent').style.removeProperty('--timeline-scroll-reserve');
   scrollPane(pane, pane.scrollHeight, true);
+}
+
+/**
+ * Opens a chat at the message a search matched (#1117): when it is older than the loaded page, the
+ * page around it, as scrolling up would load it. Centered and briefly marked; reading there is
+ * history reading, so the chat no longer follows its end until the reader goes back down.
+ */
+async function revealSearchMatch(id: string, query: string): Promise<void> {
+  const selection = selectionGeneration;
+  const current = (): boolean => selection === selectionGeneration && selectedId === id;
+  const location = await run(api.locateSearchMatch(id, query));
+  if (!location || !current()) return;
+  // The chat's own first page, and the fill that follows it, settle first.
+  for (const deadline = Date.now() + 5000; detailFor !== id || historyLoading || historyDemand !== null;) {
+    if (Date.now() > deadline || !current()) return;
+    await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()));
+  }
+  const rowFor = (): HTMLElement | null => {
+    const event = events.find(candidate => candidate.seq === location.seq) ?? (location.messageId === null ? undefined
+      : events.find(candidate => candidate.kind === location.kind && 'messageId' in candidate && candidate.messageId === location.messageId));
+    if (!event) return null;
+    const key = itemKey({ kind: 'event', event });
+    return [...$('timeline').querySelectorAll<HTMLElement>('[data-timeline-key]')].find(row => row.dataset.timelineKey === key) ?? null;
+  };
+  let row = rowFor();
+  if (!row) {
+    // Marked as history before the read, so a live update meanwhile cannot land in this page.
+    const boundary = location.position + Math.ceil(TIMELINE_BATCH_SIZE / 2);
+    events = [];
+    historyStart = null;
+    historyBefore = boundary;
+    const loaded = await loadDetail(true, boundary);
+    if (!current()) return;
+    // A failed read leaves nothing to show: open the chat at its end instead.
+    if (!loaded || !events.length) { historyBefore = null; detailFor = null; void loadDetail(); return; }
+    row = rowFor();
+  }
+  if (!row) return;
+  readTimeline();
+  row.scrollIntoView({ block: 'center' });
+  row.classList.remove('is-search-hit');
+  void row.offsetWidth;
+  row.classList.add('is-search-hit');
+  window.setTimeout(() => row.classList.remove('is-search-hit'), 2600);
 }
 
 /** Explicit history inspection releases the same follow/send hold as reading upwards. */
@@ -2348,7 +2520,7 @@ function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>, context?:
 /** A batch is storage work, not a wheel detent. Fill the requested visible edge
  * through hidden events/collapsed activity, yielding between bounded IPC reads. */
 function requestHistory(direction: number, opening = false): void {
-  if (!selectedId || detailFor !== selectedId || !direction) return;
+  if (!selectedId || detailFor !== selectedId || !direction || !timelineShown()) return;
   historyDemand = { sessionId: selectedId, selection: selectionGeneration, direction, opening };
   void fillTimelineHistory();
 }
@@ -2574,6 +2746,13 @@ function paintMessageReaction(box: HTMLElement, value: unknown): void {
   if (!existing) box.append(badge);
 }
 
+/** The approval row in the interface language. Literal `t()` calls keep the catalog audit able to see each key. */
+function approvalRowText(text: string): string {
+  if (text === APPROVAL_WAITING_TEXT) return t('ChatGPT is waiting for you to allow or deny a tool call in this chat. Nothing continues until you answer it there.');
+  if (text === APPROVAL_ANSWERED_TEXT) return t('The tool approval ChatGPT asked for in this chat was answered.');
+  return text;
+}
+
 function eventBody(event: SessionEvent, context?: { id: string; current: () => boolean; history: readonly SessionEvent[] }): HTMLElement {
   switch (event.kind) {
     case 'session_start':
@@ -2684,8 +2863,23 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
       }
       return box;
     }
-    case 'progress':
-      return el('p', 'meta is-progress', event.message.text);
+    case 'progress': {
+      if (!event.progressId?.startsWith(APPROVAL_PROGRESS_PREFIX)) return el('p', 'meta is-progress', event.message.text);
+      // ChatGPT's own tool approval card stands in this chat's page (approval-wait.ts). The app
+      // writes the English source; only the user can answer the card, so the row opens the page.
+      const waiting = event.message.text === APPROVAL_WAITING_TEXT;
+      const line = el('p', `meta is-progress thinking-line approval-wait${waiting ? ' is-waiting' : ''}`);
+      line.append(icon(waiting ? 'i-lock' : 'i-check-circle', 'ico thinking-ico'), el('span', '', () => approvalRowText(event.message.text)));
+      const owner = context?.id ?? selectedId;
+      if (waiting && owner) {
+        const open = el('button', 'btn') as HTMLButtonElement;
+        open.type = 'button';
+        open.append(icon('i-out'), el('span', '', () => t('Open in browser')));
+        open.addEventListener('click', () => void run(api.openSessionChat(owner)));
+        line.append(open);
+      }
+      return line;
+    }
     case 'page_tool': {
       const line = el('p', 'meta is-progress thinking-line');
       line.append(icon('i-globe', 'ico thinking-ico'), el('span', '', event.label));
@@ -3553,7 +3747,7 @@ function paintDetail(followBottom = historyBefore === null): void {
   reconcileChildren($('timeline'), groupImageRows(groupToolRows(timelineRows)));
   paintPendingInputs();
   $('timelineEmpty').hidden = selectedId !== null || timelineRows.length > 0 || $('inputQueue').childElementCount > 0;
-  if (!holdSentMessage()) restoreViewport();
+  if (timelineShown() && !holdSentMessage()) restoreViewport();
   paintJumpLatest();
 
   const facts: string[] = [];
@@ -5425,6 +5619,11 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
 
 // ------------------------------------------------------------------- wiring
 
+/** Opens the search dialog, as ⌘K / Ctrl+K does (the View menu). */
+export function openChatSearch(): void {
+  chatSearch?.open();
+}
+
 /**
  * Switches the session card's body.
  *
@@ -5452,6 +5651,9 @@ export function focusChatComposer(suggestedText = ''): boolean {
 }
 
 function showView(name: string): void {
+  const pane = $('chatBody');
+  const leavingTimeline = timelineShown() && name !== 'timeline';
+  if (leavingTimeline) timelineScrollTop = pane.scrollTop;
   $('composer').hidden = name === 'settings';
   $('composerDock').hidden = name === 'settings';
   $('inputQueue').hidden = name !== 'timeline';
@@ -5462,6 +5664,14 @@ function showView(name: string): void {
     view.hidden = view.dataset.view !== name;
   }
   $('chatSettingsBtn').classList.toggle('is-on', name === 'settings');
+  // Another view starts at its top; the chat comes back where its reader left it, or at its end
+  // when it was following.
+  if (leavingTimeline) pane.scrollTop = 0;
+  else if (name === 'timeline' && timelineScrollTop !== null) {
+    pane.scrollTop = readerAtEnd && !sendAnchor && !readingAfterSend ? pane.scrollHeight : timelineScrollTop;
+    timelineScrollTop = null;
+  }
+  paintJumpLatest();
 }
 
 function selectSession(id: string): void {
@@ -5529,10 +5739,11 @@ function selectNewChat(projectId: string | null = null): void {
 
 export function initChat(next: Deps): void {
   sidebarCompletion = createSidebarCompletionState();
+  sidebarPins = createSidebarPins();
   sidebarOrder = createSidebarOrder($('sessionList'), () => [
     ...projectSortEntries(),
     ...sessions.filter(entry => (entry.conversationId || entry.origin?.kind === 'desktop') && entry.origin?.kind !== 'worker')
-      .map(entry => ({ id: entry.id, scope: projectGroup(entry.projectId) ?? '' }))
+      .map(entry => ({ id: entry.id, scope: pinnedSortScope(projectGroup(entry.projectId) ?? '', pinnedChat(entry)) }))
   ], paintSessions);
   deps = next;
   const stopComposerHeightMotion = installComposerHeightMotion($('composer'));
@@ -5852,9 +6063,6 @@ export function initChat(next: Deps): void {
       if (generation === selectionGeneration) selectNewChat(project.id); else paintSessions();
     } finally { button.disabled = false; }
   });
-  $('settingsSearch').addEventListener('input', () => {
-    filterSettingsSections(document.querySelector<HTMLElement>('[data-view="settings"]')!, $<HTMLInputElement>('settingsSearch').value);
-  });
   const composerMenus = [...document.querySelectorAll<HTMLDetailsElement>('.composer-menu, .session-controls')];
   document.addEventListener('click', (event) => {
     for (const menu of composerMenus) if (!menu.contains(event.target as Node) || ((event.target as HTMLElement).closest('button') && !(event.target as HTMLElement).closest('[data-keep-menu]'))) menu.open = false;
@@ -5889,6 +6097,8 @@ export function initChat(next: Deps): void {
     // nor does a key that acts on a focused control (Space toggling a disclosure), nor
     // programmatic scrolling.
     const pane = $('chatBody');
+    /** How long a wheel, touch or key waits for the scroll it starts before it stops counting. */
+    const INTENT_SETTLE_MS = 100;
     let intent: { generation: number; scrolled: boolean } | null = null;
     let heldPointer: { id: number; generation: number; middle: boolean; released: boolean } | null = null;
     let intentFrame: number | null = null;
@@ -5903,12 +6113,20 @@ export function initChat(next: Deps): void {
       const owner = intent?.generation === selectionGeneration ? intent : { generation: selectionGeneration, scrolled: false };
       intent = owner;
       if (intentFrame !== null) window.cancelAnimationFrame(intentFrame);
-      // Scroll events precede animation-frame callbacks. A slow/hidden rendering opportunity
-      // must not age out real input; input that did not move anything expires at that frame.
-      intentFrame = window.requestAnimationFrame(() => {
+      // Input that did not move anything expires, but not at the next frame: a smooth wheel scroll
+      // starts one frame after its wheel event, so that frame's callback ran before the first scroll
+      // and a single notch up never counted as reading (the reader was then pulled back to the end
+      // by the next resize or delivery). Wait two frames and at least INTENT_SETTLE_MS; a slow or
+      // hidden rendering opportunity still cannot age out real input.
+      const armedAt = performance.now();
+      let frames = 0;
+      const expire = (): void => {
+        frames++;
+        if (frames < 2 || performance.now() - armedAt < INTENT_SETTLE_MS) { intentFrame = window.requestAnimationFrame(expire); return; }
         intentFrame = null;
         if (intent === owner && !owner.scrolled && heldPointer?.generation !== owner.generation) intent = null;
-      });
+      };
+      intentFrame = window.requestAnimationFrame(expire);
     };
     const scrollKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
     pane.addEventListener('wheel', noteIntent, { passive: true });
@@ -5950,7 +6168,7 @@ export function initChat(next: Deps): void {
     }, { passive: true, capture: true });
     window.addEventListener('keydown', event => { if (event.key === 'Escape' && heldPointer?.released) clearIntent(); }, { capture: true });
     pane.addEventListener('scroll', () => {
-      if (intent?.generation === selectionGeneration) {
+      if (intent?.generation === selectionGeneration && timelineShown()) {
         intent.scrolled = true;
         if (heldPointer?.released) heldPointer = null;
         // The absolute end, reserve included: scrolling up out of an underfilled page's blank
@@ -5987,6 +6205,18 @@ export function initChat(next: Deps): void {
     } else void sendComposer(undefined, undefined, undefined, controlAction);
   });
 
+  chatSearch = initChatSearch({
+    select: (id, match) => {
+      if (id !== selectedId) { pendingNewInput = null; selectSession(id); }
+      if (match) void revealSearchMatch(id, match);
+    },
+    selectedId: () => selectedId,
+    // The chats the sidebar lists, newest first: sub-agents, helpers and diagnostics rows stay out.
+    recent: () => sessions
+      .filter(entry => entry.origin?.kind !== 'worker' && entry.origin?.kind !== 'helper' && (!!entry.conversationId || entry.origin?.kind === 'desktop'))
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map(entry => ({ id: entry.id, title: entry.title }))
+  });
   $('sessionList').addEventListener('click', (event) => {
     const row = (event.target as HTMLElement).closest<HTMLElement>('[data-id]');
     if (!row?.dataset.id || row.dataset.id === selectedId) return;
@@ -6039,7 +6269,7 @@ export function initChat(next: Deps): void {
     let lastHeight = historyPane.clientHeight;
     new ResizeObserver(() => {
       const height = historyPane.clientHeight;
-      if (height !== lastHeight && readerAtEnd && !sendAnchor && !readingAfterSend) historyPane.scrollTop = historyPane.scrollHeight;
+      if (height !== lastHeight && timelineShown() && readerAtEnd && !sendAnchor && !readingAfterSend) historyPane.scrollTop = historyPane.scrollHeight;
       lastHeight = height;
     }).observe(historyPane);
   }
@@ -6057,6 +6287,7 @@ export function initChat(next: Deps): void {
     // badge can move the height by a rounding pixel, and following that moved every message.
     let observedHeight = $('chatBody').scrollHeight;
     const observer = new ResizeObserver(() => {
+      if (!timelineShown()) return;
       holdSentMessage();
       // Growth that no repaint saw (a row expanding, an image loading, streamed text): follow it
       // while the reader is at the end. Older history pages never follow.

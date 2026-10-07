@@ -61,7 +61,7 @@ app.whenReady().then(async () => {
       window.fixtureSaves=[]; window.fixtureAttached=[];
       const personal={id:'review',name:'Code review',description:'Read the complete change, check behavior and preserve existing work.',path:'/skills/review/SKILL.md',managed:true,scope:'managed',source:'managed',allowImplicitInvocation:true};
       const projectSkill={id:'project-check--repo-fixture',name:'Project checks',description:'Use this project’s build, conventions and verification routes.',path:'/demo/.agents/skills/check/SKILL.md',managed:false,scope:'repo',source:'repo-agents',allowImplicitInvocation:true};
-      window.api=new Proxy({getState:()=>ok(state),getLog:()=>ok([]),getZoom:()=>ok(1),listProjects:()=>ok(projects),
+      window.api=new Proxy({getState:()=>ok(state),getLog:()=>ok([]),getZoom:()=>ok(1),setZoom:factor=>ok(Math.round(factor*100)/100),petsOverlayState:()=>ok({visible:false,ready:true,activeCount:0,activityCount:0}),listProjects:()=>ok(projects),
         listSessions:()=>ok({sessions:rows,total:rows.length,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
         getSession:id=>ok({events:[{seq:1,time:1,source:'extension',kind:'user_message',messageId:'question',message:{text:'Review this project',chars:19,truncated:false}},
           {seq:2,time:2,source:'extension',kind:'assistant_message',messageId:'answer',final:true,state:'final',message:{text:'The project workspace is ready for inspection.',chars:47,truncated:false}}],total:2,nextFrom:3}),
@@ -226,7 +226,8 @@ app.whenReady().then(async () => {
     await until('!!document.querySelector(".file-pdf-canvas:not([hidden])")');
     assert.ok(await js(`(()=>{const c=document.querySelector('.file-pdf-canvas');return c.width*c.height>100&&c.width*c.height<=16*1024*1024;})()`));
     await screenshot('pdf-rendered');
-    await js(`document.getElementById('sidebarConnection').click()`);
+    // Disconnected, a click on the capsule connects; its details are one right click away.
+    await js(`document.getElementById('sidebarConnection').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))`);
     assert.equal(await js('document.getElementById("connectionPopoverTitle").textContent'), 'Not connected');
     assert.equal(await js('document.querySelector("#connectionPopover details")'), null);
     const bounds=await js(`(()=>{const r=document.getElementById('connectionPopover').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,fits:r.x>=0&&r.y>=0&&r.right<=innerWidth&&r.bottom<=innerHeight};})()`);
@@ -238,7 +239,7 @@ app.whenReady().then(async () => {
     await js(`document.getElementById('rightDockToggle').click();document.getElementById('sidebarPlugins').click()`);
     assert.equal(await js('document.querySelector(".app").dataset.screen'),'library');
     assert.equal(await js('document.getElementById("sidebarPrimary").hidden'),false);
-    await js(`document.querySelector('[data-new-project="project-b"]').click()`);
+    await js(`document.querySelector('.project-group[data-project-id="project-b"] .project-menu').click();document.querySelector('.row-menu [data-new-project="project-b"]').click()`);
     await until('document.querySelector(".app").dataset.screen==="chat"');
     assert.ok(await js('document.getElementById("chatInput").placeholder.includes("Second project")'));
     await js(`document.querySelector('.sess[data-id="task-0"]').click()`);
@@ -277,18 +278,28 @@ app.whenReady().then(async () => {
     assert.equal(await js('document.getElementById("uiLanguage").value'),'zh-TW');
     await screenshot('traditional-chinese-settings');
     // Every opening is compact, including when translucency creates a sidebar stacking context.
-    await js(`document.documentElement.dataset.translucentSidebar='true';document.getElementById('sidebarConnection').click()`);
+    await js(`document.documentElement.dataset.translucentSidebar='true';document.getElementById('sidebarConnection').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))`);
     assert.equal(await js('document.getElementById("connectionAdvanced")'),null);
     assert.equal(await js('document.getElementById("connectionPopoverSettings")'),null);
     assert.equal(await js('document.getElementById("connectionAdvancedOverwrite")'),null);
-    await js(`document.getElementById('sidebarConnection').click();document.getElementById('sidebarConnection').click()`);
+    await js(`document.getElementById('sidebarConnection').click();document.getElementById('sidebarConnection').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))`);
     assert.equal(await js('document.querySelector("#connectionPopover details")'),null);
     assert.equal(await js('document.getElementById("connectionPopover").hidden'),false);
     await screenshot('connection-compact');
-    await js(`document.getElementById('sidebarConnection').click();document.getElementById('viewMenu').open=true`);
-    assert.ok(await js(`(()=>{const n=document.getElementById('zoomIn'),r=n.getBoundingClientRect();return n.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`));
+    // The View menu: one icon button, the row menus' menu, each action with this keyboard's shortcut,
+    // above everything; a zoom step keeps it open.
+    await js(`document.getElementById('sidebarConnection').click();document.getElementById('viewMenu').click()`);
+    const viewItem=action=>`document.querySelector('.row-menu [data-row-action="${action}"]')`;
+    assert.ok(await js(`(()=>{const n=${viewItem('zoom-in')},r=n.getBoundingClientRect();return n.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`));
+    assert.deepEqual(await js(`(()=>{const mac=/^Mac/.test(navigator.platform);return [${viewItem('search')}.querySelector('.row-menu-shortcut').textContent===(mac?'⌘K':'Ctrl+K'),!${viewItem('sidebar')}]})()`),[true,true]);
     await screenshot('view-menu');
-    await js(`document.getElementById('viewMenu').open=false;document.querySelector('[data-tab=appearance]').click();window.fixture.setLanguage('en')`);
+    await js(`${viewItem('zoom-in')}.click()`);
+    await until(`${viewItem('zoom-reset')}?.querySelector('.row-menu-hint').textContent==='110%'`);
+    await js(`${viewItem('zoom-reset')}.click()`);
+    await until(`${viewItem('zoom-reset')}?.querySelector('.row-menu-hint').textContent==='100%'`);
+    await js(`document.getElementById('viewMenu').click()`);
+    await until(`!document.querySelector('.row-menu')`);
+    await js(`document.querySelector('[data-tab=appearance]').click();window.fixture.setLanguage('en')`);
     const heights=await js(`['appearanceFont','appearanceSize','setupProfile'].map(id=>{const n=document.getElementById(id).closest('.setting');return n.getBoundingClientRect().height})`);
     assert.ok(Math.max(...heights)-Math.min(...heights)<2,JSON.stringify(heights));
     await screenshot('appearance-aligned');
@@ -311,8 +322,8 @@ app.whenReady().then(async () => {
     assert.ok(await js(`(()=>{const n=document.getElementById('composerAddSkill'),r=n.getBoundingClientRect();return r.width>0&&r.height>0&&n.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))})()`));
     await js(`document.getElementById('composerAddSkill').click()`);
     assert.ok(await js('document.getElementById("chatInput").value.startsWith("Please add the following skills to my COS skills:")'));
-    await js(`window.fixture.readyConnection();document.getElementById('headerConnect').click()`);
-    await until('document.getElementById("headerConnect").hidden && document.getElementById("sidebarConnection").classList.contains("is-connected")');
+    await js(`window.fixture.readyConnection();document.getElementById('sidebarConnection').click()`);
+    await until('!document.getElementById("sidebarConnection").classList.contains("has-label") && document.getElementById("sidebarConnection").classList.contains("is-connected")');
     const errors=await js('window.fixtureErrors');
     assert.deepEqual(errors,[]);
     fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({renderer:'current source in Chromium; synthetic backend',results,save:true,draftRoundTrip:true,gitChanges:true,pdf:true,connection:bounds,skillsDraftRoundTrip:true,sharedLibrary:true,sidebar:true,composer,agentMonitor:{latestActivity:true,actionCount:true},errors},null,2));

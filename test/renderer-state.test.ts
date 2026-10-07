@@ -3,7 +3,7 @@ vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTermina
   tabs: vi.fn(() => []), selectTab: vi.fn(), closeTab: vi.fn()
 }) }));
 // Native animation/media APIs are covered by pet DOM and real Electron tests.
-vi.mock('../src/renderer/pet.js', () => ({ initPet: () => () => {} }));
+vi.mock('../src/renderer/pet.js', () => ({ initPet: () => Object.assign(() => {}, { toggle: () => {}, isVisible: () => false }) }));
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
@@ -11,6 +11,25 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_MODEL, DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
 import { DEFAULT_HANDOFF_PROMPT } from '../src/shared/handoff.js';
 import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../src/shared/browser-control.js';
+
+/** jsdom has no modal dialogs: enough of showModal/close for the app's dialogs, close event included. */
+function installDialog(w: any): void {
+  const proto = w.HTMLDialogElement.prototype;
+  if (typeof proto.showModal !== 'function') proto.showModal = function (this: any) { this.open = true; };
+  if (typeof proto.close !== 'function') proto.close = function (this: any) { if (!this.open) return; this.open = false; this.dispatchEvent(new w.Event('close')); };
+}
+
+/** A row's menu item: opens the row's "⋯" menu (it lives in the document body) and returns the item. */
+function rowMenuItem(row: Element, action: string): HTMLButtonElement | null {
+  const doc = row.ownerDocument;
+  closeRowMenus(doc);
+  (row.querySelector('.row-menu-button') as HTMLButtonElement).click();
+  return doc.querySelector<HTMLButtonElement>(`.row-menu [data-row-action="${action}"]`);
+}
+/** Closes whatever row menu is open, as Escape does. */
+function closeRowMenus(doc: Document): void {
+  doc.querySelector('.row-menu')?.dispatchEvent(new (doc.defaultView as any).KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+}
 
 let dom: JSDOM | null = null;
 afterEach(() => {
@@ -22,6 +41,7 @@ afterEach(() => {
 it('does not overwrite a focused dirty settings field on an unsolicited state push', async () => {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
+  installDialog(dom.window);
   const w = dom.window;
   w.HTMLElement.prototype.animate = vi.fn() as any;
   Object.assign(globalThis, {
@@ -203,6 +223,7 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
 it('serializes settings intent so rapid toggles and later UI changes cannot undo each other', async () => {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
+  installDialog(dom.window);
   const w = dom.window;
   w.HTMLElement.prototype.animate = vi.fn() as any;
   Object.assign(globalThis, {
@@ -359,6 +380,7 @@ async function mountChat(
 ): Promise<GoalMount> {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
+  installDialog(dom.window);
   const w = dom.window;
   w.HTMLElement.prototype.animate = vi.fn() as any;
   Object.assign(globalThis, { Event: w.Event });
@@ -488,7 +510,7 @@ it('starts project groups collapsed and deliberately expands the project selecte
   const group = () => mounted.window.document.querySelector<HTMLDetailsElement>(`[data-project-id="${project.id}"]`)!;
   await vi.waitFor(() => expect(group()).not.toBeNull());
   expect(group().open).toBe(false);
-  (group().querySelector('.project-new') as HTMLButtonElement).click();
+  rowMenuItem(group().querySelector('.project-heading')!, 'new-chat')!.click();
   expect(group().open).toBe(true);
 });
 
@@ -520,6 +542,32 @@ it('commits a project summary click before an immediate state repaint replaces i
   expect(group().open).toBe(true);
 });
 
+it("copies a chat's ChatGPT link from its row menu (#1107)", async () => {
+  const session = {
+    id: 'linked-session', title: 'Linked chat', conversationId: 'linked-chat-0001', chatIds: ['linked-chat-0001'],
+    startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastHandoffId: null, lastHandoffAt: null,
+    lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null
+  };
+  const writeClipboard = vi.fn(async () => ({ ok: true, data: true }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+    writeClipboard
+  });
+  const doc = mounted.window.document;
+  const row = () => doc.querySelector<HTMLElement>(`[data-id="${session.id}"]`)!;
+  await vi.waitFor(() => expect(row()).not.toBeNull());
+  const item = rowMenuItem(row(), 'copy-link')!;
+  expect(item.textContent).toContain('Copy link');
+  // It sits right after Open in browser.
+  expect(item.previousElementSibling?.getAttribute('data-row-action')).toBe('open');
+  item.click();
+  await vi.waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('https://chatgpt.com/c/linked-chat-0001'));
+  await vi.waitFor(() => expect(doc.querySelector('.toast')?.textContent).toBe('Link copied'));
+});
+
 it('keeps strict chat allowlisting separate from Block and exposes explicit Trust on session rows', async () => {
   const session = {
     id: 'strict-session', title: 'Strict policy chat', conversationId: 'strict-chat-0001', chatIds: ['strict-chat-0001'],
@@ -549,15 +597,17 @@ it('keeps strict chat allowlisting separate from Block and exposes explicit Trus
   mounted.push(structuredClone(mounted.state));
   const primeRow = () => doc.querySelector<HTMLElement>(`[data-id="${session.id}"]`)!;
   const workerRow = () => doc.querySelector<HTMLElement>(`[data-id="${workerSession.id}"]`)!;
-  await vi.waitFor(() => expect(primeRow().querySelector('.sess-trust')).not.toBeNull());
-  expect(workerRow().querySelector('.sess-trust')).toBeNull();
-  expect(workerRow().querySelector('.sess-block')).not.toBeNull();
+  await vi.waitFor(() => expect(rowMenuItem(primeRow(), 'trust')).not.toBeNull());
+  closeRowMenus(doc);
+  expect(rowMenuItem(workerRow(), 'trust')).toBeNull();
+  expect(doc.querySelector('.row-menu [data-row-action="block"]')).not.toBeNull();
+  closeRowMenus(doc);
 
-  (primeRow().querySelector('.sess-trust') as HTMLButtonElement).click();
+  rowMenuItem(primeRow(), 'trust')!.click();
   await vi.waitFor(() => expect(setSessionTrusted).toHaveBeenCalledWith(session.id, session.conversationId, true));
   expect(setSessionBlocked).not.toHaveBeenCalled();
 
-  (primeRow().querySelector('.sess-block') as HTMLButtonElement).click();
+  rowMenuItem(primeRow(), 'block')!.click();
   await vi.waitFor(() => expect(setSessionBlocked).toHaveBeenCalledWith(session.id, true));
 });
 
@@ -586,13 +636,210 @@ it('shows committed resume inheritance as trusted and revokes it through the cur
   mounted.state.config.multiAgent.strictChatAllowlist = true;
   mounted.push(structuredClone(mounted.state));
   const row = () => doc.querySelector<HTMLElement>(`[data-id="${session.id}"]`)!;
-  await vi.waitFor(() => expect(row().querySelector('.sess-trust')).not.toBeNull());
-  const trust = row().querySelector('.sess-trust') as HTMLButtonElement;
-  expect(trust.classList.contains('is-trusted')).toBe(true);
-  const block = row().querySelector('.sess-block') as HTMLButtonElement;
-  expect(block.classList.contains('is-blocked')).toBe(false);
+  await vi.waitFor(() => expect(rowMenuItem(row(), 'trust')).not.toBeNull());
+  const trust = rowMenuItem(row(), 'trust')!;
+  expect(trust.textContent).toBe('Untrust chat');
+  expect(doc.querySelector('.row-menu [data-row-action="block"]')!.textContent).toBe('Block chat');
   trust.click();
   await vi.waitFor(() => expect(setSessionTrusted).toHaveBeenCalledWith(session.id, current, false));
+});
+
+it('offers a chat\'s actions in one menu, by kind of row, and opens it with a right click too', async () => {
+  const base = { startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null };
+  const chat = { ...base, id: 'menu-chat-0001', title: 'A chat', conversationId: 'menu-conversation-0001', chatIds: ['menu-conversation-0001'] };
+  const loose = { ...base, id: 'menu-loose-0001', title: '', conversationId: null, chatIds: [] };
+  const deleteSession = vi.fn(async () => ({ ok: true, data: true }));
+  const openSessionChat = vi.fn(async () => ({ ok: true, data: true }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [chat, loose], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+    deleteSession, openSessionChat
+  });
+  const doc = mounted.window.document;
+  const row = (id: string) => doc.querySelector<HTMLElement>(`[data-id="${id}"]`)!;
+  await vi.waitFor(() => expect(row(chat.id)).not.toBeNull());
+  // One button on the row, no loose icons.
+  expect(row(chat.id).querySelectorAll('.sess-actions button').length).toBe(1);
+  const actions = (): Array<string | undefined> => [...doc.querySelectorAll<HTMLElement>('.row-menu .row-menu-item')].map(item => item.dataset.rowAction);
+  rowMenuItem(row(chat.id), 'rename');
+  expect(actions()).toEqual(['pin', 'rename', 'open', 'copy-link', 'block', 'remove']);
+  expect(doc.querySelector('.row-menu [data-row-action="remove"]')!.classList.contains('is-danger')).toBe(true);
+  closeRowMenus(doc);
+  // A row that is not a chat offers only what applies to it.
+  await vi.waitFor(() => expect(row(loose.id)).not.toBeNull());
+  rowMenuItem(row(loose.id), 'block');
+  expect(actions()).toEqual(['block', 'remove']);
+  closeRowMenus(doc);
+  // A right click opens the same menu; its items run their action.
+  row(chat.id).dispatchEvent(new mounted.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 40 }));
+  doc.querySelector<HTMLButtonElement>('.row-menu [data-row-action="open"]')!.click();
+  await vi.waitFor(() => expect(openSessionChat).toHaveBeenCalledWith(chat.id));
+  expect(doc.querySelector('.row-menu')).toBeNull();
+});
+
+it('names a chat in place: Enter saves, Escape keeps the old name, empty restores ChatGPT\'s title, repaints keep the field (#1107)', async () => {
+  const session = {
+    id: 'rename-session-0001', title: 'ChatGPT title', conversationId: 'rename-conversation-0001', chatIds: ['rename-conversation-0001'],
+    startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null
+  };
+  const renameSession = vi.fn(async () => ({ ok: true, data: true }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+    renameSession
+  });
+  const doc = mounted.window.document;
+  const row = () => doc.querySelector<HTMLElement>(`[data-id="${session.id}"]`)!;
+  const field = () => row().querySelector<HTMLInputElement>('.sess-rename');
+  await vi.waitFor(() => expect(row().querySelector('.row-menu-button')).not.toBeNull());
+  expect(field()).toBeNull();
+  const press = (key: string) => field()!.dispatchEvent(new mounted.window.KeyboardEvent('keydown', { key, bubbles: true }));
+  const type = (text: string) => { field()!.value = text; field()!.dispatchEvent(new mounted.window.Event('input', { bubbles: true })); };
+
+  // Escape: nothing is saved, the title is back.
+  rowMenuItem(row(), 'rename')!.click();
+  await vi.waitFor(() => expect(field()).not.toBeNull());
+  expect(field()!.value).toBe('ChatGPT title');
+  type('Never saved');
+  press('Escape');
+  await vi.waitFor(() => expect(field()).toBeNull());
+  expect(renameSession).not.toHaveBeenCalled();
+  expect(row().querySelector('.sess-top b')!.textContent).toBe('ChatGPT title');
+
+  // The sidebar repaints while the user types; the field and its text survive.
+  rowMenuItem(row(), 'rename')!.click();
+  await vi.waitFor(() => expect(field()).not.toBeNull());
+  type('  Release   prep  ');
+  const editing = field();
+  mounted.push(structuredClone(mounted.state));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  // The same node: an input method's composition would not survive a replaced field.
+  expect(field()).toBe(editing);
+  expect(field()?.value).toBe('  Release   prep  ');
+  press('Enter');
+  await vi.waitFor(() => expect(renameSession).toHaveBeenCalledWith(session.id, 'Release   prep'));
+
+  // Empty asks for ChatGPT's title again.
+  rowMenuItem(row(), 'rename')!.click();
+  await vi.waitFor(() => expect(field()).not.toBeNull());
+  type('   ');
+  press('Enter');
+  await vi.waitFor(() => expect(renameSession).toHaveBeenLastCalledWith(session.id, null));
+});
+
+it('searches chats in a dialog opened beside the app name: recent chats first, then marked matches (#1117)', async () => {
+  const base = { conversationId: null, chatIds: [], startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+    lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+    estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null };
+  const listed = { ...base, id: 'search-listed-0001', title: 'Listed chat', conversationId: 'search-listed-conversation' };
+  let indexed = 1;
+  const searchSessions = vi.fn(async (query: string) => ({ ok: true, data: query === 'bridge' ? {
+    results: [{ id: 'search-hit-0001', title: 'Release planning', projectId: null,
+      snippet: { text: '…then the bridge gets its installer.', matches: [[10, 16]] } }],
+    indexed, total: 3 } : { results: [], indexed: 3, total: 3 } }));
+  const getSession = vi.fn(async (id: string) => ({ ok: true, data: { summary: { ...base, id, title: 'Release planning' }, events: [], total: 0, nextFrom: 1 } }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [listed], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+    searchSessions, getSession
+  });
+  const doc = mounted.window.document;
+  const field = doc.getElementById('chatSearch') as HTMLInputElement;
+  const results = doc.getElementById('searchResults')!;
+  const lists = doc.getElementById('sessionList')!;
+  const dialog = doc.getElementById('searchDialog') as HTMLDialogElement;
+  await vi.waitFor(() => expect(doc.querySelector('[data-id="search-listed-0001"]')).not.toBeNull());
+  // No search field in the sidebar: one icon beside the app name opens the dialog.
+  expect(doc.querySelector('.sidebar #chatSearch')).toBeNull();
+  expect(dialog.open).toBe(false);
+  (doc.getElementById('searchChatsButton') as HTMLButtonElement).click();
+  expect(dialog.open).toBe(true);
+  expect(doc.activeElement).toBe(field);
+  // Before anything is typed: the most recent chats.
+  await vi.waitFor(() => expect(results.querySelector('.search-heading')?.textContent).toBe('Recent'));
+  expect([...results.querySelectorAll('.search-result b')].map(title => title.textContent)).toEqual(['Listed chat']);
+
+  field.value = 'bridge';
+  field.dispatchEvent(new mounted.window.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(results.querySelector('.search-snippet')).not.toBeNull());
+  // The chat lists keep their place behind the dialog.
+  expect(lists.hidden).toBe(false);
+  expect((doc.getElementById('chatSearchClear') as HTMLButtonElement).hidden).toBe(false);
+  expect(results.querySelector('.search-result b')!.textContent).toBe('Release planning');
+  expect([...results.querySelectorAll('.search-snippet mark')].map(mark => mark.textContent)).toEqual(['bridge']);
+  // Indexing is not done yet: the result says so, and asks again until it is.
+  expect(results.querySelector('.search-status')!.textContent).toContain('1 of 3');
+  indexed = 3;
+  await vi.waitFor(() => expect(results.querySelector('.search-status')).toBeNull());
+
+  // Opening a result closes the dialog and opens the chat.
+  (results.querySelector('.search-result') as HTMLButtonElement).click();
+  await vi.waitFor(() => expect(dialog.open).toBe(false));
+  await vi.waitFor(() => expect(getSession).toHaveBeenCalledWith('search-hit-0001', expect.anything()));
+
+  // Opened again (from the View menu), the last query is still there, selected, and the open chat is marked.
+  (doc.getElementById('viewMenu') as HTMLButtonElement).click();
+  (doc.querySelector('.row-menu [data-row-action="search"]') as HTMLButtonElement).click();
+  expect(dialog.open).toBe(true);
+  await vi.waitFor(() => expect(results.querySelector('.search-result')!.classList.contains('is-sel')).toBe(true));
+
+  field.value = 'nothing';
+  field.dispatchEvent(new mounted.window.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(results.textContent).toContain('No chats match'));
+
+  // The clear button empties the query and brings the recent chats back.
+  (doc.getElementById('chatSearchClear') as HTMLButtonElement).click();
+  await vi.waitFor(() => expect(results.querySelector('.search-heading')).not.toBeNull());
+  expect(field.value).toBe('');
+  // A click on the backdrop lands on the dialog itself and closes it.
+  dialog.dispatchEvent(new mounted.window.MouseEvent('click', { bubbles: true }));
+  await vi.waitFor(() => expect(dialog.open).toBe(false));
+});
+
+it.each([['Win32', 'ctrlKey', 'metaKey'], ['MacIntel', 'metaKey', 'ctrlKey']] as const)(
+  'opens chat search with the primary shortcut on %s, never from the terminal, and says when results were capped', async (platform, primary, other) => {
+  vi.stubGlobal('navigator', { ...globalThis.navigator, platform });
+  try {
+    const base = { conversationId: null, chatIds: [], startedAt: 1, updatedAt: 2, endedAt: null, events: 0, userMessages: 0, toolCalls: 0,
+      lastToolCallAt: null, processExitNonzero: 0, toolRejected: 0, toolInternalErrors: 0, errors: 0,
+      estimatedTokens: 0, contextTokens: 0, lastTurnOutcome: null, activeTurnId: null, agents: [], origin: null };
+    const listed = { ...base, id: 'search-shortcut-0001', title: 'Listed chat', conversationId: 'search-shortcut-conversation' };
+    const mounted = await mountChat({}, [], {
+      listProjects: async () => ({ ok: true, data: [] }),
+      listSessions: async () => ({ ok: true, data: { sessions: [listed], activeId: null, pressure: [], blocked: [], trusted: [] } }),
+      searchSessions: async () => ({ ok: true, data: { results: [{ id: 'search-shortcut-0001', title: 'Listed chat', projectId: null }],
+        indexed: 1, total: 1, limited: true } })
+    });
+    const doc = mounted.window.document;
+    const field = doc.getElementById('chatSearch') as HTMLInputElement;
+    await vi.waitFor(() => expect(doc.querySelector('[data-id="search-shortcut-0001"]')).not.toBeNull());
+    const press = (target: EventTarget, modifier: string) =>
+      target.dispatchEvent(new mounted.window.KeyboardEvent('keydown', { key: 'k', [modifier]: true, bubbles: true, cancelable: true }));
+    expect(press(doc.body, other)).toBe(true);
+    expect(doc.activeElement).not.toBe(field);
+    // Ctrl+K deletes to the end of the line in a shell; the terminal keeps it.
+    const terminal = doc.createElement('div');
+    terminal.className = 'xterm';
+    const input = terminal.appendChild(doc.createElement('textarea'));
+    doc.body.append(terminal);
+    input.focus();
+    expect(press(input, primary)).toBe(true);
+    expect(doc.activeElement).toBe(input);
+    expect(press(doc.body, primary)).toBe(false);
+    expect((doc.getElementById('searchDialog') as HTMLDialogElement).open).toBe(true);
+    expect(doc.activeElement).toBe(field);
+
+    field.value = 'listed';
+    field.dispatchEvent(new mounted.window.Event('input', { bubbles: true }));
+    await vi.waitFor(() => expect(doc.getElementById('searchResults')!.textContent)
+      .toContain('Showing the first 1 matches. Add a word to narrow them down.'));
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 it('shows an inherited Block ahead of Trust on a committed resumed row', async () => {
@@ -616,9 +863,9 @@ it('shows an inherited Block ahead of Trust on a committed resumed row', async (
   mounted.state.config.multiAgent.strictChatAllowlist = true;
   mounted.push(structuredClone(mounted.state));
   const row = () => doc.querySelector<HTMLElement>(`[data-id="${session.id}"]`)!;
-  await vi.waitFor(() => expect(row().querySelector('.sess-trust')).not.toBeNull());
-  expect((row().querySelector('.sess-block') as HTMLButtonElement).classList.contains('is-blocked')).toBe(true);
-  expect((row().querySelector('.sess-trust') as HTMLButtonElement).classList.contains('is-trusted')).toBe(false);
+  await vi.waitFor(() => expect(rowMenuItem(row(), 'trust')).not.toBeNull());
+  expect(doc.querySelector('.row-menu [data-row-action="block"]')!.textContent).toBe('Release chat');
+  expect(doc.querySelector('.row-menu [data-row-action="trust"]')!.textContent).toBe('Trust chat');
 });
 
 it('saves strict chat allowlisting and disables the unattributed switch while strict mode is on', async () => {
@@ -739,7 +986,8 @@ it('keeps global connection controls in a compact sidebar popover', async () => 
   const popover = doc.getElementById('connectionPopover') as HTMLElement;
   expect(doc.querySelector('#chatTitle')!.closest('header')!.querySelector('#connectBtn')).toBeNull();
   expect(trigger.closest('.sidebar-bottom')).not.toBeNull();
-  expect(trigger.textContent?.trim()).toBe('');
+  // Connected: the quiet dot alone, its label column closed.
+  expect(trigger.classList.contains('has-label')).toBe(false);
   expect(trigger.getAttribute('aria-label')).toMatch(/Connected.*verified/i);
   expect(trigger.getAttribute('aria-expanded')).toBe('false');
 
@@ -774,6 +1022,20 @@ it('keeps global connection controls in a compact sidebar popover', async () => 
   expect(popover.hidden).toBe(true);
 });
 
+it('keeps a quick Disconnecting on screen long enough to read, then shows the real state', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  const title = () => doc.getElementById('connectionPopoverTitle')!.textContent;
+  mounted.push({ ...mounted.state, status: { ...mounted.state.status, state: 'connected' } });
+  mounted.push({ ...mounted.state, status: { ...mounted.state.status, state: 'disconnecting' } });
+  expect(title()).toBe('Disconnecting');
+  // Over in a blink: the window still says Disconnecting for a moment.
+  mounted.push({ ...mounted.state, status: { ...mounted.state.status, state: 'disconnected' } });
+  expect(title()).toBe('Disconnecting');
+  await vi.waitFor(() => expect(title()).toBe('Not connected'), { timeout: 2500 });
+  expect(doc.getElementById('sidebarConnectionLabel')!.textContent).toBe('Connect');
+});
+
 it('keeps the Settings footer action visible while settings are open', async () => {
   const mounted = await mountChat({ hasApiKey: true });
   const doc = mounted.window.document;
@@ -798,34 +1060,50 @@ it('shows connection status once and keeps diagnostics out of the desktop popove
   const popover = doc.getElementById('connectionPopover')!;
   const trigger = doc.getElementById('sidebarConnection') as HTMLButtonElement;
   const button = doc.getElementById('connectionPopoverToggle') as HTMLButtonElement;
+  const label = doc.getElementById('sidebarConnectionLabel')!;
+  // Disconnected, the capsule says what to do, and a click does it instead of opening the details.
+  expect(trigger.classList.contains('has-label')).toBe(true);
+  expect(label.textContent).toBe('Connect');
   trigger.click();
+  expect(popover.hidden).toBe(true);
+  // The details stay one right click away.
+  trigger.dispatchEvent(new mounted.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
   expect(popover.querySelector('.connection-popover-head')!.textContent?.trim()).toBe('Not connected');
   expect(popover.textContent).not.toContain('Connection is off');
   expect(popover.querySelector('details')).toBeNull();
   expect(popover.querySelectorAll('button')).toHaveLength(1);
 
-  for (const [state, title, action, disabled] of [
-    ['starting-server', 'Starting', 'Disconnect', false],
-    ['connecting-tunnel', 'Connecting', 'Disconnect', false],
-    ['connected', 'Connected', 'Disconnect', false],
-    ['offline', 'No internet', 'Disconnect', false],
-    ['disconnecting', 'Disconnecting', 'Disconnecting…', true],
-    ['auth-failed', 'Sign-in failed', 'Connect', false],
-    ['tunnel-unavailable', 'Tunnel unavailable', 'Connect', false],
-    ['disconnected', 'Not connected', 'Connect', false]
+  for (const [state, title, action, disabled, capsule] of [
+    ['starting-server', 'Starting', 'Disconnect', false, 'Connecting…'],
+    ['connecting-tunnel', 'Connecting', 'Disconnect', false, 'Connecting…'],
+    ['connected', 'Connected', 'Disconnect', false, null],
+    ['offline', 'No internet', 'Disconnect', false, 'No internet'],
+    ['disconnecting', 'Disconnecting', 'Disconnecting…', true, 'Disconnecting…'],
+    ['auth-failed', 'Sign-in failed', 'Connect', false, 'Failed'],
+    ['tunnel-unavailable', 'Tunnel unavailable', 'Connect', false, 'Failed'],
+    ['disconnected', 'Not connected', 'Connect', false, 'Connect']
   ] as const) {
     mounted.push({ ...mounted.state, status: { ...mounted.state.status, state } });
     expect(popover.querySelector('.connection-popover-head')!.textContent?.trim()).toBe(title);
     expect(button.textContent).toBe(action);
     expect(button.disabled).toBe(disabled);
     expect(popover.hidden).toBe(false);
+    // The capsule: a short word while it has something to say (Disconnecting… included), the dot alone
+    // once connected.
+    expect(trigger.classList.contains('has-label')).toBe(capsule !== null);
+    if (capsule) expect(label.textContent).toBe(capsule);
+    // The details offer an action only when the capsule does not already show it.
+    expect((button.parentElement as HTMLElement).hidden).toBe(state === 'disconnected' || state === 'disconnecting');
+    // A state change is announced once, politely.
+    expect(doc.getElementById('connectionAnnounce')!.textContent).toBe(title);
   }
 
   const { setLanguage } = await import('../src/renderer/i18n.js');
   setLanguage('pt-BR');
   expect(popover.querySelector('.connection-popover-head')!.textContent?.trim()).toBe('Não conectado');
   expect(popover.textContent).not.toContain('A conexão está desativada');
-  trigger.click(); trigger.click();
+  trigger.click();
+  trigger.dispatchEvent(new mounted.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
   doc.dispatchEvent(new mounted.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   expect(popover.hidden).toBe(true);
   expect(doc.activeElement).toBe(trigger);
@@ -862,10 +1140,69 @@ it('adds and selects setup profiles and rejects an older profile status response
   await vi.waitFor(() => expect((doc.getElementById('tunnelId') as HTMLInputElement).value).toBe(initial.config.tunnel.tunnelId));
 });
 
+it('asks whether an update came out when Settings open, not on every page inside them', async () => {
+  const refreshUpdate = vi.fn(async () => ({ ok: true, data: true }));
+  const { window: w } = await mountChat({}, [], { refreshUpdate });
+  const doc = w.document;
+  expect(refreshUpdate).not.toHaveBeenCalled();
+  (doc.getElementById('workspaceSettings') as HTMLButtonElement).click();
+  expect(refreshUpdate).toHaveBeenCalledTimes(1);
+  for (const tab of ['general', 'activity', 'usage']) (doc.querySelector(`#tabs button[data-tab="${tab}"]`) as HTMLButtonElement).click();
+  expect(refreshUpdate).toHaveBeenCalledTimes(1);
+  (doc.getElementById('backToChat') as HTMLButtonElement).click();
+  (doc.getElementById('workspaceSettings') as HTMLButtonElement).click();
+  expect(refreshUpdate).toHaveBeenCalledTimes(2);
+});
+
+it('searches every settings page from the sidebar and opens the setting it finds', async () => {
+  const { window: w } = await mountChat();
+  const doc = w.document;
+  const field = doc.getElementById('settingsFind') as HTMLInputElement;
+  const box = doc.getElementById('settingsFindBox')!, pages = doc.getElementById('tabs')!, results = doc.getElementById('settingsFindResults')!;
+  const frame = () => new Promise(resolve => w.requestAnimationFrame(resolve));
+  const type = (text: string) => { field.value = text; field.dispatchEvent(new w.Event('input')); };
+  const rows = () => [...results.querySelectorAll<HTMLButtonElement>('.search-result')];
+  expect(box.hidden).toBe(true);
+  (doc.getElementById('workspaceSettings') as HTMLButtonElement).click();
+  expect(box.hidden).toBe(false);
+  // While the field holds a query, its results take the page list's place.
+  type('privacy screenshots');
+  expect([pages.hidden, results.hidden]).toEqual([true, false]);
+  expect(rows().map(row => [row.querySelector('b')!.textContent, row.querySelector('.search-snippet')!.textContent])).toEqual([['Privacy screenshots', 'General › Privacy']]);
+  expect(rows()[0]!.querySelectorAll('mark')).toHaveLength(2);
+  rows()[0]!.click(); await frame();
+  // Its page opens with the list back, the setting marked and its control focused.
+  expect(doc.querySelector('[data-panel="general"]')!.classList.contains('is-active')).toBe(true);
+  expect([field.value, pages.hidden, results.hidden]).toEqual(['', false, true]);
+  expect(doc.getElementById('privacyScreenshots')!.closest('.setting')!.classList.contains('is-found')).toBe(true);
+  expect(doc.activeElement).toBe(doc.getElementById('privacyScreenshots'));
+  // Enter opens the best match, here on Agents & automation.
+  type('session finish');
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); await frame();
+  expect(doc.querySelector('[data-panel="chat"]')!.classList.contains('is-active')).toBe(true);
+  expect(doc.querySelector<HTMLElement>('[data-view="settings"]')!.hidden).toBe(false);
+  expect(doc.activeElement).toBe(doc.getElementById('finishTool'));
+  // Nothing found says so; Escape empties the field and brings the list back.
+  type('no-such-setting-123');
+  expect(rows()).toHaveLength(0);
+  expect(results.textContent).toContain('No settings match your search.');
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  expect([field.value, pages.hidden, results.hidden]).toEqual(['', false, true]);
+  // Ctrl+F (⌘F on macOS) reaches the field only while Settings are open; leaving them hides it.
+  const mac = /^Mac/.test(navigator.platform);
+  const find = () => { const event = new w.KeyboardEvent('keydown', { key: 'f', ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true }); doc.body.dispatchEvent(event); return event.defaultPrevented; };
+  (doc.getElementById('chatBody') as HTMLElement).focus();
+  expect(find()).toBe(true);
+  expect(doc.activeElement).toBe(field);
+  (doc.getElementById('backToChat') as HTMLButtonElement).click();
+  expect(box.hidden).toBe(true);
+  expect(find()).toBe(false);
+});
+
 it('attaches pasted screenshot files with previews while preserving ordinary text paste', async () => {
   const dropFiles = vi.fn(async () => ({ ok: true, data: [{ id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'screenshot.png', size: 4, mimeType: 'image/png', preview: 'data:image/webp;base64,AAAA' }] }));
   const mounted = await mountChat({}, [], { dropFiles });
-  const w = mounted.window, input = w.document.getElementById('settingsSearch') as HTMLInputElement;
+  const w = mounted.window, input = w.document.getElementById('settingsFind') as HTMLInputElement;
   input.focus();
   const file = new w.File(['image'], 'screenshot.png', { type: 'image/png' });
   const paste = new w.Event('paste', { bubbles: true, cancelable: true });
@@ -1490,6 +1827,33 @@ it('highlights missing required setup fields while respecting drafts and a store
   expect(key.classList.contains('is-empty')).toBe(true);
   expect(mounted.keys).toEqual([]);
   expect(mounted.calls).toEqual([]);
+});
+
+it('names every connector ChatGPT never called, joined in the UI language', async () => {
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  const surface = (id: string, connectorName: string, optional: boolean, called: boolean) => ({
+    id, connectorName, description: '', cardSummary: '', optional, available: true, localUrl: null, publicUrl: null, tools: ['read'],
+    state: 'live', detail: '', lastRequestAt: called ? Date.now() - 60_000 : null, lastToolCallAt: called ? Date.now() - 60_000 : null, proof: null
+  });
+  const state = structuredClone(mounted.state);
+  state.status.state = 'connected';
+  state.status.lastRequestAt = Date.now() - 60_000;
+  state.status.lastToolCallAt = Date.now() - 60_000;
+  state.status.surfaces = [surface('core', 'Core', false, true), surface('desktop', 'Desktop', true, false), surface('plugins', 'Plugins', true, false)];
+  mounted.push(state);
+  const note = () => doc.getElementById('wizChatgpt')!.textContent!;
+  expect(note()).toContain('“Desktop” and “Plugins” have never been called — create them in ChatGPT');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  try {
+    // One language throughout: no English "and", and the plural grammar.
+    expect(note()).toContain('“Desktop” und “Plugins” wurden noch nie aufgerufen – lege sie in ChatGPT an');
+  } finally { setLanguage('en'); }
+  const single = structuredClone(state);
+  single.status.surfaces = [surface('core', 'Core', false, true), surface('desktop', 'Desktop', true, false)];
+  mounted.push(single);
+  expect(note()).toContain('“Desktop” has never been called — create it in ChatGPT');
 });
 
 it('counts a plugin ChatGPT used in an earlier run, so a restart does not reopen Setup', async () => {
@@ -2428,7 +2792,7 @@ it('shows each startup log line once and in order when lines arrive while the lo
     .toEqual(['app started', 'session catalog ready', 'renderer state ready', 'window loaded']);
 });
 
-it.each(['.project-color', '.project-new'])('keeps keyboard focus on a project row button (%s) across an activity repaint', async selector => {
+it.each(['.project-menu'])('keeps keyboard focus on a project row button (%s) across an activity repaint', async selector => {
   // Seen live on Windows: after picking a project color, focus went back to the color button and
   // the next sidebar repaint dropped it to the page. Only the project heading kept its focus.
   const { project, session } = projectSidebarFixture();

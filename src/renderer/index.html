@@ -26,27 +26,26 @@
 
     <div class="app" data-screen="chat">
       <div class="app-topbar">
-        <button class="btn" id="sidebarToggle" type="button" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true" title="Toggle sidebar (Ctrl+B)"><i class="ico ph ph-sidebar-simple" aria-hidden="true"></i></button>
-        <details class="view-menu" id="viewMenu"><summary>View</summary><div class="view-menu-items">
-          <button class="btn" id="sidebarMenuToggle" type="button">Toggle Sidebar <kbd>Ctrl+B</kbd></button>
-          <hr />
-          <button class="btn" id="viewPets" type="button">Desktop Pets</button>
-          <hr />
-          <button class="btn" id="zoomIn" type="button">Zoom In <kbd>Ctrl++</kbd></button>
-          <button class="btn" id="zoomOut" type="button">Zoom Out <kbd>Ctrl+−</kbd></button>
-          <button class="btn" id="zoomActualSize" type="button">Actual Size <span id="zoomReset">100%</span><kbd>Ctrl+0</kbd></button>
-        </div></details>
+        <button class="btn" id="sidebarToggle" type="button" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true" title="Toggle sidebar"><i class="ico ph ph-sidebar-simple" aria-hidden="true"></i></button>
+        <button class="btn" id="viewMenu" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="View" title="View"><i class="ico ph ph-list" aria-hidden="true"></i></button>
       </div>
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-resize" id="sidebarResize" role="separator" tabindex="0" aria-label="Chat list width" aria-orientation="vertical" aria-controls="sidebar" title="Drag to resize · Double-click to reset"></div>
         <button class="btn" id="backToChat" type="button" hidden><i class="ico ph ph-arrow-left" aria-hidden="true"></i><span>Back to chat</span></button>
-        <div class="sidebar-brand"><span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span><strong>LongVTT/COS-ERP-DB</strong></div>
+        <div class="sidebar-brand"><span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span><strong>LongVTT/COS-ERP-DB</strong><button class="btn sidebar-brand-search" id="searchChatsButton" type="button" aria-haspopup="dialog" aria-controls="searchDialog" title="Search chats" aria-label="Search chats"><i class="ico ph ph-magnifying-glass" aria-hidden="true"></i></button></div>
         <div class="sidebar-primary" id="sidebarPrimary">
           <button class="btn new-chat" id="newChat" type="button"><i class="ico ph ph-pencil-simple" aria-hidden="true"></i>New chat</button>
           <button class="btn sidebar-primary-link" id="sidebarPlugins" data-sidebar-page="plugins" type="button"><i class="ico ph ph-puzzle-piece" aria-hidden="true"></i>Plugins</button>
           <button class="btn sidebar-primary-link" id="sidebarSkills" data-sidebar-page="skills" type="button"><i class="ico ph ph-cube" aria-hidden="true"></i>Skills</button>
           <button class="btn sidebar-primary-link" id="sidebarPets" data-sidebar-page="pets" type="button"><i class="ico ph ph-paw-print" aria-hidden="true"></i>Pets</button>
         </div>
+      <!-- Settings search: while it holds a query, its results take the page list's place. -->
+      <div class="settings-find" id="settingsFindBox" hidden>
+        <i class="ico ph ph-magnifying-glass" aria-hidden="true"></i>
+        <input id="settingsFind" type="search" placeholder="Search settings…" aria-label="Search settings" autocomplete="off" spellcheck="false" />
+        <button class="btn settings-find-clear" id="settingsFindClear" type="button" title="Clear search" aria-label="Clear search" hidden></button>
+      </div>
+      <div class="settings-find-results" id="settingsFindResults" aria-live="polite" hidden></div>
       <nav id="tabs" aria-label="Settings navigation" hidden>
         <button class="is-sel" data-tab="home" type="button">
           <i class="ico ph ph-house" aria-hidden="true"></i>Workspace
@@ -102,7 +101,9 @@
               title="Not connected"
             >
               <span class="sidebar-connection-dot" aria-hidden="true"></span>
+              <span class="sidebar-connection-label" aria-hidden="true"><span id="sidebarConnectionLabel">Connect</span></span>
             </button>
+            <span class="sr-only" id="connectionAnnounce" role="status" aria-live="polite"></span>
             <section class="connection-popover scroll" id="connectionPopover" role="dialog" aria-label="Connection" hidden>
               <div class="connection-popover-head">
                 <strong id="connectionPopoverTitle">Not connected</strong>
@@ -115,7 +116,7 @@
                   <i aria-hidden="true"></i>
                 </div>
                 <div class="connection-popover-row">
-                  <span>Browser companion</span>
+                  <span>Extension</span>
                   <span id="connectionPopoverBrowser" class="sr-only">Not seen</span>
                   <i aria-hidden="true"></i>
                 </div>
@@ -140,7 +141,6 @@
           <span id="headerSub">Not set up yet</span>
         </span>
         <span class="state">
-          <button class="btn connect-prompt" id="headerConnect" type="button" hidden>Connect</button>
           <!-- Only ever visible with a downloaded, digest-checked update waiting. This app
                lives in the tray and is closed to it, so "installs the next time you start it"
                can mean days. This is the press that means now. -->
@@ -902,8 +902,7 @@
                 the rest of the once-only work already lives.
               -->
               <div class="view settings-page-content automation-content" data-view="settings" hidden>
-                <header class="settings-page-head automation-page-head"><div><h1>Agents &amp; automation</h1><p>Fine-tune your workspace and the way your agents work.</p></div><div class="automation-search"><label class="plugin-search"><i class="ico ph ph-magnifying-glass" aria-hidden="true"></i><input id="settingsSearch" type="search" placeholder="Search settings…" aria-label="Search settings" /></label></div></header>
-                <p id="settingsSearchEmpty" class="muted" role="status" hidden>No settings match your search.</p>
+                <header class="settings-page-head automation-page-head"><div><h1>Agents &amp; automation</h1><p>Fine-tune your workspace and the way your agents work.</p></div></header>
                 <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Continuation sources</h2><p>Choose where continuations come from and what their handoffs include.</p></div></header>
                 <div class="settings-surface pane">
                   <label class="setting">
@@ -913,7 +912,7 @@
                     </span>
                     <input id="autoContinue" type="checkbox" />
                   </label>
-                  <details class="setting-timing"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Recovery timing details</summary><p>Recover unfinished answers, including in Goal and Loop. Reload after 2 minutes without progress (Pro: 10). If still generating, wait 1 more minute (Pro: 5), then stop and send. A final answer selects Goal or Loop instead of Continue. Undelivered tickets share reload intervals of 2, 5, 10 and 15 minutes.</p></details>
+                  <details class="setting-timing"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Recovery timing details</summary><p>Recover unfinished answers, including in Goal and Loop. Reload after 2 minutes without progress (Pro: 10). If still generating, wait 1 more minute (Pro: 5), then stop and send. A final answer selects Goal or Loop instead of Continue. Undelivered steps get at most three page reloads (after 2, 5, and 10 minutes); recovery then stops visibly while the original pending work remains saved.</p></details>
                   <div class="setting"><span class="setting-text"><b id="goalBackendTitle">Goal response source</b><em>API is the most reliable. Offline uses completion markers and 200 prepared messages.</em></span><select id="goalBackend" aria-labelledby="goalBackendTitle"><option value="chatgpt">Separate ChatGPT chat</option><option value="api">API key · Most reliable</option><option value="templates">Offline · No API cost</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="loopBackendTitle">Loop response source</b><em>Loop keeps going until you switch it off.</em></span><select id="loopBackend" aria-labelledby="loopBackendTitle"><option value="api">API key · Most reliable</option><option value="chatgpt">Separate ChatGPT chat</option></select></div>
                   <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan model</b><em>Model for ChatGPT-generated messages and plans. Select GPT-5.6 and High below for planning.</em></span><select id="helperModel" aria-label="Goal, Loop and Plan model"></select></div>
@@ -1277,10 +1276,15 @@
         </section>
 
         <!-- ======================================================== Activity -->
-        <section class="panel" data-panel="activity">
+        <section class="panel activity-panel" data-panel="activity">
+          <div class="settings-page-content activity-content">
+          <header class="settings-page-head">
+            <h1>Activity</h1>
+            <p>Recent local events and failures.</p>
+          </header>
           <section class="card">
             <h2>
-              Activity
+              <span class="sr-only">Activity</span>
               <span class="acts">
                 <span class="seg" id="logAgentFilter" hidden></span>
                 <span class="seg" id="logFilter">
@@ -1306,6 +1310,7 @@
             <p class="upline" id="updateLine" hidden></p>
             <p class="foot" id="versionLine"></p>
           </section>
+          </div>
         </section>
       </main>
 
@@ -1313,6 +1318,33 @@
 
     </div>
 
+    <!-- Chat search (⌘K / Ctrl+K, or the magnifier beside the app name): recent chats, then matches. -->
+    <dialog class="search-dialog" id="searchDialog" aria-label="Search chats">
+      <div class="search-dialog-field">
+        <i class="ico ph ph-magnifying-glass" aria-hidden="true"></i>
+        <input id="chatSearch" type="search" placeholder="Search chats" aria-label="Search chats" aria-controls="searchResults" autocomplete="off" spellcheck="false" />
+        <button class="btn search-dialog-clear" id="chatSearchClear" type="button" title="Clear search" aria-label="Clear search" hidden></button>
+      </div>
+      <div class="search-dialog-results" id="searchResults" aria-live="polite"></div>
+    </dialog>
+
+    <dialog class="whats-new-dialog" id="whatsNewDialog" aria-labelledby="whatsNewTitle" aria-describedby="whatsNewLead">
+      <header class="whats-new-head">
+        <!-- The app's own tile, sealed with a sparkle: the same language as the browser sign-in card. -->
+        <div class="whats-new-hero" aria-hidden="true">
+          <span class="whats-new-tile"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
+          <span class="whats-new-seal"><i class="ico ph ph-sparkle"></i></span>
+        </div>
+        <span class="whats-new-version" id="whatsNewVersion"></span>
+        <h2 id="whatsNewTitle">What's new</h2>
+        <p class="whats-new-lead" id="whatsNewLead"></p>
+      </header>
+      <ul class="whats-new-list" id="whatsNewList"></ul>
+      <footer class="whats-new-actions">
+        <button class="whats-new-link" id="whatsNewNotes" type="button"><i class="ico ph ph-arrow-square-out" aria-hidden="true"></i>Full release notes</button>
+        <button class="whats-new-done" id="whatsNewDone" type="button">Got it</button>
+      </footer>
+    </dialog>
     <dialog id="setupProfileDialog" class="setup-profile-dialog" aria-labelledby="setupProfileDialogTitle">
       <form id="setupProfileForm">
         <h3 id="setupProfileDialogTitle">Add profile</h3>

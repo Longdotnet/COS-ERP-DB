@@ -23,10 +23,11 @@ import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
-import { recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
+import { BROWSER_PICKUP_MAX_ATTEMPTS, recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
 import { invokedSkills } from '../../shared/skill-invocation.js';
 import { SKILL_ID_PATTERN } from '../../shared/skills.js';
 import { autoSelectManagedSkills } from '../skill-routing.js';
+import { asksForImage } from './image-request.js';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -89,6 +90,13 @@ const entrySchema = inputArgs.extend({
   toolTurnId: z.string().min(1).max(256).optional(),
   sendAuthorizedAt: z.number().optional(),
   requiresAuthorization: z.boolean().optional(),
+  /** A browser pickup timeout is safely replayable only before Send authorization. */
+  pickupFailedAt: z.number().optional(),
+  /** One automatic retry is permitted for an exact, never-authorized browser pickup. */
+  pickupRetryCount: z.number().int().nonnegative().optional(),
+  /** Browser reload budget for this exact queued input; survives app restart. */
+  pickupRecovery: z.object({ attempts: z.number().int().min(0).max(BROWSER_PICKUP_MAX_ATTEMPTS),
+    nextAt: z.number().int().positive().optional(), stoppedAt: z.number().int().positive().optional() }).optional(),
   cancelledByUser: z.literal(true).optional(),
   error: z.string().max(200).optional(),
   owner: z.string().nullable(),
@@ -111,6 +119,8 @@ const STATE = 'session-input';
 const TOOL_INPUT_TEXT_BYTES = 128000;
 /** A confirmed send receipt lands in seconds. This only bounds one that is never reported. */
 const UNCERTAIN_SEND_MS = 15 * 60_000;
+const UNCLAIMED_PICKUP_RETRY_MIN_MS = 2 * 60_000;
+const UNCLAIMED_PICKUP_RETRY_MAX_AGE_MS = 30 * 60_000;
 /**
  * The same bound for the sends the one above leaves in custody: an automatic Continue, a new
  * chat's first message and a combined delivery. Their own paths normally settle them in seconds
@@ -133,6 +143,8 @@ export interface ToolInputBatch {
 export interface InputActivity { possible: boolean; exact: boolean; model?: 'pro' | 'other' | 'unknown'; turnId?: string }
 type InputDeliveryHooks = {
   recoveryAllowed?: (sessionId: string, conversationId: string) => boolean;
+  /** Whether running calls still hold this chat's automatic Continue; without it, any call does. */
+  callsHoldRecovery?: (conversationId: string) => boolean;
   activity?: (session: SessionSummary) => InputActivity;
   wakeDecision?: (entry: Readonly<InputEntry>, signal: AbortSignal) => Promise<void>;
   bindHelper?: (conversationId: string, sourceSessionId: string | null) => Promise<void>;
@@ -483,7 +495,7 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
         (row.transportIntent === 'browser' || (!row.transportIntent && !row.sessionId)) &&
         !row.error?.startsWith('Message queued. ') &&
         Date.now() - Math.max(row.createdAt, row.dueAt) >= 60_000)
-      return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
+      return { ...row, state: 'failed', pickupFailedAt: Date.now(), error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
     // Preparation can expire before Send. Once authorized, this exact claim owns
     // the uncertain outcome until receipt or explicit cancellation, regardless of
     // how long ChatGPT takes to assign its durable conversation identity.
@@ -521,6 +533,40 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
       logInfo(`input ${row.id}: ${row.error ?? 'Automatic Continue wait retired after its session left the chat.'} conversation=${row.conversationId} turn=${row.silenceBoundary?.turnId}`);
   }
   return entries!;
+}
+/** Requeue the same durable row once when the browser never claimed it. */
+export function retryUnclaimedInput(id: string): Promise<InputEntry | null> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id);
+    const now = Date.now();
+    if (!row || row.state !== 'failed' || row.error !== 'Not sent: the browser did not pick up this message within 60 seconds.' ||
+        !Number.isFinite(row.pickupFailedAt) || (row.pickupRetryCount !== undefined && row.pickupRetryCount !== 0) ||
+        now - row.pickupFailedAt! < UNCLAIMED_PICKUP_RETRY_MIN_MS || now - row.pickupFailedAt! > UNCLAIMED_PICKUP_RETRY_MAX_AGE_MS ||
+        now < row.createdAt || now - row.createdAt > UNCLAIMED_PICKUP_RETRY_MAX_AGE_MS || row.sendAuthorizedAt !== undefined || row.deliveredAt !== undefined ||
+        row.mode !== 'auto' || row.transportIntent !== 'browser' || row.purpose === 'decision' || row.opening || row.requiresAuthorization ||
+        row.cancelledByUser || row.recovery || row.silenceBoundary || row.finishOwner || row.directTurn || row.queuedTurn ||
+        row.companionInputId || row.attachments?.length || row.images?.length || row.toolImages?.length || row.delivery ||
+        row.attachmentDelivery || row.toolTurnId || row.automation || row.objective || row.stages?.length || row.loopAfterTurn ||
+        !row.sessionId || !row.conversationId) return null;
+    const session = await getSession(row.sessionId);
+    const activity = session ? deliveryHooks?.activity?.(session) ?? { possible: !!session.activeTurnId, exact: !!session.activeTurnId } : null;
+    if (!session || session.conversationId !== row.conversationId || activity?.possible || activity?.exact ||
+        deliveryHooks?.recoveryAllowed?.(row.sessionId, row.conversationId) !== true ||
+        session.browserRecoveryDismissedAt !== undefined || isChatBlocked(row.conversationId) ||
+        await conversationWasSuperseded(row.conversationId) || inFlightToolCalls(row.conversationId) > 0) return null;
+    const [boundary] = await readRecentEvents(row.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
+    if (boundary?.kind !== 'turn_end' || boundary.time > row.createdAt || boundary.outcome === 'stopped') return null;
+    const [newerMessage] = await readRecentEvents(row.sessionId, 1, { kinds: ['user_message'] });
+    if (newerMessage && newerMessage.time > row.createdAt) return null;
+    if (current.some(other => other.id !== row.id && other.sessionId === row.sessionId &&
+        (!terminal(other) || other.createdAt > row.createdAt))) return null;
+    const next: InputEntry = { ...row, state: 'queued', owner: null, dueAt: now, offeredAt: undefined,
+      completedTurnId: undefined, error: undefined, pickupFailedAt: undefined, pickupRetryCount: 1 };
+    await commit(current.map(entry => entry.id === row.id ? next : entry));
+    logInfo(`input ${row.id}: requeued the same browser message after one proven pre-Send pickup timeout`);
+    return next;
+  });
 }
 async function commit(next: InputEntry[]): Promise<void> {
   // A temporary planner keeps only ownership metadata across restart, never its task or answer.
@@ -784,6 +830,74 @@ export function listInputs(): Promise<InputEntry[]> {
     return ordered(await load()).map((entry) => ({ ...entry }));
   });
 }
+export interface PickupRecoveryState { attempts: number; nextAt?: number; stoppedAt?: number }
+
+async function rowsForPickupSource(current: InputEntry[], sessionId: string, sourceTurnId: string): Promise<InputEntry[]> {
+  const matching: InputEntry[] = [];
+  for (const entry of current) {
+    if (entry.sessionId !== sessionId || entry.purpose === 'decision' || entry.opening) continue;
+    if (await eligibleStageEnd(entry) === sourceTurnId) matching.push(entry);
+  }
+  return matching;
+}
+
+function mergedPickupState(rows: InputEntry[], inherited?: PickupRecoveryState): PickupRecoveryState {
+  const attempts = Math.min(BROWSER_PICKUP_MAX_ATTEMPTS,
+    Math.max(inherited?.attempts ?? 0, ...rows.map(row => row.pickupRecovery?.attempts ?? 0)));
+  const stoppedAt = inherited?.stoppedAt ?? rows.find(row => row.pickupRecovery?.stoppedAt)?.pickupRecovery?.stoppedAt;
+  if (stoppedAt || attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) return {
+    attempts, stoppedAt: stoppedAt ?? rows.find(row => row.pickupRecovery?.stoppedAt)?.pickupRecovery?.stoppedAt ?? Date.now()
+  };
+  const nextAt = inherited?.attempts === attempts ? inherited.nextAt : undefined;
+  return { attempts, ...(nextAt ?? rows.find(row => row.pickupRecovery?.attempts === attempts)?.pickupRecovery?.nextAt
+    ? { nextAt: nextAt ?? rows.find(row => row.pickupRecovery?.attempts === attempts)?.pickupRecovery?.nextAt } : {}) };
+}
+
+/** Copies a source-turn budget to every durable input owner, so reorder/replacement cannot reset it. */
+export function syncQueuedPickupRecoveryNow(inputId: string, sourceTurnId: string, state: PickupRecoveryState): Promise<PickupRecoveryState | null> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === inputId && entry.state === 'queued');
+    if (!row?.sessionId || row.purpose === 'decision' || await eligibleStageEnd(row) !== sourceTurnId) return null;
+    const matches = await rowsForPickupSource(current, row.sessionId, sourceTurnId);
+    const merged = mergedPickupState(matches, state);
+    const next = current.map(entry => matches.includes(entry) && !samePickupState(entry.pickupRecovery, merged)
+      ? { ...entry, pickupRecovery: merged } : entry);
+    if (next.some((entry, index) => entry !== current[index])) await commit(next);
+    return merged;
+  });
+}
+
+function samePickupState(a: PickupRecoveryState | undefined, b: PickupRecoveryState): boolean {
+  return a?.attempts === b.attempts && a?.nextAt === b.nextAt && a?.stoppedAt === b.stoppedAt;
+}
+
+/** Reserve a source-turn reload against all of its queued owners before browser handout. */
+export function recordQueuedPickupAttemptNow(inputId: string, sourceTurnId: string, at: number, nextAt?: number, inherited?: PickupRecoveryState): Promise<PickupRecoveryState | null> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === inputId);
+    if (!row || !row.sessionId || row.purpose === 'decision' || row.state !== 'queued' ||
+        await eligibleStageEnd(row) !== sourceTurnId) return null;
+    const session = await getSession(row.sessionId);
+    if (!session || session.conversationId !== row.conversationId || session.browserRecoveryDismissedAt !== undefined) return null;
+    const matches = await rowsForPickupSource(current, row.sessionId, sourceTurnId);
+    const prior = mergedPickupState(matches, inherited);
+    if (prior.stoppedAt || prior.attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) {
+      const next = current.map(entry => matches.includes(entry) && !samePickupState(entry.pickupRecovery, prior)
+        ? { ...entry, pickupRecovery: prior } : entry);
+      if (next.some((entry, index) => entry !== current[index])) await commit(next);
+      return null;
+    }
+    const attempts = prior.attempts + 1;
+    const pickupRecovery = attempts >= BROWSER_PICKUP_MAX_ATTEMPTS ? { attempts, stoppedAt: at }
+      : { attempts, ...(nextAt !== undefined ? { nextAt } : {}) };
+    const next = current.map(entry => matches.includes(entry) ? { ...entry, pickupRecovery } : entry);
+    await commit(next);
+    return { attempts, ...('nextAt' in pickupRecovery && pickupRecovery.nextAt ? { nextAt: pickupRecovery.nextAt } : {}),
+      ...('stoppedAt' in pickupRecovery && pickupRecovery.stoppedAt ? { stoppedAt: pickupRecovery.stoppedAt } : {}) };
+  });
+}
 /** A sent receipt survives a recorder failure. Existing outbox reads retry publication,
  * never transport; the stable canonical key makes a lost recording ACK idempotent. */
 async function publishHistory(): Promise<void> {
@@ -1029,10 +1143,10 @@ export async function hasQueuedAfterTurnInput(sessionId: string): Promise<boolea
 
 /** Read the same visible head as claims, including its still-running listening window.
  * Historical restored tickets without an acceptance timestamp never arm browser recovery. */
-export function pendingQueuedPickups(): Promise<Array<{ conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean }>> {
+export function pendingQueuedPickups(): Promise<Array<{ inputId: string; conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean; pickupAttempts: number; pickupNextAt?: number; pickupStoppedAt?: number }>> {
   return serial(async () => {
     const rows = await load();
-    const result: Array<{ conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean }> = [];
+    const result: Array<{ inputId: string; conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean; pickupAttempts: number; pickupNextAt?: number; pickupStoppedAt?: number }> = [];
     const pending = ordered(rows).filter(row => row.sessionId && row.purpose !== 'decision' && ['queued', 'browser', 'tool'].includes(row.state));
     for (const sessionId of new Set(pending.map(row => row.sessionId))) {
       const candidates = pending.filter(row => row.sessionId === sessionId);
@@ -1050,9 +1164,14 @@ export function pendingQueuedPickups(): Promise<Array<{ conversationId: string; 
       const acceptedAt = row.silenceBoundary?.acceptedAt ?? (!row.silenceBoundary && completed ? end.time : undefined);
       if (acceptedAt === undefined) continue;
       const selection = session.selectedModel;
-      result.push({ conversationId: session.conversationId, sessionId: row.sessionId, sourceTurnId, acceptedAt,
+      const sourceOwners = await rowsForPickupSource(rows, row.sessionId, sourceTurnId);
+      const pickupRecovery = mergedPickupState(sourceOwners);
+      result.push({ inputId: row.id, conversationId: session.conversationId, sessionId: row.sessionId, sourceTurnId, acceptedAt,
         listenUntil: completed && !row.silenceBoundary?.nativeBusy ? 0 : row.silenceBoundary?.listenUntil ?? 0,
-        pro: selection?.conversationId === session.conversationId && isProModel(selection.model, selection.reasoningEffort) });
+        pro: selection?.conversationId === session.conversationId && isProModel(selection.model, selection.reasoningEffort),
+        pickupAttempts: pickupRecovery.attempts,
+        ...(pickupRecovery.nextAt ? { pickupNextAt: pickupRecovery.nextAt } : {}),
+        ...(pickupRecovery.stoppedAt ? { pickupStoppedAt: pickupRecovery.stoppedAt } : {}) });
     }
     return result;
   });
@@ -1109,11 +1228,13 @@ function releaseRecoveryClaim(row: InputEntry, error?: string): InputEntry {
 }
 async function recoveryCurrent(row: InputEntry): Promise<boolean> {
   const conversationId = row.silenceBoundary?.conversationId;
-  // Unassigned calls conservatively block every chat while attribution settles.
-  // They cannot prove that this frozen source resumed. Hold the ticket, rechecking
-  // around asynchronous validation; actual recorded work still retires it below.
-  return !!conversationId && inFlightToolCalls(conversationId) === 0 &&
-    await recoveryInvalidReason(row) === null && inFlightToolCalls(conversationId) === 0;
+  // Unassigned calls conservatively block every chat while attribution settles, for a bounded
+  // time once the chat was found silent (#1086). They cannot prove that this frozen source
+  // resumed. Hold the ticket, rechecking around asynchronous validation; actual recorded work
+  // still retires it below.
+  const held = (id: string) => deliveryHooks?.callsHoldRecovery ? deliveryHooks.callsHoldRecovery(id) : inFlightToolCalls(id) > 0;
+  return !!conversationId && !held(conversationId) &&
+    await recoveryInvalidReason(row) === null && !held(conversationId);
 }
 /** Keep the rejection on the existing outbox receipt so an audit can identify the veto. */
 async function recoveryInvalidReason(row: InputEntry): Promise<string | null> {
@@ -1417,8 +1538,32 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (!requiresAuthorization && completedTurnId && entry.sessionId && conversationId)
       await consumeGoalReplyForInputNow(conversationId, entry.sessionId, completedTurnId);
     logInfo(`input ${id}: browser claimed after ${Math.max(0, Date.now() - entry.createdAt)} ms`);
-    return { ...combinedInput(claimed, companion), ...selection, text: claimed.deliveryText ?? claimed.text };
+    const withoutMention = await imageRequestWithoutMention(entry, session, companion);
+    if (withoutMention) logInfo(`input ${id}: asks for an image, so it goes out without the Core mention`);
+    return { ...combinedInput(claimed, companion), ...selection, text: claimed.deliveryText ?? claimed.text,
+      ...(withoutMention ? { coreMention: false as const } : {}) };
   });
+}
+/**
+ * The person's own message asking ChatGPT for a picture goes out without the Core mention: ChatGPT
+ * switches its image tool off for a message that mentions an app (see image-request.ts). Generated
+ * messages (Goal, Loop, recovery, workers, the Goal helper) keep the mention as before.
+ */
+async function imageRequestWithoutMention(entry: InputEntry, session: SessionSummary | null, companion?: InputEntry): Promise<boolean> {
+  // A combined message also carries the next queued instruction, which may need the app.
+  if (companion || entry.purpose === 'decision' || entry.recovery || entry.finishOwner || (entry.authoredSource ?? 'text') !== 'text') return false;
+  if (session?.origin?.kind === 'worker' || session?.origin?.kind === 'helper') return false;
+  const attachedImage = (entry.images?.length ?? 0) > 0 || (entry.attachments ?? []).some(file => file.mimeType.startsWith('image/'));
+  // Shortly after ChatGPT made a picture, "make it brighter" changes that picture: the picture
+  // answered one of the last two questions, so one failed edit in between still counts.
+  let afterImage = false;
+  if (session) {
+    const recent = await readRecentEvents(session.id, 64, { kinds: ['user_message', 'native_image'] }).catch(() => []);
+    const questions = recent.flatMap((event, index) => event.kind === 'user_message' ? [index] : []);
+    const since = questions.length >= 2 ? questions.at(-2)! : questions.at(-1);
+    afterImage = since !== undefined && recent.slice(since + 1).some(event => event.kind === 'native_image' && event.providerStatus !== 'in_progress');
+  }
+  return asksForImage(entry.text, { attachedImage, afterImage });
 }
 /** Initial provider binding uses the same reserved session as local admission. */
 async function bindOpening(entry: InputEntry, conversationId: string): Promise<boolean> {

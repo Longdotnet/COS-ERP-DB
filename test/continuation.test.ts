@@ -52,6 +52,7 @@ const {
   AUTOMATIC_HANDOVER_TTL_MS,
   CONTINUATION_PRO_WRITING_TTL_MS,
   CONTINUATION_TTL_MS,
+  CONTINUATION_WRITING_TTL_MS,
   abortContinuation,
   abortContinuationNow,
   abortContinuationSourceBeforeSendNow,
@@ -576,7 +577,15 @@ describe('committing', () => {
     expect(goalSwitchFor(CHAT_A).own).toBe(false);
     expect(goalPendingReplyFor(CHAT_A)).toBeNull();
     expect(goalPendingReplyFor(CHAT_B)).toBeNull();
+    // An app start replays this committed handoff. With the broker's hooks installed, as the app
+    // installs them, a chat that never led sub-agents has nothing to warn about (2026-10-06:
+    // every start warned "recovered without a broker prime repair hook" per kept handoff).
+    const { getLog } = await import('../src/main/logger.js');
+    const { primeFleetIn } = await import('../src/main/agents.js');
+    setContinuationRecoveryHooks({ repairPrimeTransfer: repairPrimeConversationAfterRecovery, hasPrimeFleet: primeFleetIn });
+    const logged = getLog().length;
     await restoreContinuations(snapshotContinuations());
+    expect(getLog().slice(logged).filter(entry => /prime repair hook|fleet is still led/.test(entry.message))).toEqual([]);
     expect(goalSwitchFor(CHAT_B)).toMatchObject({ enabled: true, mode: 'loop', afterTurn: true });
   });
 
@@ -1119,7 +1128,7 @@ describe('the swarm handover', () => {
     const summary = await createSession({ title: 'expired restore', conversationId: CHAT_A });
     spawn({ workers: [{ task: 'read the tests' }], caller: { conversationId: CHAT_A } });
 
-    vi.setSystemTime(openedAt + CONTINUATION_TTL_MS + 1);
+    vi.setSystemTime(openedAt + CONTINUATION_WRITING_TTL_MS + 1);
     await restoreContinuations({
       version: 1,
       savedAt: openedAt,
@@ -1140,10 +1149,10 @@ describe('the swarm handover', () => {
       ]
     });
 
-    // Recovery must not mint a fresh transfer lease for a transaction whose own ten-minute
+    // Recovery must not mint a fresh transfer lease for a transaction whose writing
     // deadline already elapsed. The reusable worker run is independent of that expired
     // continuation, so losing the prime browser view pauses the run rather than destroying it.
-    expect(continuationByToken('expired-wait-token')?.state).toBe('aborted');
+    expect(continuationByToken('expired-wait-token')).toBeNull();
     expect(primeConversationGone(CHAT_A)).toBe(false);
     expect(swarmRunning()).toBe(true);
   });
@@ -1396,6 +1405,29 @@ describe('the window in which a replacement chat is expected', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('keeps the destination ownership gate armed while an already-dispatched resume still awaits its chat id', async () => {
+    const { sessionId, token } = await readyContinuation();
+    const destination = '94949494-2222-4333-8444-666666666666';
+    await claimContinuationNow(token, 'very-slow-resume-command');
+    expect((await beginContinuationDestinationSendNow(token))?.allowed).toBe(true);
+    expect(await dispatchContinuationDestinationSendNow(token)).toBe(true);
+
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    await vi.advanceTimersByTimeAsync(RESUME_CLAIM_WINDOW_MS + 100);
+
+    // Once dispatch is durable, ChatGPT may already hold the bootstrap in a conversation whose
+    // id the page still cannot expose. The recorder fence therefore belongs to the dispatched
+    // continuation, not to the age of the original browser-opening claim.
+    expect(resumeOpeningChat()).toBe(true);
+
+    const create = vi.spyOn(store, 'createSession');
+    const observation = sessionForConversation(destination);
+    expect(await commitContinuation(token, destination)).toBe(true);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await observation).toBe(sessionId);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it.each(['abort', 'expiry'] as const)('releases unrelated new recording when the resume claim ends by %s', async reason => {
     const { token } = await readyContinuation();
     await claimContinuationNow(token, 'unfinished-resume-command');
@@ -1482,6 +1514,21 @@ describe('the window in which a replacement chat is expected', () => {
     resetContinuationsForTests();
     expect(resumeOpeningChat()).toBe(false);
     await restoreContinuations(snapshot);
+    expect(resumeOpeningChat()).toBe(true);
+  });
+
+  it('restores a dispatched destination as transaction-owned instead of aging it out after restart', async () => {
+    const { token } = await readyContinuation();
+    await claimContinuationNow(token, 'restart-after-dispatch');
+    expect((await beginContinuationDestinationSendNow(token))?.allowed).toBe(true);
+    expect(await dispatchContinuationDestinationSendNow(token)).toBe(true);
+    const snapshot = snapshotContinuations();
+
+    resetContinuationsForTests();
+    await restoreContinuations(snapshot);
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    await vi.advanceTimersByTimeAsync(RESUME_CLAIM_WINDOW_MS + 100);
+
     expect(resumeOpeningChat()).toBe(true);
   });
 
@@ -1800,7 +1847,8 @@ describe('the window in which a replacement chat is expected', () => {
 });
 
 /**
- * Issue #21: a handoff that was still being written got declared dead at ten minutes.
+ * Issue #21: a handoff that was still being written got declared dead before the browser
+ * recovery schedule could finish.
  *
  * The deadline is a limit on *waiting*, but it was measured from the moment the transaction
  * opened — so a brief ChatGPT was still generating looked exactly like one nobody had touched.
@@ -1809,8 +1857,8 @@ describe('the window in which a replacement chat is expected', () => {
  * auto-compaction treated the compaction itself as an eligible turn, stopped it, and started
  * another one on top.
  *
- * The renewal is deliberately not a longer timeout. A chat that has genuinely gone quiet still
- * expires on the original clock, which the second test here is for.
+ * A chat that has genuinely gone quiet still expires on its phase-specific deadline, which the
+ * second test here is for.
  */
 describe('an exact handoff response owns its waiting deadline', () => {
   it('survives growing output and restart but expires after unchanged snapshots', async () => {
@@ -1832,7 +1880,7 @@ describe('an exact handoff response owns its waiting deadline', () => {
       await restoreContinuations(snapshot);
       expect(continuationByToken(opened.token)?.state).toBe('awaiting-summary');
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message', 500)).toBe(true);
-      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS);
+      vi.setSystemTime(Date.now() + CONTINUATION_WRITING_TTL_MS);
       expect(continuationByToken(opened.token)?.state).toBe('aborted');
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message', 1000)).toBe(false);
     } finally { vi.useRealTimers(); }
@@ -1843,7 +1891,7 @@ describe('an exact handoff response owns its waiting deadline', () => {
     { name: 'a pro model slug', model: 'gpt-5.6-pro', effort: null, pro: true },
     { name: 'an ordinary model', model: 'gpt-5.6-sol', effort: 'high', pro: false },
     { name: 'an unobserved selection', model: null, effort: null, pro: false }
-  ] as const)('keeps a writing manual ticket alive past ten minutes only for a frozen Pro selection ($name)', async ({ model, effort, pro }) => {
+  ] as const)('uses a retry-safe writing deadline for ordinary and Pro handoff selections ($name)', async ({ model, effort, pro }) => {
     vi.useFakeTimers();
     try {
       const session = await createSession({ title: 'writing deadline identity', conversationId: CHAT_A });
@@ -1853,12 +1901,16 @@ describe('an exact handoff response owns its waiting deadline', () => {
       await dispatchContinuationSourceSendNow(opened.token);
       expect(await bindContinuationSourceMessageNow(opened.token, 'exact-user-message')).toBe(true);
 
-      // Pro reasoning is not visible transcript growth, so nothing renews this clock while the
-      // model thinks. Only the frozen Pro identity earns the longer writing deadline.
-      vi.setSystemTime(Date.now() + CONTINUATION_TTL_MS + 1);
+      const sentAt = Date.now();
+
+      // All handoff briefs get time for three five-minute browser pickups. Pro reasoning is not
+      // visible transcript growth, so its frozen selection still receives the longer window.
+      vi.setSystemTime(sentAt + CONTINUATION_WRITING_TTL_MS - 1);
+      expect(continuationByToken(opened.token)?.state).toBe('awaiting-summary');
+      vi.setSystemTime(sentAt + CONTINUATION_WRITING_TTL_MS + 1);
       expect(continuationByToken(opened.token)?.state).toBe(pro ? 'awaiting-summary' : 'aborted');
 
-      // The longer clock is still a clock: a genuinely silent ticket expires.
+      // The Pro writing clock is still a clock: a genuinely silent ticket expires.
       vi.setSystemTime(Date.now() + CONTINUATION_PRO_WRITING_TTL_MS);
       expect(continuationForSession(session.id)).toBeNull();
     } finally { vi.useRealTimers(); }

@@ -68,7 +68,7 @@ import { clearGoalObjective, clearGoalSwitch, goalObjectiveFor, goalSwitchFor, m
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { handoffMatchesContinuation, prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote, rebindConversation } from './recorder.js';
-import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
+import { endResumeClaim, noteResumeClaim, noteResumeDispatch, resetResumeGate } from './resume-gate.js';
 import {
   ensureCommittedResumeHandoff,
   findSessionByConversation,
@@ -87,6 +87,15 @@ import {
  * than staying transferable indefinitely.
  */
 export const CONTINUATION_TTL_MS = 10 * 60_000;
+
+/**
+ * The normal writing deadline for a manual handoff brief.
+ *
+ * The browser gets three recovery pickups five minutes apart while ChatGPT is writing the
+ * brief. Keep this phase open long enough for all three attempts plus a reconnect window;
+ * once a brief is captured, app-paced phases return to CONTINUATION_TTL_MS.
+ */
+export const CONTINUATION_WRITING_TTL_MS = 30 * 60_000;
 
 /**
  * The longer writing deadline for a manual ticket whose frozen source selection is Pro.
@@ -418,6 +427,8 @@ export interface ContinuationRecoveryHooks {
    * repair hook; ordinary callers must never receive a model-callable adoption path.
    */
   repairPrimeTransfer?: (fromConversationId: string, toConversationId: string) => boolean;
+  /** Whether a sub-agent fleet is led from this chat: only then is a missed move worth a word. */
+  hasPrimeFleet?: (conversationId: string) => boolean;
 }
 
 let recoveryHooks: ContinuationRecoveryHooks = {};
@@ -471,20 +482,22 @@ const handoffAsked = (entry: Continuation): boolean =>
   entry.sourceSend.state === 'sent';
 
 /**
- * The waiting deadline for a manual ticket. Pro's longer budget exists only while its brief
+ * The waiting deadline for a manual ticket. The extended budget exists only while its brief
  * is being written: later phases are app-paced and keep the ordinary clock.
  */
 const manualWaitingTtlMs = (state: ContinuationState, requested: RequestedModel | null): number =>
-  state === 'awaiting-summary' && requested !== null &&
-  isProModel(requested.model, requested.reasoningEffort ?? undefined)
-    ? CONTINUATION_PRO_WRITING_TTL_MS
+  state === 'awaiting-summary'
+    ? requested !== null && isProModel(requested.model, requested.reasoningEffort ?? undefined)
+      ? CONTINUATION_PRO_WRITING_TTL_MS
+      : CONTINUATION_WRITING_TTL_MS
     : CONTINUATION_TTL_MS;
 
 /**
  * Whether a nonterminal continuation has outlived its wait. A manual one gets
- * CONTINUATION_TTL_MS from its last sign of progress — CONTINUATION_PRO_WRITING_TTL_MS while
- * a Pro brief is still being written; an automatic one has no clock until it is asked for and
- * AUTOMATIC_HANDOVER_TTL_MS from then.
+ * CONTINUATION_TTL_MS from its last sign of progress after the brief is captured;
+ * CONTINUATION_WRITING_TTL_MS while an ordinary manual brief is being written;
+ * CONTINUATION_PRO_WRITING_TTL_MS while a Pro brief is being written. An automatic one has no
+ * clock until it is asked for and AUTOMATIC_HANDOVER_TTL_MS from then.
  */
 const expired = (entry: Continuation, now = Date.now()): boolean =>
   entry.automatic
@@ -959,7 +972,7 @@ export async function dispatchContinuationDestinationSendNow(token: string): Pro
       ...current,
       destinationSend: { state: 'dispatched-unresolved', conversationId: null, messageId: null }
     }));
-    noteResumeClaim(entry.token);
+    noteResumeDispatch(entry.token);
     return true;
   });
 }
@@ -994,6 +1007,7 @@ export async function releaseContinuationDestinationSendNow(token: string, unatt
       claimedBy: null,
       destinationSend: { state: 'not-attempted', conversationId: null, messageId: null }
     }));
+    endResumeClaim(entry.token);
     return true;
   });
 }
@@ -1198,7 +1212,13 @@ export async function claimContinuationNow(token: string, claimant: string): Pro
     // After the transition, never before it. A throw here leaves nothing claimed, and arming
     // first would have made every unrelated new chat wait out the window for a claim that
     // does not exist.
-    if (entry.state === 'claimed') noteResumeClaim(entry.token);
+    if (entry.state === 'claimed') {
+      if (entry.destinationSend.state === 'dispatched-unresolved' || entry.destinationSend.state === 'sent') {
+        noteResumeDispatch(entry.token);
+      } else {
+        noteResumeClaim(entry.token);
+      }
+    }
     return { summary: entry.summary };
   });
 }
@@ -1226,7 +1246,13 @@ function publishCommittedProjection(
     // continuation WAL may repair the broker's derived A→B prime projection.
     const repaired = recoveryHooks.repairPrimeTransfer?.(entry.from, toConversationId) ?? false;
     if (!repaired && !commitPrimeTransfer(entry.from, toConversationId)) {
-      logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
+      // Every app start replays the committed handoffs it still keeps. A chat that never led
+      // sub-agents has no fleet to move, and saying otherwise on each start was only noise.
+      if (!recoveryHooks.repairPrimeTransfer) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} recovered without a broker prime repair hook`);
+      } else if (recoveryHooks.hasPrimeFleet?.(entry.from)) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} recovered, but its sub-agent fleet is still led from ${entry.from}`);
+      }
     }
   }
 }
@@ -1748,7 +1774,13 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
     // collision it exists to prevent would be wide open for exactly the restart that is most
     // likely to hit it. Re-armed from now rather than from the original claim, because what
     // matters is how long from *here* that chat still has to appear.
-    if (entry.state === 'claimed') noteResumeClaim(entry.token);
+    if (entry.state === 'claimed') {
+      if (entry.destinationSend.state === 'dispatched-unresolved' || entry.destinationSend.state === 'sent') {
+        noteResumeDispatch(entry.token);
+      } else {
+        noteResumeClaim(entry.token);
+      }
+    }
     byToken.set(entry.token, entry);
   }
   try {

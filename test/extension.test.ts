@@ -1916,6 +1916,54 @@ describe('active agent tab discard protection', () => {
     }
   });
 
+  it('hands an image export to the tab showing its chat and posts the page\'s answer, once (#889)', async () => {
+    const SHOWN = 'dddddddd-eeee-4fff-8aaa-444444444444';
+    const CLOSED = 'dddddddd-eeee-4fff-8aaa-555555555555';
+    const NONCE_SHOWN = '11111111-2222-4333-8444-555555555555';
+    const NONCE_CLOSED = '66666666-7777-4888-8999-000000000000';
+    const posted: Array<{ canExportImages?: boolean }> = [];
+    const delivered: Array<Record<string, unknown>> = [];
+    const jobs = [
+      { nonce: NONCE_SHOWN, conversationId: SHOWN, messageId: 'message-1', assetId: 'file_1' },
+      { nonce: NONCE_CLOSED, conversationId: CLOSED, messageId: 'message-2', assetId: 'file_2' },
+      { nonce: 'not-a-nonce', conversationId: SHOWN, messageId: 'message-3', assetId: 'file_3' }
+    ];
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch: vi.fn(async (input: string, init?: Record<string, unknown>) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/status') {
+          posted.push(JSON.parse(String(init?.body || '{}')));
+          // Still pending on the next poll: the worker must not hand the same export out twice.
+          return response(200, { ok: true, repairs: [], imageExports: jobs });
+        }
+        if (url.pathname === '/image-export') { delivered.push(JSON.parse(String(init?.body || '{}'))); return response(200, { ok: true }); }
+        return response(404, {});
+      }),
+      tabsQuery: async () => [
+        { id: 3, windowId: 7, url: `https://chatgpt.com/c/${CHAT}`, status: 'complete' },
+        { id: 5, windowId: 7, url: `https://chatgpt.com/c/${SHOWN}`, status: 'complete' }
+      ],
+      tabsSendMessage: async (_tabId, message) => message.type === 'clf-image-export' ? { data: 'iVBORw0KGgo=' } : { ok: true }
+    });
+
+    await worker.fireAlarm();
+    await vi.waitFor(() => expect(delivered).toHaveLength(2));
+    await worker.fireAlarm();
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(posted[0]?.canExportImages).toBe(true);
+    const asked = worker.tabsSendMessage.mock.calls.filter(([, message]) => (message as { type?: string }).type === 'clf-image-export');
+    expect(asked).toEqual([[5, { type: 'clf-image-export', conversationId: SHOWN, messageId: 'message-1', assetId: 'file_1' }, undefined]]);
+    expect(delivered).toEqual(expect.arrayContaining([
+      { nonce: NONCE_SHOWN, data: 'iVBORw0KGgo=' },
+      { nonce: NONCE_CLOSED, error: 'not_open' }
+    ]));
+    expect(delivered).toHaveLength(2);
+  });
+
   it('relays a page bootstrap step to the app by name and id only (#882)', async () => {
     const steps: unknown[] = [];
     const worker = loadWorker({
@@ -3696,6 +3744,60 @@ describe('extension observation journal', () => {
     ]);
     expect(session.data.commandAckOutbox).toEqual([]);
     expect(session.data.settled).toEqual(['resume-retry']);
+  });
+
+  it('durably keeps a failed command diagnostic detail through a service worker restart', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const firstFetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/ack') return response(503, { error: 'temporarily_unavailable' });
+      return response(404, {});
+    });
+    const first = loadWorker({ local, session, fetch: firstFetch });
+
+    const attempted = await first.send({
+      type: 'ack',
+      id: 'resume-failure-detail',
+      status: 'failed',
+      error: 'plain translated failure',
+      detail: 'project-entry:transition-timeout:last=source-route',
+      client: 'page-one'
+    });
+    expect(attempted.ok).toBe(false);
+    expect(session.data.commandAckOutbox).toMatchObject([{
+      id: 'resume-failure-detail',
+      status: 'failed',
+      error: 'plain translated failure',
+      detail: 'project-entry:transition-timeout:last=source-route',
+      client: 'page-one'
+    }]);
+
+    const bodies: Array<Record<string, unknown>> = [];
+    const secondFetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/ack') {
+        bodies.push(JSON.parse(String(init.body)));
+        return response(200, { ok: true, committed: false, outcome: 'terminal-failure' });
+      }
+      return response(404, {});
+    });
+    const restarted = loadWorker({ local, session, fetch: secondFetch });
+    await restarted.send({ type: 'status' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(bodies).toEqual([{
+      id: 'resume-failure-detail',
+      status: 'failed',
+      error: 'plain translated failure',
+      detail: 'project-entry:transition-timeout:last=source-route',
+      client: 'page-one'
+    }]);
+    expect(session.data.commandAckOutbox).toEqual([]);
+    expect(session.data.settled ?? []).toEqual([]);
   });
 
   it('keeps a fresh command page journal behind its pending ACK after the route gets an id', async () => {
