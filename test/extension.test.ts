@@ -1148,7 +1148,7 @@ describe('this install\'s Core app for fresh tabs (#1086)', () => {
     const worker = loadWorker({
       local, session: new FakeStorageArea(),
       fetch: async input => new URL(input).pathname === '/hello'
-        ? response(200, { app: 'cos-erp-db', paired: true }) : response(200, { ok: true })
+        ? response(200, { app: 'chat-on-steroids', paired: true }) : response(200, { ok: true })
     });
     await worker.registerTab(1);
     expect((await worker.send({ type: 'status' }, 1)).ownCoreApp).toBeNull();
