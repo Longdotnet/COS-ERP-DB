@@ -60,6 +60,23 @@ const analogueAssessmentSchema = z.object({
   note: z.string().min(1).max(2_000)
 }).strict();
 
+const impactAssessmentSchema = z.object({
+  nodeId: z.string().min(1).max(256),
+  decision: z.enum(['preserved', 'changed', 'not_applicable']),
+  note: z.string().min(1).max(4_000)
+}).strict();
+
+const learningRefSchema = z.object({
+  kind: z.enum(['incident_outcome', 'incident_pattern']),
+  key: z.string().min(1).max(160),
+  role: z.enum(['context', 'advisory', 'relied_upon']),
+  scope: z.string().min(1).max(120),
+  semanticHash: z.string().regex(/^[a-f0-9]{64}$/),
+  capturedRevision: z.number().int().positive(),
+  boundLiveStatus: z.enum(['accepted', 'promoted']),
+  boundAt: z.string().datetime()
+}).strict();
+
 const requirementComparisonSchema = z.object({
   requirement: z.string().min(1).max(2_000),
   status: z.enum(['existing', 'partial', 'missing', 'conflicting', 'investigate']),
@@ -114,6 +131,12 @@ const taskSchema = z.object({
   deliberatedAt: z.string().datetime().nullable().default(null),
   implementationBindingHash: z.string().regex(/^[a-f0-9]{64}$/).nullable().default(null),
   implementationBoundAt: z.string().datetime().nullable().default(null),
+  impactReviewRequired: z.boolean().default(false),
+  impactReviewStatus: z.enum(['not_required', 'pending', 'reviewed']).default('not_required'),
+  impactAssessments: z.array(impactAssessmentSchema).max(256).default([]),
+  impactReviewBasisHash: z.string().regex(/^[a-f0-9]{64}$/).nullable().default(null),
+  impactReviewedAt: z.string().datetime().nullable().default(null),
+  learningRefs: z.array(learningRefSchema).max(32).default([]),
   authorizedReferences: z.array(authorizedReferenceSchema).max(4).default([]),
   requirements: z.array(z.string().min(1).max(2_000)).max(200),
   decisions: z.array(z.string().min(1).max(2_000)).max(200),
@@ -205,6 +228,12 @@ const scaleVerificationSchema = z.object({
   limitations: z.array(z.string().max(2000)).max(100)
 }).strict();
 
+const incidentVerificationBindingSchema = z.object({
+  scope: z.string().min(1).max(120),
+  outcomeKey: z.string().min(1).max(160),
+  outcomeBasisHash: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+
 const verificationSchema = z.object({
   id: z.string().regex(/^[a-f0-9]{64}$/),
   lineageKey: z.string().regex(/^[a-f0-9]{64}$/),
@@ -217,6 +246,7 @@ const verificationSchema = z.object({
   fileSnapshots: z.array(verificationFileSchema).max(256),
   command: commandVerificationSchema.nullable(),
   scale: scaleVerificationSchema.nullable(),
+  incidentBinding: incidentVerificationBindingSchema.nullable().optional(),
   provenanceHash: z.string().regex(/^[a-f0-9]{64}$/),
   createdAt: z.string().datetime()
 }).strict();

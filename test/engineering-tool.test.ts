@@ -31,6 +31,9 @@ it('publishes a compact project-native engineering surface and serves profiles w
   expect(schema).toContain('convention_put');
   expect(schema).toContain('validation_run');
   expect(schema).toContain('validation_get');
+  expect(schema).toContain('impact_get');
+  expect(schema).toContain('impact_put');
+  expect(schema).toContain('incident_verify');
   expect(schema).toContain('performance_get');
   expect(schema).toContain('quality_gate');
   expect(declaration.annotations).toMatchObject({ destructiveHint: false });
@@ -51,7 +54,11 @@ it('publishes a compact project-native engineering surface and serves profiles w
   expect(declaration.inputSchema.safeParse({ action: 'discover', query: 'frmEdit', limit: 2 }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'prepare' }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'validation_run' }).success).toBe(false);
+  expect(declaration.inputSchema.safeParse({ action: 'impact_put' }).success).toBe(false);
+  expect(declaration.inputSchema.safeParse({ action: 'incident_verify' }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'task_put' }).success).toBe(false);
+  expect(declaration.inputSchema.safeParse({ action: 'impact_get' }).success).toBe(false);
+  expect(declaration.inputSchema.safeParse({ action: 'impact_get', items: ['task-a', 'task-b'] }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'quality_gate', items: ['task-a', 'task-b'] }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'performance_get', items: ['task-a', 'task-b'] }).success).toBe(false);
 

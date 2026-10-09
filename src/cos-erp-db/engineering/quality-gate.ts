@@ -21,6 +21,9 @@ import {
   getEngineeringTasks
 } from './task-service.js';
 import { measureEngineeringPhase } from './performance.js';
+import { analyzeEngineeringImpact } from './impact-service.js';
+import { verifyEngineeringLearningRef } from './learning-service.js';
+import { buildEngineeringLearningProposal } from './learning-proposal.js';
 import {
   captureEngineeringTaskFiles,
   getEngineeringVerifications,
@@ -99,6 +102,13 @@ export async function engineeringQualityGate(
   let referenceBindingsVerified = true;
   let solutionReviewVerified = true;
   let deliberationVerified = true;
+  let impactReviewVerified = true;
+  const learningRefAssurance = {
+    current: 0,
+    staleContext: 0,
+    staleAdvisory: 0,
+    staleReliedUpon: 0
+  };
   const currentKnowledge = await measureEngineeringPhase('gate.current_index', async () => workspace
     ? await indexKnowledge({
         scope: engineeringKnowledgeScope(lineage),
@@ -458,6 +468,80 @@ export async function engineeringQualityGate(
     }
   }
 
+  if (task.impactReviewRequired && task.changedFiles.length) {
+    if (!resolved) {
+      impactReviewVerified = false;
+      blockers.push('Changed-file impact review cannot be verified without the current project workspace.');
+    } else {
+      try {
+        const impact = await measureEngineeringPhase(
+          'gate.impact_review',
+          () => analyzeEngineeringImpact(resolved, task, roots, { refreshKnowledge: false })
+        );
+        if (!impact.coverageComplete) {
+          impactReviewVerified = false;
+          blockers.push('Changed-file impact review coverage is incomplete: one or more changed source files are absent from the current Implementation Graph or graph expansion was truncated.');
+        } else if (task.impactReviewStatus === 'reviewed' && task.impactReviewBasisHash) {
+          if (task.impactReviewBasisHash !== impact.basisHash) {
+            impactReviewVerified = false;
+            blockers.push('Changed-file impact review is stale: changed file content or high-confidence implementation-graph impacts changed after review.');
+          } else {
+            const assessmentById = new Map(task.impactAssessments.map(assessment => [assessment.nodeId, assessment]));
+            const missing = impact.required.filter(target => !assessmentById.has(target.nodeId));
+            if (missing.length) {
+              impactReviewVerified = false;
+              blockers.push(`${missing.length} high-confidence changed-file impact(s) still require assessment.`);
+            }
+            for (const target of impact.required) {
+              const assessment = assessmentById.get(target.nodeId);
+              if (!assessment || assessment.decision !== 'changed'
+                || !['process', 'rule', 'expected_behavior'].includes(target.kind)) continue;
+              const acceptedFinding = task.solutionFindings.find(finding =>
+                target.recordKey !== null
+                && finding.processKeys.includes(target.recordKey)
+                && finding.decision === 'accepted'
+                && task.implementedFindingKeys.includes(finding.key));
+              if (task.deliberationStatus !== 'decided'
+                || task.deliberationAuthority !== 'user'
+                || !acceptedFinding) {
+                impactReviewVerified = false;
+                blockers.push(
+                  `Changed accepted business impact ${target.label} requires a user-authority deliberation and an accepted implemented solution finding bound to ${target.recordKey ?? target.nodeId}.`
+                );
+              }
+            }
+          }
+        } else if (!impact.required.length) {
+          impactReviewVerified = true;
+        } else {
+          impactReviewVerified = false;
+          blockers.push('Changed-file impact review is required: run impact_get, assess every high-confidence accepted Process / Rule / Expected Behavior and database contract impact, then record impact_put.');
+        }
+      } catch (error) {
+        impactReviewVerified = false;
+        blockers.push(`Changed-file impact review could not be verified: ${error instanceof Error ? error.message : String(error)}.`);
+      }
+    }
+  }
+
+  if (task.learningRefs.length) {
+    const learning = await Promise.all(task.learningRefs.map(ref => verifyEngineeringLearningRef(ref)));
+    for (const item of learning) {
+      if (item.status === 'current') {
+        learningRefAssurance.current += 1;
+        continue;
+      }
+      if (item.ref.role === 'relied_upon') {
+        learningRefAssurance.staleReliedUpon += 1;
+        blockers.push(`Relied-upon learning is ${item.status}: ${item.ref.kind}:${item.ref.key}. ${item.detail}`);
+      } else if (item.ref.role === 'advisory') {
+        learningRefAssurance.staleAdvisory += 1;
+      } else {
+        learningRefAssurance.staleContext += 1;
+      }
+    }
+  }
+
   if (task.conventionKeys.length) {
     const conventions = await getEngineeringConventions(lineage, task.conventionKeys);
     const found = new Set(conventions.map(item => item.key));
@@ -553,6 +637,15 @@ export async function engineeringQualityGate(
     && executionReplayed
     && hasSubstantiveExecution
     && (scaleVerification.status === 'not-required' || scaleVerification.status === 'current-runtime');
+  const learningProposalVerificationIds = [
+    ...commandVerifications
+      .filter(item => item.status === 'current-pass' && item.verificationId)
+      .map(item => item.verificationId!),
+    ...(scaleVerification.status === 'current-runtime' && scaleVerification.verificationId
+      ? [scaleVerification.verificationId]
+      : [])
+  ];
+  const learningProposal = buildEngineeringLearningProposal(task, machineVerified, learningProposalVerificationIds);
 
   return {
     lineage,
@@ -565,12 +658,15 @@ export async function engineeringQualityGate(
       referenceBindingsVerified,
       solutionReviewVerified,
       deliberationVerified,
+      impactReviewVerified,
+      learningRefs: learningRefAssurance,
       executionReplayed,
       machineVerified,
       reportedPassedValidations: reportedPassed.length,
       evidenceBackedPassedValidations: evidenceBackedPassed.length,
       commandVerifications,
       scaleVerification
-    }
+    },
+    learningProposal
   };
 }

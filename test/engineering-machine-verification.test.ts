@@ -4,7 +4,11 @@ import { afterEach, beforeEach, expect, it } from 'vitest';
 import type { EngineeringProjectLineage } from '../src/cos-erp-db/engineering/contracts.js';
 import type { ResolvedEngineeringLineage } from '../src/cos-erp-db/engineering/lineage.js';
 import { engineeringQualityGate } from '../src/cos-erp-db/engineering/quality-gate.js';
-import { initEngineeringStore, resetEngineeringStoreForTests } from '../src/cos-erp-db/engineering/store.js';
+import {
+  initEngineeringStore,
+  mutateEngineeringScope,
+  resetEngineeringStoreForTests
+} from '../src/cos-erp-db/engineering/store.js';
 import { putEngineeringTask } from '../src/cos-erp-db/engineering/task-service.js';
 import { runEngineeringValidation } from '../src/cos-erp-db/engineering/verification-service.js';
 import { knowledgeSha256 } from '../src/cos-erp-db/knowledge/evidence.js';
@@ -81,6 +85,52 @@ it('reports Machine Verified only after Core actually runs a current successful 
   expect(after.assurance.executionReplayed).toBe(true);
   expect(after.assurance.machineVerified).toBe(true);
   expect(after.assurance.commandVerifications[0]).toMatchObject({ status: 'current-pass', verificationId: record.id });
+  expect(after.learningProposal).toMatchObject({ eligible: false, autoPersisted: false, candidates: [] });
+});
+
+it('keeps legacy Engineering verification provenance valid when incidentBinding was absent', async () => {
+  await putEngineeringTask(lineage, {
+    key: 'legacy-verification',
+    goal: 'Preserve pre-incident-binding verification compatibility.',
+    changedFiles: ['src/Feature.cs'],
+    validations: [{ name: 'build', status: 'pending', detail: 'Build changed code.' }]
+  });
+  const record = await runEngineeringValidation(resolved, {
+    kind: 'command',
+    taskKey: 'legacy-verification',
+    name: 'build',
+    command: 'dotnet',
+    args: ['build']
+  }, roots, {
+    commandPolicy: { enabled: false, mode: 'allow', rules: [] },
+    commandRunner: successfulCommand
+  });
+  const {
+    id: _currentId,
+    provenanceHash: _currentHash,
+    incidentBinding: _incidentBinding,
+    ...legacyBase
+  } = record;
+  const provenanceHash = knowledgeSha256('engineering-verification:v1\0' + JSON.stringify(legacyBase));
+  const id = knowledgeSha256([
+    'engineering-verification-id:v1',
+    legacyBase.lineageKey,
+    legacyBase.taskKey,
+    String(legacyBase.taskRevision),
+    legacyBase.name,
+    legacyBase.kind,
+    legacyBase.createdAt,
+    provenanceHash
+  ].join('\0'));
+  await mutateEngineeringScope(lineage, current => ({
+    ...current,
+    verifications: [{ ...legacyBase, provenanceHash, id }]
+  }));
+
+  const gate = await engineeringQualityGate(lineage, 'legacy-verification', roots, resolved.workspace);
+  expect(gate.status).toBe('pass');
+  expect(gate.assurance.commandVerifications[0]).toMatchObject({ status: 'current-pass', verificationId: id });
+  expect(gate.assurance.machineVerified).toBe(true);
 });
 
 it('uses the real Core process runner to capture a project typecheck command', async () => {

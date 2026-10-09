@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import type {
   EngineeringAuthorizedReference,
+  EngineeringImpactAssessment,
+  EngineeringImpactReviewStatus,
+  EngineeringLearningRefInput,
   EngineeringProjectLineage,
   EngineeringTask,
   EngineeringTaskInput
@@ -9,6 +12,11 @@ import { readKnowledgeScope } from '../knowledge/store.js';
 import { engineeringKnowledgeScope } from './lineage.js';
 import { mutateEngineeringScope, readEngineeringScope } from './store.js';
 import { inferEngineeringValidationPurpose } from './validation-purpose.js';
+import {
+  bindEngineeringLearningRefs,
+  mergeDiscoveredEngineeringLearningRefs,
+  reliedUponLearningBasis
+} from './learning-service.js';
 
 function hash(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -39,6 +47,7 @@ export function engineeringSolutionReviewBasisHash(task: Pick<
   | 'solutionOptions'
   | 'selectedOptionKey'
   | 'deliberationDecisionNote'
+  | 'learningRefs'
   | 'conventionKeys'
   | 'largeDataRisk'
 >): string {
@@ -62,6 +71,7 @@ export function engineeringSolutionReviewBasisHash(task: Pick<
     solutionOptions: task.solutionOptions,
     selectedOptionKey: task.selectedOptionKey,
     deliberationDecisionNote: task.deliberationDecisionNote,
+    learningRefs: reliedUponLearningBasis(task.learningRefs),
     conventionKeys: task.conventionKeys,
     largeDataRisk: task.largeDataRisk
   }));
@@ -107,6 +117,7 @@ export function engineeringDeliberationBasisHash(task: Pick<
   | 'solutionOptions'
   | 'selectedOptionKey'
   | 'deliberationDecisionNote'
+  | 'learningRefs'
   | 'conventionKeys'
   | 'largeDataRisk'
 >): string {
@@ -130,6 +141,7 @@ export function engineeringDeliberationBasisHash(task: Pick<
     solutionOptions: task.solutionOptions,
     selectedOptionKey: task.selectedOptionKey,
     deliberationDecisionNote: task.deliberationDecisionNote,
+    learningRefs: reliedUponLearningBasis(task.learningRefs),
     conventionKeys: task.conventionKeys,
     largeDataRisk: task.largeDataRisk
   }));
@@ -142,13 +154,22 @@ export async function putEngineeringTask(
     prepared?: boolean;
     authorizedReferences?: EngineeringAuthorizedReference[];
     solutionReviewRequired?: boolean;
+    impactReviewRequired?: boolean;
+    discoveredLearningRefs?: EngineeringLearningRefInput[];
+    impactReview?: {
+      status: EngineeringImpactReviewStatus;
+      assessments: EngineeringImpactAssessment[];
+      basisHash: string | null;
+      reviewedAt: string | null;
+    };
   } = {}
 ): Promise<EngineeringTask> {
   const key = input.key.trim();
   if (!key || key.length > 160) throw new Error('Engineering task key must contain 1 to 160 characters.');
-  const knowledgeGeneration = (await readKnowledgeScope(engineeringKnowledgeScope(lineage))).generation;
+  const learningScope = engineeringKnowledgeScope(lineage);
+  const knowledgeGeneration = (await readKnowledgeScope(learningScope)).generation;
   let saved!: EngineeringTask;
-  await mutateEngineeringScope(lineage, current => {
+  await mutateEngineeringScope(lineage, async current => {
     const previous = current.tasks.find(task => task.key === key);
     if (input.expectedRevision !== undefined && previous?.revision !== input.expectedRevision) {
       throw new Error(`ENGINEERING_REVISION_MISMATCH: expected ${input.expectedRevision}, current ${previous?.revision ?? 0}`);
@@ -158,6 +179,17 @@ export async function putEngineeringTask(
       throw new Error('Engineering task goal must contain 1 to 12000 characters when creating a task.');
     }
     const now = new Date().toISOString();
+    const impactReviewRequired = options.impactReviewRequired ?? previous?.impactReviewRequired ?? false;
+    const changedFiles = input.changedFiles === undefined ? previous?.changedFiles ?? [] : cleanList(input.changedFiles, 256);
+    const changedFilesChanged = previous
+      ? JSON.stringify([...previous.changedFiles].sort()) !== JSON.stringify([...changedFiles].sort())
+      : false;
+    const previousLearningRefs = previous?.learningRefs ?? [];
+    const learningRefs = input.learningRefs !== undefined
+      ? await bindEngineeringLearningRefs(learningScope, input.learningRefs, previousLearningRefs)
+      : options.discoveredLearningRefs?.length
+        ? await mergeDiscoveredEngineeringLearningRefs(learningScope, previousLearningRefs, options.discoveredLearningRefs)
+        : previousLearningRefs;
     saved = {
       id: previous?.id ?? hash(`engineering-task\0${lineage.key}\0${key}`),
       lineageKey: lineage.key,
@@ -169,6 +201,14 @@ export async function putEngineeringTask(
       deliberatedAt: previous?.deliberatedAt ?? null,
       implementationBindingHash: previous?.implementationBindingHash ?? null,
       implementationBoundAt: previous?.implementationBoundAt ?? null,
+      impactReviewRequired,
+      impactReviewStatus: options.impactReview?.status
+        ?? previous?.impactReviewStatus
+        ?? (impactReviewRequired ? 'pending' : 'not_required'),
+      impactAssessments: options.impactReview?.assessments ?? previous?.impactAssessments ?? [],
+      impactReviewBasisHash: options.impactReview?.basisHash ?? previous?.impactReviewBasisHash ?? null,
+      impactReviewedAt: options.impactReview?.reviewedAt ?? previous?.impactReviewedAt ?? null,
+      learningRefs,
       knowledgeGeneration,
       key,
       goal,
@@ -249,7 +289,7 @@ export async function putEngineeringTask(
         ? previous?.implementedOptionKey ?? null
         : input.implementedOptionKey?.trim() || null,
       conventionKeys: input.conventionKeys === undefined ? previous?.conventionKeys ?? [] : cleanList(input.conventionKeys, 128),
-      changedFiles: input.changedFiles === undefined ? previous?.changedFiles ?? [] : cleanList(input.changedFiles, 256),
+      changedFiles,
       validations: input.validations === undefined ? previous?.validations ?? [] : input.validations.slice(0, 128).map(validation => ({
         ...validation,
         purpose: validation.purpose ?? inferEngineeringValidationPurpose(validation.name),
@@ -263,6 +303,22 @@ export async function putEngineeringTask(
       createdAt: previous?.createdAt ?? now,
       updatedAt: now
     };
+    if (!saved.impactReviewRequired) {
+      saved.impactReviewStatus = 'not_required';
+      saved.impactAssessments = [];
+      saved.impactReviewBasisHash = null;
+      saved.impactReviewedAt = null;
+    } else if (previous?.impactReviewRequired !== true && options.impactReview === undefined) {
+      saved.impactReviewStatus = 'pending';
+      saved.impactAssessments = [];
+      saved.impactReviewBasisHash = null;
+      saved.impactReviewedAt = null;
+    } else if (changedFilesChanged && options.impactReview === undefined) {
+      saved.impactReviewStatus = 'pending';
+      saved.impactAssessments = [];
+      saved.impactReviewBasisHash = null;
+      saved.impactReviewedAt = null;
+    }
     if (input.solutionReviewStatus !== undefined) {
       if (saved.solutionReviewStatus === 'reviewed') {
         saved.solutionReviewBasisHash = engineeringSolutionReviewBasisHash(saved);

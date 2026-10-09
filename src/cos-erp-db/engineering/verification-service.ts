@@ -16,6 +16,7 @@ import { knowledgeSha256 } from '../knowledge/evidence.js';
 import { measureEngineeringPhase } from './performance.js';
 import { indexKnowledge } from '../knowledge/service.js';
 import type {
+  EngineeringIncidentVerificationBinding,
   EngineeringTask,
   EngineeringVerificationFileSnapshot,
   EngineeringVerificationRecord
@@ -24,6 +25,7 @@ import type { ResolvedEngineeringLineage } from './lineage.js';
 import { engineeringKnowledgeScope } from './lineage.js';
 import { mutateEngineeringScope, readEngineeringScope } from './store.js';
 import { getEngineeringTasks } from './task-service.js';
+import { getIncidentOutcomes, incidentOutcomeTechnicalBasisHash } from '../knowledge/outcome-service.js';
 import {
   commandMatchesEngineeringValidationPurpose,
   inferEngineeringValidationPurpose
@@ -43,7 +45,12 @@ const commandInputSchema = z.object({
   purpose: z.enum(['build', 'test', 'typecheck', 'lint', 'custom']).optional(),
   command: z.string().trim().min(1).max(4096),
   args: z.array(z.string().max(8192)).max(128).default([]),
-  timeoutMs: z.number().int().min(1000).max(300_000).optional()
+  timeoutMs: z.number().int().min(1000).max(300_000).optional(),
+  incidentBinding: z.object({
+    scope: z.string().trim().min(1).max(120),
+    outcomeKey: z.string().trim().min(1).max(160),
+    outcomeBasisHash: z.string().regex(/^[a-f0-9]{64}$/)
+  }).strict().optional()
 }).strict();
 
 const sqlScaleInputSchema = z.object({
@@ -55,7 +62,12 @@ const sqlScaleInputSchema = z.object({
   runtimeSource: z.enum(['query_store', 'live_performance']).optional(),
   queryContains: z.string().trim().min(4).max(1000).optional(),
   hours: z.union([z.literal(1), z.literal(6), z.literal(24), z.literal(168)]).optional(),
-  sort: z.enum(['duration', 'cpu', 'reads', 'executions']).optional()
+  sort: z.enum(['duration', 'cpu', 'reads', 'executions']).optional(),
+  incidentBinding: z.object({
+    scope: z.string().trim().min(1).max(120),
+    outcomeKey: z.string().trim().min(1).max(160),
+    outcomeBasisHash: z.string().regex(/^[a-f0-9]{64}$/)
+  }).strict().optional()
 }).strict().superRefine((value, ctx) => {
   if (value.runtimeSource && !value.queryContains) {
     ctx.addIssue({ code: 'custom', path: ['queryContains'], message: 'runtime SQL verification requires queryContains' });
@@ -195,6 +207,26 @@ async function taskFor(resolved: ResolvedEngineeringLineage, taskKey: string): P
   return task;
 }
 
+async function resolveIncidentVerificationBinding(
+  binding: EngineeringIncidentVerificationBinding | undefined
+): Promise<EngineeringIncidentVerificationBinding | null> {
+  if (!binding) return null;
+  const result = await getIncidentOutcomes(binding.scope, [binding.outcomeKey]);
+  const outcome = result.outcomes[0]?.outcome;
+  if (!outcome) throw new Error('ENGINEERING_INCIDENT_BINDING_OUTCOME_NOT_FOUND');
+  if (!outcome.incidentClass) throw new Error('ENGINEERING_INCIDENT_BINDING_REQUIRES_TYPED_OUTCOME');
+  if (outcome.status === 'invalidated') throw new Error('ENGINEERING_INCIDENT_BINDING_OUTCOME_INVALIDATED');
+  const currentBasisHash = incidentOutcomeTechnicalBasisHash(outcome);
+  if (currentBasisHash !== binding.outcomeBasisHash) {
+    throw new Error('ENGINEERING_INCIDENT_BINDING_STALE_OUTCOME_BASIS');
+  }
+  return {
+    scope: binding.scope.trim(),
+    outcomeKey: outcome.key,
+    outcomeBasisHash: currentBasisHash
+  };
+}
+
 async function runCommandVerification(
   resolved: ResolvedEngineeringLineage,
   input: Extract<EngineeringValidationRunInput, { kind: 'command' }>,
@@ -202,6 +234,7 @@ async function runCommandVerification(
   deps: EngineeringVerificationDependencies
 ): Promise<EngineeringVerificationRecord> {
   const task = await taskFor(resolved, input.taskKey);
+  const incidentBinding = await resolveIncidentVerificationBinding(input.incidentBinding);
   const expectedValidation = task.validations.find(validation => validation.name === input.name);
   if (!expectedValidation) {
     throw new Error(`ENGINEERING_VALIDATION_NOT_DECLARED: ${input.name} is not listed in the current Engineering Task Packet`);
@@ -262,6 +295,7 @@ async function runCommandVerification(
       stderrHash: knowledgeSha256(execution.stderr)
     },
     scale: null,
+    incidentBinding,
     createdAt
   }));
 }
@@ -319,6 +353,7 @@ async function runSqlScaleVerification(
   deps: EngineeringVerificationDependencies
 ): Promise<EngineeringVerificationRecord> {
   const task = await taskFor(resolved, input.taskKey);
+  const incidentBinding = await resolveIncidentVerificationBinding(input.incidentBinding);
   const beforeKnowledge = await measureEngineeringPhase('validation.pre_index', () => indexKnowledge({
     scope: engineeringKnowledgeScope(resolved.lineage),
     sources: [{ kind: 'source', path: resolved.workspace.virtual }],
@@ -446,6 +481,7 @@ async function runSqlScaleVerification(
       resultHash: knowledgeSha256(JSON.stringify(scaleMaterial)),
       limitations: [...new Set(limitations)].slice(0, 100)
     },
+    incidentBinding,
     createdAt
   }));
 }

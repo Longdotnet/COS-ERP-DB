@@ -26,6 +26,10 @@ export interface IncidentPatternOccurrence {
   incidentKey: string;
   processKey: string;
   expectedBehaviorKey: string;
+  rootCauseCategory: string | null;
+  rootCauseSignature: string | null;
+  /** Server-derived from current supporting root-cause evidence content hashes, excluding validation/runtime evidence. */
+  independenceFingerprint: string | null;
   evidence: BusinessProcessEvidenceRef[];
   note: string | null;
   createdAt: string;
@@ -38,10 +42,14 @@ export interface IncidentPattern {
   title: string;
   symptom: string;
   finding: string;
+  /** Established from the first machine-backed occurrence; later occurrences must match. */
+  rootCauseCategory: string | null;
+  rootCauseSignature: string | null;
   recommendedChecks: string[];
   tags: string[];
   status: IncidentPatternStatus;
   supportingScopeCount: number;
+  independentSupportingCount: number;
   occurrences: IncidentPatternOccurrence[];
   revision: number;
   createdAt: string;
@@ -63,6 +71,7 @@ export interface IncidentPatternPutResult {
 export interface IncidentPatternProvenanceSummary {
   liveStatus: IncidentPatternLiveStatus;
   currentSupportingScopeCount: number;
+  currentIndependentSupportingCount: number;
   otherSupportingScopeCount: number;
   occurrenceCount: number;
   staleOccurrenceCount: number;

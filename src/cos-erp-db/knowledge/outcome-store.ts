@@ -17,6 +17,11 @@ const evidenceSchema = z.object({
   relation: z.enum(['supports', 'context', 'contradicts'])
 }).strict();
 
+const technicalEvidenceSchema = z.object({
+  evidenceId: z.string().regex(/^[a-f0-9]{64}$/),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+
 const validationSchema = z.object({
   result: z.enum(['pending', 'passed', 'failed']),
   summary: z.string().min(1).max(4_000),
@@ -35,9 +40,11 @@ const outcomeSchema = z.object({
   rootCauseCategory: z.string().min(1).max(160),
   finding: z.string().min(1).max(8_000),
   remediation: z.string().min(1).max(8_000),
+  incidentClass: z.enum(['logic_correctness', 'performance', 'deployment', 'data', 'concurrency']).nullable().default(null),
   evidence: z.array(evidenceSchema).max(64),
   deploymentEvidence: z.array(evidenceSchema).max(64),
   runtimeEvidence: z.array(evidenceSchema).max(64),
+  technicalEvidence: z.array(technicalEvidenceSchema).max(64).default([]),
   validation: validationSchema,
   status: z.enum(['draft', 'accepted', 'invalidated']),
   decisionNote: z.string().max(2_000).nullable(),

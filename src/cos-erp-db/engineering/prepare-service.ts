@@ -220,6 +220,14 @@ export async function prepareEngineeringTask(
     proposedDisposition: 'investigate' as const,
     note: ''
   }));
+  const discoveredLearningRefs = [
+    ...(priorOutcomeState.value?.hits ?? [])
+      .filter(hit => hit.provenance.liveStatus === 'accepted')
+      .map(hit => ({ kind: 'incident_outcome' as const, key: hit.outcome.key, role: 'context' as const })),
+    ...(patternState.value?.hits ?? [])
+      .filter(hit => hit.provenance.liveStatus === 'promoted')
+      .map(hit => ({ kind: 'incident_pattern' as const, key: hit.pattern.key, role: 'context' as const }))
+  ].slice(0, 8);
   const task = await putEngineeringTask(resolved.lineage, {
     key: input.taskKey,
     goal: input.goal,
@@ -247,7 +255,9 @@ export async function prepareEngineeringTask(
   }, {
     prepared: true,
     authorizedReferences,
-    solutionReviewRequired: input.requirements.length > 0
+    solutionReviewRequired: input.requirements.length > 0,
+    impactReviewRequired: true,
+    discoveredLearningRefs
   });
 
   return {
@@ -270,6 +280,10 @@ export async function prepareEngineeringTask(
       status: 'pending' as const,
       optionCount: { minimum: 2, maximum: 3 },
       statement: 'Before implementation, explicitly classify deliberation. Use not_required with a concrete evidence-based rationale when there is only one meaningful implementation path. Otherwise compare 2-3 concrete options with trade-offs/risks/evidence, select one, and record why. Technical choices supported by project evidence are agent-resolvable; business behavior, scope, destructive/external action, or unresolved requirement authority must be recorded as a user-authority decision.'
+    },
+    impactReviewPolicy: {
+      requiredAfterChangedFiles: true,
+      statement: 'After implementation files are recorded, run impact_get and review every high-confidence accepted Process / Rule / Expected Behavior and database contract impact. Draft/weak business records and medium-confidence graph links are advisory only and never become blockers by themselves.'
     },
     referencePolicy: {
       autoDiscovery: false,
@@ -316,6 +330,7 @@ export async function prepareEngineeringTask(
         decisionNote: task.deliberationDecisionNote,
         implementedOptionKey: task.implementedOptionKey
       },
+      learningRefs: task.learningRefs,
       openQuestions: [...task.openQuestions]
     },
     task,

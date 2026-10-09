@@ -26,6 +26,10 @@ import {
   putIncidentOutcome,
   searchIncidentOutcomes
 } from '../knowledge/outcome-service.js';
+import {
+  captureIncidentTechnicalEvidence,
+  getIncidentTechnicalEvidence
+} from '../knowledge/technical-evidence-service.js';
 import { fail, type SurfaceRegistrar, type ToolAnnotations, type ToolResult } from '../../main/mcp/kernel.js';
 import { toolDeclaration } from '../../main/mcp/tool-declarations.js';
 
@@ -57,6 +61,8 @@ interface KnowledgeExecutor {
   patternSearch(scope: string, query: string, limit?: number): Promise<unknown>;
   patternGet(scope: string, keys: string[]): Promise<unknown>;
   patternHistory(key: string): Promise<unknown>;
+  technicalCapture(scope: string, input: unknown, roots: SurfaceRegistrar['ctx']['roots']): Promise<unknown>;
+  technicalGet(scope: string, ids: string[]): Promise<unknown>;
 }
 
 const DEFAULT_EXECUTOR: KnowledgeExecutor = {
@@ -78,7 +84,9 @@ const DEFAULT_EXECUTOR: KnowledgeExecutor = {
   patternPut: (scope, input) => putIncidentPatternOccurrence(scope, input),
   patternSearch: (scope, query, limit) => searchIncidentPatterns(scope, query, limit),
   patternGet: (scope, keys) => getIncidentPatterns(scope, keys),
-  patternHistory: key => getIncidentPatternHistory(key)
+  patternHistory: key => getIncidentPatternHistory(key),
+  technicalCapture: (scope, input, roots) => captureIncidentTechnicalEvidence(scope, input, roots),
+  technicalGet: (scope, ids) => getIncidentTechnicalEvidence(scope, ids)
 };
 
 function sourceToken(value: KnowledgeSourceToken): KnowledgeIndexRequest['sources'][number] {
@@ -124,14 +132,15 @@ export function registerKnowledgeTool(
   reg.register(
     'knowledge',
     toolDeclaration('knowledge', () => ({
-      description: 'ERP.',
+      description: 'ERP knowledge, process/implementation graph, incident outcomes/patterns, and Core-captured technical evidence.',
       inputSchema: z.object({
         action: z.enum([
           'index', 'search', 'get', 'verify',
           'process_put', 'process_search', 'process_get', 'process_history',
           'graph_search', 'graph_expand', 'incident_context',
           'outcome_put', 'outcome_search', 'outcome_get', 'outcome_history',
-          'pattern_put', 'pattern_search', 'pattern_get', 'pattern_history'
+          'pattern_put', 'pattern_search', 'pattern_get', 'pattern_history',
+          'technical_capture', 'technical_get'
         ]),
         scope: z.string().trim().min(1).max(120),
         items: z.array(z.string().trim().min(1).max(16_000)).min(1).max(20).optional(),
@@ -167,7 +176,7 @@ export function registerKnowledgeTool(
         if (['search', 'process_search', 'graph_search', 'incident_context', 'outcome_search', 'pattern_search'].includes(input.action) && input.query === undefined) {
           ctx.addIssue({ code: 'custom', path: ['query'], message: 'query is required for search actions' });
         }
-        if (['process_put', 'process_history', 'graph_expand', 'outcome_put', 'outcome_history', 'pattern_put', 'pattern_history'].includes(input.action) && input.items?.length !== 1) {
+        if (['process_put', 'process_history', 'graph_expand', 'outcome_put', 'outcome_history', 'pattern_put', 'pattern_history', 'technical_capture'].includes(input.action) && input.items?.length !== 1) {
           ctx.addIssue({ code: 'custom', path: ['items'], message: input.action + ' requires exactly one item' });
         }
       }),
@@ -257,12 +266,21 @@ export function registerKnowledgeTool(
         if (input.action === 'pattern_history') {
           return result(await executor.patternHistory(input.items![0]!));
         }
+        if (input.action === 'technical_capture') {
+          let parsed: unknown;
+          try { parsed = JSON.parse(input.items![0]!); }
+          catch { throw new Error('technical_capture item must be valid JSON.'); }
+          return result(await executor.technicalCapture(input.scope, parsed, reg.ctx.roots));
+        }
+        if (input.action === 'technical_get') {
+          return result(await executor.technicalGet(input.scope, input.items!.map(evidenceId)));
+        }
         return result(await executor.graphExpand(input.scope, input.items![0]!));
       } catch (error) {
         return fail(error instanceof Error ? error.message : String(error));
       }
       };
-      return input.action === 'process_put' || input.action === 'outcome_put' || input.action === 'pattern_put'
+      return input.action === 'process_put' || input.action === 'outcome_put' || input.action === 'pattern_put' || input.action === 'technical_capture'
         ? reg.guarded('edit', 'knowledge', run)
         : reg.guarded('read', 'knowledge', run);
     }

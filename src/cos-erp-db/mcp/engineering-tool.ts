@@ -7,6 +7,8 @@ import { engineeringProfile } from '../engineering/profiles/index.js';
 import { engineeringPrepareInputSchema, prepareEngineeringTask } from '../engineering/prepare-service.js';
 import { getEngineeringPerformance, observeEngineeringInvocation } from '../engineering/performance.js';
 import { engineeringQualityGate } from '../engineering/quality-gate.js';
+import { getEngineeringImpact, putEngineeringImpactReview } from '../engineering/impact-service.js';
+import { recordIncidentMachineVerification } from '../engineering/incident-verification-service.js';
 import { getEngineeringTaskHistory, getEngineeringTasks, putEngineeringTask } from '../engineering/task-service.js';
 import {
   engineeringValidationRunInputSchema,
@@ -30,6 +32,9 @@ type EngineeringAction =
   | 'convention_history'
   | 'validation_run'
   | 'validation_get'
+  | 'impact_get'
+  | 'impact_put'
+  | 'incident_verify'
   | 'performance_get'
   | 'quality_gate';
 
@@ -52,13 +57,13 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
     'engineering',
     toolDeclaration('engineering', () => ({
       title: 'Project-Native Engineering',
-      description: 'Project-bound preparation, evidence-backed task packets with explicit deliberation/options, convention discovery, Core-owned command/SQL verification, profiles and quality gates.',
+      description: 'Project-bound preparation, evidence-backed task packets, deliberation, changed-file impact review, incident verification receipts, durable learning bindings, Core-owned validation, profiles and quality gates.',
       inputSchema: z.object({
         action: z.enum([
           'context', 'profile_get', 'prepare', 'discover',
           'task_put', 'task_get', 'task_history',
           'convention_put', 'convention_search', 'convention_get', 'convention_history',
-          'validation_run', 'validation_get', 'performance_get',
+          'validation_run', 'validation_get', 'impact_get', 'impact_put', 'incident_verify', 'performance_get',
           'quality_gate'
         ] satisfies EngineeringAction[]),
         profile: z.string().trim().min(1).max(80).optional(),
@@ -69,9 +74,10 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
         query: z.string().trim().min(1).max(1000).optional(),
         limit: z.number().int().min(1).max(50).optional()
       }).strict().superRefine((input, ctx) => {
-        const put = input.action === 'prepare' || input.action === 'task_put' || input.action === 'convention_put' || input.action === 'validation_run';
+        const put = input.action === 'prepare' || input.action === 'task_put' || input.action === 'convention_put'
+          || input.action === 'validation_run' || input.action === 'impact_put' || input.action === 'incident_verify';
         const search = input.action === 'discover' || input.action === 'convention_search';
-        const keyed = ['task_get', 'task_history', 'convention_get', 'convention_history', 'validation_get', 'performance_get', 'quality_gate'].includes(input.action);
+        const keyed = ['task_get', 'task_history', 'convention_get', 'convention_history', 'validation_get', 'impact_get', 'performance_get', 'quality_gate'].includes(input.action);
         if (put !== (input.item !== undefined)) {
           ctx.addIssue({ code: 'custom', path: ['item'], message: put ? 'item is required for put actions' : 'item is only valid for put actions' });
         }
@@ -80,7 +86,8 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
         }
         if (keyed && !input.items?.length) ctx.addIssue({ code: 'custom', path: ['items'], message: 'items is required for keyed actions' });
         if (!keyed && input.items !== undefined) ctx.addIssue({ code: 'custom', path: ['items'], message: 'items is only valid for keyed actions' });
-        if ((input.action === 'task_history' || input.action === 'convention_history' || input.action === 'validation_get' || input.action === 'performance_get' || input.action === 'quality_gate') && input.items?.length !== 1) {
+        if ((input.action === 'task_history' || input.action === 'convention_history' || input.action === 'validation_get'
+          || input.action === 'impact_get' || input.action === 'performance_get' || input.action === 'quality_gate') && input.items?.length !== 1) {
           ctx.addIssue({ code: 'custom', path: ['items'], message: `${input.action} requires exactly one key` });
         }
         if (input.limit !== undefined && !search) ctx.addIssue({ code: 'custom', path: ['limit'], message: 'limit is only valid for search/discover actions' });
@@ -143,10 +150,20 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
             const verifications = all.slice(-50);
             return result({ lineage, verifications, total: all.length, truncated: all.length > verifications.length });
           }
+          if (input.action === 'impact_get') {
+            return result(await getEngineeringImpact(resolved, input.items![0]!, reg.ctx.roots));
+          }
+          if (input.action === 'impact_put') {
+            return result(await putEngineeringImpactReview(resolved, parseJson<unknown>(input.item, 'impact_put'), reg.ctx.roots));
+          }
+          if (input.action === 'incident_verify') {
+            return result(await recordIncidentMachineVerification(resolved, parseJson<unknown>(input.item, 'incident_verify'), reg.ctx.roots));
+          }
           return result(await engineeringQualityGate(lineage, input.items![0]!, reg.ctx.roots, resolved.workspace));
           };
           let taskKey = input.items?.[0] ?? '__unattributed__';
-          if (input.action === 'prepare' || input.action === 'task_put' || input.action === 'validation_run') {
+          if (input.action === 'prepare' || input.action === 'task_put' || input.action === 'validation_run'
+            || input.action === 'impact_put' || input.action === 'incident_verify') {
             try {
               const parsed = JSON.parse(input.item ?? '{}') as { taskKey?: unknown; key?: unknown };
               const selected = parsed.taskKey ?? parsed.key;
@@ -162,7 +179,8 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
           return fail(`engineering failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       };
-      if (input.action === 'prepare' || input.action === 'task_put' || input.action === 'convention_put') return reg.guarded('edit', 'engineering', run);
+      if (input.action === 'prepare' || input.action === 'task_put' || input.action === 'convention_put'
+        || input.action === 'impact_put' || input.action === 'incident_verify') return reg.guarded('edit', 'engineering', run);
       if (input.action === 'validation_run') {
         let kind: unknown;
         try { kind = (JSON.parse(input.item ?? '{}') as { kind?: unknown }).kind; } catch { kind = null; }

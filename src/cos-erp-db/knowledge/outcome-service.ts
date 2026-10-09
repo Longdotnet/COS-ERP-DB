@@ -9,10 +9,12 @@ import type {
   IncidentOutcomePutResult,
   IncidentOutcomeSearchResult
 } from './contracts/incident-outcome.js';
+import type { IncidentTechnicalEvidenceRef } from './contracts/incident-technical-evidence.js';
 import { knowledgeSha256 } from './evidence.js';
 import { mutateIncidentOutcomeScope, readIncidentOutcomeScope } from './outcome-store.js';
 import { readBusinessProcessScope } from './process-store.js';
 import { readKnowledgeScope } from './store.js';
+import { evaluateIncidentEvidencePolicy, resolveIncidentTechnicalEvidence } from './technical-evidence-service.js';
 
 const MAX_SEARCH_RESULTS = 20;
 const MAX_REVISIONS_PER_SCOPE = 50_000;
@@ -21,6 +23,11 @@ const evidenceInputSchema = z.object({
   evidenceId: z.string().regex(/^[a-f0-9]{64}$/),
   contentHash: z.string().regex(/^[a-f0-9]{64}$/),
   relation: z.enum(['supports', 'context', 'contradicts']).default('supports')
+}).strict();
+
+const technicalEvidenceInputSchema = z.object({
+  evidenceId: z.string().regex(/^[a-f0-9]{64}$/),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/)
 }).strict();
 
 const inputSchema = z.object({
@@ -33,9 +40,11 @@ const inputSchema = z.object({
   rootCauseCategory: z.string().trim().min(1).max(160),
   finding: z.string().trim().min(1).max(8_000),
   remediation: z.string().trim().min(1).max(8_000),
+  incidentClass: z.enum(['logic_correctness', 'performance', 'deployment', 'data', 'concurrency']).nullable().optional(),
   evidence: z.array(evidenceInputSchema).max(64).default([]),
   deploymentEvidence: z.array(evidenceInputSchema).max(64).default([]),
   runtimeEvidence: z.array(evidenceInputSchema).max(64).default([]),
+  technicalEvidence: z.array(technicalEvidenceInputSchema).max(64).default([]),
   validation: z.object({
     result: z.enum(['pending', 'passed', 'failed']),
     summary: z.string().trim().min(1).max(4_000),
@@ -92,6 +101,18 @@ function dedupeEvidence(values: readonly BusinessProcessEvidenceRef[]): Business
   return result;
 }
 
+function dedupeTechnicalEvidence(values: readonly IncidentTechnicalEvidenceRef[]): IncidentTechnicalEvidenceRef[] {
+  const seen = new Set<string>();
+  const result: IncidentTechnicalEvidenceRef[] = [];
+  for (const item of values) {
+    const key = `${item.evidenceId}:${item.contentHash}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
 function byKey(records: readonly BusinessProcessRecord[]): Map<string, BusinessProcessRecord> {
   return new Map(records.map(record => [normalizedKey(record.key), record]));
 }
@@ -114,6 +135,44 @@ export function incidentOutcomeEvidence(outcome: IncidentOutcome): BusinessProce
     ...outcome.runtimeEvidence,
     ...outcome.validation.evidence
   ]);
+}
+
+type IncidentOutcomeBasis = Pick<
+  IncidentOutcome,
+  | 'scope'
+  | 'key'
+  | 'incidentKey'
+  | 'symptom'
+  | 'processKey'
+  | 'expectedBehaviorKey'
+  | 'rootCauseCategory'
+  | 'finding'
+  | 'remediation'
+  | 'incidentClass'
+  | 'evidence'
+  | 'deploymentEvidence'
+  | 'runtimeEvidence'
+  | 'validation'
+>;
+
+export function incidentOutcomeTechnicalBasisHash(outcome: IncidentOutcomeBasis): string {
+  return knowledgeSha256('incident-outcome-technical-basis:v1\0' + JSON.stringify({
+    scope: outcome.scope,
+    key: outcome.key,
+    incidentKey: outcome.incidentKey,
+    symptom: outcome.symptom,
+    processKey: outcome.processKey,
+    expectedBehaviorKey: outcome.expectedBehaviorKey,
+    rootCauseCategory: outcome.rootCauseCategory,
+    finding: outcome.finding,
+    remediation: outcome.remediation,
+    incidentClass: outcome.incidentClass,
+    evidence: dedupeEvidence(outcome.evidence),
+    deploymentEvidence: dedupeEvidence(outcome.deploymentEvidence),
+    runtimeEvidence: dedupeEvidence(outcome.runtimeEvidence),
+    validationSummary: outcome.validation.summary,
+    validationEvidence: dedupeEvidence(outcome.validation.evidence)
+  }));
 }
 
 async function validateReferences(scope: string, processKey: string, expectedBehaviorKey: string, evidence: readonly BusinessProcessEvidenceRef[]) {
@@ -152,9 +211,11 @@ function materialShape(outcome: IncidentOutcome): unknown {
     rootCauseCategory: outcome.rootCauseCategory,
     finding: outcome.finding,
     remediation: outcome.remediation,
+    incidentClass: outcome.incidentClass,
     evidence: outcome.evidence,
     deploymentEvidence: outcome.deploymentEvidence,
     runtimeEvidence: outcome.runtimeEvidence,
+    technicalEvidence: outcome.technicalEvidence,
     validation: outcome.validation,
     status: outcome.status,
     decisionNote: outcome.decisionNote,
@@ -164,10 +225,24 @@ function materialShape(outcome: IncidentOutcome): unknown {
 
 export async function evaluateIncidentOutcome(outcome: IncidentOutcome): Promise<IncidentOutcomeProvenance> {
   if (outcome.status === 'draft') {
-    return { liveStatus: 'draft', current: false, staleEvidenceCount: 0, evidenceCount: incidentOutcomeEvidence(outcome).length, processCurrent: false, expectedBehaviorCurrent: false };
+    return {
+      liveStatus: 'draft', current: false, staleEvidenceCount: 0, evidenceCount: incidentOutcomeEvidence(outcome).length,
+      processCurrent: false, expectedBehaviorCurrent: false, machineBacked: false, causalVerificationCurrent: false,
+      verificationLevel: outcome.incidentClass ? 'typed_incomplete' : 'legacy_declared', technicalEvidenceCurrent: false,
+      technicalEvidenceCount: outcome.technicalEvidence.length,
+      technicalEvidenceRoles: { observations: 0, hypotheses: 0, causalVerifications: 0, legacyVerifications: 0 },
+      missingTechnicalEvidence: []
+    };
   }
   if (outcome.status === 'invalidated') {
-    return { liveStatus: 'invalidated', current: false, staleEvidenceCount: 0, evidenceCount: incidentOutcomeEvidence(outcome).length, processCurrent: false, expectedBehaviorCurrent: false };
+    return {
+      liveStatus: 'invalidated', current: false, staleEvidenceCount: 0, evidenceCount: incidentOutcomeEvidence(outcome).length,
+      processCurrent: false, expectedBehaviorCurrent: false, machineBacked: false, causalVerificationCurrent: false,
+      verificationLevel: outcome.incidentClass ? 'typed_incomplete' : 'legacy_declared', technicalEvidenceCurrent: false,
+      technicalEvidenceCount: outcome.technicalEvidence.length,
+      technicalEvidenceRoles: { observations: 0, hypotheses: 0, causalVerifications: 0, legacyVerifications: 0 },
+      missingTechnicalEvidence: []
+    };
   }
   try {
     const [processSnapshot, knowledgeSnapshot] = await Promise.all([
@@ -184,22 +259,58 @@ export async function evaluateIncidentOutcome(outcome: IncidentOutcome): Promise
     const indexed = new Map(knowledgeSnapshot.evidence.map(item => [item.id, item]));
     const evidence = incidentOutcomeEvidence(outcome);
     const staleEvidenceCount = evidence.filter(reference => indexed.get(reference.evidenceId)?.contentHash !== reference.contentHash).length;
+    const technical = outcome.incidentClass
+      ? await evaluateIncidentEvidencePolicy(
+          outcome.scope,
+          outcome.incidentKey,
+          outcome.incidentClass,
+          incidentOutcomeTechnicalBasisHash(outcome),
+          outcome.technicalEvidence
+        )
+      : null;
+    const legacyTechnical = outcome.incidentClass || !outcome.technicalEvidence.length
+      ? null
+      : await resolveIncidentTechnicalEvidence(outcome.scope, outcome.incidentKey, outcome.technicalEvidence);
+    const machineBacked = technical?.machineBacked ?? false;
+    const technicalEvidenceCurrent = technical
+      ? technical.satisfied
+      : legacyTechnical ? legacyTechnical.staleCount === 0 : true;
     const current = processCurrent && expectedBehaviorCurrent && outcome.validation.result === 'passed'
       && outcome.evidence.some(item => item.relation === 'supports')
       && outcome.validation.evidence.some(item => item.relation === 'supports')
-      && staleEvidenceCount === 0;
+      && staleEvidenceCount === 0
+      && technicalEvidenceCurrent;
     return {
       liveStatus: current ? 'accepted' : 'stale',
       current,
       staleEvidenceCount,
       evidenceCount: evidence.length,
       processCurrent,
-      expectedBehaviorCurrent
+      expectedBehaviorCurrent,
+      machineBacked,
+      causalVerificationCurrent: Boolean(technical?.machineBacked),
+      verificationLevel: outcome.incidentClass
+        ? machineBacked ? 'typed_machine_backed' : 'typed_incomplete'
+        : 'legacy_declared',
+      technicalEvidenceCurrent,
+      technicalEvidenceCount: technical?.currentRecords.length ?? legacyTechnical?.current.length ?? 0,
+      technicalEvidenceRoles: technical?.roleCounts ?? {
+        observations: legacyTechnical?.current.filter(record => record.role === 'observation').length ?? 0,
+        hypotheses: legacyTechnical?.current.filter(record => record.role === 'hypothesis').length ?? 0,
+        causalVerifications: legacyTechnical?.current.filter(record => record.role === 'causal_verification').length ?? 0,
+        legacyVerifications: legacyTechnical?.current.filter(record => record.role === 'verification').length ?? 0
+      },
+      missingTechnicalEvidence: technical?.missing ?? []
     };
   } catch {
     return {
       liveStatus: 'stale', current: false, staleEvidenceCount: incidentOutcomeEvidence(outcome).length,
-      evidenceCount: incidentOutcomeEvidence(outcome).length, processCurrent: false, expectedBehaviorCurrent: false
+      evidenceCount: incidentOutcomeEvidence(outcome).length, processCurrent: false, expectedBehaviorCurrent: false,
+      machineBacked: false, causalVerificationCurrent: false,
+      verificationLevel: outcome.incidentClass ? 'typed_incomplete' : 'legacy_declared',
+      technicalEvidenceCurrent: false, technicalEvidenceCount: 0,
+      technicalEvidenceRoles: { observations: 0, hypotheses: 0, causalVerifications: 0, legacyVerifications: 0 },
+      missingTechnicalEvidence: ['technical evidence unavailable']
     };
   }
 }
@@ -210,6 +321,7 @@ export async function putIncidentOutcome(scopeInput: string, rawInput: unknown):
     evidence: BusinessProcessEvidenceRef[];
     deploymentEvidence: BusinessProcessEvidenceRef[];
     runtimeEvidence: BusinessProcessEvidenceRef[];
+    technicalEvidence: IncidentTechnicalEvidenceRef[];
     validation: IncidentOutcomeInput['validation'] & { evidence: BusinessProcessEvidenceRef[] };
     status: IncidentOutcome['status'];
     tags: string[];
@@ -217,9 +329,34 @@ export async function putIncidentOutcome(scopeInput: string, rawInput: unknown):
   const evidence = dedupeEvidence(parsed.evidence);
   const deploymentEvidence = dedupeEvidence(parsed.deploymentEvidence);
   const runtimeEvidence = dedupeEvidence(parsed.runtimeEvidence);
+  const technicalEvidence = dedupeTechnicalEvidence(parsed.technicalEvidence);
   const validationEvidence = dedupeEvidence(parsed.validation.evidence ?? []);
   const allEvidence = dedupeEvidence([...evidence, ...deploymentEvidence, ...runtimeEvidence, ...validationEvidence]);
   await validateReferences(scope, parsed.processKey, parsed.expectedBehaviorKey, allEvidence);
+  const incidentClass = parsed.incidentClass ?? null;
+  const technicalBasis = incidentClass ? incidentOutcomeTechnicalBasisHash({
+    scope,
+    key: parsed.key.trim(),
+    incidentKey: parsed.incidentKey.trim(),
+    symptom: parsed.symptom.trim(),
+    processKey: parsed.processKey.trim(),
+    expectedBehaviorKey: parsed.expectedBehaviorKey.trim(),
+    rootCauseCategory: parsed.rootCauseCategory.trim(),
+    finding: parsed.finding.trim(),
+    remediation: parsed.remediation.trim(),
+    incidentClass,
+    evidence,
+    deploymentEvidence,
+    runtimeEvidence,
+    validation: {
+      result: parsed.validation.result,
+      summary: parsed.validation.summary.trim(),
+      evidence: validationEvidence
+    }
+  }) : null;
+  const technicalPolicy = incidentClass && technicalBasis
+    ? await evaluateIncidentEvidencePolicy(scope, parsed.incidentKey, incidentClass, technicalBasis, technicalEvidence)
+    : null;
   const decisionNote = parsed.decisionNote?.trim() || null;
   if (parsed.status === 'accepted') {
     if (!evidence.some(item => item.relation === 'supports')) {
@@ -229,6 +366,9 @@ export async function putIncidentOutcome(scopeInput: string, rawInput: unknown):
       throw new Error('Accepted incident outcomes require passed validation with supporting evidence.');
     }
     if (!decisionNote) throw new Error('Accepted incident outcomes require an explicit decisionNote.');
+    if (incidentClass && !technicalPolicy?.satisfied) {
+      throw new Error(`Accepted typed incident outcome requires current machine-backed technical evidence: ${technicalPolicy?.missing.join(', ') || 'policy not satisfied'}.`);
+    }
   }
   if (parsed.status === 'invalidated' && !decisionNote) {
     throw new Error('Invalidated incident outcomes require a decisionNote.');
@@ -258,9 +398,11 @@ export async function putIncidentOutcome(scopeInput: string, rawInput: unknown):
       rootCauseCategory: parsed.rootCauseCategory.trim(),
       finding: parsed.finding.trim(),
       remediation: parsed.remediation.trim(),
+      incidentClass,
       evidence,
       deploymentEvidence,
       runtimeEvidence,
+      technicalEvidence,
       validation: { result: parsed.validation.result, summary: parsed.validation.summary.trim(), evidence: validationEvidence },
       status: parsed.status,
       decisionNote,
@@ -366,5 +508,6 @@ export async function getAcceptedIncidentOutcomeForPattern(scopeInput: string, k
   if (outcome.status !== 'accepted') throw new Error('Incident pattern requires an accepted incident outcome.');
   const provenance = await evaluateIncidentOutcome(outcome);
   if (!provenance.current) throw new Error('Incident pattern requires a current accepted outcome with current validation evidence.');
+  if (!provenance.machineBacked) throw new Error('Incident pattern requires a machine-backed accepted outcome; legacy declared validation cannot promote shared learning.');
   return outcome;
 }

@@ -30,6 +30,29 @@ export type EngineeringSolutionFindingDecision = 'pending' | 'accepted' | 'rejec
 export type EngineeringFindingConfidence = 'low' | 'medium' | 'high';
 export type EngineeringDeliberationStatus = 'pending' | 'not_required' | 'decided';
 export type EngineeringDeliberationAuthority = 'agent' | 'user';
+export type EngineeringImpactReviewStatus = 'not_required' | 'pending' | 'reviewed';
+export type EngineeringImpactAssessmentDecision = 'preserved' | 'changed' | 'not_applicable';
+export type EngineeringLearningKind = 'incident_outcome' | 'incident_pattern';
+export type EngineeringLearningRole = 'context' | 'advisory' | 'relied_upon';
+
+export interface EngineeringLearningRefInput {
+  kind: EngineeringLearningKind;
+  key: string;
+  role: EngineeringLearningRole;
+  /** Explicitly recapture the current semantic binding instead of preserving an existing binding. */
+  refreshBinding?: boolean;
+}
+
+export interface EngineeringLearningRef {
+  kind: EngineeringLearningKind;
+  key: string;
+  role: EngineeringLearningRole;
+  scope: string;
+  semanticHash: string;
+  capturedRevision: number;
+  boundLiveStatus: 'accepted' | 'promoted';
+  boundAt: string;
+}
 export type EngineeringDeliberationTrigger =
   | 'ambiguity'
   | 'architecture'
@@ -140,6 +163,35 @@ export interface EngineeringAnalogueAssessment {
   note: string;
 }
 
+export interface EngineeringImpactAssessment {
+  nodeId: string;
+  decision: EngineeringImpactAssessmentDecision;
+  note: string;
+}
+
+export interface EngineeringImpactTarget {
+  nodeId: string;
+  fingerprint: string;
+  kind: 'process' | 'rule' | 'expected_behavior' | 'database_object' | 'database_column' | 'form' | 'control' | 'source_method';
+  label: string;
+  recordKey: string | null;
+  confidence: 'high' | 'medium';
+  changedFiles: string[];
+}
+
+export interface EngineeringImpactAnalysis {
+  lineage: EngineeringProjectLineage;
+  taskKey: string;
+  graphGeneration: string;
+  changedFiles: string[];
+  coverageComplete: boolean;
+  required: EngineeringImpactTarget[];
+  advisory: EngineeringImpactTarget[];
+  unknownChangedFiles: string[];
+  basisHash: string;
+  limitations: string[];
+}
+
 export interface EngineeringTaskInput {
   key: string;
   /** Required for a new task; optional on later revision-fenced partial updates. */
@@ -178,6 +230,8 @@ export interface EngineeringTaskInput {
   deliberationDecisionNote?: string;
   /** Explicit implementation mapping; not part of the review basis so code/validation updates do not stale review. */
   implementedOptionKey?: string | null;
+  /** Prior incident learning explicitly attached to this task. */
+  learningRefs?: EngineeringLearningRefInput[];
   conventionKeys?: string[];
   changedFiles?: string[];
   validations?: EngineeringValidation[];
@@ -189,7 +243,7 @@ export interface EngineeringTaskInput {
   expectedRevision?: number;
 }
 
-export interface EngineeringTask extends Omit<Required<EngineeringTaskInput>, 'expectedRevision'> {
+export interface EngineeringTask extends Omit<Required<EngineeringTaskInput>, 'expectedRevision' | 'learningRefs'> {
   id: string;
   lineageKey: string;
   /** Server-owned marker: true only when the task was created/refreshed through engineering prepare. */
@@ -207,6 +261,14 @@ export interface EngineeringTask extends Omit<Required<EngineeringTaskInput>, 'e
   /** Server-owned binding from the decided option to the exact implementation file/finding set. */
   implementationBindingHash: string | null;
   implementationBoundAt: string | null;
+  /** Server-owned opt-in marker. Prepared tasks require impact review once implementation files exist. */
+  impactReviewRequired: boolean;
+  /** Server-owned review state; only impact_put can mark a current graph basis reviewed. */
+  impactReviewStatus: EngineeringImpactReviewStatus;
+  impactAssessments: EngineeringImpactAssessment[];
+  impactReviewBasisHash: string | null;
+  impactReviewedAt: string | null;
+  learningRefs: EngineeringLearningRef[];
   /** Server-observed Engineering knowledge generation at the time this task revision was saved. */
   knowledgeGeneration: string;
   revision: number;
@@ -251,6 +313,12 @@ export interface EngineeringSqlScaleVerification {
   limitations: string[];
 }
 
+export interface EngineeringIncidentVerificationBinding {
+  scope: string;
+  outcomeKey: string;
+  outcomeBasisHash: string;
+}
+
 export interface EngineeringVerificationRecord {
   id: string;
   lineageKey: string;
@@ -263,6 +331,11 @@ export interface EngineeringVerificationRecord {
   fileSnapshots: EngineeringVerificationFileSnapshot[];
   command: EngineeringCommandVerification | null;
   scale: EngineeringSqlScaleVerification | null;
+  /**
+   * Optional pre-execution binding to an incident hypothesis. When present it is
+   * provenance-hashed with the verification and cannot be attached post hoc.
+   */
+  incidentBinding?: EngineeringIncidentVerificationBinding | null;
   provenanceHash: string;
   createdAt: string;
 }
@@ -342,6 +415,13 @@ export interface EngineeringQualityGateResult {
     referenceBindingsVerified: boolean;
     solutionReviewVerified: boolean;
     deliberationVerified: boolean;
+    impactReviewVerified: boolean;
+    learningRefs: {
+      current: number;
+      staleContext: number;
+      staleAdvisory: number;
+      staleReliedUpon: number;
+    };
     executionReplayed: boolean;
     machineVerified: boolean;
     reportedPassedValidations: number;
@@ -356,5 +436,22 @@ export interface EngineeringQualityGateResult {
       status: 'current-runtime' | 'current-static' | 'current-fail' | 'stale' | 'missing' | 'not-required';
       verificationId: string | null;
     };
+  };
+  learningProposal: {
+    eligible: boolean;
+    sourceTaskKey: string;
+    sourceTaskRevision: number;
+    implementationBindingHash: string | null;
+    verificationIds: string[];
+    autoPersisted: false;
+    candidates: Array<{
+      kind: 'convention_review' | 'business_process_review';
+      sourceFindingKey: string;
+      title: string;
+      statement: string;
+      processKeys: string[];
+      evidence: EngineeringReviewEvidenceRef[];
+      requiresExplicitReview: true;
+    }>;
   };
 }

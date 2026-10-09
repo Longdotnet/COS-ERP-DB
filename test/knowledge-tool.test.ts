@@ -40,7 +40,9 @@ it('publishes one provenance-aware knowledge primitive and routes evidence plus 
     patternPut: vi.fn(async () => ({ changed: true, pattern: { key: 'double-adjustment' } })),
     patternSearch: vi.fn(async () => ({ requestingScope: 'erp', hits: [] })),
     patternGet: vi.fn(async () => ({ requestingScope: 'erp', patterns: [] })),
-    patternHistory: vi.fn(async () => ({ key: 'double-adjustment', revisions: [] }))
+    patternHistory: vi.fn(async () => ({ key: 'double-adjustment', revisions: [] })),
+    technicalCapture: vi.fn(async () => ({ scope: 'erp', records: [], refs: [] })),
+    technicalGet: vi.fn(async () => ({ scope: 'erp', records: [], missingIds: [] }))
   };
   registerKnowledgeTool(reg, executor);
 
@@ -62,6 +64,8 @@ it('publishes one provenance-aware knowledge primitive and routes evidence plus 
   expect(schema).toContain('pattern_search');
   expect(schema).toContain('pattern_get');
   expect(schema).toContain('pattern_history');
+  expect(schema).toContain('technical_capture');
+  expect(schema).toContain('technical_get');
   expect(declaration.annotations).toMatchObject({ destructiveHint: false });
 
   await invoke({
@@ -170,5 +174,19 @@ it('publishes one provenance-aware knowledge primitive and routes evidence plus 
 
   await invoke({ action: 'pattern_history', scope: 'erp', items: ['double-adjustment'] });
   expect(executor.patternHistory).toHaveBeenCalledWith('double-adjustment');
+
+  const technicalCapture = {
+    incidentKey: 'INC-1',
+    source: 'deployment_compare',
+    baselineConnection: 'BASE',
+    currentConnection: 'CURRENT'
+  };
+  await invoke({ action: 'technical_capture', scope: 'erp', items: [JSON.stringify(technicalCapture)] });
+  expect(executor.technicalCapture).toHaveBeenCalledWith('erp', technicalCapture, reg.ctx.roots);
+
+  await invoke({ action: 'technical_get', scope: 'erp', items: [id] });
+  expect(executor.technicalGet).toHaveBeenCalledWith('erp', [id]);
+
+  expect(declaration.inputSchema.safeParse({ action: 'technical_capture', scope: 'erp', items: [] }).success).toBe(false);
   await server.close();
 });

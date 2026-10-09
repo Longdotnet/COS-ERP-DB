@@ -8,13 +8,31 @@ import {
 } from '../src/cos-erp-db/engineering/lineage.js';
 import { prepareEngineeringTask } from '../src/cos-erp-db/engineering/prepare-service.js';
 import { engineeringQualityGate } from '../src/cos-erp-db/engineering/quality-gate.js';
-import { initEngineeringStore, resetEngineeringStoreForTests } from '../src/cos-erp-db/engineering/store.js';
+import {
+  initEngineeringStore,
+  readEngineeringScope,
+  resetEngineeringStoreForTests
+} from '../src/cos-erp-db/engineering/store.js';
 import { getEngineeringTasks, putEngineeringTask } from '../src/cos-erp-db/engineering/task-service.js';
 import { runEngineeringValidation } from '../src/cos-erp-db/engineering/verification-service.js';
 import { knowledgeSha256 } from '../src/cos-erp-db/knowledge/evidence.js';
 import { resetKnowledgeSearchCacheForTests, searchKnowledge } from '../src/cos-erp-db/knowledge/service.js';
 import { initKnowledgeStore, resetKnowledgeStoreForTests } from '../src/cos-erp-db/knowledge/store.js';
-import { initBusinessProcessStore, resetBusinessProcessStoreForTests } from '../src/cos-erp-db/knowledge/process-store.js';
+import {
+  initBusinessProcessStore,
+  readBusinessProcessScope,
+  resetBusinessProcessStoreForTests
+} from '../src/cos-erp-db/knowledge/process-store.js';
+import {
+  initIncidentOutcomeStore,
+  readIncidentOutcomeScope,
+  resetIncidentOutcomeStoreForTests
+} from '../src/cos-erp-db/knowledge/outcome-store.js';
+import {
+  initIncidentPatternStore,
+  readIncidentPatternStore,
+  resetIncidentPatternStoreForTests
+} from '../src/cos-erp-db/knowledge/pattern-store.js';
 import type { Root } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
@@ -75,6 +93,8 @@ beforeEach(async () => {
   initEngineeringStore(userData);
   initKnowledgeStore(userData);
   initBusinessProcessStore(userData);
+  initIncidentOutcomeStore(userData);
+  initIncidentPatternStore(userData);
   resetKnowledgeSearchCacheForTests();
 });
 
@@ -83,6 +103,8 @@ afterEach(async () => {
   resetKnowledgeSearchCacheForTests();
   resetKnowledgeStoreForTests();
   resetBusinessProcessStoreForTests();
+  resetIncidentOutcomeStoreForTests();
+  resetIncidentPatternStoreForTests();
   await removeTempDir(directory);
 });
 
@@ -159,6 +181,21 @@ it('blocks a blind spot until its business/process decision is recorded, then pr
     decision: 'pending' as const,
     decisionNote: ''
   };
+  const improvementFinding = {
+    key: 'reuse-current-save-path',
+    title: 'Reuse the current transfer save path',
+    type: 'proposed_improvement' as const,
+    statement: 'The current project analogue already provides a localized transfer save path that avoids a parallel persistence mechanism.',
+    impact: 'Reusing it keeps the change surface smaller and avoids duplicate persistence semantics.',
+    confidence: 'high' as const,
+    affectedRequirements: prepared.task.requirements,
+    processKeys: [],
+    evidence: currentEvidence,
+    recommendation: 'Review this reuse choice as a project convention candidate after the implementation is Machine Verified.',
+    disposition: 'advisory' as const,
+    decision: 'accepted' as const,
+    decisionNote: 'Accepted for this implementation only; durable promotion still requires explicit review.'
+  };
   const reviewedPending = await putEngineeringTask(project.lineage, {
     key: prepared.task.key,
     analogueAssessments: assessments(prepared.task),
@@ -173,7 +210,7 @@ it('blocks a blind spot until its business/process decision is recorded, then pr
       proposedDisposition: 'adapt',
       note: 'The core transfer exists as a pattern, but history behavior requires a business decision.'
     }],
-    solutionFindings: [finding],
+    solutionFindings: [finding, improvementFinding],
     expectedRevision: prepared.task.revision
   });
   const pendingGate = await engineeringQualityGate(project.lineage, reviewedPending.key, roots, project.workspace);
@@ -191,7 +228,7 @@ it('blocks a blind spot until its business/process decision is recorded, then pr
     solutionReviewStatus: 'reviewed',
     solutionReviewSummary: reviewedPending.solutionReviewSummary,
     requirementComparisons: reviewedPending.requirementComparisons,
-    solutionFindings: [decidedFinding],
+    solutionFindings: [decidedFinding, improvementFinding],
     deliberationStatus: 'decided',
     deliberationQuestion: 'Should this task add historical ownership persistence, or keep the accepted transfer-only behavior?',
     deliberationTriggers: ['business'],
@@ -229,6 +266,7 @@ it('blocks a blind spot until its business/process decision is recorded, then pr
     key: prepared.task.key,
     changedFiles: ['MachineTransfer.cs'],
     implementedOptionKey: 'keep-current-transfer',
+    implementedFindingKeys: [improvementFinding.key],
     validations: [{ name: 'build', status: 'pending', detail: 'Build the reviewed implementation.' }],
     expectedRevision: decided.revision
   });
@@ -249,12 +287,40 @@ it('blocks a blind spot until its business/process decision is recorded, then pr
       durationMs: 1
     })
   });
+  const scope = engineeringKnowledgeScope(project.lineage);
+  const engineeringBeforeProposal = await readEngineeringScope(project.lineage);
+  const processBeforeProposal = await readBusinessProcessScope(scope);
+  const outcomesBeforeProposal = await readIncidentOutcomeScope(scope);
+  const patternsBeforeProposal = await readIncidentPatternStore();
   const finalGate = await engineeringQualityGate(project.lineage, implementation.key, roots, project.workspace);
   expect(finalGate.status).toBe('pass');
   expect(finalGate.assurance.solutionReviewVerified).toBe(true);
   expect(finalGate.assurance.deliberationVerified).toBe(true);
   expect(finalGate.assurance.referenceBindingsVerified).toBe(true);
   expect(finalGate.assurance.machineVerified).toBe(true);
+  expect(finalGate.learningProposal).toMatchObject({
+    eligible: true,
+    sourceTaskKey: implementation.key,
+    sourceTaskRevision: implementation.revision,
+    autoPersisted: false
+  });
+  expect(finalGate.learningProposal.verificationIds).toHaveLength(1);
+  expect(finalGate.learningProposal.candidates).toEqual([
+    expect.objectContaining({
+      kind: 'convention_review',
+      sourceFindingKey: improvementFinding.key,
+      requiresExplicitReview: true
+    })
+  ]);
+  const engineeringAfterProposal = await readEngineeringScope(project.lineage);
+  const processAfterProposal = await readBusinessProcessScope(scope);
+  const outcomesAfterProposal = await readIncidentOutcomeScope(scope);
+  const patternsAfterProposal = await readIncidentPatternStore();
+  expect(engineeringAfterProposal.conventions).toEqual(engineeringBeforeProposal.conventions);
+  expect(engineeringAfterProposal.conventionRevisions).toEqual(engineeringBeforeProposal.conventionRevisions);
+  expect(processAfterProposal).toEqual(processBeforeProposal);
+  expect(outcomesAfterProposal).toEqual(outcomesBeforeProposal);
+  expect(patternsAfterProposal).toEqual(patternsBeforeProposal);
 });
 
 it('requires an explicit deliberation classification but allows evidence-based not_required for a single-path task', async () => {

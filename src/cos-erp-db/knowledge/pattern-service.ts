@@ -85,6 +85,16 @@ function occurrenceId(patternKey: string, scope: string, incidentKey: string): s
   );
 }
 
+function rootCauseEvidenceFingerprint(evidence: readonly BusinessProcessEvidenceRef[]): string | null {
+  const supportingContentHashes = [...new Set(dedupeEvidence(evidence)
+    .filter(item => item.relation === 'supports')
+    .map(item => item.contentHash))]
+    .sort((left, right) => left.localeCompare(right));
+  return supportingContentHashes.length
+    ? knowledgeSha256(`incident-pattern-independence:v2\0${supportingContentHashes.join('\0')}`)
+    : null;
+}
+
 async function validateOccurrence(
   sourceScope: string,
   occurrence: IncidentPatternInput['occurrence']
@@ -93,6 +103,9 @@ async function validateOccurrence(
   incidentKey: string;
   processKey: string;
   expectedBehaviorKey: string;
+  rootCauseCategory: string;
+  rootCauseSignature: string;
+  independenceFingerprint: string | null;
   evidence: BusinessProcessEvidenceRef[];
 }> {
   const outcome = await getAcceptedIncidentOutcomeForPattern(sourceScope, occurrence.outcomeKey);
@@ -100,20 +113,29 @@ async function validateOccurrence(
   if (!evidence.some(item => item.relation === 'supports')) {
     throw new Error('Incident-pattern outcome does not contain supporting evidence.');
   }
+  const independenceFingerprint = rootCauseEvidenceFingerprint(outcome.evidence);
+  const rootCauseSignature = knowledgeSha256(
+    `incident-pattern-root-cause:v1\0${normalized(outcome.rootCauseCategory)}\0${normalized(outcome.finding)}`
+  );
   return {
     outcomeKey: outcome.key,
     incidentKey: outcome.incidentKey,
     processKey: outcome.processKey,
     expectedBehaviorKey: outcome.expectedBehaviorKey,
+    rootCauseCategory: outcome.rootCauseCategory,
+    rootCauseSignature,
+    independenceFingerprint,
     evidence
   };
 }
 
-function definitionShape(pattern: Pick<IncidentPattern, 'title' | 'symptom' | 'finding' | 'recommendedChecks' | 'tags'>): unknown {
+function definitionShape(pattern: Pick<IncidentPattern, 'title' | 'symptom' | 'finding' | 'rootCauseCategory' | 'rootCauseSignature' | 'recommendedChecks' | 'tags'>) {
   return {
     title: pattern.title,
     symptom: pattern.symptom,
     finding: pattern.finding,
+    rootCauseCategory: pattern.rootCauseCategory,
+    rootCauseSignature: pattern.rootCauseSignature,
     recommendedChecks: pattern.recommendedChecks,
     tags: pattern.tags
   };
@@ -126,6 +148,9 @@ function occurrenceShape(occurrence: IncidentPatternOccurrence): unknown {
     incidentKey: occurrence.incidentKey,
     processKey: occurrence.processKey,
     expectedBehaviorKey: occurrence.expectedBehaviorKey,
+    rootCauseCategory: occurrence.rootCauseCategory,
+    rootCauseSignature: occurrence.rootCauseSignature,
+    independenceFingerprint: occurrence.independenceFingerprint,
     evidence: occurrence.evidence,
     note: occurrence.note
   };
@@ -145,7 +170,7 @@ export async function putIncidentPatternOccurrence(
   let changed = false;
   let output!: IncidentPattern;
 
-  await mutateIncidentPatternStore(current => {
+  await mutateIncidentPatternStore(async current => {
     const existing = current.patterns.find(pattern => normalizedKey(pattern.key) === normalizedKey(key));
     if (!existing && parsed.expectedRevision !== undefined) {
       throw new Error('expectedRevision is only valid when updating an existing incident pattern.');
@@ -158,11 +183,24 @@ export async function putIncidentPatternOccurrence(
       title: parsed.title.trim(),
       symptom: parsed.symptom.trim(),
       finding: parsed.finding.trim(),
+      rootCauseCategory: existing?.rootCauseCategory ?? validatedOccurrence.rootCauseCategory,
+      rootCauseSignature: existing?.rootCauseSignature ?? validatedOccurrence.rootCauseSignature,
       recommendedChecks,
       tags
     };
+    if (existing?.rootCauseCategory && normalized(existing.rootCauseCategory) !== normalized(validatedOccurrence.rootCauseCategory)) {
+      throw new Error('Incident-pattern occurrence root-cause category differs from the shared pattern definition.');
+    }
+    if (existing?.rootCauseSignature && existing.rootCauseSignature !== validatedOccurrence.rootCauseSignature) {
+      throw new Error('Incident-pattern occurrence root-cause finding differs from the shared pattern definition.');
+    }
+    const comparableExistingDefinition = existing ? {
+      ...definitionShape(existing),
+      rootCauseCategory: existing.rootCauseCategory ?? validatedOccurrence.rootCauseCategory,
+      rootCauseSignature: existing.rootCauseSignature ?? validatedOccurrence.rootCauseSignature
+    } : null;
     if (existing && parsed.expectedRevision === undefined
-      && JSON.stringify(definitionShape(existing)) !== JSON.stringify(requestedDefinition)) {
+      && JSON.stringify(comparableExistingDefinition) !== JSON.stringify(requestedDefinition)) {
       throw new Error('Existing incident-pattern definition differs; provide expectedRevision to make a reviewed definition change.');
     }
 
@@ -174,6 +212,9 @@ export async function putIncidentPatternOccurrence(
       incidentKey: validatedOccurrence.incidentKey,
       processKey: validatedOccurrence.processKey,
       expectedBehaviorKey: validatedOccurrence.expectedBehaviorKey,
+      rootCauseCategory: validatedOccurrence.rootCauseCategory,
+      rootCauseSignature: validatedOccurrence.rootCauseSignature,
+      independenceFingerprint: validatedOccurrence.independenceFingerprint,
       evidence: validatedOccurrence.evidence,
       note,
       createdAt: now,
@@ -194,12 +235,26 @@ export async function putIncidentPatternOccurrence(
       ? existing!.occurrences.map(item => item.id === nextOccurrence.id ? nextOccurrence : item)
       : [...(existing?.occurrences ?? []), nextOccurrence];
     const supportingScopeCount = new Set(occurrences.map(item => item.sourceScope)).size;
+    const currentOccurrenceStates = await Promise.all(occurrences.map(async occurrence => ({
+      occurrence,
+      ...await occurrenceState(occurrence)
+    })));
+    const currentSupportingScopeCount = new Set(
+      currentOccurrenceStates.filter(item => item.current).map(item => item.occurrence.sourceScope)
+    ).size;
+    const independentSupportingCount = new Set(
+      currentOccurrenceStates
+        .filter(item => item.current && item.independenceFingerprint)
+        .map(item => item.independenceFingerprint!)
+    ).size;
+    const currentlyPromotable = currentSupportingScopeCount >= 2 && independentSupportingCount >= 2;
     const candidate: IncidentPattern = {
       id: existing?.id ?? patternId(key),
       key,
       ...requestedDefinition,
-      status: supportingScopeCount >= 2 ? 'promoted' : 'candidate',
+      status: existing?.status === 'promoted' || currentlyPromotable ? 'promoted' : 'candidate',
       supportingScopeCount,
+      independentSupportingCount,
       occurrences,
       revision: (existing?.revision ?? 0) + 1,
       createdAt: existing?.createdAt ?? now,
@@ -216,31 +271,46 @@ export async function putIncidentPatternOccurrence(
   return { changed, pattern: output };
 }
 
-async function occurrenceCurrent(occurrence: IncidentPatternOccurrence): Promise<boolean> {
+async function occurrenceState(occurrence: IncidentPatternOccurrence): Promise<{
+  current: boolean;
+  independenceFingerprint: string | null;
+}> {
   try {
-    if (!occurrence.outcomeKey) return false;
+    if (!occurrence.outcomeKey) return { current: false, independenceFingerprint: null };
     const outcome = await getAcceptedIncidentOutcomeForPattern(occurrence.sourceScope, occurrence.outcomeKey);
-    return normalizedKey(outcome.incidentKey) === normalizedKey(occurrence.incidentKey)
+    const fingerprint = rootCauseEvidenceFingerprint(outcome.evidence);
+    const rootCauseSignature = knowledgeSha256(
+      `incident-pattern-root-cause:v1\0${normalized(outcome.rootCauseCategory)}\0${normalized(outcome.finding)}`
+    );
+    const current = normalizedKey(outcome.incidentKey) === normalizedKey(occurrence.incidentKey)
       && normalizedKey(outcome.processKey) === normalizedKey(occurrence.processKey)
       && normalizedKey(outcome.expectedBehaviorKey) === normalizedKey(occurrence.expectedBehaviorKey)
+      && (occurrence.rootCauseCategory === null
+        || normalized(outcome.rootCauseCategory) === normalized(occurrence.rootCauseCategory))
+      && (occurrence.rootCauseSignature === null || rootCauseSignature === occurrence.rootCauseSignature)
       && JSON.stringify(dedupeEvidence(incidentOutcomeEvidence(outcome))) === JSON.stringify(dedupeEvidence(occurrence.evidence));
+    return { current, independenceFingerprint: current ? fingerprint : null };
   } catch {
-    return false;
+    return { current: false, independenceFingerprint: null };
   }
 }
 
 async function provenance(pattern: IncidentPattern, requestingScope: string): Promise<IncidentPatternProvenanceSummary> {
   const states = await Promise.all(pattern.occurrences.map(async occurrence => ({
     occurrence,
-    current: await occurrenceCurrent(occurrence)
+    ...await occurrenceState(occurrence)
   })));
   const currentScopes = new Set(states.filter(item => item.current).map(item => item.occurrence.sourceScope));
-  const liveStatus = currentScopes.size >= 2
+  const currentIndependentFingerprints = new Set(states
+    .filter(item => item.current && item.independenceFingerprint)
+    .map(item => item.independenceFingerprint!));
+  const liveStatus = currentScopes.size >= 2 && currentIndependentFingerprints.size >= 2
     ? 'promoted' as const
     : pattern.status === 'promoted' ? 'degraded' as const : 'candidate' as const;
   return {
     liveStatus,
     currentSupportingScopeCount: currentScopes.size,
+    currentIndependentSupportingCount: currentIndependentFingerprints.size,
     otherSupportingScopeCount: [...currentScopes].filter(scope => scope !== requestingScope).length,
     occurrenceCount: pattern.occurrences.length,
     staleOccurrenceCount: states.filter(item => !item.current).length
