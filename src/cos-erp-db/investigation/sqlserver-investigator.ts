@@ -20,7 +20,10 @@ import type {
   DatabaseServerIncidentHistoryResult,
   DatabaseServerIncidentSession,
   DatabaseSchemaCompareResult,
-  DatabaseSchemaDifference
+  DatabaseSchemaDifference,
+  DatabaseTableScaleIndex,
+  DatabaseTableScaleProfileResult,
+  DatabaseTableScaleStatistic
 } from './types.js';
 import {
   querySqlServer,
@@ -47,6 +50,8 @@ const MAX_DEADLOCK_EVENTS = 30;
 const MAX_SQL_TEXT_CHARS = 8_000;
 const MAX_SERVER_INCIDENT_CAPTURES = 20;
 const MAX_SERVER_INCIDENT_SESSIONS = 200;
+const MAX_SCALE_INDEX_ROWS = 1_000;
+const MAX_SCALE_STAT_ROWS = 500;
 
 export const DEFAULT_INCIDENT_THRESHOLDS: DatabaseIncidentThresholds = {
   blockingThresholdMs: 10_000,
@@ -299,6 +304,151 @@ ORDER BY COUNT_BIG(*) DESC, ${normalized};`;
     maxValue: nullableStr(statsRow, 'max_value'),
     maxDataLengthBytes: statsRow.max_data_length_bytes === null || statsRow.max_data_length_bytes === undefined ? null : num(statsRow, 'max_data_length_bytes'),
     examples: (examples?.rows ?? []).map(example => ({ value: nullableStr(example, 'value'), count: num(example, 'value_count') })),
+    limitations,
+    elapsedMs: Date.now() - startedAt
+  };
+}
+
+const TABLE_SCALE_HEADER_SQL = `
+SELECT TOP (1) t.object_id,s.name AS schema_name,t.name AS table_name
+FROM sys.tables AS t
+INNER JOIN sys.schemas AS s ON s.schema_id=t.schema_id
+WHERE t.object_id=@object_id AND t.is_ms_shipped=0;`;
+
+const TABLE_SCALE_SIZE_SQL = `
+SELECT
+  SUM(CASE WHEN index_id IN (0,1) THEN CONVERT(bigint,row_count) ELSE 0 END) AS approximate_rows,
+  SUM(CONVERT(bigint,reserved_page_count)) * 8.0 / 1024.0 AS reserved_mb,
+  SUM(CONVERT(bigint,used_page_count)) * 8.0 / 1024.0 AS used_mb,
+  SUM(CONVERT(bigint,in_row_data_page_count + lob_used_page_count + row_overflow_used_page_count)) * 8.0 / 1024.0 AS data_mb
+FROM sys.dm_db_partition_stats
+WHERE object_id=@object_id;`;
+
+const TABLE_SCALE_INDEX_SQL = `
+SELECT
+  i.index_id,i.name AS index_name,i.type_desc,i.is_unique,i.is_primary_key,i.is_disabled,i.filter_definition,
+  ic.key_ordinal,ic.is_included_column,c.name AS column_name
+FROM sys.indexes AS i
+LEFT JOIN sys.index_columns AS ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id
+LEFT JOIN sys.columns AS c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+WHERE i.object_id=@object_id AND i.is_hypothetical=0
+ORDER BY i.index_id,CASE WHEN ic.is_included_column=0 THEN 0 ELSE 1 END,ic.key_ordinal,ic.index_column_id;`;
+
+const TABLE_SCALE_STATS_SQL = `
+SELECT TOP (${MAX_SCALE_STAT_ROWS})
+  st.stats_id,st.name AS stats_name,STATS_DATE(st.object_id,st.stats_id) AS last_updated_at,
+  st.auto_created,st.user_created,st.no_recompute,st.filter_definition
+FROM sys.stats AS st
+WHERE st.object_id=@object_id
+ORDER BY st.stats_id;`;
+
+function scaleIndexRows(rows: readonly Record<string, unknown>[]): DatabaseTableScaleIndex[] {
+  const indexes = new Map<number, DatabaseTableScaleIndex>();
+  for (const row of rows) {
+    const indexId = Math.round(num(row, 'index_id', -1));
+    if (indexId < 0) continue;
+    let index = indexes.get(indexId);
+    if (!index) {
+      index = {
+        indexId,
+        name: nullableStr(row, 'index_name'),
+        type: str(row, 'type_desc', 'UNKNOWN'),
+        unique: bool(row, 'is_unique'),
+        primaryKey: bool(row, 'is_primary_key'),
+        disabled: bool(row, 'is_disabled'),
+        filterDefinition: nullableStr(row, 'filter_definition'),
+        keyColumns: [],
+        includeColumns: []
+      };
+      indexes.set(indexId, index);
+    }
+    const column = nullableStr(row, 'column_name');
+    if (!column) continue;
+    const target = bool(row, 'is_included_column') ? index.includeColumns : index.keyColumns;
+    if (!target.includes(column)) target.push(column);
+  }
+  return [...indexes.values()];
+}
+
+function scaleStatisticRows(rows: readonly Record<string, unknown>[]): DatabaseTableScaleStatistic[] {
+  return rows.slice(0, MAX_SCALE_STAT_ROWS).map(row => ({
+    statsId: Math.round(num(row, 'stats_id')),
+    name: str(row, 'stats_name', '(unnamed)'),
+    lastUpdatedAt: nullableDateTime(row, 'last_updated_at'),
+    autoCreated: bool(row, 'auto_created'),
+    userCreated: bool(row, 'user_created'),
+    noRecompute: bool(row, 'no_recompute'),
+    filterDefinition: nullableStr(row, 'filter_definition')
+  }));
+}
+
+export async function profileSqlServerTableScale(
+  connectionId: string,
+  connection: SqlServerConnection,
+  objectId: number,
+  query: Query = defaultQuery
+): Promise<DatabaseTableScaleProfileResult> {
+  const startedAt = Date.now();
+  if (!Number.isInteger(objectId) || objectId <= 0) throw new Error('Table scale profile requires a positive object id.');
+  const header = await query(connection, TABLE_SCALE_HEADER_SQL, {
+    maxRows: 1,
+    maxBytes: 32_000,
+    parameters: { object_id: objectId }
+  });
+  const table = header.rows[0];
+  if (!table) throw new Error(`Table object_id ${objectId} was not found.`);
+  const limitations: string[] = [
+    'Row count is approximate metadata from sys.dm_db_partition_stats, not COUNT_BIG(*) over the customer table.',
+    'This profile proves table/index/statistics shape only; runtime query scalability still requires Query Store, execution-plan or live-workload evidence.'
+  ];
+  let approximateRows: number | null = null;
+  let reservedMb: number | null = null;
+  let usedMb: number | null = null;
+  let dataMb: number | null = null;
+  try {
+    const size = await query(connection, TABLE_SCALE_SIZE_SQL, {
+      maxRows: 1,
+      maxBytes: 32_000,
+      parameters: { object_id: objectId }
+    });
+    const row = size.rows[0];
+    if (row) {
+      approximateRows = row.approximate_rows === null || row.approximate_rows === undefined ? null : num(row, 'approximate_rows');
+      reservedMb = row.reserved_mb === null || row.reserved_mb === undefined ? null : num(row, 'reserved_mb');
+      usedMb = row.used_mb === null || row.used_mb === undefined ? null : num(row, 'used_mb');
+      dataMb = row.data_mb === null || row.data_mb === undefined ? null : num(row, 'data_mb');
+    }
+  } catch {
+    limitations.push('Partition scale metadata is unavailable; this login may lack permission to read sys.dm_db_partition_stats.');
+  }
+  const [indexSettled, statsSettled] = await Promise.all([
+    query(connection, TABLE_SCALE_INDEX_SQL, {
+      maxRows: MAX_SCALE_INDEX_ROWS + 1,
+      maxBytes: 512_000,
+      parameters: { object_id: objectId }
+    }).then(value => ({ ok: true as const, value }), () => ({ ok: false as const })),
+    query(connection, TABLE_SCALE_STATS_SQL, {
+      maxRows: MAX_SCALE_STAT_ROWS + 1,
+      maxBytes: 256_000,
+      parameters: { object_id: objectId }
+    }).then(value => ({ ok: true as const, value }), () => ({ ok: false as const }))
+  ]);
+  if (!indexSettled.ok) limitations.push('Index metadata is unavailable for this table.');
+  else if (indexSettled.value.truncated || indexSettled.value.rows.length > MAX_SCALE_INDEX_ROWS) limitations.push(`Index-column output was bounded to ${MAX_SCALE_INDEX_ROWS} rows.`);
+  if (!statsSettled.ok) limitations.push('Statistics metadata is unavailable for this table.');
+  else if (statsSettled.value.truncated || statsSettled.value.rows.length > MAX_SCALE_STAT_ROWS) limitations.push(`Statistics output was bounded to ${MAX_SCALE_STAT_ROWS} rows.`);
+
+  return {
+    connection: connectionId,
+    database: connection.database ?? '',
+    capturedAt: new Date().toISOString(),
+    object: { objectId, schema: str(table, 'schema_name', 'dbo'), table: str(table, 'table_name', '(unknown table)') },
+    approximateRows,
+    reservedMb,
+    usedMb,
+    dataMb,
+    indexes: indexSettled.ok ? scaleIndexRows(indexSettled.value.rows.slice(0, MAX_SCALE_INDEX_ROWS)) : [],
+    statistics: statsSettled.ok ? scaleStatisticRows(statsSettled.value.rows) : [],
     limitations,
     elapsedMs: Date.now() - startedAt
   };

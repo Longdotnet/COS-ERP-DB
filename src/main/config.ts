@@ -314,7 +314,11 @@ const configSchema = z.object({
   connectorSuffix: z.string().trim().max(CONNECTOR_SUFFIX_MAX).regex(CONNECTOR_SUFFIX_PATTERN).optional().catch(undefined),
   setupProfiles: z.array(z.object({
     id: z.string().min(1).max(64), name: z.string().trim().min(1).max(80),
-    tunnelId: z.string().max(128), desktopTunnelId: z.string().max(128), pluginsTunnelId: z.string().max(128)
+    tunnelId: z.string().max(128),
+    // Inactive profiles written before the connector split do not have these fields.
+    // Repair them independently so one legacy snapshot cannot invalidate every shared setting.
+    desktopTunnelId: z.string().max(128).optional().default(''),
+    pluginsTunnelId: z.string().max(128).optional().default('')
   })).max(11).refine(rows => new Set(rows.map(row => row.id)).size === rows.length, 'Duplicate setup profile').optional(),
   ui: z.object({
     appearance: appearanceSchema.optional().catch(undefined),

@@ -202,6 +202,39 @@ export function evaluateCommandAllowlist(
   return { allowed: true, args: parsed };
 }
 
+/**
+ * Applies the same saved command policy to an already-tokenized direct process launch.
+ * This is used by server-owned validation runners that deliberately avoid shell parsing.
+ */
+export function evaluateCommandArgvAllowlist(
+  policy: CommandAllowlistSettings,
+  argv: readonly string[]
+): CommandAllowlistDecision {
+  if (!policy.enabled) return { allowed: true, args: [] };
+  if (policy.mode !== 'allow' && policy.mode !== 'deny') {
+    return { allowed: false, commandIndex: 0, kind: 'invalid-policy', detail: 'Saved command policy mode is invalid.' };
+  }
+  if (!argv.length || !argv[0]?.trim()) {
+    return { allowed: false, commandIndex: 0, kind: 'unsupported', detail: 'Direct command argv requires an executable.' };
+  }
+  const rules: ParsedInvocation[] = [];
+  for (const [index, rule] of policy.rules.entries()) {
+    const message = validateCommandAllowlistRule(rule);
+    if (message) {
+      return { allowed: false, commandIndex: 0, kind: 'invalid-policy', detail: `Saved rule ${index + 1} is invalid: ${message}` };
+    }
+    rules.push(parseInvocation(rule.trim(), 'neutral', 'rule'));
+  }
+  const matchedRule = rules.findIndex(rule => ruleMatches(rule, argv));
+  if (policy.mode === 'allow' && matchedRule === -1) {
+    return { allowed: false, commandIndex: 0, kind: 'unmatched', detail: 'No allowlist rule matched the executable and complete argument list.' };
+  }
+  if (policy.mode === 'deny' && matchedRule !== -1) {
+    return { allowed: false, commandIndex: 0, kind: 'denied', detail: `Denylist rule ${matchedRule + 1} matched the executable and complete argument list.` };
+  }
+  return { allowed: true, args: [[...argv]] };
+}
+
 export function commandHasSameArguments(expected: readonly string[], command: string, shell: CommandAllowlistShell): boolean {
   try {
     const parsed = parseInvocation(command, shell, 'command').args;

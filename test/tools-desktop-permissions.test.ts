@@ -64,7 +64,6 @@ describe('macOS Desktop computer permission normalization', () => {
       sessionToolsExposed: false,
       agentToolsLive: false,
       agentToolsExposed: false,
-      findExposed: false,
       register(name: string, _config: unknown, handler: (input: any) => Promise<any>) {
         if (name === 'computer') computerHandler = handler;
       },
@@ -103,7 +102,6 @@ describe('macOS Desktop computer permission normalization', () => {
       sessionToolsExposed: false,
       agentToolsLive: false,
       agentToolsExposed: false,
-      findExposed: false,
       register(name: string, _config: unknown, handler: (input: any) => Promise<any>) {
         if (name === 'computer') computerHandler = handler;
       },
@@ -141,7 +139,6 @@ describe('macOS Desktop computer permission normalization', () => {
       sessionToolsExposed: false,
       agentToolsLive: false,
       agentToolsExposed: false,
-      findExposed: false,
       register(name: string, _config: unknown, handler: (input: any) => Promise<any>) {
         if (name === 'observe') observeHandler = handler;
       },

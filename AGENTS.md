@@ -368,7 +368,7 @@ still checks live policy. Schema visibility is never the security boundary.
 
 | Surface | Advertised operations under current eligibility |
 | --- | --- |
-| Core — `chat-on-steroids-core` | `read`, `view_image`, `find` when command execution is off, `apply_patch`, `exec_command`/`write_stdin`, `update_plan`, `agents`, `session_finish`, code-mode `exec`. |
+| Core — `chat-on-steroids-core` | `read`, `view_image`, bounded `find`, provenance-aware `knowledge`, `apply_patch`, `exec_command`/`write_stdin`, `database`, `update_plan`, `agents`, `session_finish`, code-mode `exec`. |
 | Desktop — `chat-on-steroids-desktop` | All Chromium extension hosts: `browser_tabs`, `browser_snapshot`, `browser_screenshot`, `browser_console`, `browser_network`, `browser_navigate`, `browser_action`, `browser_evaluate`. Windows additionally exposes 13 Window2 operations, clipboard and `exec` with `sky`; macOS adds `observe`/`computer`. Surface `exec` composes browser tools too. |
 | Plugins — `chat-on-steroids-plugins` | Enabled external tools with their upstream names and schemas, plus code-mode `exec` when that composition name is available. |
 
@@ -878,8 +878,41 @@ Its 512 KiB text budget is separate from its four-image/12 MiB base64 budget. Im
 `view_image`'s full per-file validation; a rejected image does not discard other valid sections.
 `tools-core.ts` owns its contract; `codex/read-backend.ts` owns listing/decoding semantics;
 `codex/filesystem.ts` is primitives; `sandbox.ts` is authorization. Do not push policy into
-low-level primitives and assume every public caller became safe. Search uses bundled-first
-ripgrep when commands are allowed, or `find` with `search.ts` when they are not.
+low-level primitives and assume every public caller became safe. Ordinary model-facing search
+uses `find` with `search.ts`, which reaches bundled-first ripgrep directly; shell-specific
+search remains available through `exec_command` when command permission is on.
+
+`knowledge` is a local derived cache for repeated investigation, not an authority that replaces
+the source. Index only approved source/document roots and configured SQL metadata. Search returns
+evidence ids plus content/source hashes; callers should fetch narrow evidence and use verify before
+promoting an indexed claim to current fact. Generic plugin memory may hold scratch context, but it
+does not replace provenance-backed knowledge.
+
+The business-process store is the canonical local owner for curated Customer → Process →
+Solution/Change Request → Rule → Expected Behavior records. Records are revisioned and may point
+to immutable evidence id/content-hash pairs from the knowledge index. Accepted facts need
+supporting evidence or an explicit acceptance note; stale evidence is surfaced instead of silently
+rewriting the accepted fact.
+
+The incident-outcome store is customer-scoped and owns confirmed incident results separately from
+technical snapshots and shared learning. Accepted outcomes require the local Process and accepted
+Expected Behavior, supporting root-cause evidence, a remediation, passed validation with supporting
+evidence, and an explicit decision note. Accepted outcomes are revision-fenced; stale or invalidated
+outcomes cannot contribute current reusable learning.
+
+The incident-pattern store owns cross-customer learning separately from customer process scopes.
+New occurrences must derive from a current accepted incident outcome and keep that outcome key plus
+its original customer scope, incident key, process/accepted expected-behavior references and evidence
+hashes. Promotion requires support from at least two distinct scopes.
+Patterns may suggest where to investigate in another customer, but never import foreign process
+facts as local truth; the current customer's context/deployment/runtime evidence must verify them.
+
+`database incident_workspace` is the context-first coordinator for LINKQ incidents. It must build
+the scoped incident context before any live database capture. If no curated local process context
+matches, it returns those gaps and skips diagnosis, health and deployment reads. Partial or grounded
+context may capture those technical layers, but the workspace itself never confirms root cause;
+confirmation belongs to an accepted incident outcome with evidence and passed validation. The lower-
+level `incident_diagnose` primitive remains available for direct database diagnostics.
 
 `apply_patch` accepts Codex V4A in the MCP `patch` string. Its parser, grammar, hunk matching,
 text/line-ending representation and replacement application live in `codex/apply-patch/*`.

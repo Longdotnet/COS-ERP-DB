@@ -12,7 +12,7 @@ separate secret tokenized local paths.
 
 | Connector | Purpose | Possible tools |
 | --- | --- | --- |
-| **Chat On Steroids Core** | Approved files, patches, terminal, task plans, workers | `read`, `view_image`, `find`, `apply_patch`, `exec_command`, `write_stdin`, `update_plan`, `agents` |
+| **Chat On Steroids Core** | Approved files, verified local knowledge, project-native engineering, SQL Server, patches, terminal, task plans, workers | `read`, `view_image`, `find`, `knowledge`, `engineering`, `database`, `apply_patch`, `exec_command`, `write_stdin`, `update_plan`, `agents` |
 | **Chat On Steroids Desktop** | **Windows/macOS:** screen, windows, mouse/keyboard and clipboard | `observe`, `computer` |
 
 The Desktop connector is optional on Windows/macOS. Core is the main connector everywhere.
@@ -23,12 +23,75 @@ Desktop permissions off at runtime while preserving stored choices for a config 
 Windows or macOS. Existing configs keep explicit choices during upgrades; missing legacy permissions are
 not silently widened.
 
-With fresh defaults, Core advertises `read`, `view_image`, `apply_patch`, `exec_command`,
-`write_stdin`, `update_plan`, and `agents`.
-`find` is the search fallback for a snapshot where search is enabled and command execution is
-unavailable. Tool exposure is monotonic within a running connector instance, so a permission
+With fresh defaults, Core advertises `read`, `view_image`, `find`, `knowledge`, `engineering`, `database`,
+`apply_patch`, `exec_command`, `write_stdin`, `update_plan`, and `agents`.
+`find` is the bounded repository-search primitive whenever search permission is enabled;
+`exec_command` is independent and remains the shell escape hatch. Tool exposure is monotonic
+within a running connector instance, so a permission
 changed mid-conversation can leave a previously exposed name listed; its handler still enforces
 the current permission.
+
+`knowledge` keeps a local, isolated evidence index for approved source trees, solution documents
+and configured SQL metadata. Search results carry stable evidence ids plus content/source hashes.
+`get` returns bounded evidence text, and `verify` rechecks the live file or database object so
+stale indexed material is not silently treated as current truth.
+For `action=index`, `items` use `source:/path`, `document:/path`, `database`, or
+`database:connection`. For `verify`, each item is `evidenceId` or `evidenceId@contentHash`.
+`process_put` stores one JSON record in `items` with `key`, `kind`, `title`, `statement`
+and optional `parentKey`, `status`, `confidence`, `tags`, `evidence` and
+`acceptanceNote`. The hierarchy is Customer → Process → Solution/Change Request → Rule →
+Expected Behavior. Accepted records require supporting indexed evidence or an explicit acceptance
+note. `process_search`, `process_get` and `process_history` read the living model and its
+revision/provenance state. `incident_context` composes that curated process model with verified
+evidence and the implementation graph for one symptom/query. Its `readiness` is `grounded`,
+`partial`, or `empty`, and `gaps` names missing expected behavior, implementation links, or stale
+evidence. LINKQ incident investigation uses this context packet before live database diagnosis so
+customer-specific process intent stays separate from runtime symptoms.
+`outcome_put` stores one customer-scoped incident outcome JSON. Draft outcomes may capture a proposed
+finding, but accepted outcomes require the real Process, accepted Expected Behavior, supporting
+root-cause evidence, remediation, passed validation with supporting evidence, and a decision note.
+`outcome_search`, `outcome_get` and `outcome_history` expose its live provenance and revisions;
+stale/invalidated outcomes are not current learning. `incident_context` may also return matching
+current `priorConfirmedOutcomes`; outcome lookup failure does not block the local context packet.
+`pattern_put` contributes one occurrence by `outcomeKey`; it derives incident/process/evidence from
+that current accepted local outcome rather than trusting caller-supplied foreign facts. A pattern is
+promoted only after at least two distinct scopes support it. `pattern_search`, `pattern_get` and
+`pattern_history` expose revision/provenance state.
+`incident_context` may return promoted patterns as cross-customer suggestions, but never copies
+foreign process records or evidence into the current scope; the suggestion remains a hypothesis
+until the current customer's process, deployment and runtime evidence verifies it.
+
+`engineering` is the project-bound Project-Native Engineering Harness. `context` resolves the
+current project root, registered/generic profile and runtime family and returns the derived
+Knowledge scope. `.agents/engineering.json` can declare project defaults; otherwise profile
+detection stays profile-owned and runtime detection is a bounded scan across supported project
+manifests. `prepare` takes a task goal, explicit requirements and project-local attachment paths.
+It indexes supported Word/PDF/Excel/text requirements as task context in that same scope, searches
+Process/convention context, performs bounded 3–7 analogue discovery and creates the initial
+Engineering Task Packet. Foreign-root attachments are rejected even when the other root is also
+approved. Screenshots are inspected by the agent and their extracted requirements are passed to
+`prepare`; image content is not silently promoted to durable project truth. Prepared analogues
+must be classified task-locally as convention/business_rule/legacy_debt/engineering_improvement;
+new task requirements or those assessments never become accepted durable truth without explicit
+review/acceptance.
+
+`validation_run` creates server-owned verification records rather than trusting task metadata.
+For `kind=command`, the input names a task/validation plus executable and argv. Core applies the
+current command permission and saved allow/deny policy, runs the process directly in the project
+root, captures exit/timing/bounded output plus hashes, and binds the record to the task revision
+and hashes of `changedFiles`. For `kind=sql_scale`, Core reads `table_scale_profile` evidence and,
+when requested, task-related Query Store or live-performance evidence. Table/index/statistics shape
+alone is only static proof; runtime Machine Verified requires recent SQL matching both the task
+binding and the exact table profiled by `table_scale_profile`. No SQL writes are issued.
+`quality_gate` rechecks record integrity, task revision and implementation-file
+hashes and exposes `assurance.machineVerified`; caller-supplied `passed` or `runtime_evidenced`
+metadata alone can never produce Machine Verified.
+`database action=incident_workspace` is the context-first LINKQ incident coordinator. It always
+builds `incident_context` first. With `readiness=empty` it returns the context gaps and skips live
+SQL diagnosis. With `partial` or `grounded` context it then captures the deployment fingerprint,
+database health gate and live incident snapshot in parallel. Partial technical capture is returned
+with explicit errors instead of discarding the verified process packet. The workspace never marks a
+root cause confirmed; that requires an evidence-backed accepted `outcome_put` with passed validation.
 
 ## Core tools
 

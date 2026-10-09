@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   commandHasSameArguments,
+  evaluateCommandArgvAllowlist,
   evaluateCommandAllowlist,
   parseCommandAllowlistText,
   validateCommandAllowlistRule
@@ -14,6 +15,16 @@ describe('command allowlist', () => {
     expect(evaluateCommandAllowlist(enabled(['git status']), ['git status'], 'powershell').allowed).toBe(true);
     expect(evaluateCommandAllowlist(enabled(['git status']), ['git status-other'], 'powershell').allowed).toBe(false);
     expect(evaluateCommandAllowlist(enabled(['git status']), ['git status --short'], 'powershell').allowed).toBe(false);
+  });
+
+  it('applies the same policy to server-owned direct argv validation runs', () => {
+    expect(evaluateCommandArgvAllowlist(enabled(['dotnet build *']), ['dotnet', 'build', 'App.csproj']).allowed).toBe(true);
+    expect(evaluateCommandArgvAllowlist(enabled(['dotnet build']), ['dotnet', 'build', 'App.csproj'])).toMatchObject({
+      allowed: false, kind: 'unmatched'
+    });
+    expect(evaluateCommandArgvAllowlist(enabled(['dotnet *'], 'deny'), ['dotnet', 'test'])).toMatchObject({
+      allowed: false, kind: 'denied'
+    });
   });
 
   it('allows zero or more additional arguments only for a final standalone wildcard', () => {

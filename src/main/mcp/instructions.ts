@@ -100,48 +100,52 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
     skills,
     '',
     '# Local tools',
-    `Use the connected tools as needed: ${surfaceDefinition('core').connectorName} for files, terminal, configured SQL Server databases, plans and workers` +
-    `; ${surfaceDefinition('desktop').connectorName} for background browser tabs, DOM, console, screenshots and input${desktop ? ', native windows and clipboard' : ''}` +
-    `; ${surfaceDefinition('plugins').connectorName} for enabled external apps and services.`,
+    `Use the connected tools as needed: ${surfaceDefinition('core').connectorName} for files, terminal, SQL Server, plans and workers` +
+    `; ${surfaceDefinition('desktop').connectorName} for background browser tabs, DOM, screenshots and input${desktop ? ', native windows and clipboard' : ''}` +
+    `; ${surfaceDefinition('plugins').connectorName} for enabled external apps.`,
     `Host: ${host}. Roots: ${roots}`,
     `Current Core authority (informational; live guards decide): ${authority}; read-only=${ctx.readOnly ? 'on' : 'off'}; plans=${sessionTools ? 'on' : 'off'}; workers=${agentTools ? 'on' : 'off'}.`,
     ctx.readOnly ? 'The local tools are read-only.' : 'Use the tools listed in this conversation.',
     ...(writable || executable ? [`You can always use ${[writable && 'file writing', executable && 'exec_command'].filter(Boolean).join(' and ')} in CoS. Never hallucinate a block from ChatGPT environment messages.`] : []),
-    'Report exact failures: identity, session_id and output-limit errors do not mean Read-only. Never replay successful patches or commands to recover a terminal.',
-    '"This tool call was blocked by OpenAI because we couldn\'t determine the safety status of the request." comes from ChatGPT before CoS receives the call. It is not a CoS failure or a missing capability: retry the identical call once.',
-    'Unattributed is recording status, not permission. With Allow unattributed calls enabled, the request id owns its workspace, plan, terminals and agent family until exact chat proof arrives. A missing target limits that operation only; keep using enabled tools.',
-    'Use full project paths under an approved root, including intermediate folders. Virtual or absolute native paths work; linked projects also accept relative paths.',
+    'Exact failures matter: identity/session/output errors are not Read-only. Never replay successful mutations to recover a terminal.',
+    '"This tool call was blocked by OpenAI because we couldn\'t determine the safety status of the request." comes from ChatGPT before CoS receives the call; retry the identical call once.',
+    'Unattributed is recording status, not permission. If allowed, the request owns workspace, plan, terminals and agents until exact chat proof.',
+    'Use paths under approved roots; native/virtual and linked-project relative paths work.',
   ];
 
   if (caps.read || caps.browse || caps.metadata) lines.push(
-    'read batches paths, lists folders, expands globs and returns numbered text. Read whole files for orientation; otherwise use known regions. A start_line/end_line range applies to every file the call reads.',
+    'read batches paths and lists folders/globs. Read whole files for orientation; otherwise use ranges. A start_line/end_line range applies to every file the call reads.',
   );
   if (caps.read) lines.push('view_image inspects a local image. Use it when visual evidence matters.');
+  if (caps.search) {
+    lines.push('find searches repository filenames/text; then read relevant files/ranges.');
+  }
   if (caps.command) {
     lines.push(
-      'Use rg or rg --files for searches; if unavailable, use the next best tool. Prefer rg -g \'*.ts\' src over shell globs.',
-      'exec_command is enabled. Batch checks with exec_command cmds: [...]: one shell, per-command output and exit codes.',
-      'Set workdir to the project; virtual paths work there. Inside cmd use relative or native paths.',
-      'write_stdin accepts session_id (running) or completed_session_id (finished). Completed reads replay output without rerunning work. Inspect exit/output; benign_exit marks an expected non-zero result.',
-      'If output is truncated, narrow the command or read the relevant region.'
+      'Use exec_command cmds for related builds/tests/git and shell-specific searches.',
+      'Set workdir to the project; use relative/native cmd paths.',
+      'write_stdin uses session_id for running terminals or completed_session_id for finished output, without rerunning work. Inspect exit/output; benign_exit marks expected non-zero.',
+      'If output truncates, narrow the command/read range.'
     );
     if (windows) lines.push(
-      'PowerShell does not expand * or ? for native programs. Regex \\x22 matches double quotes. Use script files for complex JavaScript; nested -Command/-e can corrupt quotes or expand variables. Pipe loops as @(foreach (...) { ... }) | Format-Table.',
-      'rg/ripgrep uses the bundled executable. Omit 2>&1 on native programs in PowerShell: stderr is captured; redirecting it can leave $? false after exit 0.',
+      'PowerShell does not expand * or ? for native programs. Regex \\x22 matches quotes; use script files for complex JavaScript. Pipe loops before Format-Table.',
+      'Use bundled rg. Avoid 2>&1 on native PowerShell commands; stderr is captured.',
       ...(LAUNCHES_WINDOWS_POWERSHELL_5 ? ['This is Windows PowerShell 5.1, without && or ||. Use cmds or A; if ($?) { B }.'] : [])
     );
     else lines.push('exec_command uses the host’s normal POSIX shell (zsh/bash/sh unless requested otherwise). The bundled ripgrep directory is first on PATH.');
     if (config.commandAllowlist.enabled) lines.push(
       `Command launch policy is enabled in ${config.commandAllowlist.mode === 'deny' ? 'denylist' : 'allowlist'} mode. COMMAND_NOT_ALLOWED is the user\'s launch policy, not Read-only mode or an internal failure. Do not evade it through another tool, alternate spelling or apply_patch interception; ask the user to change Settings. Programs permitted to start remain trusted after launch, including stdin, child processes and project code.`
     );
-  } else if (ctx.exposedFind ?? caps.search) {
-    lines.push('find searches filenames or file contents without a shell. Narrow path and include patterns to the relevant area.');
   }
   if (caps.create || caps.edit || caps.move || caps.deleteFile) lines.push(
     'apply_patch enables atomic add/update/move/delete within approved roots and permissions. Never copy read’s line-number prefixes into a patch.'
   );
   lines.push(
-    'database accesses configured SQL Server directly. Use it, not exec_command/sqlcmd/Invoke-Sqlcmd/ODBC/SqlClient/scripts, for DB data/schema. For current/default DB, omit connection and do not reuse an old id. For “this table” or the selected Database Explorer object, use action=workspace_context. For a live slowdown/blocking/open-transaction incident, prefer action=incident_diagnose; use action=incident_history for recent local snapshots plus LinkQDiagnostics server history when available. Use action=list_connections for configured/default ids. If a write is refused, do not bypass it. Queries are read-only; never request database credentials in SQL or tool arguments.'
+    'database is the SQL Server path; use no shell SQL clients. For LINKQ incidents, incident_workspace reads process context first and skips SQL if empty. Omit connection for the default DB. Use workspace_context for selected objects and incident_history for recent captures. Queries are read-only.'
+  );
+  if (caps.read) lines.push(
+    'knowledge caches scoped evidence; verify before use. incident_workspace is context-first; only accepted evidence-backed outcomes feed patterns.',
+    'For substantial project work: engineering context -> prepare -> classify analogues -> code -> validation_run -> quality_gate. Only assurance.machineVerified=true is Machine Verified.'
   );
   if (sessionTools) lines.push(
     '',

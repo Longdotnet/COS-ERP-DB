@@ -7,6 +7,7 @@ import {
   compareSqlServerSchemas,
   decodeIncidentReasonMask,
   profileSqlServerColumn,
+  profileSqlServerTableScale,
   readSqlServerDeadlocks,
   readSqlServerDiagnosticHistory,
   readSqlServerFieldConsumers,
@@ -88,6 +89,30 @@ describe('database investigator SQL Server checks', () => {
     expect(profile.examples[0]).toEqual({ value: 'UV001', count: 14 });
     expect(profile.limitations.join(' ')).toMatch(/10,000 rows/i);
     expect(query.mock.calls.some(call => call[1].includes('TOP (10000)'))).toBe(true);
+  });
+
+  it('profiles table scale from bounded metadata without counting the customer table', async () => {
+    const query = vi.fn(async (_connection: SqlServerConnection, sql: string) => {
+      if (sql.includes('FROM sys.tables AS t')) return result([{ object_id: 42, schema_name: 'dbo', table_name: 'L80CT' }]);
+      if (sql.includes('sys.dm_db_partition_stats')) return result([{ approximate_rows: 18_400_000, reserved_mb: 4096, used_mb: 3700, data_mb: 3400 }]);
+      if (sql.includes('FROM sys.indexes AS i')) return result([
+        { index_id: 1, index_name: 'PK_L80CT', type_desc: 'CLUSTERED', is_unique: true, is_primary_key: true, is_disabled: false, filter_definition: null, key_ordinal: 1, is_included_column: false, column_name: 'Stt' },
+        { index_id: 2, index_name: 'IX_L80CT_Ma_Ct_Ngay_Ct', type_desc: 'NONCLUSTERED', is_unique: false, is_primary_key: false, is_disabled: false, filter_definition: null, key_ordinal: 1, is_included_column: false, column_name: 'Ma_Ct' },
+        { index_id: 2, index_name: 'IX_L80CT_Ma_Ct_Ngay_Ct', type_desc: 'NONCLUSTERED', is_unique: false, is_primary_key: false, is_disabled: false, filter_definition: null, key_ordinal: 2, is_included_column: false, column_name: 'Ngay_Ct' },
+        { index_id: 2, index_name: 'IX_L80CT_Ma_Ct_Ngay_Ct', type_desc: 'NONCLUSTERED', is_unique: false, is_primary_key: false, is_disabled: false, filter_definition: null, key_ordinal: 0, is_included_column: true, column_name: 'Stt' }
+      ]);
+      if (sql.includes('FROM sys.stats AS st')) return result([{ stats_id: 2, stats_name: 'IX_L80CT_Ma_Ct_Ngay_Ct', last_updated_at: new Date('2026-10-01T00:00:00Z'), auto_created: false, user_created: false, no_recompute: false, filter_definition: null }]);
+      throw new Error(`unexpected SQL: ${sql}`);
+    });
+
+    const profile = await profileSqlServerTableScale('linkq-test', connection, 42, query);
+
+    expect(profile.approximateRows).toBe(18_400_000);
+    expect(profile.reservedMb).toBe(4096);
+    expect(profile.indexes[1]).toMatchObject({ keyColumns: ['Ma_Ct', 'Ngay_Ct'], includeColumns: ['Stt'] });
+    expect(profile.statistics[0]?.lastUpdatedAt).toBe('2026-10-01T00:00:00.000Z');
+    expect(query.mock.calls.some(call => call[1].includes('COUNT_BIG(*)'))).toBe(false);
+    expect(profile.limitations.join(' ')).toMatch(/runtime query scalability/i);
   });
 
   it('labels field-consumer evidence by confidence instead of claiming every text match is proven', async () => {

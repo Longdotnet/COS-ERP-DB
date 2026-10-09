@@ -44,6 +44,42 @@ describe('browser bridge port config', () => {
 });
 
 describe('settings migration', () => {
+  it('loads a UTF-8 BOM config without discarding saved settings', async () => {
+    const config = defaultConfig();
+    config.roots = [{ name: 'project', path: 'C:\\Users\\example\\project' }];
+    config.ui.autoRefreshPlugins = true;
+    await fs.writeFile(path.join(dir, 'config.json'), `\uFEFF${JSON.stringify(config)}`, 'utf8');
+
+    const loaded = await loadConfig();
+    expect(loaded.roots).toEqual(config.roots);
+    expect(loaded.ui.autoRefreshPlugins).toBe(true);
+    expect(loaded.readOnly).toBe(false);
+  });
+
+  it('repairs connector ids missing from legacy inactive setup profiles', async () => {
+    const config = defaultConfig();
+    config.roots = [{ name: 'project', path: 'C:\\Users\\example\\project' }];
+    const legacy = {
+      ...config,
+      setupProfiles: [{
+        id: 'legacy-profile',
+        name: 'Legacy profile',
+        tunnelId: 'tunnel_0123456789abcdef0123456789abcdef'
+      }]
+    };
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+
+    const loaded = await loadConfig();
+    expect(loaded.roots).toEqual(config.roots);
+    expect(loaded.setupProfiles).toEqual([{
+      id: 'legacy-profile',
+      name: 'Legacy profile',
+      tunnelId: 'tunnel_0123456789abcdef0123456789abcdef',
+      desktopTunnelId: '',
+      pluginsTunnelId: ''
+    }]);
+  });
+
   it('defaults command policy enforcement off in allow mode and round-trips both modes', async () => {
     expect(defaultConfig().commandAllowlist).toEqual({ enabled: false, mode: 'allow', rules: [] });
     const legacy = defaultConfig() as Partial<ReturnType<typeof defaultConfig>>;

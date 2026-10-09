@@ -288,8 +288,8 @@ function toolsFor(id: SurfaceId): string[] {
   }
   const tools: string[] = [];
   if (caps.read || caps.browse || caps.metadata) tools.push('read');
-  if (caps.read) tools.push('view_image');
-  if (!caps.command && caps.search) tools.push('find');
+  if (caps.read) tools.push('view_image', 'knowledge');
+  if (caps.search) tools.push('find');
   if (caps.create || caps.edit || caps.move || caps.deleteFile) tools.push('apply_patch');
   if (caps.command) tools.push('exec_command', 'write_stdin');
   if (config.sessions.record) tools.push('update_plan');

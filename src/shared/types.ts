@@ -816,13 +816,12 @@ export const CAPABILITY_DETAILS: Record<Capability, string> = {
  *
  * Kept beside the capability list rather than written into the prose above, so the tool
  * selector shows what this build really registers. `read` carries `view_image` as well as
- * `read`; `find` exists only where running commands is switched off, which is why it is
- * marked rather than listed flatly (see SurfaceRegistrar.findExposed).
+ * `read`; search carries the bounded `find` primitive independently of shell permission.
  */
 const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
   browse: ['read'],
   search: ['read', 'find'],
-  read: ['read', 'view_image'],
+  read: ['read', 'view_image', 'knowledge'],
   metadata: ['read'],
   create: ['apply_patch'],
   edit: ['apply_patch'],

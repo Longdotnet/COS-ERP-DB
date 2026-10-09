@@ -607,8 +607,7 @@ describe('surface boundaries', () => {
   it('advertises exactly Core’s tools on Core, with nothing from Desktop', async () => {
     everything();
     const names = toolNames(await core('tools/list'));
-    // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'database', 'exec', 'exec_command', 'read', 'save_image', 'update_plan', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'database', 'engineering', 'exec', 'exec_command', 'find', 'knowledge', 'read', 'save_image', 'update_plan', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -767,21 +766,20 @@ describe('surface boundaries', () => {
     for (const name of surfaceDefinition('core').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
-  it('does not let Desktop discovery freeze Core’s mutually-exclusive tool shape', async () => {
+  it('does not let Desktop discovery affect Core capability exposure', async () => {
     // Core has not been queried yet. A Desktop request must not count as a cached Core
     // snapshot, because ChatGPT caches these two connectors independently.
     ctx.readOnly = false;
     ctx.caps = withCaps({ search: true, screen: true });
     expect(toolNames(await desktop('tools/list'))).toEqual([...BROWSER_READ_TOOLS, ...(IS_WINDOWS ? [...WINDOWS_COMPUTER_READ_METHODS, 'exec'] : process.platform === 'darwin' ? ['exec', 'observe'] : ['exec'])].sort());
 
-    // Before Core's first discovery the user enables command execution. Core should make
-    // its one-time find-vs-exec choice from *this* state, not the state Desktop happened to
-    // observe earlier.
+    // Before Core's first discovery the user enables command execution. Core should expose
+    // both independently authorized capabilities regardless of what Desktop observed earlier.
     ctx.caps = withCaps({ search: true, command: true, screen: true });
     const names = toolNames(await core('tools/list'));
     expect(names).toContain('exec_command');
     expect(names).toContain('write_stdin');
-    expect(names).not.toContain('find');
+    expect(names).toContain('find');
   });
 
   it('never advertises a tool its surface does not declare', async () => {
@@ -916,8 +914,8 @@ describe('surface boundaries', () => {
     const coreTools = toolList(await core('tools/list'));
     const desktopTools = toolList(await desktop('tools/list'));
 
-    // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(10);
+    // Each populated surface includes code mode; bounded find, local knowledge and shell execution coexist.
+    expect(coreTools).toHaveLength(13);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -927,7 +925,9 @@ describe('surface boundaries', () => {
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(20_500);
+    // knowledge and engineering are intentionally compact schemas: durable evidence/task state
+    // removes repeated repo/doc/DB scans from later turns. Keep only measured headroom.
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(24_000);
     expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(IS_WINDOWS ? 24_000 : 24_500);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
@@ -1157,7 +1157,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['database', 'exec', 'find', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['database', 'engineering', 'exec', 'find', 'knowledge', 'read', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1215,12 +1215,12 @@ describe('capability gating', () => {
     expect(names).toContain('write_stdin');
   });
 
-  it('drops find when exec_command can do the same job better', async () => {
+  it('keeps bounded find available alongside command execution', async () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ command: true, search: true });
     const names = toolNames(await core('tools/list'));
     expect(names).toContain('exec_command');
-    expect(names).not.toContain('find');
+    expect(names).toContain('find');
   });
 
   it('offers find when there is no shell to search with', async () => {
@@ -1336,11 +1336,6 @@ describe('capability gating', () => {
     await expect(fs.stat(path.join(approved, 'should-not-exist.txt'))).rejects.toThrow();
   });
 
-  // find and the exec pair are mutually exclusive: find exists so that a user who has
-  // not granted command execution still gets a way to search. But `exposedCaps` only ever
-  // widens, so deriving find's registration from the live "command is off" would DELETE a
-  // tool from an already-cached ChatGPT snapshot the moment the user granted commands —
-  // the exact stale-snapshot failure the monotonic rule exists to prevent.
   it('keeps find listed after command execution is switched on mid-run', async () => {
     ctx.caps = withCaps({ search: true, read: true, browse: true });
     expect(toolNames(await core('tools/list'))).toContain('find');
@@ -1352,13 +1347,13 @@ describe('capability gating', () => {
     expect(names).toContain('exec_command');
   });
 
-  it('does not add find to a surface that started with command execution on', async () => {
+  it('adds find when search permission is enabled after command execution was already exposed', async () => {
     ctx.readOnly = false;
-    ctx.caps = withCaps({ search: true, read: true, command: true });
+    ctx.caps = withCaps({ search: false, read: true, command: true });
     expect(toolNames(await core('tools/list'))).not.toContain('find');
 
     ctx.caps = withCaps({ search: true, read: true, command: false });
-    expect(toolNames(await core('tools/list'))).not.toContain('find');
+    expect(toolNames(await core('tools/list'))).toContain('find');
   });
 
   it('always offers read, because that is what the app is for', async () => {

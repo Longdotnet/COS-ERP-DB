@@ -105,10 +105,8 @@ import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 import { configureCosErpDbIdentity, COS_ERP_DB_AUTO_UPDATE } from '../cos-erp-db/app-identity.js';
-import { initDatabaseSubsystem } from './database/subsystem.js';
-import { closeSqlServerPools } from './database/sqlserver.js';
-import { stopAllIncidentWatches } from './database/incident-watch.js';
 import { showConnectionLossNotice } from './connection-loss-notice.js';
+import { closeCosErpDbResources, initCosErpDbSubsystems, stopCosErpDbBackgroundWork } from '../cos-erp-db/integration/lifecycle.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -408,7 +406,7 @@ void app.whenReady().then(async () => {
   initConnectorProofPath(userData);
   initBrowserProofPath(userData);
   initSecretsPath(userData);
-  initDatabaseSubsystem(userData);
+  initCosErpDbSubsystems(userData);
   initKeychainNotice(userData, {
     platform: process.platform,
     contents: () => (window && !window.isDestroyed() ? window.webContents : null),
@@ -651,14 +649,14 @@ app.on('will-quit', (event) => {
       {
         name: 'admission/drain',
         budgetMs: 40_000,
-        run: () => [shutdownConnection(), shutdownBridge(), shutdownControlApi(), stopAgentRuntimeGc(), stopAllIncidentWatches()]
+        run: () => [shutdownConnection(), shutdownBridge(), shutdownControlApi(), stopAgentRuntimeGc(), stopCosErpDbBackgroundWork()]
       },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {
         name: 'process cleanup',
         budgetMs: 15_000,
         run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), shutdownPetOverlay(), pluginManager.close(),
-          closeSqlServerPools(), Promise.resolve().then(() => loadedCosBrowser()?.stop())]
+          closeCosErpDbResources(), Promise.resolve().then(() => loadedCosBrowser()?.stop())]
       },
       // Phase 3: recorder work can enqueue both session projections and named durable state.
       { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },

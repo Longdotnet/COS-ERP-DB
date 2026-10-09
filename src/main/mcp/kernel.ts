@@ -228,17 +228,6 @@ export interface ToolContext {
    */
   exposedSessionTools?: boolean;
   exposedAgentTools?: boolean;
-  /**
-   * Whether `find` must stay registered for the lifetime of the endpoint.
-   *
-   * `find` and the exec pair are mutually exclusive, and that choice cannot be derived
-   * from `exposedCaps.command` on each request: `exposedCaps` only ever widens, so a user
-   * switching command execution on mid-run would silently *delete* `find` from under a
-   * cached ChatGPT snapshot — the exact stale-snapshot failure the monotonic rule exists
-   * to prevent. So the decision is made once, from the live capabilities, and then only
-   * ever added to. Defaults to the live answer when the caller does not track it.
-   */
-  exposedFind?: boolean;
 }
 
 export type ToolContent =
@@ -1385,8 +1374,6 @@ export interface SurfaceRegistrar {
   sessionToolsExposed: boolean;
   agentToolsLive: boolean;
   agentToolsExposed: boolean;
-  /** Whether `find` is part of this endpoint's surface. See ToolContext.exposedFind. */
-  findExposed: boolean;
   register<Schema extends z.ZodType>(
     name: string,
     config: {
@@ -1425,7 +1412,6 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
   const agentToolsLive = ctx.agentTools ?? getConfig().multiAgent.enabled;
   const sessionToolsExposed = ctx.exposedSessionTools ?? sessionToolsLive;
   const agentToolsExposed = ctx.exposedAgentTools ?? agentToolsLive;
-  const findExposed = ctx.exposedFind ?? (!exposedCaps.command && exposedCaps.search);
   const names: string[] = [];
   const handlers = new Map<string, { description: string; run: (args: unknown) => Promise<ToolResult> }>();
 
@@ -1437,7 +1423,6 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
     sessionToolsExposed,
     agentToolsLive,
     agentToolsExposed,
-    findExposed,
     registered: () => [...names],
     descriptions: () => [...handlers].map(([name, entry]) => ({ name, description: entry.description })),
     invokeNested(name, args, parent) {

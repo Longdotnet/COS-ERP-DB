@@ -217,16 +217,14 @@ interface SurfaceExposure {
   caps: ToolContext['caps'] | null;
   sessionTools: boolean;
   agentTools: boolean;
-  find: boolean | null;
 }
 
 /**
  * What each independently discoverable connector has already exposed.
  *
  * Core and Desktop share one loopback listener, but they are separate MCP servers to the
- * client. Keeping this as one global snapshot let a Desktop request freeze Core's mutually
- * exclusive `find`/exec choice before Core had ever been discovered, and it could similarly
- * preserve Core-only feature exposure solely because the other connector was queried first.
+ * client. Keeping this as one global snapshot could preserve Core-only feature exposure solely
+ * because the other connector was queried first.
  * Monotonicity therefore has to be per surface, which is the same boundary ChatGPT caches.
  */
 const surfaceExposure = new Map<SurfaceId, SurfaceExposure>();
@@ -234,7 +232,7 @@ const surfaceExposure = new Map<SurfaceId, SurfaceExposure>();
 function exposureFor(surface: SurfaceId): SurfaceExposure {
   let state = surfaceExposure.get(surface);
   if (!state) {
-    state = { finishTool: false, caps: null, sessionTools: false, agentTools: false, find: null };
+    state = { finishTool: false, caps: null, sessionTools: false, agentTools: false };
     surfaceExposure.set(surface, state);
   }
   return state;
@@ -289,7 +287,6 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   const stableContext = (surface: SurfaceId): ToolContext => {
     const live = getContext();
     const exposed = exposureFor(surface);
-    if (exposed.find === null) exposed.find = !live.caps.command && live.caps.search;
     if (exposed.caps === null) {
       exposed.caps = { ...live.caps };
     } else {
@@ -310,8 +307,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       exposedCaps: { ...exposed.caps },
       exposedSessionTools: exposed.sessionTools,
       exposedFinishTool: exposed.finishTool,
-      exposedAgentTools: exposed.agentTools,
-      exposedFind: exposed.find
+      exposedAgentTools: exposed.agentTools
     };
   };
 

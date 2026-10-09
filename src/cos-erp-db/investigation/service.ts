@@ -3,8 +3,13 @@ import type {
   DatabaseColumnProfileRequest,
   DatabaseColumnProfileResult,
   DatabaseColumnSearchResult,
+  DatabaseDataTimelineRequest,
+  DatabaseDataTimelineResult,
   DatabaseFieldConsumerRequest,
   DatabaseFieldConsumersResult,
+  DatabaseDeploymentCompareResult,
+  DatabaseDeploymentFingerprint,
+  DatabaseHealthGateResult,
   DatabaseIncidentHistoryResult,
   DatabaseIncidentCauseTraceRequest,
   DatabaseIncidentCauseTraceResult,
@@ -18,7 +23,9 @@ import type {
   DatabaseSchemaCompareResult,
   DatabaseServerIncidentHistoryResult,
   DatabaseSourceTraceRequest,
-  DatabaseSourceTraceResult
+  DatabaseSourceTraceResult,
+  DatabaseTableScaleProfileRequest,
+  DatabaseTableScaleProfileResult
 } from './types.js';
 import { resolveSqlServerProfile } from '../../main/database/profiles.js';
 import { readSqlServerGrowthDiagnostics } from '../../main/database/growth-diagnostics.js';
@@ -31,11 +38,15 @@ import {
   readSqlServerDiagnosticHistory,
   readSqlServerLivePerformance,
   readSqlServerQueryStore,
+  profileSqlServerTableScale,
   searchSqlServerColumns
 } from './sqlserver-investigator.js';
 import { traceApplicationSource } from './source-trace.js';
 import { traceApplicationObjectTerms } from './source-trace.js';
 import { extractIncidentCauseCandidates } from './incident-cause.js';
+import { readDatabaseHealthGate } from './health-gate.js';
+import { readDatabaseDeploymentFingerprint } from './deployment-fingerprint.js';
+import { readDatabaseDataTimeline } from './data-timeline.js';
 import {
   deleteDatabaseIncidentSnapshot,
   clearDatabaseIncidentHistory,
@@ -70,6 +81,15 @@ export async function executeColumnProfile(request: DatabaseColumnProfileRequest
   const profile = await resolved(request.connection);
   try {
     return await profileSqlServerColumn(profile.id, profile.connection, request.objectId, request.column);
+  } catch (error) {
+    throw redact(error, profile.connection.authentication.password);
+  }
+}
+
+export async function executeTableScaleProfile(request: DatabaseTableScaleProfileRequest): Promise<DatabaseTableScaleProfileResult> {
+  const profile = await resolved(request.connection);
+  try {
+    return await profileSqlServerTableScale(profile.id, profile.connection, request.objectId);
   } catch (error) {
     throw redact(error, profile.connection.authentication.password);
   }
@@ -234,6 +254,81 @@ export async function executeSchemaCompare(request: DatabaseSchemaCompareRequest
     );
   } catch (error) {
     throw redact(redact(error, baseline.connection.authentication.password), current.connection.authentication.password);
+  }
+}
+
+export async function executeHealthGate(connectionId?: string): Promise<DatabaseHealthGateResult> {
+  const profile = await resolved(connectionId);
+  try {
+    return await readDatabaseHealthGate(profile.id, profile.connection);
+  } catch (error) {
+    throw redact(error, profile.connection.authentication.password);
+  }
+}
+
+export async function executeDeploymentFingerprint(connectionId?: string): Promise<DatabaseDeploymentFingerprint> {
+  const profile = await resolved(connectionId);
+  try {
+    return await readDatabaseDeploymentFingerprint(profile.id, profile.connection);
+  } catch (error) {
+    throw redact(error, profile.connection.authentication.password);
+  }
+}
+
+export async function executeDeploymentCompare(request: DatabaseSchemaCompareRequest): Promise<DatabaseDeploymentCompareResult> {
+  if (request.baselineConnection.toLowerCase() === request.currentConnection.toLowerCase()) {
+    throw new Error('Baseline and Current must be different database connections.');
+  }
+  const [baseline, current] = await Promise.all([
+    resolved(request.baselineConnection),
+    resolved(request.currentConnection)
+  ]);
+  try {
+    const [baselineFingerprint, currentFingerprint, schema] = await Promise.all([
+      readDatabaseDeploymentFingerprint(baseline.id, baseline.connection),
+      readDatabaseDeploymentFingerprint(current.id, current.connection),
+      compareSqlServerSchemas(baseline.id, baseline.connection, current.id, current.connection)
+    ]);
+    const comparable = baselineFingerprint.complete && currentFingerprint.complete;
+    return {
+      baseline: baselineFingerprint,
+      current: currentFingerprint,
+      exactFingerprintMatch: comparable && baselineFingerprint.fingerprint && currentFingerprint.fingerprint
+        ? baselineFingerprint.fingerprint === currentFingerprint.fingerprint
+        : null,
+      schemaHashMatch: comparable && baselineFingerprint.schemaHash && currentFingerprint.schemaHash
+        ? baselineFingerprint.schemaHash === currentFingerprint.schemaHash
+        : null,
+      moduleHashMatch: baselineFingerprint.moduleHash && currentFingerprint.moduleHash
+        ? baselineFingerprint.moduleHash === currentFingerprint.moduleHash
+        : null,
+      configurationHashMatch: baselineFingerprint.configurationHash && currentFingerprint.configurationHash
+        ? baselineFingerprint.configurationHash === currentFingerprint.configurationHash
+        : null,
+      schema,
+      limitations: [
+        ...baselineFingerprint.limitations.map(item => 'Baseline: ' + item),
+        ...currentFingerprint.limitations.map(item => 'Current: ' + item),
+        ...schema.limitations
+      ]
+    };
+  } catch (error) {
+    throw redact(redact(error, baseline.connection.authentication.password), current.connection.authentication.password);
+  }
+}
+
+export async function executeDataTimeline(request: DatabaseDataTimelineRequest): Promise<DatabaseDataTimelineResult> {
+  const profile = await resolved(request.connection);
+  try {
+    return await readDatabaseDataTimeline(
+      profile.id,
+      profile.connection,
+      request.objectId,
+      request.subject,
+      request.limit
+    );
+  } catch (error) {
+    throw redact(error, profile.connection.authentication.password);
   }
 }
 

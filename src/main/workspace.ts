@@ -49,7 +49,15 @@ const MAX_WORKSPACES = 64;
  * and nothing has been saved. Walking up to the nearest marker is what makes a relative
  * path mean the same thing it means in a terminal at the project root.
  */
-const PROJECT_MARKERS = ['.git', 'package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml', 'pom.xml'];
+const PROJECT_MARKERS = [
+  '.git',
+  '.agents/engineering.json',
+  'package.json',
+  'pyproject.toml',
+  'go.mod',
+  'Cargo.toml',
+  'pom.xml'
+];
 
 export interface Workspace {
   /** Virtual path of the folder, e.g. `/project/chat-on-steroids`. */

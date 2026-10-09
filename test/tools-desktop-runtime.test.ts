@@ -60,7 +60,6 @@ function desktopSurface(over: Partial<Capabilities> = {}) {
     sessionToolsExposed: false,
     agentToolsLive: false,
     agentToolsExposed: false,
-    findExposed: false,
     register(name: string, config: any, handler: (input: any) => Promise<any>) {
       registered.set(name, { config, handler });
     },

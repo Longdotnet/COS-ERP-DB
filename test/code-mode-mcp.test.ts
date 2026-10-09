@@ -305,6 +305,24 @@ it('initializes, discovers and executes the actual model-facing MCP contract wit
   expect(JSON.stringify(events.filter(event => event.call.tool === 'exec'))).not.toContain('PRIVATE_ALPHA');
 });
 
+it('composes bounded find then targeted read while command execution is enabled', async () => {
+  const who = await identity();
+  const names = JSON.parse(
+    text(await call(who.requestId, 'text(JSON.stringify(ALL_TOOLS.map(tool => tool.name)));'))
+  ) as string[];
+  expect(names).toContain('find');
+  expect(names).toContain('exec_command');
+
+  const response = await call(
+    who.requestId,
+    'const found = await tools.find({query:"PRIVATE_ALPHA",path:"/workspace",mode:"content",max_results:5}); ' +
+      'const read = await tools.read({paths:["/workspace/alpha.txt"]}); ' +
+      'text(JSON.stringify({hit:found.content.some(c=>c.text?.includes("alpha.txt")),read:read.content.some(c=>c.text?.includes("PRIVATE_ALPHA"))}));'
+  );
+  expect(response.result.isError).not.toBe(true);
+  expect(JSON.parse(text(response))).toEqual({ hit: true, read: true });
+});
+
 it.runIf(process.platform === 'win32').each([true, false])('routes sky through Desktop MCP with attributed=%s, retaining observation and live permissions', async attributed => {
   const who = attributed ? await identity() : { requestId: undefined, session: { id: null } };
   const window = { id: 77, app: 'fixture.exe', title: 'Owned fixture', process: 'fixture', x: 0, y: 0, width: 2, height: 2, dpi: 96 };

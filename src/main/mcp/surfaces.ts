@@ -27,6 +27,7 @@ import { getConfig } from '../config.js';
 import { CONNECTOR_BRAND, connectorName } from '../../shared/connector-names.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from '../../shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../../shared/browser-control.js';
+import { COS_ERP_DB_CORE_TOOLS } from '../../cos-erp-db/integration/core-surface.js';
 
 export const SURFACE_IDS = ['core', 'desktop', 'plugins'] as const;
 export type SurfaceId = (typeof SURFACE_IDS)[number];
@@ -92,8 +93,8 @@ export interface SurfaceDefinition {
  *    no discovery benefit.
  *
  * Each surface also exposes JavaScript exec, restricted to that surface's own tools.
- * `find` and the exec pair are mutually exclusive — `find` exists only when command
- * execution is off — so not all declarations are exposed together.
+ * `find` is the bounded repository-search primitive; `exec_command` remains available
+ * independently for arbitrary shell work when command permission is enabled.
  */
 const CORE: SurfaceDefinition = {
   id: 'core',
@@ -107,7 +108,7 @@ const CORE: SurfaceDefinition = {
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
   cardSummary: 'Files, patches, terminal and configured SQL Server databases. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'save_image', 'exec_command', 'write_stdin', 'database', 'update_plan', 'agents', 'session_finish', 'exec']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'save_image', 'exec_command', 'write_stdin', ...COS_ERP_DB_CORE_TOOLS, 'update_plan', 'agents', 'session_finish', 'exec']
 };
 
 /**

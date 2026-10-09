@@ -159,7 +159,6 @@ import {
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
-import { registerDatabaseTool } from './database-tool.js';
 import { configuredDatabaseShellPolicyViolation } from '../database/exec-policy.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
@@ -436,8 +435,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     );
   }
 
-  registerDatabaseTool(reg);
-
   // -------------------------------------------------------------- view_image
 
   if (exposedCaps.read) {
@@ -543,16 +540,11 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
 
   // ------------------------------------------------------------------- find
   //
-  // Only when commands are unavailable. With `exec_command` present, ripgrep through the
-  // shell is strictly better than anything this can offer, and a seventh Core schema that
-  // duplicates a capability the model already has is exactly the kind of weight this
-  // surface exists to refuse.
-  //
-  // `reg.findExposed` rather than `!exposedCaps.command && exposedCaps.search`: the second
-  // form reads a monotonically widening value, so switching command execution on mid-run
-  // would delete `find` from under a cached tool list. The decision is frozen for the life
-  // of the endpoint instead, which is the same rule every other tool here follows.
-  if (reg.findExposed) {
+  // Search is a first-class read primitive even when command execution is available. It
+  // reaches the bundled ripgrep backend directly, keeps the approved-root/search bounds in
+  // one owner, and avoids paying shell/process-custody setup for ordinary repository lookup.
+  // `exec_command` remains the escape hatch for pipelines and shell-specific rg usage.
+  if (exposedCaps.search) {
     reg.register(
       'find',
       toolDeclaration('find', () => ({

@@ -101,6 +101,8 @@ beforeAll(async () => {
     'project/notes.txt': 'top level\n',
     'other/package.json': '{"name":"other"}\n',
     'other/src/index.ts': 'export const other = 1;\n',
+    'manifested/.agents/engineering.json': '{"profile":"linkq","runtimeFamily":"mixed"}\n',
+    'manifested/legacy/Module/Form.cs': 'class Form {}\n',
     'loose/file.txt': 'no marker anywhere\n'
   });
   await writeTree(outside, { 'secret.txt': 'hunter2\n' });
@@ -251,6 +253,11 @@ describe('learning a folder from the paths a call already uses', () => {
     // `src/main` would be technically true and useless: the next call would have to write
     // `../renderer/chat.ts` and nothing would have been saved.
     expect(run('worker-1', currentWorkspace)?.virtual).toBe('/workspace/project');
+  });
+
+  it('treats a project-local Engineering manifest as a project root marker', async () => {
+    await run('worker-1', () => resolveIn(roots, '/workspace/manifested/legacy/Module/Form.cs'));
+    expect(run('worker-1', currentWorkspace)?.virtual).toBe('/workspace/manifested');
   });
 
   it('lets the next call write the path short', async () => {

@@ -295,6 +295,48 @@ export interface DatabaseQueryStoreResult {
   elapsedMs: number;
 }
 
+export interface DatabaseTableScaleProfileRequest {
+  connection: string;
+  objectId: number;
+}
+
+export interface DatabaseTableScaleIndex {
+  indexId: number;
+  name: string | null;
+  type: string;
+  unique: boolean;
+  primaryKey: boolean;
+  disabled: boolean;
+  filterDefinition: string | null;
+  keyColumns: string[];
+  includeColumns: string[];
+}
+
+export interface DatabaseTableScaleStatistic {
+  statsId: number;
+  name: string;
+  lastUpdatedAt: string | null;
+  autoCreated: boolean;
+  userCreated: boolean;
+  noRecompute: boolean;
+  filterDefinition: string | null;
+}
+
+export interface DatabaseTableScaleProfileResult {
+  connection: string;
+  database: string;
+  capturedAt: string;
+  object: { objectId: number; schema: string; table: string };
+  approximateRows: number | null;
+  reservedMb: number | null;
+  usedMb: number | null;
+  dataMb: number | null;
+  indexes: DatabaseTableScaleIndex[];
+  statistics: DatabaseTableScaleStatistic[];
+  limitations: string[];
+  elapsedMs: number;
+}
+
 export interface DatabaseDeadlockProcess {
   processId: string | null;
   sessionId: number | null;
@@ -321,6 +363,100 @@ export interface DatabaseDeadlockHistoryResult {
   capturedAt: string;
   available: boolean;
   events: DatabaseDeadlockEvent[];
+  limitations: string[];
+  elapsedMs: number;
+}
+
+export type DatabaseHealthCheckStatus = 'ok' | 'attention' | 'critical' | 'unavailable';
+
+export interface DatabaseHealthCheck {
+  id: 'query-store' | 'runtime' | 'deadlocks' | 'jobs' | 'storage-log' | 'server-history';
+  status: DatabaseHealthCheckStatus;
+  summary: string;
+  detail: string;
+}
+
+export interface DatabaseHealthGateResult {
+  connection: string;
+  database: string;
+  capturedAt: string;
+  status: 'healthy' | 'attention' | 'critical';
+  checks: DatabaseHealthCheck[];
+  limitations: string[];
+  elapsedMs: number;
+}
+
+export interface DatabaseDeploymentFingerprint {
+  connection: string;
+  database: string;
+  capturedAt: string;
+  complete: boolean;
+  fingerprint: string | null;
+  schemaHash: string | null;
+  moduleHash: string | null;
+  configurationHash: string | null;
+  counts: {
+    objects: number;
+    columns: number;
+    indexes: number;
+    constraints: number;
+    modules: number;
+  };
+  configuration: {
+    compatibilityLevel: number | null;
+    collation: string | null;
+    recoveryModel: string | null;
+    readCommittedSnapshot: boolean | null;
+    snapshotIsolationState: string | null;
+  };
+  limitations: string[];
+  elapsedMs: number;
+}
+
+export interface DatabaseDeploymentCompareResult {
+  baseline: DatabaseDeploymentFingerprint;
+  current: DatabaseDeploymentFingerprint;
+  exactFingerprintMatch: boolean | null;
+  schemaHashMatch: boolean | null;
+  moduleHashMatch: boolean | null;
+  configurationHashMatch: boolean | null;
+  schema: DatabaseSchemaCompareResult;
+  limitations: string[];
+}
+
+export interface DatabaseDataTimelineRequest {
+  connection: string;
+  objectId: number;
+  subject: string;
+  limit?: number;
+}
+
+export interface DatabaseDataTimelineEvent {
+  kind: 'created' | 'modified' | 'voucher-history';
+  happenedAt: string | null;
+  user: string | null;
+  updateType: string | null;
+  computer: string | null;
+  detail: string;
+  rawLog: string | null;
+}
+
+export interface DatabaseDataTimelineResult {
+  connection: string;
+  database: string;
+  capturedAt: string;
+  object: { objectId: number; schema: string; table: string };
+  subject: { column: string; value: string };
+  matchedRows: number;
+  ambiguous: boolean;
+  current: Array<Record<string, unknown>>;
+  events: DatabaseDataTimelineEvent[];
+  sources: {
+    createModifyLog: boolean;
+    voucherHistory: boolean;
+    genericHistoryAvailable: boolean;
+    genericHistoryLinked: false;
+  };
   limitations: string[];
   elapsedMs: number;
 }

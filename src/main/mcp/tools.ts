@@ -27,6 +27,7 @@ import { APP_VERSION } from './../version.js';
 import { toVirtualPath } from '../sandbox.js';
 import { logWarn } from '../logger.js';
 import { withManagedSkills } from '../skill-access.js';
+import { registerCosErpDbCoreTools } from '../../cos-erp-db/integration/core-tools.js';
 
 export function buildServer(ctx: ToolContext, surface: SurfaceId, observe?: (connectorName: string, version: string, instructions: string, tools: PluginToolSchema[]) => void, liveContext: () => ToolContext = () => ctx): McpServer {
   if (surface === 'core') ctx = withManagedSkills(ctx);
@@ -48,14 +49,20 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId, observe?: (con
     const schema = toolSchemaJson(config.inputSchema);
     tools.push({ name, description: config.description, inputSchema: { type: 'object', ...schema }, ...(config.annotations ? { annotations: { ...config.annotations } } : {}) });
   } : undefined);
-  if (surface === 'core') registerCoreTools(registrar);
+  if (surface === 'core') {
+    registerCoreTools(registrar);
+    registerCosErpDbCoreTools(registrar);
+  }
   else registerDesktopTools(registrar);
   registerCodeMode(registrar, (name, args, parent) => {
     // Reuse the same registration/validation/handler authority, refreshed for every child
     // so a permission or approved-root change during an awaited script takes effect.
     const live = liveContext();
     const nested = createRegistrar(null, surface === 'core' ? withManagedSkills(live) : live, surface);
-    if (surface === 'core') registerCoreTools(nested);
+    if (surface === 'core') {
+      registerCoreTools(nested);
+      registerCosErpDbCoreTools(nested);
+    }
     else registerDesktopTools(nested);
     return nested.invokeNested(name, args, parent);
   }, { windowsDesktop: surface === 'desktop' && process.platform === 'win32' });
