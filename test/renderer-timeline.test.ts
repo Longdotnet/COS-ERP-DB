@@ -281,7 +281,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         backgroundProcessListener = listener;
         return () => undefined;
       },
-      livePreview: () => ok(null), listPausedHelpers: () => ok(pausedHelpers),
+      turnTraces: () => ok({}), listPausedHelpers: () => ok(pausedHelpers),
       retryHelper: (id: string, sourceSessionId: string) => {
         live.controlCalls.push({ id: sourceSessionId, action: `retry:${id}` });
         pausedHelpers = pausedHelpers.filter(row => row.id !== id);
@@ -359,7 +359,14 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   };
 }
 
-  it('makes parent and worker session selectors keyboard-focusable and activates them with Enter/Space', async () => {
+it('ignores a pointer release when the timeline owns no pointer press', async () => {
+  const { w } = await boot([]);
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  w.dispatchEvent(new w.MouseEvent('pointerup'));
+  expect(error).not.toHaveBeenCalled();
+});
+
+it('makes parent and worker session selectors keyboard-focusable and activates them with Enter/Space', async () => {
   const parent: SessionSummary = { ...summary([]), id: 'parent-session', title: 'Parent', conversationId: 'parent-chat', chatIds: ['parent-chat'] };
   const worker: SessionSummary = { ...summary([]), id: 'worker-session', title: 'Worker', conversationId: 'worker-chat', chatIds: ['worker-chat'],
     origin: { kind: 'worker', fromSessionId: parent.id, agentId: 'worker-1', task: 'Inspect' } };
@@ -1526,7 +1533,7 @@ it.each([false, true])('removes a project group in one click, keeps its chats an
   const api = (w as any).api;
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   (w.document.querySelector('.worker-toggle') as HTMLButtonElement).click();
-  projectMenu(w, project.id); (w.document.querySelector(`.row-menu [data-new-project="${project.id}"]`) as HTMLButtonElement).click();
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click();
   input.value = 'Keep my draft';
   input.dispatchEvent(new w.Event('input', { bubbles: true }));
   if (selectedSkill) {
@@ -1586,21 +1593,23 @@ it('keeps the project visible when its removal fails, and lets the removal be tr
   expect((w as any).api.removeProject).toHaveBeenCalledTimes(2);
 });
 
-it('offers a project\'s actions in one menu: a new chat, its color as a submenu, and removal', async () => {
+it('offers a new chat beside a project\'s menu, and its color as a submenu and removal inside it', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: 'C:\\workspace\\primary', createdAt: 1 };
   const { w } = await boot([], false, [], [project]);
   const group = w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
-  // No loose buttons on the row: one "⋯", and a right click opens the same menu.
-  expect(group.querySelector('.project-heading')!.querySelectorAll('button').length).toBe(1);
+  // Two buttons on the row: the primary new chat, then one "⋯"; a right click opens the same menu.
+  expect([...group.querySelector('.project-heading')!.querySelectorAll('button')].map(b => b.className)).toEqual(['btn row-menu-button project-new', 'btn row-menu-button project-menu']);
   const button = projectMenu(w, project.id);
   expect(button.getAttribute('aria-expanded')).toBe('true');
   const menu = w.document.querySelector<HTMLElement>('.row-menu')!;
   expect(menu.getAttribute('role')).toBe('menu');
-  expect([...menu.querySelectorAll<HTMLElement>('.row-menu-item')].map(item => item.dataset.rowAction)).toEqual(['new-chat', 'color', 'remove']);
+  expect([...menu.querySelectorAll<HTMLElement>('.row-menu-item')].map(item => item.dataset.rowAction)).toEqual(['color', 'remove']);
   expect(menuItem(w, 'remove').classList.contains('is-danger')).toBe(true);
-  expect(w.document.activeElement).toBe(menuItem(w, 'new-chat'));
-  // Keyboard: Down moves, Right opens the color submenu on the current choice, Left comes back.
+  expect(w.document.activeElement).toBe(menuItem(w, 'color'));
+  // Keyboard: Down and Up move, Right opens the color submenu on the current choice, Left comes back.
   menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  expect(w.document.activeElement).toBe(menuItem(w, 'remove'));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
   expect(w.document.activeElement).toBe(menuItem(w, 'color'));
   menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
   expect(w.document.querySelectorAll('.row-menu').length).toBe(2);
@@ -1619,8 +1628,10 @@ it('offers a project\'s actions in one menu: a new chat, its color as a submenu,
   expect(menuItem(w, 'color')).not.toBeNull();
   w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
   expect(w.document.querySelector('.row-menu')).toBeNull();
-  // New chat in this project.
-  projectMenu(w, project.id); menuItem(w, 'new-chat').click(); await settle();
+  // New chat in this project: the row's own button, no longer a menu item.
+  expect(projectMenu(w, project.id) && menuItem(w, 'new-chat')).toBeNull();
+  w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click(); await settle();
   expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).placeholder).toBe('Message in Workspace…');
 });
 
@@ -1800,7 +1811,7 @@ it('groups project chats and restores each project composer with its selected id
   expect([...groups].map(group => group.open)).toEqual([false, false]);
   expect(groups[0]!.querySelector('[data-id]')?.getAttribute('data-id')).toBe(summary([]).id);
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
-  const choose = (id: string) => { projectMenu(w, id); (w.document.querySelector(`.row-menu [data-new-project="${id}"]`) as HTMLButtonElement).click(); };
+  const choose = (id: string) => { (w.document.querySelector(`.project-heading > [data-new-project="${id}"]`) as HTMLButtonElement).click(); };
   choose(projects[0]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[0]!.id}"]`)!.open).toBe(true); input.value = 'Alpha draft';
   choose(projects[1]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[1]!.id}"]`)!.open).toBe(true); expect(input.value).toBe(''); input.value = 'Beta draft';
   (w.document.getElementById('newChat') as HTMLButtonElement).click();
@@ -2498,7 +2509,8 @@ it('keeps an unfolded tool row as the same open node while the chat keeps append
   expect(detached.some(node => node === group || node === before || (node as Element).contains?.(before))).toBe(false);
   expect(timeline.querySelector('details.tool-group')).toBe(group);
   expect(group.open).toBe(false);
-  expect(group.querySelector('summary')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-title')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-count')!.textContent).toBe('4');
   expect(group.querySelector('summary')!.title).toContain('4 actions');
 });
 
@@ -2539,7 +2551,7 @@ it('colors removed lines separately from added lines without changing other tool
   expect(rows[1]!.querySelector('.edit-card .metric-removed')?.textContent).toBe('−7');
 });
 
-it('keeps mixed tool and agent activity in one latest-action disclosure between authored messages', async () => {
+it('opens a round with the ChatGPT caption and keeps its mixed tool and agent activity in one latest-action disclosure', async () => {
   const { w, append } = await boot([
     { seq: 1, time: T0, source: 'extension', kind: 'progress', message: text('Checking the implementation') },
     toolCall(2, 'first'),
@@ -2549,7 +2561,10 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   const timeline = w.document.getElementById('timeline')!;
   const group = timeline.querySelector<HTMLDetailsElement>('.tool-group')!;
   expect(group.open).toBe(false);
-  expect(group.querySelector('.activity-title')!.textContent).toBe('Checking the implementation');
+  // The caption is what ChatGPT said before the step: it stands as the round's opening line.
+  expect(timeline.children[0]!.className).toContain('ev-progress');
+  expect(timeline.children[0]!.textContent).toContain('Checking the implementation');
+  expect(group.querySelector('.activity-title')!.textContent).toBe(group.querySelector('.ev-tool_call:last-of-type .tool > summary b')!.textContent);
   expect(group.querySelector('.agent-communication summary')!.textContent).toContain('Message from worker-2');
   expect(group.querySelector('.agent-avatar')).not.toBeNull();
   expect(group.querySelectorAll('.ev')).toHaveLength(3);
@@ -2575,7 +2590,6 @@ it('never titles a tool group with the app\'s own recovery note', async () => {
   const title = group.querySelector('.activity-title')!.textContent;
   expect(title).not.toContain('Reloaded chat');
   expect(title).toBe(group.querySelector('.ev-tool_call:last-of-type .tool > summary b')?.textContent ?? title);
-  expect(group.classList.contains('has-activity-phase')).toBe(false);
   // The note itself stays in the transcript, in front of the group.
   expect(timeline.children[0]!.textContent).toContain('Reloaded chat to recover an interrupted response.');
 });
@@ -4565,7 +4579,7 @@ it('ends the running turn with a row saying what it is doing now', async () => {
   expect(shown()?.[0]).toBe('Thinking');
 });
 
-it('says what a new chat\'s first turn is writing before ChatGPT publishes it (#942)', async () => {
+it('shows a new chat\'s first sentences in the timeline and keeps the live row for what happens now (#942)', async () => {
   const asked = Date.now() - 12_000;
   const { w, append } = await boot([
     { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
@@ -4574,23 +4588,35 @@ it('says what a new chat\'s first turn is writing before ChatGPT publishes it (#
   const now = () => w.document.querySelector<HTMLElement>('#timeline .turn-now')!;
   const shown = () => now().hidden ? null : now().querySelector('.turn-now-text')!.textContent;
   const asks: string[][] = [];
-  (w as any).api.livePreview = (ids: string[]) => {
+  // ChatGPT shows the sentence long before it publishes a message for it; the turn's outline holds it.
+  (w as any).api.turnTraces = (_id: string, ids: string[]) => {
     asks.push(ids);
-    return Promise.resolve({ ok: true, data: 'First command printed one; now running the second.' });
+    return Promise.resolve({ ok: true, data: { 'held-turn': [{ kind: 'say', text: 'First command printed one; now running the second.', done: true },
+      ...(status ? [{ kind: 'now', text: status }] : [])] } });
   };
+  let status = '';
   await append([]); await append([]);
-  expect(asks.at(-1)).toEqual(['chat-b', 'chat-a']);
-  expect(shown()).toBe('First command printed one; now running the second.');
+  expect(asks.at(-1)).toEqual(['held-turn']);
+  const sentence = w.document.querySelector<HTMLElement>('#timeline .ev.is-interim')!;
+  expect(sentence.textContent).toContain('First command printed one; now running the second.');
+  // The sentence is the turn's own words, before the row that says what it does right now.
+  expect(sentence.compareDocumentPosition(now()) & w.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(shown()).toBe('Thinking');
+  // ChatGPT's own phrase for what the turn is doing takes Thinking's place, with Thinking's sign.
+  status = 'Comparando três estruturas de projeto';
+  await append([]); await append([]);
+  expect(shown()).toBe('Comparando três estruturas de projeto');
   expect(now().classList.contains('is-thinking')).toBe(true);
-  // A call of this app that runs right now is what the turn is doing.
+  // A call of this app running meanwhile keeps ChatGPT's words and lends them its icon.
+  (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running echo one', kind: 'run', since: Date.now() }] });
+  await append([]); await append([]);
+  expect(shown()).toBe('Comparando três estruturas de projeto');
+  expect(now().classList.contains('is-thinking')).toBe(false);
+  status = '';
   (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running echo two', kind: 'run', since: Date.now() }] });
   await append([]); await append([]);
   expect(shown()).toBe('Running echo two');
-  // Once the page clears it, the row is back to its ordinary state.
-  (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [] });
-  (w as any).api.livePreview = () => Promise.resolve({ ok: true, data: null });
-  await append([]); await append([]);
-  expect(shown()).toBe('Thinking');
+  expect(w.document.querySelectorAll('#timeline .ev.is-interim')).toHaveLength(1);
 });
 
 it('shows a just-started turn working right after your message, never in the header first', async () => {
@@ -4722,6 +4748,7 @@ it('opens round participants in the existing dock without moving the prime reade
   expect(w.document.getElementById('inlineAgents')).toBeNull();
   expect(w.document.querySelectorAll('#chatBody .agent-panel')).toHaveLength(0);
   const indicators = [...w.document.querySelectorAll<HTMLButtonElement>('#timeline .activity-workers')];
+  // One pill per round, whatever the count: the team icon and how many workers it involved.
   expect(indicators.map(button => button.textContent)).toEqual(['2', '1']);
   expect(indicators[0]!.getAttribute('aria-label')).toBe('2 sub-agents in this round');
   // One worker reads as one, not "1 sub-agents" (seen on the 2.1.27 canary).

@@ -2624,6 +2624,22 @@ var CLF_DOM = (() => {
 
   /** Native attachment identity from the composer's exact tile/remove control. */
   function composerFileName(button) {
+    // Current shell: a filename-labelled open button and a translated remove button share a
+    // span tile, without role/group/default-action. Count only that exact remove control;
+    // treating both buttons as attachments prevents the upload receipt from reaching Send.
+    const attachmentHost = button.closest('[data-composer-attachments]');
+    const tileParent = button.parentElement;
+    if (attachmentHost && tileParent && tileParent !== attachmentHost) {
+      const actions = [...tileParent.querySelectorAll('button')];
+      if (actions.length === 2 && actions[1] === button) {
+        const open = actions[0], name = open.getAttribute('aria-label');
+        const removal = button.getAttribute('aria-label') || '';
+        const labelled = [...tileParent.querySelectorAll('span')].some(node =>
+          !node.children.length && node.textContent === name);
+        if (name && removal !== name && removal.endsWith(` ${name}`) && labelled &&
+            open.closest('[data-composer-attachments]') === attachmentHost) return name;
+      }
+    }
     const tile = button.closest('[data-composer-attachments] [role="button"][aria-label]');
     if (tile && tile !== button) {
       const name = tile.getAttribute('aria-label');
@@ -2947,6 +2963,16 @@ var CLF_DOM = (() => {
     return model && /^[a-zA-Z0-9._-]{1,80}$/.test(model) && ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(reasoningEffort)
       ? { model, reasoningEffort } : null;
   }
+  /**
+   * Whether a borrowed chat can serve account model discovery. A chat still set to a model the
+   * account no longer lists (GPT-5.6 Sol after GPT-6, VM 2026-10-08) has no selected version and no
+   * effort lanes, so the reader rightly refuses it; discovery elected that tab anyway and timed out
+   * with picker_unavailable. The Chat/Work toggle changes the picker first, so it defers to it.
+   */
+  async function modelPickerReadable() {
+    if ([...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')].some(node => !node.closest(OWN_SURFACES) && node.getClientRects().length > 0)) return true;
+    return Boolean(await readPickerState());
+  }
   /** Account model discovery belongs to Chat; Work mounts a different picker.
    * The caller owns one idle document and verifies draft/epoch before and after this transition. */
   async function prepareChatModelSurface(stillCurrent = () => true) {
@@ -3237,6 +3263,7 @@ var CLF_DOM = (() => {
     composerVisible,
     conversationLoadFailure,
     prepareChatModelSurface,
+    modelPickerReadable,
     newChatControl,
     projectHomeId,
     enterProject,

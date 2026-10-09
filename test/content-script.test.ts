@@ -21,6 +21,13 @@ import { prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js'
 
 let domSource = '';
 let contentSource = '';
+/**
+ * The page-helper version the content script under test expects, so its Fiber replies match it.
+ * Read at load: some fixtures are built while their describe block is collected.
+ */
+const fiberVersion = Number(/const FIBER_VERSION = (\d+);/.exec(
+  await fs.readFile(path.join(process.cwd(), 'extension', 'content.js'), 'utf8'))?.[1]);
+if (!Number.isInteger(fiberVersion)) throw new Error('content.js no longer declares FIBER_VERSION');
 
 beforeAll(async () => {
   [domSource, contentSource] = await Promise.all([
@@ -530,6 +537,16 @@ describe('one synchronous page snapshot per observer turn', () => {
     composer.removeAttribute('aria-hidden');
     expect(await live.runtimeMessage({ type: 'clf-model-catalog-state' })).toMatchObject({ ready: true });
     expect(await live.runtimeMessage({ type: 'clf-tab-close-check', conversationId: null })).toMatchObject({ safe: true, conversationId: null });
+  });
+  it('keeps a borrowed chat out of model discovery while its picker is unreadable', async () => {
+    live = await harness();
+    await settle();
+    const composer = live.document.querySelector('#prompt-textarea')!;
+    Object.defineProperty(composer, 'getClientRects', { value: () => [{ width: 400, height: 60 }] });
+    const readable = vi.spyOn(live.window.CLF_DOM, 'modelPickerReadable').mockResolvedValue(false);
+    expect(await live.runtimeMessage({ type: 'clf-model-catalog-state' })).toEqual({ ready: false, reason: 'picker_unreadable' });
+    readable.mockResolvedValue(true);
+    expect(await live.runtimeMessage({ type: 'clf-model-catalog-state' })).toEqual({ ready: true, reason: null });
   });
   it('permits closing only an exact idle document with no text or attachment draft', async () => {
     live = await harness();
@@ -1777,6 +1794,38 @@ describe('desktop input delivery and helper ownership', () => {
     expect(mentions).toEqual([expected]);
   });
 
+  it.each([
+    ['the remembered Core before the page lists its apps', 'Chat On Steroids Core (Windows)', null,
+      { path: 'app://asdk_app_win2222', name: 'Chat On Steroids Core (Windows)' }],
+    ['nothing when the remembered Core has another name', 'Chat On Steroids Core', null, null],
+    ['nothing once the page\'s complete list lacks this Core', 'Chat On Steroids Core (Windows)',
+      { type: 'cos-core-mention', path: null, name: null, candidates: [], pluginList: true }, null]
+  ] as const)('mentions %s in a fresh tab (#1086)', async (_case, rememberedName, pageList, expected) => {
+    // A worker's fresh tab can send before its own plugin list arrives. Its first message then went
+    // out without the Core mention, and in a workspace shared with another computer ChatGPT sent
+    // the worker's calls to that computer's plain Core. Another tab's sighting stands in.
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
+        core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)' },
+        ownCoreApp: { appId: 'asdk_app_win2222', name: rememberedName } }),
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
+    });
+    await settle();
+    if (pageList) live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: pageList }));
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      live!.dom.reconfigure({ url: `https://chatgpt.com/c/${chatA}` });
+      userTurn(live!.document, 'remembered-core-receipt', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    const adapter = (live.window as any).CLF_DOM;
+    const send = adapter.send;
+    const mentions: unknown[] = [];
+    adapter.send = (options: { mention?: unknown }) => { mentions.push(options.mention ?? null); return send({ ...options, mention: null }); };
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: true });
+    expect(mentions).toEqual([expected]);
+  });
+
   it('keeps the plain names for a status reply that carries foreign or malformed names', async () => {
     live = await harness(`https://chatgpt.com/c/${chatA}`, {
       status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
@@ -2776,7 +2825,7 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 21, scanOk: true, rows, turns: indexedTurns },
+        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: fiberVersion, scanOk: true, rows, turns: indexedTurns },
         source: window
       })
     );
@@ -4729,7 +4778,7 @@ describe('the app-owned chronological stream', () => {
         section.querySelector(`[data-message-id="${id}"] .markdown`)?.setAttribute('data-clf-fiber-message', `${scanToken}:0:${id}`);
       }
       live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21, scanOk: true, rows: [], turns: [{
+        data: { source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: fiberVersion, scanOk: true, rows: [], turns: [{
           index: 0, turnId: 'idle-history-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           calls: [{ messageId: 'idle-history-tool', requestId, tool: 'exec_command', order: 0, answered: true }],
           messages: [
@@ -4786,7 +4835,7 @@ describe('the app-owned chronological stream', () => {
       const scanToken = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
       live!.window.dispatchEvent(new live!.window.MessageEvent('message', { source: live!.window as unknown as Window, data: {
-        source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: fiberVersion, scanOk: true, rows: [], turns: [{
           index: 0, turnId: 'idle-resume-answer', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           calls: [], activities: [], endMessageId: 'idle-resume-final-raw', messages: [
             { role: 'user', messageId: 'idle-resume-user', rawMessageId: 'idle-resume-user-raw', stable: true,
@@ -4993,7 +5042,7 @@ describe('the app-owned chronological stream', () => {
       ({ messageId, rawMessageId: messageId, stable: true, rawText, renderedHtml: '' }));
     section.setAttribute('data-clf-fiber-turn', '0');
     await replyFiber([{
-      v: 21, index: 0, messageId: 'interim-native-X', tool: 'read', app: 'COS ERP DB Core', answered: true,
+      v: fiberVersion, index: 0, messageId: 'interim-native-X', tool: 'read', app: 'COS ERP DB Core', answered: true,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     }], [{ turnId: 'interrupted-fold-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', messages,
       calls: [{ messageId: 'interim-native-X', requestId, tool: 'read', order: 0, answered: true }], activities: [],
@@ -5277,7 +5326,7 @@ describe('the app-owned chronological stream', () => {
         section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
         row.setAttribute('data-clf-fiber-thought', `${scanToken}:0:${thoughtId}`);
         answer = () => window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21, scanOk: true, rows: [],
+          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: fiberVersion, scanOk: true, rows: [],
           turns: [{ index: 0, turnId: 'pending-stamp-answer', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
             calls: [], messages: [], thoughtNotifications: [{ messageId: thoughtId, kind: 'thought_notification' }] }]
         } }));
@@ -6343,9 +6392,9 @@ describe('the app-owned chronological stream', () => {
     blocks[0]!.setAttribute('data-clf-fiber', '0');
     blocks[1]!.setAttribute('data-clf-fiber', '1');
     const rows = (secondAnswered: boolean) => [
-      { v: 21, index: 0, messageId: 'fiber-one', tool: 'read_file', path: '/COS ERP DB Core/read_file',
+      { v: fiberVersion, index: 0, messageId: 'fiber-one', tool: 'read_file', path: '/COS ERP DB Core/read_file',
         app: 'COS ERP DB Core', answered: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' },
-      { v: 21, index: 1, messageId: 'fiber-two', tool: 'exec_command', path: '/COS ERP DB Core/exec_command',
+      { v: fiberVersion, index: 1, messageId: 'fiber-two', tool: 'exec_command', path: '/COS ERP DB Core/exec_command',
         app: 'COS ERP DB Core', answered: secondAnswered, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
     ];
     const turn = (secondAnswered: boolean) => ({
@@ -6385,7 +6434,7 @@ describe('the app-owned chronological stream', () => {
     userTurn(live.document, 'exact-block-owner', 'Read the exact file', { sent: false });
     const section = assistantTurn(live.document, 'exact-block-page', ['Native connector row']);
     const block = blocksOf(section)[0]!; section.setAttribute('data-clf-fiber-turn', '0'); block.setAttribute('data-clf-fiber', '0');
-    await replyFiber([{ v: 21, index: 0, messageId: 'fiber-exact-block', tool: 'read_file',
+    await replyFiber([{ v: fiberVersion, index: 0, messageId: 'fiber-exact-block', tool: 'read_file',
       path: `/${app}/read_file`, app, answered: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }], [{
       turnId: 'exact-block-page', calls: [{ messageId: 'fiber-exact-block', tool: 'read_file', order: 0,
         answered: true, requestId: 'wfr-exact-block' }]
@@ -6411,7 +6460,7 @@ describe('the app-owned chronological stream', () => {
     const blocks = blocksOf(section); section.setAttribute('data-clf-fiber-turn', '0');
     blocks.forEach((block, index) => block.setAttribute('data-clf-fiber', String(index)));
     const calls = ['read', secondTool].map((tool, index) => ({ messageId: `result-provider-${index}`, tool, order: index, requestId, answered: true }));
-    await replyFiber(calls.map((call, index) => ({ v: 21, index, ...call, path: null,
+    await replyFiber(calls.map((call, index) => ({ v: fiberVersion, index, ...call, path: null,
       app: 'COS ERP DB Core', resource: `/asdk_app_fixture/link_fixture/${call.tool}`,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' })), [{ turnId: 'result-only-page', calls }]);
     await live.hook.pullActivity(); live.hook.renderStreams();
@@ -7381,7 +7430,7 @@ describe('the app-owned chronological stream', () => {
     section.setAttribute('data-clf-fiber-turn', '0');
     block.setAttribute('data-clf-fiber', '0');
     const bind = async (answered: boolean) => replyFiber([{
-      v: 21, index: 0, messageId: 'fiber-moved-call', tool: 'read_file',
+      v: fiberVersion, index: 0, messageId: 'fiber-moved-call', tool: 'read_file',
       path: '/COS ERP DB Core/read_file', app: 'COS ERP DB Core', answered,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     }], [{ turnId, calls: [{ messageId: 'fiber-moved-call', tool: 'read_file', order: 0,
@@ -8609,7 +8658,7 @@ describe('a stop button that goes missing while the turn is still running', () =
           source: 'clf-fiber-reply',
           nonce: event.data.nonce,
           scanToken: event.data.nonce,
-          v: 21,
+          v: fiberVersion,
           scanOk: true,
           rows: [],
           turns: [{
@@ -11337,7 +11386,7 @@ describe('a page leaving the screen', () => {
  */
 describe('evidence from the page context', () => {
   const GOOD = {
-    v: 21,
+    v: fiberVersion,
     index: 0,
     tool: 'agent_status',
     path: '/TobisComputer/mcp/agent_status',
@@ -12489,7 +12538,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 21,
+            v: fiberVersion,
             scanOk: true,
             rows: [],
             turns: [
@@ -12596,7 +12645,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 21,
+            v: fiberVersion,
             scanOk: true,
             rows: [{ ...GOOD, tool: 'read' }],
             turns: []
@@ -16855,7 +16904,7 @@ describe('the context meter and automatic compaction', () => {
             calls: binding.calls, codeModeCalls: codeModeCalls(), requests: index === 0 ? requests() : [], messages: [], activities: [] };
         });
         window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21,
+          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: fiberVersion,
           scanOk: currentCalls !== null, rows: [], turns
         } }));
       });
@@ -17209,6 +17258,25 @@ describe('the context meter and automatic compaction', () => {
 
     expect(ticketCalls).toBe(2);
     expect(live.sent.filter((message) => message.type === 'focus_tab')).toHaveLength(2);
+  });
+
+  it('takes a desktop Compact pickup it has not yet read about without a reload', async () => {
+    // VM 2026-10-09: the app hands the pickup ~90 ms after opening the ticket, before this page's
+    // feed carried the job. The page declined, the worker reloaded the chat, and the handoff request
+    // then met a composer that was not ready yet ("Send button or message box was not ready").
+    let opened = false;
+    live = await harness(undefined, {
+      activity: () => withContext(50_000, settings({ auto: false, threshold: 200_000 }),
+        opened ? { job: { ...automaticTicket('not-attempted').job, automatic: false } } : {})
+    });
+    live.hook.injectControl();
+    await live.hook.pullActivity();
+    await settle();
+    opened = true;
+    expect(await live.runtimeMessage({
+      type: 'clf-resume-compaction',
+      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    })).toEqual({ accepted: true });
   });
 
   it.each(['broken', 'streaming'] as const)('leaves a compaction pickup to the reload while the source answer is broken (%s)', async state => {
@@ -18165,7 +18233,7 @@ describe('the goal loop', () => {
       const nonce = event.data.nonce;
       live!.document.querySelector('[data-turn-id="finished-answer"]')!.setAttribute('data-clf-fiber-turn', `${nonce}:0`);
       win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 21, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: fiberVersion, scanOk: true, rows: [], turns: [{
           index: 0, conversationId: CHAT, turnId: 'finished-answer', endMessageId: 'finished-final', calls: [], activities: [],
           messages: [{ messageId: 'finished-final', rawMessageId: 'finished-final', stable: true, rawText: 'Completed answer.' }]
         }]
@@ -20345,7 +20413,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 21,
+            v: fiberVersion,
             scanOk: true,
             rows: [],
             turns: [{
@@ -20428,7 +20496,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 21,
+            v: fiberVersion,
             scanOk: true,
             rows: [],
             turns: [{
@@ -21626,7 +21694,7 @@ describe('app Stop command uses current native turn proof', () => {
       if (event.data?.source !== 'clf-fiber-ask') return;
       section.setAttribute('data-clf-fiber-turn', `${event.data.nonce}:0`);
       window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 21, scanOk: true, rows: [],
+        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: fiberVersion, scanOk: true, rows: [],
         turns: [{ ...terminal, index: 0, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', messages: [{
           messageId: 'late-final-message', stable: true, rawText: 'First words and the complete final answer.', renderedHtml: '<p>First words and the complete final answer.</p>'
         }] }]
@@ -21665,7 +21733,7 @@ describe('app Stop command uses current native turn proof', () => {
       }
       section.setAttribute('data-clf-fiber-turn', `${event.data.nonce}:0`);
       window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 21, scanOk: true, rows: [],
+        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: fiberVersion, scanOk: true, rows: [],
         turns: [{ ...terminal, index: 0, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', endMessageId: next === 'retry' ? null : terminal.endMessageId }]
       } }));
     };
@@ -21833,7 +21901,7 @@ describe('ordinary Continue native recovery', () => {
         if (mapped) section?.setAttribute('data-clf-fiber-turn', `${data.nonce}:0`);
         else section?.removeAttribute('data-clf-fiber-turn');
         win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: 21, scanOk: true, rows: [],
+          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: fiberVersion, scanOk: true, rows: [],
           turns: mapped ? [{
             index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: null,
             calls: [], messages: [{ role: 'assistant', messageId: 'native-progress', rawMessageId: 'native-progress',
@@ -21899,7 +21967,7 @@ describe('ordinary Continue native recovery', () => {
         if (mapped) section?.setAttribute('data-clf-fiber-turn', `${data.nonce}:0`);
         else section?.removeAttribute('data-clf-fiber-turn');
         win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: 21, scanOk: true, rows: [],
+          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: fiberVersion, scanOk: true, rows: [],
           turns: mapped ? [{
             index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: null,
             calls: [], messages: [{ role: 'assistant', messageId: 'native-progress', rawMessageId: 'native-progress',
@@ -21959,7 +22027,7 @@ describe('ordinary Continue native recovery', () => {
       queueMicrotask(() => {
         section.setAttribute('data-clf-fiber-turn', `${data.nonce}:0`);
         win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: 21, scanOk: true, rows: [], turns: [{
+          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: fiberVersion, scanOk: true, rows: [], turns: [{
             index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: null,
             calls: [], messages: [{ role: 'assistant', messageId: 'native-progress', rawMessageId: 'native-progress',
               stable: true, rawText: 'Inspecting the task.' }]
@@ -22009,7 +22077,7 @@ describe('ordinary Continue native recovery', () => {
     win.__CLF_CONTENT_RECORDER__.stop();
     win.CLF_TEST_HOOK = (api: Hook) => { live!.hook = api; };
     win.eval(contentSource.replace('const RECORDER_VERSION = 22;', 'const RECORDER_VERSION = 13;')
-      .replace('const FIBER_VERSION = 21;', 'const FIBER_VERSION = 12;'));
+      .replace(`const FIBER_VERSION = ${fiberVersion};`, 'const FIBER_VERSION = 12;'));
     await settle();
     userTurn(live.document, 'source', 'Complete the task');
     const section = assistantTurn(live.document, 'native-answer', []);
@@ -22024,7 +22092,7 @@ describe('ordinary Continue native recovery', () => {
       queueMicrotask(() => {
         section.setAttribute('data-clf-fiber-turn', `${data.nonce}:0`);
         win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: 21, scanOk: true, rows: [], turns: [{
+          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: fiberVersion, scanOk: true, rows: [], turns: [{
             index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: null,
             calls: [], messages: [{ role: 'assistant', messageId: 'native-progress', rawMessageId: 'native-progress',
               stable: true, rawText: 'Inspecting the task.' }]
@@ -22083,7 +22151,7 @@ describe('ordinary Continue native recovery', () => {
       const nonce = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${nonce}:0`);
       win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 21, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: fiberVersion, scanOk: true, rows: [], turns: [{
           index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: terminal ? 'native-terminal' : null,
           calls: [], activities: [], messages: terminal ? [{ role: 'assistant', messageId: 'native-terminal',
             rawMessageId: 'native-terminal', stable: true, rawText: scenario === 'image-only' ? '' : 'Finished the task.' }] : [progress]

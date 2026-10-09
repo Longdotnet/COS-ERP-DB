@@ -402,9 +402,10 @@ describe('the chat panel cards', () => {
 
   it('gives the session card one row per child, including its navigation row', () => {
     const card = document.getElementById('chatBody')!.closest('.card')!;
-    // Subhead, scrolling conversation, shared process/plan/queue dock, composer and footer.
+    // The chat's header, subhead, scrolling conversation, shared process/plan/queue dock, composer and footer.
     const layoutChildren = [...card.children].filter(child => child.id !== 'chatSettingsBtn');
-    expect(layoutChildren.length).toBe(5);
+    expect(layoutChildren.length).toBe(6);
+    expect(layoutChildren[0]!.classList.contains('chat-head')).toBe(true);
     const dockBody = document.getElementById('composerDock')!.firstElementChild!;
     expect(dockBody.classList.contains('composer-dock-body')).toBe(true);
     expect(dockBody.firstElementChild?.id).toBe('backgroundExecStatus');
@@ -660,6 +661,7 @@ describe('the window as a whole', () => {
     const horizontal = [...css.matchAll(/([^{}]+)\{[^{}]*overflow-x:\s*(?:auto|scroll)[^{}]*\}/g)];
     expect(horizontal.map(match => match[1]!.trim())).toEqual([
       '.msg.rich .markdown-table',
+      '.msg .math-display',
       '.file-panel-toolbar-actions',
       '.review-panel .file-changes-header-content',
       '.file-preview-markdown pre',

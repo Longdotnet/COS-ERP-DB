@@ -41,7 +41,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 21;
+  const VERSION = 22;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Retire it across versions too: picker/plugin replies use their own v1
@@ -99,8 +99,11 @@
   /** Aggregate authored text/HTML copied through MAIN -> isolated world in one scan. */
   const MAX_RESPONSE_TEXT = MAX_TURNS * 512 * 1024;
   const MAX_TURN_TEXT = 512 * 1024;
-  /** One live caption line; the full text is recorded once ChatGPT publishes its message. */
-  const MAX_PREVIEW_TEXT = 300;
+  /** A turn outline (`shellTurnTrace`): items, one sentence block, one recap, and all of its text. */
+  const MAX_TRACE_ITEMS = 400;
+  const MAX_TRACE_SAY = 8000;
+  const MAX_TRACE_RECAP = 300;
+  const MAX_TRACE_TEXT = 128 * 1024;
 
   function budgetedText(value, budget, perValueLimit) {
     if (typeof value !== 'string' || !value || !budget || budget.remaining <= 0) return '';
@@ -1917,18 +1920,113 @@
     rendered.sort((a, b) => a.order - b.order);
     return { events, notifications: [] };
   }
-  /** The newest public preamble of a running shell turn whose source message ChatGPT has not
-   * published (#942: a new chat's first turn keeps them out of every mapping until history is
-   * fetched again). Presentation only: no identity, never recorded, gone once the turn ends or
-   * its source message becomes readable and is recorded the ordinary way. */
-  function shellLivePreview(shell, metadata) {
-    if (shell.endMessageId) return null;
-    const preambles = shell.entry.turn.items.flatMap(item => item?.type === 'chatgpt-reasoning-group' &&
-      Array.isArray(item.items) && item.reasoningRecap?.type !== 'hide_all' ? item.items : []).filter(item => item?.type === 'reasoning' &&
-        item.isTransient !== true && item.presentation === 'preamble' && typeof item.content === 'string');
-    const newest = preambles.at(-1);
-    if (!newest || metadata.some(source => source.preamble === newest.content)) return null;
-    return budgetedText(visibleText(newest.content), { remaining: MAX_PREVIEW_TEXT }, MAX_PREVIEW_TEXT) || null;
+  /** A reply that is nothing but content references to other messages. */
+  const ONLY_CONTENT_REFERENCES = /^\s*(?:::chatgpt-content-reference\{[^}\n]*\}\s*)+$/;
+  /**
+   * The Markdown a shell item says. ChatGPT's newer renderer (DIL, GPT-6 on 2026-10-08) leaves
+   * only `::chatgpt-content-reference{…}` in `content` and keeps the reply itself as
+   * `fallbackMarkdown` on the one `dil` reference that names this same message: the text the page
+   * shows when its widget cannot render, so the text the model wrote. Anything else keeps its
+   * content as it is.
+   */
+  function shellItemText(item) {
+    const content = typeof item?.content === 'string' ? item.content : '';
+    if (!ONLY_CONTENT_REFERENCES.test(content)) return content;
+    const id = str(item.messageId);
+    const own = (Array.isArray(item.contentReferences) ? item.contentReferences : []).filter(reference =>
+      reference?.type === 'dil' && id && reference.source_message_id === id &&
+      typeof reference.model_dil_v2?.fallbackMarkdown === 'string' && reference.model_dil_v2.fallbackMarkdown.trim());
+    return own.length === 1 ? unescapeFallbackMarkdown(own[0].model_dil_v2.fallbackMarkdown).slice(0, MAX_RENDERED_TEXT) : content;
+  }
+  /**
+   * The reply as the model wrote it. `fallbackMarkdown` keeps its formatting but backslash-escapes
+   * every literal punctuation mark in plain text (measured on GPT-6, 2026-10-09: `2\^10 = 1024 \[ok\]`,
+   * and the Goal marker as `\[\[COS\_GOAL:COMPLETE\]\]`), while code spans and fenced code keep
+   * theirs verbatim. Every reader of a reply (Goal markers, Loop decisions, compaction briefs) expects
+   * the model's own text, so outside code each `\` before ASCII punctuation is dropped, as Markdown
+   * itself would on rendering.
+   */
+  function unescapeFallbackMarkdown(markdown) {
+    let fence = null;
+    return markdown.split('\n').map(line => {
+      const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+      if (fence) {
+        if (marker && marker[0] === fence[0] && marker.length >= fence.length && !line.slice(line.indexOf(marker) + marker.length).trim()) fence = null;
+        return line;
+      }
+      if (marker && !(marker[0] === '`' && line.slice(line.indexOf(marker) + marker.length).includes('`'))) { fence = marker; return line; }
+      let out = '';
+      for (let at = 0; at < line.length;) {
+        const char = line[at];
+        if (char === '\\' && /[!-\/:-@[-`{-~]/.test(line[at + 1] || '')) { out += line[at + 1]; at += 2; continue; }
+        if (char === '`') {
+          const run = /^`+/.exec(line.slice(at))[0];
+          const close = new RegExp(`(?<!\`)${run}(?!\`)`).exec(line.slice(at + run.length));
+          if (close) { const end = at + run.length + close.index + run.length; out += line.slice(at, end); at = end; continue; }
+          out += run; at += run.length; continue;
+        }
+        out += char; at++;
+      }
+      return out;
+    }).join('\n');
+  }
+  /**
+   * The provider's own outline of a shell turn's work, in its order: what the model said between
+   * steps, each call of this app's connectors, and the recap ChatGPT closes each round with.
+   *
+   * ChatGPT draws a turn's work as reasoning groups. Inside one, a round is the model's sentences
+   * (`assistant-message` items under GPT-6, id-less `reasoning` preambles under GPT-5.x), its calls,
+   * and a public `thought` that recaps them ("Created the test files"). In a new chat's first turn
+   * none of the sentences or recaps reach any message mapping (#942), so the outline is the only
+   * place they exist while the turn runs. It is presentation: it names no message the recorder
+   * does not already know, and the app places its recorded calls in rounds by tool and order
+   * (renderer/timeline-rounds.ts), never by an id. Hidden groups and transient reasoning stay out.
+   */
+  function shellTurnTrace(shell) {
+    const out = [], budget = { remaining: MAX_TRACE_TEXT };
+    for (const item of shell.entry.turn.items) {
+      // The turn's answer stands outside its rounds; naming it keeps it from reading as one more sentence.
+      if (item?.type === 'assistant-message' && item.phase === 'final_answer' && str(item.messageId)) {
+        out.push({ kind: 'answer', id: str(item.messageId) });
+        continue;
+      }
+      if (item?.type !== 'chatgpt-reasoning-group' || !Array.isArray(item.items) || item.reasoningRecap?.type === 'hide_all') continue;
+      for (const step of item.items) {
+        if (out.length >= MAX_TRACE_ITEMS) return out;
+        if (step?.type === 'assistant-message') {
+          const text = shellItemText(step).trim();
+          if (!text || ONLY_CONTENT_REFERENCES.test(text)) continue;
+          const id = str(step.messageId), said = budgetedText(text, budget, MAX_TRACE_SAY);
+          if (said) out.push({ kind: 'say', ...(id ? { id } : {}), text: said, done: step.completed === true });
+        } else if (step?.type === 'reasoning' && step.isTransient !== true && typeof step.content === 'string' && step.content.trim()) {
+          if (step.presentation === 'preamble') {
+            const said = budgetedText(step.content.trim(), budget, MAX_TRACE_SAY);
+            if (said) out.push({ kind: 'say', text: said, done: step.completed !== false });
+          } else if (step.presentation === 'thought') {
+            const recap = budgetedText(visibleText(step.content), budget, MAX_TRACE_RECAP);
+            if (recap) out.push({ kind: 'recap', text: recap });
+          }
+        } else if (step?.type === 'mcp-tool-call' && OUR_APPS.some(app =>
+            step.invocation?.server === app || step.invocation?.server === app.replaceAll(' ', '_'))) {
+          const id = str(step.callId), tool = toolName(step.invocation?.tool);
+          if (id && tool) out.push({ kind: 'call', id, tool, done: step.completed === true });
+        } else if (step?.type === 'dynamic-tool-call' && step.tool === 'exec') {
+          // ChatGPT's own code mode: one item for any number of this app's calls it makes.
+          const id = str(step.callId);
+          if (id) out.push({ kind: 'exec', id, done: step.completed === true });
+        }
+      }
+    }
+    // What ChatGPT says the turn is doing right now ("Comparing three layouts…"): the open thought of
+    // the newest group, which becomes that round's recap once it closes. Only while the turn runs.
+    if (shell.entry.turn.status !== 'complete') {
+      const groups = shell.entry.turn.items.filter(item => item?.type === 'chatgpt-reasoning-group' && item.reasoningRecap?.type !== 'hide_all');
+      const active = groups.at(-1)?.activeReasoning;
+      const now = active && active.completed !== true && active.isTransient !== true && active.presentation === 'thought' &&
+        typeof active.content === 'string' ? budgetedText(visibleText(active.content), budget, MAX_TRACE_RECAP) : '';
+      if (now) out.push({ kind: 'now', text: now });
+    }
+    return out;
   }
   /** Translate only publicly identified items in the mounted exchange. Missing item ids
    * stay missing; a stopped turn does not manufacture replies to its tool calls. */
@@ -1948,7 +2046,7 @@
         const user = item.type === 'user-message', id = str(item.messageId) || (user ? str(item.serverMessageId) : null);
         if (!id) continue;
         if (!remember(id) || (user && item.serverMessageId && item.messageId && item.serverMessageId !== item.messageId)) return null;
-        const role = user ? 'user' : 'assistant', text = user ? item.message : item.content;
+        const role = user ? 'user' : 'assistant', text = user ? item.message : shellItemText(item);
         const final = !user && item.phase === 'final_answer';
         if (final) lastAnswer = item;
         const completed = final && item.completed === true && entry.turn.status === 'complete';
@@ -2120,7 +2218,7 @@
         const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes, shell?.images);
         const activities = nativeActivities.events;
         const endMessageId = shell ? shell.endMessageId : turnEndMessageId(messages);
-        const preview = shell ? shellLivePreview(shell, metadata) : null;
+        const trace = shell ? shellTurnTrace(shell) : [];
         // The shell supplies the completed final item's own exact message id,
         // without the classic thought-parent/timestamp tuple. Preserve that
         // identity for handoff capture; streaming and cancelled items stay weak.
@@ -2132,7 +2230,7 @@
           codeModeCalls.length === 0 && calls.length === 0 &&
           requests.length === 0 &&
           renderedMessages.length === 0 &&
-          activities.length === 0 && nativeActivities.notifications.length === 0 && generatedImages.length === 0 && !endMessageId && !preview
+          activities.length === 0 && nativeActivities.notifications.length === 0 && generatedImages.length === 0 && !endMessageId && trace.length === 0
         ) continue;
         const index = out.length;
         entry = {
@@ -2149,7 +2247,7 @@
           activities,
           thoughtNotifications: nativeActivities.notifications,
           images: generatedImages,
-          ...(preview ? { preview } : {})
+          ...(trace.length ? { trace } : {})
         };
         // The isolated-world renderer needs to know which visible section this exact Fiber
         // turn descriptor came from. Remember the desired ephemeral scan index now and apply
@@ -2408,6 +2506,12 @@
     return /^(?:pro|(?:gpt-?)?\d+(?:[.-]\d+)?-pro)$/.test(normalized);
   }
 
+  /** A shell lane's transport effort when its label is translated. The Extra High lane sends max
+   * (English and German pages alike, 2026-10-09), as the September picker's non-Work max did. */
+  function shellLaneTransportEffort(value) {
+    return ({ none:'none', minimal:'minimal', low:'low', medium:'medium', high:'high', xhigh:'xhigh', max:'xhigh' })[value] ?? null;
+  }
+
   // The native closed picker does not mount composerIntelligencePickerState.
   // Its own ancestor carries the current execution model; its visible label
   // carries the selected effort. These are observation, never catalog discovery.
@@ -2422,9 +2526,12 @@
       // The shell picker's selected lane carries the visible effort name: the machine
       // attribute reports its transport value (medium/max) for Pro/Extra High lanes.
       const sel = fiber.memoizedProps?.selectedPowerSelection ?? fiber.memoizedProps?.selectedLabelCandidate;
-      if (lane === null && sel) lane = { model: sel.model,
-        effort: ({ instant:'none', minimal:'minimal', low:'low', medium:'medium', high:'high',
-          'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[String(sel.labels?.effort ?? sel.sliderLabel ?? '').trim().toLowerCase()] ?? null };
+      if (lane === null && sel) {
+        const caption = String(sel.labels?.effort ?? sel.sliderLabel ?? '').trim().toLowerCase();
+        lane = { model: sel.model,
+          effort: ({ instant:'none', minimal:'minimal', low:'low', medium:'medium', high:'high',
+            'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[caption] ?? (caption ? shellLaneTransportEffort(sel.reasoningEffort) : null) };
+      }
       const current = fiber.memoizedProps?.currentModelId;
       if (current === undefined) continue;
       if (typeof current !== 'string' || !/^[a-zA-Z0-9._-]{1,80}$/.test(current) || (model && model !== current)) return null;
@@ -2492,19 +2599,38 @@
       // The machine reasoningEffort is a lane's transport setting, not its identity: the
       // Pro and Extra High lanes still report medium/max. The lane's visible label is what
       // the picker offers, matching readPickerSnapshot's modelLane/thinkingEffort mapping.
+      // A translated label ("Sehr hoch") falls back to that transport value, where max is Extra High.
       const laneEffort = c => shellProExecutionModel(c?.model) ? 'pro' :
-        effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ?? effort(c?.reasoningEffort);
+        effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ??
+        ((c?.labels?.effort ?? c?.sliderLabel) ? shellLaneTransportEffort(c?.reasoningEffort) : effort(c?.reasoningEffort));
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
       const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
+      // The shell names older models by number alone ("5.6"); the September picker's own rule
+      // names them in full, so the list reads GPT-6, GPT-5.6, GPT-5.5 alike.
+      const modelName = value => { const name = label(value); return name && /^\d/.test(name) ? `GPT-${name}` : name; };
       const choices = p.powerSelections.map(c => ({ bucket: c?.powerSettingIndex, id: id(c?.model),
-        label: label(c?.modelLabel), familyId: id(c?.model), familyLabel: label(c?.modelLabel), effort: laneEffort(c),
+        label: modelName(c?.modelLabel), familyId: id(c?.model), familyLabel: modelName(c?.modelLabel), effort: laneEffort(c),
         available: p.modelSelectionDisabled !== true && c?.disabled !== true &&
           (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }));
       if (!version || !versions.length || versions.some(v => !v.id || !v.label) || !choices.length ||
           choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length || !versions.some(v => v.id === version)) return null;
+      // One model's Instant and thinking lanes are separate slugs under one name (gpt-6 and
+      // gpt-6-thinking, both "GPT-6"; observed 2026-10-07). They are one family, as the September
+      // picker had them, so the effort control offers Instant, Medium and High together. Lanes join
+      // only under one name in this version and with distinct efforts: a mixed group never merges.
+      // GPT-6's Instant lane is ChatGPT's automatic `gpt-6`, which its server may answer with the
+      // thinking lane; the fixed `gpt-6-instant` exists but no native view offers it (2026-10-08).
+      for (const name of new Set(choices.map(c => c.label))) {
+        const lanes = choices.filter(c => c.label === name);
+        if (lanes.length < 2 || new Set(lanes.map(c => c.effort)).size !== lanes.length) continue;
+        const shared = lanes.map(c => c.id).reduce((a, b) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return a.slice(0, i); })
+          .replace(/[-._]+$/, '');
+        const family = id(shared) && /\d/.test(shared) ? shared : lanes[0].id;
+        for (const lane of lanes) lane.familyId = family;
+      }
       const matches = choices.filter(c => c.id === id(selected.model) && c.effort === laneEffort(selected));
       if (matches.length !== 1 || (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)) return null;
       return { version, currentBucket: matches[0].bucket, versions, choices };

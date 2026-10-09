@@ -202,7 +202,7 @@ define the tool/config/wire contract. README and worklogs are secondary and can 
 | Strict chat allowlist | Off. | When on, every model-facing tool call needs exact attribution. Existing/direct browser chats require explicit Trust from the chat list. A fresh chat opened by the CoS composer gains an explicit Trust entry only after its exact opening row authoritatively binds to the new conversation. Broker-owned workers follow their exact owning prime and a committed Compact & Resume successor follows its durable source lineage. Block still wins, revocation is dynamic, and unattributed calls are refused even when the ordinary unattributed allowance is on. |
 | Recover ordinary/agent tabs | Off. | Goal/Loop can independently justify recovery; history alone cannot. |
 | Automatic Continue | On. | Unfinished-response recovery also serves enabled Goal/Loop. This switch controls ordinary chats; explicit Off survives and malformed config disables it. See §14. |
-| Goal / Loop | Off, preferred mode Goal. Both decision backends default to ChatGPT, helper `gpt-5.6-sol` High. | API uses the configured OpenRouter/custom endpoint and stored model. These defaults are not account-availability proof. |
+| Goal / Loop | Off, preferred mode Goal. Both decision backends default to ChatGPT, helper `gpt-6-thinking` High (`DEFAULT_HELPER_CHAT_MODEL`); a config holding the superseded `gpt-5.6-sol` adopts it on load. | API uses the configured OpenRouter/custom endpoint and stored model. These defaults are not account-availability proof. |
 | Ordinary new-chat model | Automatic: no persisted model or reasoning override. | Optional `ui.defaultChatModel` / `ui.defaultChatReasoning` apply only to a fresh ordinary chat before it has a conversation selection. A recorded conversation or accepted opening input wins. Worker and Goal/Loop/Plan defaults remain separate. |
 | Desktop | Windows on; macOS retains its off default and separate native OS consent; Linux supports extension browser control. | Existing screen/control grants also govern browser tools; unsupported native clipboard remains masked. No new per-tab permission dialog. |
 | Shell/UI | Dark theme, minimize to tray, no automatic connector connection/login startup by default. | Optional browser/finish/plan choices are resolved by current config and their consumer, not invented from absent fields. |
@@ -262,6 +262,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Exact request ownership | `correlation.ts` / `state/request-correlations.json` plus recorded proof | First exact proof wins; retain local session epoch; new owners are written before browser ACK. Startup trusts a complete ledger and scans history only to migrate an older one. |
 | Running exec process | `UnifiedExecProcessManager` process memory plus `codex/ownership.ts` custody | The manager is the only live-process authority. A yielded child may start under temporary request custody; exact correlation promotes it to the durable session. IPC/preload/renderer only project that owner-scoped state and may request an ownership- and incarnation-checked stop. |
 | Authored message | `store.ts` / canonical message shard | Replace by stable identity, preserving origin chronology. |
+| Turn round outline | `recorder.ts` `turn_trace` → `store.ts::writeTurnTrace` / `sessions/<id>/traces/<turnId>.json` | Validated by `shared/turn-trace.ts`; the newest outline replaces the turn's; never an event or evidence. |
 | Agent progress plan | `request-plans.ts` → `store.ts::updateSessionPlan` / `sessions/<id>/plan.json` | Request-scoped storage before proof; exact session and invocation ordering on attachment; atomically replace the whole plan. |
 | Input and checkpoints | `input.ts` / `state/session-input.json` | Serialized acceptance, frozen payload, exclusive claim and receipt; stages belong here. |
 | Native upload originals | `input-attachments.ts` / `input-attachments/` | Immutable bytes, opaque ids; outbox owns membership and retention. |
@@ -1124,6 +1125,12 @@ plain names. ChatGPT records a connector's calls under the exact name typed (cal
   `TobisComputer`), never a prefix, so one computer never records or attributes the other's calls.
 - `usage.js` reports every Core-like app from the page's system hints; the content script mentions
   the one with this install's exact name, and none when it is missing or ambiguous.
+- A fresh tab can send before its own system hints arrive. The extension remembers the app id a page
+  reported for this install's exact Core name (`ownCoreApp` in local storage, handed out with
+  `status`) and forgets it when a page's complete plugin list lacks the Core; until the page lists
+  its own apps, that sighting supplies the mention. Without it a worker's first message went out with
+  no mention, and in a shared workspace ChatGPT routed its calls to the other computer's plain Core
+  (seen live, 2026-10-07). Only the page's own list counts as the `core_plugin` report.
 - Plugin refresh treats any "Chat On Steroids Plugins (…)" as the Plugins kind for its action limits.
 - Worker protocol text (the brief and wake-up messages) names this install's exact Core when a
   suffix is set, and the "no run" refusal names the Core that answered: a worker told only "the
@@ -1520,6 +1527,7 @@ userData/sessions/<local-id>/
   meta.json             recoverable projection plus durable ownership/project facts
   meta.backup.json      last validated metadata checkpoint
   plan.json             current agent-maintained plan
+  traces/<turnId>.json  each turn's round outline as ChatGPT showed it (presentation only)
   assets/               bounded binary and overflow material
   handoffs/             exact captured briefs and provenance
 ```
@@ -2099,11 +2107,12 @@ fresh New Chat scope with no per-conversation selection. Once a conversation or 
 input records a model/effort, that exact selection takes precedence. `multiAgent.default*` and
 `goal.helper*` continue to own worker and Goal/Loop/Plan helper defaults independently.
 
-Model names and recovery policy checked against native picker metadata on **2026-09-17**:
+Model names and recovery policy checked against native picker metadata on **2026-09-17**; GPT-6 lanes observed on **2026-10-07**:
 
 | Display family / compatible short name | Execution identity / selected effort | Silence refresh |
 | --- | --- | --- |
-| GPT-5.6 Sol / 5.6 Sol / Sol | `gpt-5-6`, `gpt-5-6-thinking`; Instant/Medium/High | 2 minutes, then 1 minute listening after confirmed refresh |
+| GPT-6 / 6 | `gpt-6` (Instant: ChatGPT's automatic lane, which decides per answer whether to reason), `gpt-6-thinking` (Medium/High) | 2 minutes, then 1 minute listening |
+| GPT-5.6 Sol / GPT-5.6 / 5.6 Sol / Sol | `gpt-5-6`, `gpt-5-6-instant`, `gpt-5-6-thinking`; Instant/Medium/High | 2 minutes, then 1 minute listening after confirmed refresh |
 | GPT-5.5 / 5.5 | `gpt-5-5-instant`, `gpt-5-5-thinking`; non-Pro efforts up to High | 2 minutes, then 1 minute listening |
 | Any non-Pro family at Extra high / Max / Ultra | selected `xhigh`, `max` or `ultra` effort | 20 minutes (Thinking failed: 2), then 1 minute listening |
 | GPT-5.6 Pro / 5.6 Pro; GPT-5.5 Pro / 5.5 Pro | `gpt-5-6-pro`, `gpt-5-5-pro`, or an explicitly selected `pro` effort | 10 minutes |
@@ -2138,9 +2147,19 @@ The alternate shell uses an id-less editable textbox under `form[data-chatgpt-co
 `data-model-picker-view` for its portal. Its evaluated `powerSelections`, current selection and
 version options normalize into the same bounded picker snapshot. Mixed-version powers retain
 their execution ids rather than merging unrelated models into a synthetic Latest family.
+Within one version, lanes under one name with distinct efforts (GPT-6's `gpt-6` Instant and
+`gpt-6-thinking` Medium/High) form one family keyed by their shared slug prefix, with each lane
+as an alias, so the composer offers Instant, Medium and High together and each effort still
+selects its own lane. A colliding effort keeps the lanes apart. A name given by number alone
+reads in full (5.6 is GPT-5.6), as in the September picker.
+GPT-6's Instant position is ChatGPT's automatic lane, not a fixed model (observed 2026-10-08): the
+picker sends `gpt-6` ("chooses how long to think"), and ChatGPT's server answers with `gpt-6` or
+switches to `gpt-6-thinking` without an effort, as it judges each request. The account also lists
+a fixed `gpt-6-instant` ("immediate answers"), but no picker view offers it and `?model=` does not
+select it; the app offers exactly what the native picker offers and never substitutes a hidden slug.
 Ambiguous triggers and unrecognized state remain unknown. MAIN helper replacement removes the
 previous listener across protocol versions, because the picker/plugin reply protocols are shared.
-The matched recorder/MAIN helper version is 21. Shell exchanges are read only under the native
+The matched recorder/MAIN helper version is 22. Shell exchanges are read only under the native
 main/thread anchors. Their `entry.turn.items` supply actual user/assistant ids, public text and
 per-call completion; DOM slot keys only join those exact items to the current scan. Missing ids
 do not become invented messages. Only a completed final item in a successfully completed turn
@@ -2261,6 +2280,11 @@ document, navigation epoch and conversation in the existing session-storage snap
 lifecycle event carries a non-manual departure through the close outbox; it does not create
 recovery authority. Main still requires eligible outstanding work. Failed removals and unknown
 origins remain conservative, and a later manual close supersedes a pending automatic departure.
+The same non-manual departure covers a chat leaving the exact document the extension borrowed
+for a new chat (#1180), or whose page reported ChatGPT's "could not be loaded" surface
+(`load_failure`, sent at most every 30 s while it shows): its Retry may take the tab to the home
+page without anyone deciding to close the chat (#1086). Both records (`tabReuses`) are spent on first
+use and trusted for two minutes.
 An unexpected lost/discarded page retains its existing recovery contract. A newer observation
 of the exact departed page clears the dismissal; unresolved work reuses its last exact MCP
 timestamp and normal deadline. A tab close never fabricates provider completion.
@@ -3031,11 +3055,26 @@ undelivered messages, page absence, manual departure, Stop and current recovery 
 Only a live broker slot grants or refuses worker recovery; parked prime history cannot veto
 a later ordinary turn. Tests: `bridge.test.ts`, including cancellation during the storage read.
 
-Revival reserves the new assignment with its current inbox task preview, a neutral worker-id
-label and no completion result. The previous spawn label/result must not describe new work.
+Revival reserves the new assignment with its current inbox task preview and no completion
+result. An omitted message label preserves the worker name. The prime can explicitly supply
+`messages[].label` (1–60 characters, ideally 1–3 words) when messaging a sleeping worker with a
+new job; the single to+text form has none, which keeps the agents schema inside its measured
+byte budget (`mcp.test.ts`) without trimming existing guidance. Labels cannot rename active workers or primes; conflicting
+names in one batch are rejected before mutation. The app does not infer task identity from prose.
 Rejected acceptance restores that prior metadata; accepted work keeps its new metadata even
 if browser wake fails. Historical reports remain in the prime inbox and recorded history.
 A worker proving it never stopped clears its obsolete result while retaining the same task.
+The local UI swarm projection also includes dormant workers in `retainedWorkers`, so parking
+a family preserves its displayed name and task. The panel matches the exact worker conversation;
+caller/model status remains scoped separately.
+After a critical broker snapshot is written, its bounded name/task presentation is projected into
+the exact worker session's `workerAssignment`, in the background: neither the acceptance barrier
+nor startup waits on it, and unchanged workers skip the store. Startup projects the saved snapshot
+itself, so families its restore prunes as expired keep their names. The session archive supplies historical labels/tasks after broker eviction;
+it never grants slots, routing or revival authority, and a failed broker write projects nothing.
+Legacy plain-text briefs with multiple `Your task:` boundaries remain intact rather than guessing
+which authored section to discard. The panel shows tool activity only when its recorded timestamp
+is newer than the last finish report and turn end, and belongs at or after the current turn start.
 
 After a worker reaches its own 400k estimated-context ceiling, its next stop becomes terminal
 and it is no longer reusable. Do not interrupt its current useful work merely for that ceiling.
@@ -3374,6 +3413,16 @@ scheduled refresh rereads the selected transcript only when it is named, all tra
 invalidated, or its refreshed summary's `updatedAt`/`events` differ from those its last live-tail
 read was requested against; manual/visible refreshes still reread. Losing the selected row from the catalog clears its transcript.
 
+Setup's Access step (after Folder) offers Full access, Files and terminal, and Read only, and
+under them, folded, the Workspace permission surface itself: `placePermissions` moves that one
+DOM surface into Setup while Setup is shown, so there is never a second permission control or
+store. Any choice completes the step; read-only or a mix without create/edit/command still ends
+on all set, but Ready marks the access row and says how to change it. A recovered (unreadable)
+settings file reports `settingsRecovered` until read-only is switched off. The unavailable
+Desktop card links to the same step. Fresh installs start with automatic plugin refresh on;
+older and recovered configs keep it off. `scripts/verify-setup-access.cjs` checks the shared
+surface, the saves and Ready in the production renderer.
+
 First-run Setup keeps the six-step flow, with reviewed screenshots in `renderer/setup-images/`
 and translated numbered highlights in `renderer/setup-guide.ts`. Sensitive identifiers must
 be removed from asset pixels before inclusion; an HTML overlay is never a privacy boundary.
@@ -3435,11 +3484,31 @@ paged transcript. Main owns durable mutation acknowledgements; renderer optimism
 receipt. Native edit context menus respect the focused editable control and selection.
 The timeline retains each exact tool row. It folds five or more consecutive successful agent
 status checks or waits on the same process inside the existing activity disclosure, preserving
-each row on expansion; a failed call breaks the fold. An immediately preceding recorded progress
-line may title that disclosure as the observed activity phase. Tool diff counts and shell/result
+each row on expansion; a failed call breaks the fold. Tool diff counts and shell/result
 headers are projections of recorded data, not new execution or completion evidence.
-A working turn's timeline ends with one live row: the call this app is running for the chat,
-else a step ChatGPT's page names in the progressive, else Thinking. `sessions:runningTools`
+A turn's work reads in rounds, as ChatGPT draws it (`renderer/timeline-rounds.ts`, pure). A round
+is what the model said before a step, the step's activity (this app's calls, ChatGPT's own steps,
+agent messages) and the recap ChatGPT closes it with. The sentences stand as prose in the interim
+style; the activity folds under one disclosure titled with the recap and a check once the round is
+done, else with its latest action; a lone action without a recap stays its own row. The rounds come
+from the turn's outline when one was recorded (`shared/turn-trace.ts`): its sentences, recaps and
+answer id in ChatGPT's order. Recorded calls are aligned with the outline's calls as the longest
+order-preserving match on tool name, preferring calls that started within 90 s of when the page
+first showed them; ChatGPT can show calls that never reached this app (a 22-minute turn on
+2026-10-07 showed 106 and recorded 92), so unmatched outline calls stay unmatched. A recorded call
+the outline does not show joins ChatGPT's code-mode `exec` between its aligned neighbours, the
+newest round once the outline has moved on, else its predecessor's round. Other rows follow the row
+recorded before them; a recorded interim message the outline shows is used in its place, and a
+native step whose label equals an outlined recap is not repeated (late recaps were recorded after the
+answer). Without an outline, each interim message or ChatGPT caption opens a round and a native step
+ending a finished round titles it, by position. Disclosures are keyed by turn and round, reuse the
+node their rows already sit in when paging moves a round's start, and rounds drawn after a chat's
+first paint enter with a short fade (none under reduced motion).
+A working turn's timeline ends with one live row: ChatGPT's own words for what the turn is doing
+(the outline's `now`, in the page's language), wearing the icon and clock of a call this app runs
+meanwhile; else that running call by its own caption; else a step ChatGPT's page names in the
+progressive; else Thinking. ChatGPT shows only a generic Thinking during a turn's first stretch of
+reasoning too (observed 2026-10-08); its words appear once a round is under way. `sessions:runningTools`
 answers it from `mcp/call-context.ts` `runningToolActivity`, whose caption the kernel builds
 from the call's arguments when it starts. It shares one ownership rule, `exactOwner`, with
 `runningToolProgress`: a call counts for a chat by its placed conversation or, while it still
@@ -3448,17 +3517,32 @@ runs, by the page's exact proof of its request id (`requestCorrelation`, install
 a second while the chat works. The row is presentation only: it records nothing and is not
 completion evidence. Page step labels are recognised by English wording; in other languages
 the row says Thinking.
-Between the running call and the page step, the row shows the running turn's newest
-unpublished sentence (#942). In a new chat's first turn ChatGPT draws the model's preambles from
-id-less view items and keeps their messages out of every mapping until history is fetched again.
-fiber.js reports the newest such preamble as the turn descriptor's optional `preview` (at most
-300 characters, only while the turn has no end message and only when no readable source message
-matches it). content.js forwards it as `live_preview` for the generation it owns and clears it
-at `finishGeneration`. background.js relays it to `POST /live-preview`, and `/closed` also clears
-it. `src/main/live-preview.ts` holds it in memory, dropping it after ten minutes without a
-refresh. `sessions:livePreview` (preload `livePreview`) returns it beside `sessions:runningTools`.
-It is a caption only: it is never recorded and never becomes a message id, so the sentence is
-recorded once, in its place, when ChatGPT publishes it.
+The live row never shows the model's prose; its sentences belong to the timeline (#942). In a new
+chat's first turn ChatGPT keeps them, and each round's recap, out of every message mapping until
+history is fetched again, so fiber.js reads the turn's outline from the shell's `entry.turn.items`
+(`shellTurnTrace`): `say` (GPT-5.x id-less `reasoning` preambles, or GPT-6 `assistant-message`
+items inside a reasoning group with their own id), `call` (this app's connectors, with ChatGPT's
+call id and tool), `exec` (ChatGPT's code mode), `recap` (a public `thought`), the top-level
+`answer` id, and, only while the turn runs, `now`: the newest group's open `activeReasoning`
+thought, which ChatGPT shows as the turn's status line and later closes into that round's recap.
+Hidden groups and transient reasoning stay out. Bounds: 400 items, 8,000 characters a
+sentence, 300 a recap, 128 KiB in all. content.js revalidates it (`turnTraceOf`), stamps each call
+with when this document first showed it (`at`, only for the generation it runs live), and sends
+`turn_trace` for an owned local turn whenever it changes, coalescing unsent ones; a settled turn
+read after a reload sends its outline too, which is how recaps that arrived late find their rounds.
+The bridge validates it (`shared/turn-trace.ts`), and the recorder stores it per turn in
+`sessions/<id>/traces/<turnId>.json`, replacing the turn's previous outline. It is presentation
+beside the log, never an event, message, call, work or completion evidence. `sessions:traces`
+(preload `turnTraces`) returns the outlines of up to 64 turns a timeline shows. A DIL reply whose
+`content` is only `::chatgpt-content-reference{…}` naming itself is read as the `fallbackMarkdown`
+of that one `dil` reference (`shellItemText`), so its recorded text is the reply rather than the
+directive. In that Markdown the timeline shows an `entity` widget as its name in bold and drops
+widgets it cannot draw (`image_group`). Formulas render with KaTeX (`renderer/math.ts`): `\( … \)`
+inline and `\[ … \]` or `$$ … $$` as a block, the shapes ChatGPT writes; a lone `$` stays text. The
+Markdown pass leaves only a placeholder, the message is sanitised as usual, and each placeholder
+then becomes KaTeX's rendering of the original source with `trust` off, so a formula cannot add
+links, classes or styles. Source KaTeX cannot parse, or longer than 8,000 characters, shows as
+written; a wide block formula scrolls on its own.
 Setup's Show/Hide guide button stays available even while setup is incomplete. Manual collapse
 survives status pushes. Profile management stays out of first-run Setup: a compact row below
 Language in Appearance has a dropdown, a plus button with a name dialog and a delete button
@@ -3692,12 +3776,29 @@ The bottom dock has no generic shortcut screen or second tool tab strip; Termina
 tabs and `+` menu there. Both `+` controls follow the last tab, not the far edge of the bar.
 Hiding Files retires its watches without discarding an unsaved draft. Hiding the bottom dock
 does not retire its PTYs; closing a terminal tab does. Closing the last bottom tab hides that
-dock. The top-right control group orders right expansion (shown only while right is open),
-bottom, then right; the latter two buttons toggle their panels. There is no separate right-dock
-close button. Layout controls grant no new file, terminal or worker authority.
+dock. The layout control group sits at the right end of the title bar (`.app-topbar`) and orders
+right expansion (shown only while right is open), bottom, then right; the latter two buttons toggle
+their panels. Where the system's caption buttons share that end (Windows), the bar's resolved right
+padding marks the group `.is-beside-caption` and a divider separates the two. There is no separate
+right-dock close button. Layout controls grant no new file, terminal or worker authority.
+The chat's header (title, project, Install update) is the first row of the chat column
+(`.chat-head` in `.card.is-session`), not a row above the workspace, so the right dock runs from
+the title bar to the bottom with one unbroken edge and needs no compensation. Expanded, the dock
+covers the column, header included, and takes the sidebar's rounded corner while it rests there
+or moves to or from it.
 The sub-agent overview starts directly with Active and History, without a heading or close X.
 History appends the failed-worker count only when it is nonzero; the existing group counts remain unchanged.
-Each worker row also projects its recorded tool-call count and the newest bounded tool activity
+Each worker is one plain row, not a boxed card: its tinted identity avatar carries the state (a
+presence dot; while working, the connection capsule's traveling light around it), then name and
+elapsed time, the task, and one line of facts: state, the model as the composer names it (no
+thinking reads Instant, never "none"), the action count once there is one, and Degraded only when
+it is (a failed worker already says so). The name is the label the prime gave the worker (the
+agents tool asks for 1-3 words), else "Worker 2"; the id stays in the avatar and the row's
+tooltip, since the prime and the chat address workers by it. The task is the worker's own: the
+run's shared context, which opens every brief alike (`src/shared/worker-brief.ts`), is left out
+there and in a worker chat's title. The
+newest tool activity shows, in the turn's sheen, only while the worker works. Each worker row
+also projects its recorded tool-call count and the newest bounded tool activity
 from the session summary. The store owns that compact latest-activity projection and preserves
 event-time order when late attribution repairs append older calls, so the overview never loads
 every worker transcript just to paint one line. These fields are read-only telemetry; lifecycle,
@@ -3705,7 +3806,8 @@ scheduling, messaging and execution authority remain with the existing broker/to
 Its tab close or Escape closes the pane; a selected worker retains its title and Back button.
 Each collapsed activity round that used workers shows one Phosphor Sub-agents icon and the
 number of distinct workers. Its keyboard-reachable button labels that count accessibly and
-opens the existing Sub-agents dock with those exact workers highlighted; it does not expand
+opens the existing Sub-agents dock with those exact workers highlighted (one glow as the dock
+opens, which settles into the plain row; focus moves to the first only from the keyboard); it does not expand
 the round, load worker transcripts or move the timeline reader. Inspection releases the existing
 follow-output/send hold; Jump to latest resumes following. Membership and selection generations
 fence activation, and parent changes clear highlights. Participation derives from recorded
