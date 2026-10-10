@@ -195,6 +195,13 @@
   function rememberCleanup(cleanup) {
     stopCleanups.push(cleanup);
   }
+  // An identical attribute write still queues a mutation record for every observer on the page,
+  // this script's and ChatGPT's own. The once-a-second render rewrote ~60 unchanged attributes a
+  // second on an idle chat (measured 2026-10-09), so the hot paths write only on a change.
+  function setAttr(node, name, value) { if (node.getAttribute(name) !== value) node.setAttribute(name, value); }
+  function setData(node, key, value) { if (node.dataset[key] !== value) node.dataset[key] = value; }
+  function setHidden(node, hidden) { if (node.hidden !== hidden) node.hidden = hidden; }
+
   function listen(target, type, listener, options) {
     target.addEventListener(type, listener, options);
     rememberCleanup(() => target.removeEventListener(type, listener, options));
@@ -2723,6 +2730,7 @@
         }
       }
     }
+    publishHistoryRateLimit();
     flushStreamRequestOrigins();
     // Route assignment and authored text can arrive in either order. This receipt is
     // evaluated on the existing observer, rather than only on the one route-change edge.
@@ -6684,7 +6692,7 @@
       // an old-known/new-unknown authored descriptor never enters this branch.
       if (!websiteRender && compatiblePriorKey && existing &&
           identity.messageMatches.length === 0 && identity.missingMessages === false) {
-        for (const node of nodes) if (node.dataset) node.dataset.clfStreamKey = streamKey;
+        for (const node of nodes) if (node.dataset) setData(node, 'clfStreamKey', streamKey);
         // Root continuity is presentation identity, not continuing proof that a native
         // connector row is covered. Re-evaluate the current answered/app/request evidence on
         // every paint so an in-flight or restamped row becomes visible immediately.
@@ -6704,7 +6712,7 @@
         record.strongKeys = [...strongStreamIdentityKeys(rendered)];
         record.anchors = placement.anchors;
         streamRootsByKey.set(streamKey, record);
-        for (const node of nodes) if (node.dataset) node.dataset.clfStreamKey = streamKey;
+        for (const node of nodes) if (node.dataset) setData(node, 'clfStreamKey', streamKey);
         CLF_DOM.replaceActivity(turn, null, true);
         syncNativeActivity(turn, [], websiteRender ? placement : null);
         painted.add(streamKey);
@@ -6727,10 +6735,10 @@
       for (const gap of gaps) {
         kept.add(gap.key);
         const root = record.chunks.get(gap.key) || document.createElement('div');
-        root.className = 'clf-stream';
-        root.dataset.clfKey = streamKey;
-        root.dataset.clfGap = gap.key;
-        root.dataset.clfTurn = turn.id || groupKey || 'anchored';
+        if (root.className !== 'clf-stream') root.className = 'clf-stream';
+        setData(root, 'clfKey', streamKey);
+        setData(root, 'clfGap', gap.key);
+        setData(root, 'clfTurn', turn.id || groupKey || 'anchored');
         renderStreamChunk(root, gap.entries, record, retainedRows, retainedGroups, priorGroups);
         record.chunks.set(gap.key, root);
         CLF_DOM.replaceActivity(gap.turn || turn, root, true, gap);
@@ -6751,7 +6759,7 @@
       record.completeAt = Date.now();
       record.strongKeys = [...strongStreamIdentityKeys(rendered)];
       record.anchors = placement.anchors;
-      for (const node of nodes) if (node.dataset) node.dataset.clfStreamKey = streamKey;
+      for (const node of nodes) if (node.dataset) setData(node, 'clfStreamKey', streamKey);
       CLF_DOM.replaceActivity(turn, null, true);
       syncNativeActivity(turn, coveredNativeBlocks(turn, gaps), websiteRender ? placement : null);
       painted.add(streamKey);
@@ -8667,6 +8675,10 @@
 
   function renderControl() {
     if (!control || !control.root.isConnected) return;
+    // These writes stay unconditional for now (unlike the stream's, see setAttr): they sit inside
+    // ChatGPT's composer, so each one wakes watchTranscript, and a hidden tab's resumed Goal answer
+    // currently relies on that wake (content-script test "continues the first resumed answer that
+    // finished while the replacement tab was hidden"). Replace that wake before trimming these.
     const state = currentState();
     const busy = state.mode === 'busy' || state.mode === 'waiting';
     control.root.hidden = state.mode === 'hidden';
@@ -12029,6 +12041,14 @@
       loadFailureSince = 0;
       loadFailureRetries = 0;
     }
+    // The provider has already told this exact history read when it may be tried again.
+    // Do not spend the page's own Retry button inside that window: each click is another
+    // history request and can extend the throttle. Once Retry-After expires, the
+    // established settle/backoff logic below resumes unchanged.
+    if (pendingHistoryRateLimit?.conversationId === route) {
+      if (pendingHistoryRateLimit.retryAt > now) return false;
+      pendingHistoryRateLimit = null;
+    }
     const retry = CLF_DOM.conversationLoadFailure ? CLF_DOM.conversationLoadFailure() : null;
     if (!retry) {
       loadFailureSince = 0;
@@ -12201,6 +12221,35 @@
     const encoded = JSON.stringify({ rows, observedAt });
     if (encoded.length > 24000 || encoded === lastUsageProjection) return;
     void ask({ type: 'usage_observation', rows, observedAt }).then((reply) => { if (reply?.ok) lastUsageProjection = encoded; });
+  });
+  let pendingHistoryRateLimit = null;
+  function publishHistoryRateLimit() {
+    const limit = pendingHistoryRateLimit;
+    if (!limit || limit.retryAt <= Date.now() || limit.published === limit.retryAt) return;
+    if (conversationId !== limit.conversationId || CLF_DOM.conversationId() !== limit.conversationId) return;
+    limit.published = limit.retryAt;
+    emit({
+      kind: 'chat_error',
+      text: t('content_history_rate_limited', 'ChatGPT temporarily rate-limited loading this conversation history. Chat On Steroids is pausing automatic recovery until the retry wait ends.'),
+      recoverable: false,
+      blocking: true,
+      retryAt: limit.retryAt
+    });
+    void flush();
+  }
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-history-rate-limit') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed) ||
+        CLF_DOM.conversationId() !== claimed) return;
+    const retryAt = Number(event.data.retryAt), observedAt = Number(event.data.observedAt);
+    if (!Number.isFinite(retryAt) || !Number.isFinite(observedAt) || retryAt <= observedAt ||
+        retryAt - observedAt > 24 * 60 * 60_000 || retryAt <= Date.now()) return;
+    if (!pendingHistoryRateLimit || pendingHistoryRateLimit.conversationId !== claimed ||
+        retryAt > pendingHistoryRateLimit.retryAt) {
+      pendingHistoryRateLimit = { conversationId: claimed, retryAt, observedAt, published: 0 };
+    }
+    publishHistoryRateLimit();
   });
   function flushStreamRequestOrigins() {
     const route = CLF_DOM.conversationId();
@@ -12795,7 +12844,18 @@
         // Send was clicked, but no row proved it. Say so instead of keeping the claim open: the
         // app retires it as an uncertain send, never a replay, and this document takes the next
         // input. The reason is a fixed code the app recognises (see failBrowserInput).
-        if (sendAttempted && !receipt) return fail('Native Send receipt was not confirmed.');
+        if (sendAttempted && !receipt) {
+          // Proof that the click did not deliver: ChatGPT left this exact text in its composer and
+          // showed no new user message. Clearing that exact draft lets the app send it once more;
+          // anything less certain stays an unconfirmed send that is never replayed (#821).
+          if (onTarget() && sendText(CLF_DOM.composer()?.textContent) === submittedText &&
+              CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === previousUserId) {
+            let cleared = false;
+            try { cleared = await draft.clear(); } catch { /* An unclearable draft is no proof. */ }
+            if (cleared) return fail('Native Send did not take the message.');
+          }
+          return fail('Native Send receipt was not confirmed.');
+        }
         return false;
       }
       if (!receipt || !sendingTarget()) return false;
@@ -13499,6 +13559,7 @@
       pullActivity,
       activityPullDelay,
       currentActivityPullDelay,
+      recoverConversationLoad,
       notePresentation,
       presentationPending,
       runCommand,

@@ -142,6 +142,7 @@ interface Hook {
   pullActivity(): Promise<void>;
   activityPullDelay(input: Record<string, boolean>): number;
   currentActivityPullDelay(): number;
+  recoverConversationLoad(now?: number): boolean;
   notePresentation(messageId: string, text: string, now?: number): boolean;
   presentationPending(now?: number): boolean;
   runCommand(): Promise<void>;
@@ -1586,6 +1587,28 @@ describe('desktop input delivery and helper ownership', () => {
    * native Send dropped its deadline after the click. The page held its input slot until reload,
    * and the claim stayed open in the app, so the next message could not be delivered.
    */
+  it('reports a clicked Send that ChatGPT did not take, and clears exactly its own draft', async () => {
+    const typed = 'Inspect the exact requested task';
+    let claims = 0;
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.fail || message.ack ? { ok: true }
+        : ++claims === 1 ? { input: claimed({ text: typed }) } : {} })
+    });
+    // The click lands while the page is between states: no user row, the text stays put.
+    const sends = vi.fn();
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', sends);
+    const held = live.window.setTimeout;
+    live.window.setTimeout = ((fn: () => void, ms?: number) =>
+      held(fn, ms === live!.hook.DESKTOP_RECEIPT_MS ? 0 : ms)) as typeof live.window.setTimeout;
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: false });
+    expect(sends).toHaveBeenCalledTimes(1);
+    expect(live.sent.filter(message => message.type === 'desktop_input' && message.fail)).toEqual([
+      expect.objectContaining({ id: inputId, owner: 'input-owner', error: 'Native Send did not take the message.' })
+    ]);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe('');
+    expect(live.hook.desktopInputBusyForTest()).toBe(false);
+  });
+
   it('ends a receipt wait the page cannot recognise without a second Send, and frees the input slot', async () => {
     const typed = 'Inspect the exact requested task';
     let claims = 0;
@@ -4505,6 +4528,28 @@ describe('the app-owned chronological stream', () => {
     expect(live.document.activeElement).toBe(focused);
     expect(focused.closest('.clf-stream-tool-group')).toBe(groups[1]);
     expect(section.querySelectorAll('[data-clf-call]')).toHaveLength(4);
+  });
+
+  it('rewrites nothing when the once-a-second render finds the stream unchanged', async () => {
+    // Every identical attribute write wakes each MutationObserver on the page, ChatGPT's included:
+    // an idle chat took ~60 such writes a second (measured 2026-10-09).
+    const owner = 'idle-owner';
+    const rows = [{ seq: 1, time: 100, kind: 'turn_start', turnId: owner },
+      { seq: 2, time: 110, kind: 'tool_call', turnId: owner, callId: 'idle-call', tool: 'read', summary: { title: 'Read file' } },
+      { seq: 3, time: 200, kind: 'assistant_message', turnId: owner, messageId: 'idle-final', text: 'Done', final: true }];
+    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], resetActivity: true, stream: rows } }) });
+    renderingOn(); const section = assistantTurn(live.document, 'idle-page', []);
+    await bindRenderedFiberTurns([{ section, turn: { turnId: 'idle-page', messages: [{ messageId: 'idle-final',
+      rawMessageId: 'idle-final', stable: true, rawText: 'Done', renderedHtml: '<p>Done</p>' }] } }]);
+    await live.hook.pullActivity(); live.hook.renderStreams();
+    expect(section.querySelectorAll('.clf-stream')).not.toHaveLength(0);
+    const records: MutationRecord[] = [];
+    const observer = new (live.document.defaultView as unknown as { MutationObserver: typeof MutationObserver }).MutationObserver(list => records.push(...list));
+    observer.observe(live.document.documentElement, { subtree: true, attributes: true, childList: true, characterData: true });
+    live.hook.renderStreams(); live.hook.renderStreams();
+    await Promise.resolve();
+    records.push(...observer.takeRecords()); observer.disconnect();
+    expect(records.map(record => `${(record.target as Element).className || (record.target as Element).tagName} ${record.type} ${record.attributeName ?? ''}`)).toEqual([]);
   });
 
   it('groups twenty calls around public interim prose and retains open nodes across updates', async () => {
@@ -12049,6 +12094,66 @@ describe('evidence from the page context', () => {
     }
     await settle();
     expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([]);
+  });
+
+  it('turns an exact history Retry-After projection into one blocking non-recoverable chat error', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const observedAt = live.window.Date.now();
+    const publish = (retryAt: number, id = conversationId) => live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+      source: live!.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId: id, observedAt, retryAt }
+    }));
+
+    publish(observedAt + 24_000);
+    await settle();
+    expect(emitted(live.sent, 'chat_error')).toEqual([
+      expect.objectContaining({
+        conversationId,
+        event: expect.objectContaining({
+          blocking: true,
+          recoverable: false,
+          retryAt: observedAt + 24_000,
+          text: expect.stringContaining('retry wait')
+        })
+      })
+    ]);
+
+    publish(observedAt + 20_000);
+    publish(observedAt + 30_000, '11111111-2222-3333-4444-555555555555');
+    await settle();
+    expect(emitted(live.sent, 'chat_error')).toHaveLength(1);
+
+    publish(observedAt + 31_000);
+    await settle();
+    expect(emitted(live.sent, 'chat_error')).toHaveLength(2);
+    expect(emitted(live.sent, 'chat_error').at(-1)?.event.retryAt).toBe(observedAt + 31_000);
+  });
+
+  it('does not press ChatGPT history Retry inside the provider Retry-After window', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const now = live.window.Date.now();
+    let clicks = 0;
+    const retry = live.document.createElement('button');
+    retry.addEventListener('click', () => { clicks++; });
+    (live.window as any).CLF_DOM.conversationLoadFailure = () => retry;
+
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId, observedAt: now, retryAt: now + 24_000 }
+    }));
+    await settle();
+
+    expect(live.hook.recoverConversationLoad(now + 6_000)).toBe(false);
+    expect(live.hook.recoverConversationLoad(now + 23_999)).toBe(false);
+    expect(clicks).toBe(0);
+
+    expect(live.hook.recoverConversationLoad(now + 24_001)).toBe(false);
+    expect(live.hook.recoverConversationLoad(now + 29_002)).toBe(true);
+    expect(clicks).toBe(1);
   });
 
   it('does not let a stale owned Fiber turn bypass a rejected live ownership handshake', async () => {
