@@ -186,10 +186,12 @@ describe('Goal decision backends', () => {
     });
     goal.startGoalDraft({ conversationId: id, sessionId, turnId: 'first' });
     expect((await settled(id)).stage).toBe('ready');
-    expect(browser.request.mock.calls[0]?.[2]).toEqual({ sourceSessionId: sessionId, conversationId: null, lifetime: 'temporary-planner', model: 'gpt-6-thinking', reasoningEffort: 'high', publish: expect.any(Function) });
+    expect(browser.request.mock.calls[0]?.[2]).toEqual({ sourceSessionId: sessionId, conversationId: null, lifetime: 'temporary-planner', model: 'gpt-6', reasoningEffort: 'high', publish: expect.any(Function) });
     expect(browser.request.mock.calls[0]?.[0]).toContain('Original reference only');
     // ChatGPT offers connected apps in the helper chat too; the helper must not run them (2026-10-02).
     expect(browser.request.mock.calls[0]?.[0]).toContain('Do not call any tools, apps or connectors');
+    // GPT-6's page drops a reply that opens with `{`; fenced JSON survives (2026-10-09).
+    expect(browser.request.mock.calls[0]?.[0]).toContain('Return one JSON object in a ```json code block');
     const saved = goal.snapshotGoalSwitches();
     goal.resetGoalStateForTests();
     goal.restoreGoalSwitches(saved);
@@ -207,6 +209,15 @@ describe('Goal decision backends', () => {
     expect(browser.request.mock.calls[2]?.[0]).toContain('Original reference only');
     expect(browser.request.mock.calls[2]?.[2]).toMatchObject({ conversationId: null, lifetime: 'temporary-planner' });
     expect(fetch).not.toHaveBeenCalled();
+  });
+  it('accepts the decision a GPT-6 helper returns in a json code block', async () => {
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: true, backend: 'chatgpt' } });
+    const id = 'fenced-helper';
+    const sessionId = await recording(id, 'Fenced task');
+    browser.request.mockResolvedValueOnce('```json\n{"action":"continue","reply":"Run the fenced check"}\n```');
+    goal.startGoalDraft({ conversationId: id, sessionId, turnId: 'fenced' });
+    // The reply may carry the app's deliberate human typo; the point is that it was parsed at all.
+    expect(await settled(id)).toMatchObject({ stage: 'ready', reply: expect.stringMatching(/^Run the f\w+ check$/) });
   });
   it('bounds the complete browser envelope while keeping a large original brief and newest result', async () => {
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: true, backend: 'chatgpt' } });
@@ -494,7 +505,7 @@ it('publishes readable partial plan stages while final validation remains author
     return raw;
   });
   expect(await goal.draftTaskPlan('Build it', 'chatgpt', progress)).toEqual(['Build the feature', 'Verify acceptance']);
-  expect(browser.request.mock.calls[0]?.[2]).toMatchObject({ model: 'gpt-6-thinking', reasoningEffort: 'high' });
+  expect(browser.request.mock.calls[0]?.[2]).toMatchObject({ model: 'gpt-6', reasoningEffort: 'high' });
   expect(progress).toHaveBeenCalledWith({ phase: 'generating', text: '1. Build the fea' });
   expect(progress).toHaveBeenCalledWith({ phase: 'generating', text: '1. Build the feature\n\n2. Verify acceptance' });
 
