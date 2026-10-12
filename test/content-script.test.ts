@@ -1821,8 +1821,8 @@ describe('desktop input delivery and helper ownership', () => {
     ['a malformed path', { path: 'https://evil.example/', name: 'COS ERP DB Core' }, null]
   ])('mentions %s on a desktop-delivered prompt (#861)', async (_case, report, expected) => {
     live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
-      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
-        core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins' } }),
+      status: () => ({ connected: true, paired: true, port: 8865, pending: 0, connectorNames: {
+        core: 'COS ERP DB Core', desktop: 'COS ERP DB Desktop', plugins: 'COS ERP DB Plugins' } }),
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
     });
     await settle();
@@ -1874,18 +1874,18 @@ describe('desktop input delivery and helper ownership', () => {
   });
 
   it.each([
-    ['the remembered Core before the page lists its apps', 'Chat On Steroids Core (Windows)', null,
-      { path: 'app://asdk_app_win2222', name: 'Chat On Steroids Core (Windows)' }],
-    ['nothing when the remembered Core has another name', 'Chat On Steroids Core', null, null],
-    ['nothing once the page\'s complete list lacks this Core', 'Chat On Steroids Core (Windows)',
+    ['the remembered Core before the page lists its apps', 'COS ERP DB Core (Windows)', null,
+      { path: 'app://asdk_app_win2222', name: 'COS ERP DB Core (Windows)' }],
+    ['nothing when the remembered Core has another name', 'COS ERP DB Core', null, null],
+    ['nothing once the page\'s complete list lacks this Core', 'COS ERP DB Core (Windows)',
       { type: 'cos-core-mention', path: null, name: null, candidates: [], pluginList: true }, null]
   ] as const)('mentions %s in a fresh tab (#1086)', async (_case, rememberedName, pageList, expected) => {
     // A worker's fresh tab can send before its own plugin list arrives. Its first message then went
     // out without the Core mention, and in a workspace shared with another computer ChatGPT sent
     // the worker's calls to that computer's plain Core. Another tab's sighting stands in.
     live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
-      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
-        core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)' },
+      status: () => ({ connected: true, paired: true, port: 8865, pending: 0, connectorNames: {
+        core: 'COS ERP DB Core (Windows)', desktop: 'COS ERP DB Desktop (Windows)', plugins: 'COS ERP DB Plugins (Windows)' },
         ownCoreApp: { appId: 'asdk_app_win2222', name: rememberedName } }),
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
     });
@@ -1919,8 +1919,8 @@ describe('desktop input delivery and helper ownership', () => {
     await settle();
     live.window.dispatchEvent(new live.window.MessageEvent('message', {
       source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: { type: 'cos-core-mention', path: null, name: null,
-        candidates: [{ name: 'Chat On Steroids Core', path: 'app://asdk_app_mac1111' },
-          { name: 'Chat On Steroids Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: true } }));
+        candidates: [{ name: 'COS ERP DB Core', path: 'app://asdk_app_mac1111' },
+          { name: 'COS ERP DB Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: true } }));
     await settle();
     expect(asks).toEqual([]);
     live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
@@ -1941,10 +1941,10 @@ describe('desktop input delivery and helper ownership', () => {
     // A sighting remembered under this computer's name before the fix above can name the other
     // computer's app. The app's proven Core id outranks it.
     live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
-      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
-        core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)' },
-        connectorApps: { core: [{ appId: 'asdk_app_win2222', linkId: 'link_w', name: 'Chat On Steroids Core (Windows)' }], desktop: [], plugins: [] },
-        ownCoreApp: { appId: 'asdk_app_mac1111', name: 'Chat On Steroids Core (Windows)' } }),
+      status: () => ({ connected: true, paired: true, port: 8865, pending: 0, connectorNames: {
+        core: 'COS ERP DB Core (Windows)', desktop: 'COS ERP DB Desktop (Windows)', plugins: 'COS ERP DB Plugins (Windows)' },
+        connectorApps: { core: [{ appId: 'asdk_app_win2222', linkId: 'link_w', name: 'COS ERP DB Core (Windows)' }], desktop: [], plugins: [] },
+        ownCoreApp: { appId: 'asdk_app_mac1111', name: 'COS ERP DB Core (Windows)' } }),
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
     });
     await settle();
@@ -2046,10 +2046,10 @@ describe('desktop input delivery and helper ownership', () => {
   ] as const)('leaves the Core mention off only where the app says so: %s', async (_case, extra, expected) => {
     // ChatGPT switches its own image tool off for a message that mentions an app, so the app marks
     // a person's request for a picture; every other message keeps the mention (setting on).
-    const core = { path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', name: 'Chat On Steroids Core' };
+    const core = { path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', name: 'COS ERP DB Core' };
     live = await harness(`https://chatgpt.com/c/${chatA}`, {
-      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
-        core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins' } }),
+      status: () => ({ connected: true, paired: true, port: 8865, pending: 0, connectorNames: {
+        core: 'COS ERP DB Core', desktop: 'COS ERP DB Desktop', plugins: 'COS ERP DB Plugins' } }),
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, activeTurnId: null, userAnchors: [], mentionCore: true } }),
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.response ? { ok: true } : { input: claimed({ ...extra }) } })
     });
@@ -8929,6 +8929,33 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(emitted(live.sent, 'turn_end').map(row => [row.event.turnId, row.event.continued])).toEqual([[first, true]]);
   });
 
+  it('marks continued the end of a turn with only interim prose when a message arrives before end_turn (#1301)', async () => {
+    // 2026-10-12, live: a message sent at 02:20:26 joined the running response, which had already
+    // said "I'll pick up where it stopped…". Stop was gone at the tick that saw the message, and the
+    // interim prose made that turn look answered: it ended completed, unmarked. The request then ran
+    // ten more calls and its final answer, all filed under the ended turn, and the turn the message
+    // opened sat empty until it was called stalled at ten minutes.
+    live = await harness();
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'turn-interim-only', []);
+    live.hook.observe();
+    await settle();
+    await replyFiber([], []);
+    await settle();
+    prose(live.document, section, 'interim-1', "I'll pick up exactly where it stopped.");
+    live.hook.observe();
+    await settle();
+    const first = emitted(live.sent, 'turn_start')[0]!.event.turnId;
+
+    stopGenerating(live.document);
+    userTurn(live.document, 'joined-user', 'also finish the report');
+    live.hook.observe();
+    await settle();
+
+    const ends = emitted(live.sent, 'turn_end').map((entry) => entry.event);
+    expect(ends.map(end => [end.turnId, end.continued])).toEqual([[first, true]]);
+  });
+
   it('keeps an in-flight Fiber scan owned by the generation that requested it', async () => {
     live = await harness();
     startGenerating(live.document);
@@ -12327,6 +12354,36 @@ describe('evidence from the page context', () => {
     expect(emitted(live.sent, 'chat_error').at(-1)?.event.retryAt).toBe(observedAt + 31_000);
   });
 
+  it('backs off ChatGPT history Retry after a rate limit instead of pressing it once a minute (2026-10-11)', async () => {
+    // Each press after Retry-After drew another 429 with a longer Retry-After, so a press a minute
+    // kept the limit alive for half an hour. After a limit the presses spread out: 0 s, 2, 4, 8, 15 min.
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const start = live.window.Date.now();
+    let clicks = 0;
+    const retry = live.document.createElement('button');
+    retry.addEventListener('click', () => { clicks++; });
+    (live.window as any).CLF_DOM.conversationLoadFailure = () => retry;
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId, observedAt: start, retryAt: start + 10_000 }
+    }));
+    await settle();
+    // The first press still comes when ChatGPT said it may.
+    expect(live.hook.recoverConversationLoad(start + 10_001)).toBe(false);
+    expect(live.hook.recoverConversationLoad(start + 15_002)).toBe(true);
+    // The next ones wait two, then four minutes, where a plain load failure would press every minute.
+    const first = start + 15_002;
+    expect(live.hook.recoverConversationLoad(first + 65_000)).toBe(false);
+    expect(live.hook.recoverConversationLoad(first + 124_000)).toBe(false);
+    expect(live.hook.recoverConversationLoad(first + 125_001)).toBe(true);
+    const second = first + 125_001;
+    expect(live.hook.recoverConversationLoad(second + 125_001)).toBe(false);
+    expect(live.hook.recoverConversationLoad(second + 245_001)).toBe(true);
+    expect(clicks).toBe(3);
+  });
+
   it('does not press ChatGPT history Retry inside the provider Retry-After window', async () => {
     live = await harness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -15614,12 +15671,12 @@ describe('the fresh chat the app opened', () => {
   it('mentions this install\'s own Core on the bootstrap before its first status reply', async () => {
     // Seen live (2026-10-11): a computer with a suffix shares its ChatGPT account with another
     // computer. Its resume tab sent the bootstrap before status arrived, matched the plain
-    // "Chat On Steroids Core" (the other computer's) and the new chat called that computer's tools.
+    // "COS ERP DB Core" (the other computer's) and the new chat called that computer's tools.
     let releaseStatus: () => void = () => undefined;
     const statusHeld = new Promise((resolve) => {
-      releaseStatus = () => resolve({ connected: true, paired: true, port: 8765, pending: 0 });
+      releaseStatus = () => resolve({ connected: true, paired: true, port: 8865, pending: 0 });
     });
-    const names = { core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)' };
+    const names = { core: 'COS ERP DB Core (Windows)', desktop: 'COS ERP DB Desktop (Windows)', plugins: 'COS ERP DB Plugins (Windows)' };
     let releaseRedeem: () => void = () => undefined;
     const redeemHeld = new Promise((resolve) => {
       releaseRedeem = () => resolve({
@@ -15647,12 +15704,12 @@ describe('the fresh chat the app opened', () => {
     adapter.send = (options: { mention?: unknown }) => { mentions.push(options.mention ?? null); return send({ ...options, mention: null }); };
     live.window.dispatchEvent(new live.window.MessageEvent('message', {
       source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: { type: 'cos-core-mention', path: null, name: null,
-        candidates: [{ name: 'Chat On Steroids Core', path: 'app://asdk_app_mac1111' },
-          { name: 'Chat On Steroids Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: true } }));
+        candidates: [{ name: 'COS ERP DB Core', path: 'app://asdk_app_mac1111' },
+          { name: 'COS ERP DB Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: true } }));
     releaseRedeem();
     await settle(200);
     await settle();
-    expect(mentions).toEqual([{ path: 'app://asdk_app_win2222', name: 'Chat On Steroids Core (Windows)' }]);
+    expect(mentions).toEqual([{ path: 'app://asdk_app_win2222', name: 'COS ERP DB Core (Windows)' }]);
     releaseStatus();
     await settle();
   });

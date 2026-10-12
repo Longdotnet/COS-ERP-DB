@@ -2093,7 +2093,7 @@ describe('active agent tab discard protection', () => {
 
   describe('keep-awake in the app tab group (#128)', () => {
     type GroupTab = { id: number; windowId: number; groupId: number; url: string; status: string; active: boolean; frozen: boolean };
-    const GROUP = { id: 50, windowId: 7, title: 'Chat On Steroids', collapsed: true };
+    const GROUP = { id: 50, windowId: 7, title: 'COS ERP DB', collapsed: true };
     const groupWorker = (tabs: GroupTab[], placement: () => string = () => 'group', groups = [GROUP]) => loadWorker({
       local: new FakeStorageArea({ ...paired, backgroundPlacement: 'group' }),
       session: new FakeStorageArea({ chatBackgroundGroup: 50 }),

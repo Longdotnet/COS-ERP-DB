@@ -1,11 +1,14 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { currentCaller } from '../../main/mcp/call-context.js';
+import { managedWorkerAllocationIdentity, managedWorkerIsolationRequired } from '../../main/agents.js';
+import { getConfig } from '../../main/config.js';
+import { currentCall, currentCaller } from '../../main/mcp/call-context.js';
 import { getProject, projectWorkspace } from '../../main/projects.js';
 import { nativePathIdentity } from '../../main/sandbox.js';
 import { getSession } from '../../main/session/store.js';
 import { currentWorkspace } from '../../main/workspace.js';
+import { lookupWorkerWorkspace, validateWorkerWorkspaceLease } from '../../main/worktrees/index.js';
 import type { EngineeringProjectLineage } from './contracts.js';
 import { canonicalEngineeringProfileId, detectRegisteredEngineeringProfile } from './profiles/index.js';
 
@@ -170,8 +173,22 @@ export function engineeringLineageKey(rootIdentity: string, profile: string, _ru
 
 export async function resolveEngineeringLineage(options: EngineeringLineageOptions = {}): Promise<ResolvedEngineeringLineage> {
   const caller = currentCaller();
+  const call = currentCall();
   let projectId: string | null = null;
   let workspace: { virtual: string; real: string } | null = null;
+
+  // A managed worker's source project remains useful metadata/instruction context, but it is not
+  // the worker's operational filesystem. Match Core's file/command fence here so Engineering
+  // discovery, hashing and machine validation observe the same verified checkout that code edits do.
+  if (managedWorkerIsolationRequired(caller)) {
+    const allocation = managedWorkerAllocationIdentity(caller);
+    const lease = allocation && call?.agent === allocation.agentId ? lookupWorkerWorkspace(allocation) : null;
+    if (!lease) {
+      throw new Error('WORKTREE_OWNER_UNAVAILABLE: the required isolated worker checkout has no verified owner for Engineering');
+    }
+    const verified = await validateWorkerWorkspaceLease(lease, getConfig().roots);
+    workspace = { virtual: verified.workspace.virtual, real: verified.workspace.real };
+  }
 
   if (caller.sessionId) {
     const session = await getSession(caller.sessionId);
@@ -179,7 +196,7 @@ export async function resolveEngineeringLineage(options: EngineeringLineageOptio
       const project = await getProject(session.projectId);
       if (!project) throw new Error('ENGINEERING_PROJECT_UNAVAILABLE: the session project no longer exists');
       projectId = project.id;
-      workspace = await projectWorkspace(project.id);
+      if (!workspace) workspace = await projectWorkspace(project.id);
     }
   }
   if (!workspace) {

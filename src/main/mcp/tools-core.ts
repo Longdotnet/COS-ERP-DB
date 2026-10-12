@@ -33,7 +33,9 @@ import {
 } from '../codex/view-image.js';
 import { logInfo, logWarn } from '../logger.js';
 import { SandboxError, isAbsoluteVirtualPath, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
-import { currentWorkspace } from '../workspace.js';
+import { currentWorkspace, primeWorkspace, setWorkspaceFor } from '../workspace.js';
+import { getSessionProject } from '../projects.js';
+import { allocWorkerWorkspace, validateWorkerWorkspaceLease, WorkerWorktreeError, type WorkerWorktreeLease } from '../worktrees/index.js';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { commandHasSameArguments, evaluateCommandAllowlist } from '../../shared/command-allowlist.js';
 import type { FileChange } from '../../shared/session.js';
@@ -109,7 +111,7 @@ import {
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
 import { locateRipgrep } from '../ripgrep.js';
-import { ensureDevToolchain } from '../toolchain.js';
+import { ensureDevToolchain, isGitRepository } from '../toolchain.js';
 import {
   agentForCaller,
   agentFamiliesForCaller,
@@ -124,6 +126,9 @@ import {
   stageMessages,
   stagePrimeMessage,
   stageSpawn,
+  markStagedWorkerWorktree,
+  managedWorkerIsolationRequired,
+  managedWorkerAllocationIdentity,
   swarmRunning,
   swarmStateForCaller,
   type Caller
@@ -147,6 +152,7 @@ import {
   adoptAgent,
   fail,
   failIdentity,
+  validatedWorkspace,
   formatFileInfo,
   friendlyError,
   guard,
@@ -701,7 +707,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (args.environmentId !== null) {
             return fail('apply_patch environment selection is unavailable for this turn');
           }
-          const workspace = currentWorkspace();
+          // apply_patch previously read the synchronous cwd cache, bypassing the managed
+          // lease check shared by resolveIn/resolveCwd. Validate before patch base selection.
+          const workspace = await validatedWorkspace();
           const hasRelativePath = args.hunks.some(hunk => {
             const paths = hunk.kind === 'update_file' && hunk.movePath !== null
               ? [hunk.path, hunk.movePath]
@@ -719,6 +727,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
           const base = await resolveIn(ctx.roots, baseVirtual);
+          await validatedWorkspace();
           return (await runParsedPatch(args, ctx.roots, base, caps)).result;
         })
     );
@@ -865,6 +874,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const command = deriveExecArgs(shell, boundCommand, useLoginShell);
           let liveProcessId: number | null = null;
           try {
+            await validatedWorkspace();
             // Current Codex intercepts an explicit `apply_patch` shell invocation before spawning
             // the shell process. The parser is the port of apply-patch/src/invocation.rs and uses
             // the same tree-sitter-bash grammar/query as upstream.
@@ -937,6 +947,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             const ripgrep = locateRipgrep();
             const executionCommand = deriveExecArgs(shell,
               withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
+            await validatedWorkspace();
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -1106,6 +1117,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             const message = `write_stdin failed for session ${input.session_id}: ${reason} No input was sent and no output was read. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work.`;
             return denied === 'unidentified' ? failIdentity(message) : fail(message);
           }
+          // A worker can keep an interactive shell running after its Git worktree has been
+          // replaced. Verify the exact current allocation before forwarding even empty polls:
+          // stdin may execute writes in the shell's now user-owned directory.
+          await validatedWorkspace();
           // Both sides of the wait. An empty poll blocks for seconds by design, and a caller
           // sitting in one is attending its session rather than neglecting it.
           noteExecAttended(input.session_id);
@@ -1225,7 +1240,8 @@ async function measureSleepingWorkers(caller: Caller): Promise<void> {
 async function acceptAgentMutation(
   staged: { commit(): void | boolean; rollback(): void },
   failure: string,
-  commitFailure: string = failure
+  commitFailure: string = failure,
+  admission?: { validate(): Promise<void>; assertCurrent(): void }
 ): Promise<void> {
   try {
     let durable: boolean;
@@ -1235,9 +1251,27 @@ async function acceptAgentMutation(
       throw new Error(`${failure} (${error instanceof Error ? error.message : String(error)})`);
     }
     if (!durable) throw new Error(failure);
+    // The durable write itself awaits filesystem IO. Recheck live ownership after it,
+    // then check the current policy synchronously beside the broker's commit.
+    if (admission) {
+      await admission.validate();
+      admission.assertCurrent();
+    }
     if (staged.commit() === false) throw new Error(commitFailure);
   } catch (error) {
     staged.rollback();
+    if (admission) {
+      // A rejected admission can happen after the persistence sink successfully wrote
+      // the staged topology. Publish the compensating rollback before returning the
+      // rejection, otherwise an immediate restart could restore unaccepted workers.
+      try {
+        if (!(await persistCriticalSwarmNow())) {
+          throw new Error('the broker has no immediate durable persistence sink');
+        }
+      } catch (rollbackError) {
+        throw new Error(`Worker admission rollback could not be made durable (${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)})`);
+      }
+    }
     throw error;
   }
 }
@@ -1363,14 +1397,118 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // Reserve under exact chat proof or the permitted transport request, atomically.
           // The request remains the reachable prime before browser attachment; later proof
           // changes its frontend projection without recreating workers or replaying spawn.
+          const spawnCaller = await callerNow(startedAt, { exact: true, runId: input.run_id });
+          // A stale managed worker whose family and ordinary retired-worker TTL have expired
+          // must not bootstrap a new prime family to regain local mutation authority. Session
+          // origin and durable managed tombstones are denial-only, not adoption credentials.
+          if (await managedWorkerIsolationRequired(spawnCaller) && !managedWorkerAllocationIdentity(spawnCaller)) {
+            return fail('WORKTREE_OWNER_UNAVAILABLE: a retired worker cannot create a prime run after its isolated checkout owner was lost.');
+          }
           const staged = stageSpawn({
             workers: input.workers,
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true, runId: input.run_id })
+            caller: spawnCaller
           });
-          await acceptAgentMutation(staged,
-            'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.');
+          // Newly staged admissions alone may own Git branches. A repeated spawn may show
+          // existing workers in `created`, but must never reallocate their checkouts.
+          const allocated: WorkerWorktreeLease[] = [];
+          const admittedLeases: WorkerWorktreeLease[] = [];
+          const isolationNotes: string[] = [];
+          let sourceDirty = false;
+          let allocationAttempted = false;
+          try {
+            if (staged.newlyStaged && getConfig().multiAgent.autoWorktrees === true) {
+              // A selected Local Project is durable even before this prime has made its first
+              // file call. Fetch that binding explicitly instead of relying on the cwd cache.
+              const sessionId = currentCall()?.caller.sessionId;
+              const source = (sessionId ? await getSessionProject(sessionId) : null) ??
+                primeWorkspace(currentCaller().conversationId) ?? currentWorkspace();
+              // Unfiled chats without any selected/learned folder can still delegate ordinary
+              // work. Once a source exists, a Git checkout must pass strict isolation checks.
+              if (!source) {
+                isolationNotes.push('No workspace is selected; workers were spawned without isolated Git worktrees.');
+              } else if (isGitRepository(source.real)) {
+                if (reg.ctx.readOnly || !reg.caps.command || !reg.caps.create || !reg.caps.edit) {
+                  throw new Error('WORKTREE_PERMISSION_REQUIRED: worker isolation requires Command, Create and Edit, with Read-only disabled.');
+                }
+                for (const agentId of staged.newlyStagedWorkerIds) {
+                  allocationAttempted = true;
+                  const lease = await allocWorkerWorkspace({
+                    runId: staged.runId,
+                    agentId,
+                    primeWorkspace: source,
+                    approvedRoots: getConfig().roots
+                  });
+                  if (lease.newlyCreated) allocated.push(lease);
+                  // Allocation awaited Git with the then-current approved roots. Revocation,
+                  // rename or replacement during that wait must prevent worker admission.
+                  await validateWorkerWorkspaceLease(lease, getConfig().roots);
+                  admittedLeases.push(lease);
+                  sourceDirty ||= lease.sourceDirty;
+                  markStagedWorkerWorktree(staged.runId, agentId);
+                }
+                if (getConfig().multiAgent.autoWorktrees !== true) {
+                  throw new Error('WORKTREE_POLICY_CHANGED: automatic worker isolation was disabled during the spawn.');
+                }
+                isolationNotes.push(`${staged.newlyStagedWorkerIds.length} newly staged worker(s) received isolated Git worktrees.`);
+                if (sourceDirty) {
+                  isolationNotes.push('Warning: the source checkout has uncommitted changes. Workers start from the committed Git base revision, so those uncommitted changes were not copied into their worktrees.');
+                }
+              } else {
+                isolationNotes.push('The selected workspace is not a Git repository; no worktrees were allocated.');
+              }
+            }
+            staged.prepareDurability();
+            await acceptAgentMutation(staged,
+              'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.',
+              undefined,
+              admittedLeases.length ? {
+                validate: async () => {
+                  for (const lease of admittedLeases) {
+                    await validateWorkerWorkspaceLease(lease, getConfig().roots);
+                  }
+                },
+                assertCurrent: () => {
+                  const liveConfig = getConfig();
+                  if (liveConfig.multiAgent.autoWorktrees !== true) {
+                    throw new Error('WORKTREE_POLICY_CHANGED: automatic worker isolation was disabled during the spawn.');
+                  }
+                  for (const lease of admittedLeases) {
+                    if (!liveConfig.roots.some(root => root.name === lease.approvedRoot.name &&
+                      nodePath.resolve(root.path) === nodePath.resolve(lease.approvedRoot.path))) {
+                      throw new WorkerWorktreeError('WORKTREE_ROOT_CHANGED', 'the owning approved root was revoked during worker admission');
+                    }
+                  }
+                }
+              } : undefined);
+          } catch (error) {
+            staged.rollback();
+            // An unaccepted spawn never opened a worker chat, but user files can appear in a
+            // checkout between a Git status check and `git worktree remove`. Even non-force
+            // removal may erase ignored files. Retain these newly created leases on failure;
+            // they are not broker-admitted and can be inspected/disposed of explicitly later.
+            // In particular, a retry must not take another user's branch or remove its files.
+            if (allocated.length) {
+              const retained = allocated.map(lease => lease.worktreePath).join(', ');
+              logWarn(`multi-agent: spawn failed (${error instanceof Error ? error.message : String(error)}); ${allocated.length} unaccepted managed worktree(s) retained for safe inspection: ${retained}`);
+              throw new Error(`WORKTREE_ROLLBACK_RETAINED: ${allocated.length} unaccepted Git checkout(s) were kept to protect user files. Inspect the local app logs for their locations and the allocation error.`);
+            }
+            if (allocationAttempted) {
+              // Even the first failed allocation can include a native path in a Git or
+              // filesystem error (for example an unsafe managed parent directory).
+              // Only a trusted worktree error code crosses the model-facing boundary.
+              logWarn(`multi-agent: worker allocation failed: ${error instanceof Error ? error.message : String(error)}`);
+              const code = error instanceof WorkerWorktreeError ? error.code : 'WORKTREE_ALLOCATION_FAILED';
+              throw new Error(`${code}: isolated Git checkout allocation failed; see local app logs for details. The worker spawn was rolled back.`);
+            }
+            throw error;
+          }
           const { created, becamePrime, runId, defaultNotes } = staged;
+          // Keep provisional workspaces out of the cwd cache until the broker has accepted
+          // their owners. A failed stage retains its checkout but exposes no orphan cwd.
+          for (const lease of admittedLeases) {
+            setWorkspaceFor(`agent:${lease.runId}:${lease.agentId}`, lease.workspace);
+          }
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
           // visible only after the exact broker revision above is durable.
@@ -1387,6 +1525,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                   `${created.length} worker(s) matched: ${created.map((info) => `${info.id} (${info.label}, ${info.state}${info.model ? `, model ${info.model}` : ''}${info.reasoningEffort ? `, reasoning ${info.reasoningEffort}` : ''})`).join(', ')}. ` +
                   (invited.length > 0 ? 'New worker chats are opening with their briefs already in them. ' : '') +
                   (defaultNotes?.length ? `${defaultNotes.join(' ')} ` : '') +
+                  (isolationNotes.length ? `${isolationNotes.join(' ')} ` : '') +
                   (sleeping.length > 0
                     ? `${sleeping.map((worker) => worker.id).join(', ')} already finished that earlier piece and is sleeping in its existing chat; wake it with action=message instead of spawning a duplicate. `
                     : '') +
@@ -2253,6 +2392,8 @@ const MISSING_PATH_LISTING = 40;
  */
 async function nearestFolderListing(roots: Root[], requested: string, err: unknown): Promise<string> {
   if (!(err instanceof SandboxError) || !err.message.startsWith('Not found:')) return '';
+  const meant = await pathUnderNamedRoot(roots, requested);
+  if (meant) return `\nDid you mean ${meant}? It exists under the approved root of that name.`;
   let candidate = requested;
   for (let depth = 0; depth < 8; depth++) {
     const parent = candidate.replace(/[\\/]+[^\\/]+[\\/]*$/, '');
@@ -2277,6 +2418,29 @@ async function nearestFolderListing(roots: Root[], requested: string, err: unkno
     }
   }
   return '';
+}
+
+/**
+ * A missing path that names another approved root further down, where the rest exists.
+ *
+ * Live 2026-10-12: with roots `/downloads` and `/voxelcraft`, a model read
+ * `/downloads/.Dev-projects/voxelcraft/shared/adventure.ts`, the project's disk path under the
+ * wrong root. The listing that followed showed the user's Downloads folder, unrelated to the
+ * project, instead of the file it was after.
+ */
+async function pathUnderNamedRoot(roots: Root[], requested: string): Promise<string | null> {
+  const segments = requested.split(/[\\/]+/).filter(Boolean);
+  for (let index = 1; index < segments.length - 1; index++) {
+    const root = roots.find(entry => entry.name.toLowerCase() === segments[index]!.toLowerCase());
+    if (!root) continue;
+    const candidate = `/${[root.name, ...segments.slice(index + 1)].join('/')}`;
+    try {
+      return (await resolveIn(roots, candidate, { access: 'read' })).virtual;
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 /**

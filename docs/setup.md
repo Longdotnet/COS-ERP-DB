@@ -26,7 +26,7 @@ Want screen and keyboard control? Enable **Desktop** permissions and connect its
 2. Create a **Restricted** [API key](https://platform.openai.com/settings/organization/api-keys) with **Tunnels: Read** and **Tunnels: Use**.
 3. Enter the tunnel ID and key in CoS and press **Connect**.
 4. In ChatGPT, open [Plugins](https://chatgpt.com/plugins), click **Add** at the top right and choose **Add custom MCP server**. Under **Connection** pick **Tunnel** and select your tunnel (or paste its ID), set **Authentication** to **No authentication**, tick **I understand and want to continue** and click **Create as a plugin**. Older ChatGPT versions instead need Developer mode turned on first (**Settings → Security and login**) and show a **+** button. Review and enable the app's actions.
-5. Name each app exactly as CoS shows it (for example `Chat On Steroids Core`). You can rename it later in ChatGPT: after its first call, CoS recognizes the app by ChatGPT's app ID, and Setup shows the new name next to the original.
+5. Name each app exactly as CoS shows it (for example `COS ERP DB Core`). You can rename it later in ChatGPT: after its first call, CoS recognizes the app by ChatGPT's app ID, and Setup shows the new name next to the original.
 
 > **No Developer mode switch?** That's expected. Current ChatGPT accounts, including new Plus accounts, create the app from **Plugins → Add → Add custom MCP server** without it, and file edits and desktop control work as before ([#522](https://github.com/totec448-spec/chat-on-steroids/issues/522)).
 
@@ -42,7 +42,9 @@ Core, Desktop and Plugins are separate connectors. Configure each surface you en
 
 In **Settings → Agents & automation → Browser & history → Browser bridge port**, choose **Auto** (default) or
 **8865**, **8866**, **8867**, **8868**, **8869**. Auto uses the first available port in that
-order. A fixed choice uses exactly that port. The companion discovers the same supported range.
+order and, when all five are taken, the fallback ranges **18865–18869** and **38865–38869**
+(Windows can reserve whole blocks of ports for Hyper-V, WSL2 or Docker). A fixed choice uses
+exactly that port. The companion scans every port Auto may choose.
 
 If the selected port is occupied, the save is rejected and the previous choice and working
 bridge remain active. If a saved port is occupied when CoS starts, the app stays open with the

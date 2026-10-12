@@ -27,7 +27,9 @@ import './i18n.js';
 
 const activeTabs = globalThis.chrome?.debugger ? createActiveTabs(chrome) : null;
 
-const PORTS = [8865, 8866, 8867, 8868, 8869];
+// The app's Auto order (src/shared/browser-bridge.ts): the primary range, then two fallback ranges
+// for when Windows reserves 8865-8869 (#1314 upstream). Refused local ports fail at once, so scanning is cheap.
+const PORTS = [8865, 8866, 8867, 8868, 8869, 18865, 18866, 18867, 18868, 18869, 38865, 38866, 38867, 38868, 38869];
 const EXPECTED_APP = 'cos-erp-db';
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -1374,7 +1376,7 @@ async function redeemCommand(id, client, conversationId = null, projectEntry = f
   };
   const command = result.data && result.data.command ? result.data.command : null;
   // A tab the app opened runs its command before its first status reply. Without this install's
-  // names it would take the plain "Chat On Steroids Core" for its own, which on a computer with a
+  // names it would take the plain "COS ERP DB Core" for its own, which on a computer with a
   // suffix is the other computer's, and mention that Core in the bootstrap.
   return { ok: true, command, ...(command ? { identity: { connectorNames, connectorApps, ownCoreApp } } : {}) };
 }
@@ -1970,7 +1972,7 @@ async function storedBackgroundWindow() {
  * only trusted while the group still carries the app's title: group ids are per browser session,
  * onStartup drops the mirror, and a group the user renamed is theirs now.
  */
-const BACKGROUND_GROUP_TITLE = 'Chat On Steroids';
+const BACKGROUND_GROUP_TITLE = 'COS ERP DB';
 const BACKGROUND_GROUP_MIRROR = 'chatBackgroundGroupMirror';
 async function rememberBackgroundGroup(id) {
   await chrome.storage.session.set({ chatBackgroundGroup: id });
