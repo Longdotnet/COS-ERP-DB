@@ -29,7 +29,7 @@ vi.mock('electron', () => ({
     encryptStringAsync: vi.fn(async (value: string) => Buffer.from(value, 'utf8')),
     decryptStringAsync: vi.fn(async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }))
   },
-  app: { on: vi.fn(), getPath: (_name: string) => '', getLocale: () => 'en-US', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
+  app: { on: vi.fn(), once: vi.fn(), getPath: (_name: string) => '', getLocale: () => 'en-US', getVersion: vi.fn(() => '0.0.0'), getAppPath: () => process.cwd(), isPackaged: false }
 }));
 
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
@@ -1993,6 +1993,29 @@ describe('session IPC contracts', () => {
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
   });
+});
+
+it('follows only the newest chat selection when an earlier lookup finishes last (#1249, #1267)', async () => {
+  const bridge = await import('../src/main/bridge.js');
+  const store = await import('../src/main/session/store.js');
+  const first = await createSession({ title: 'first', conversationId: 'aaaaaaaa-1111-4222-8333-444444444444' });
+  const second = await createSession({ title: 'second', conversationId: 'bbbbbbbb-1111-4222-8333-444444444444' });
+  const followed = vi.spyOn(bridge, 'followChatInBackground').mockImplementation(() => undefined);
+  const lookup = store.getSession;
+  let releaseFirst: () => void = () => undefined;
+  const firstHeld = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const slow = vi.spyOn(store, 'getSession').mockImplementation(async (id, ...rest) => {
+    if (id === first.id) await firstHeld;
+    return lookup(id, ...rest);
+  });
+  try {
+    const earlier = handlers.get('sessions:followTab')!(null, { id: first.id });
+    const later = await handlers.get('sessions:followTab')!(null, { id: second.id }) as any;
+    expect(later.ok, later.error).toBe(true);
+    releaseFirst();
+    expect(((await earlier) as any).ok).toBe(true);
+    expect(followed.mock.calls).toEqual([['bbbbbbbb-1111-4222-8333-444444444444']]);
+  } finally { slow.mockRestore(); followed.mockRestore(); }
 });
 
 it('saves this computer\'s connector suffix normalized, refuses an invalid one, and keeps a newer one through an older form', async () => {

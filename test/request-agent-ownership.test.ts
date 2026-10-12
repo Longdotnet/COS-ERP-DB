@@ -27,6 +27,7 @@ const { recordRequestEvidence, noteChatOrigin, resetRecorderForTests } = await i
 const { findSessionByConversation, getSession } = await import('../src/main/session/store.js');
 const { dispatch, ok } = await import('../src/main/mcp/kernel.js');
 const { currentCaller } = await import('../src/main/mcp/call-context.js');
+const { connectorName } = await import('../src/shared/connector-names.js');
 
 let directory: string;
 const request = { requestId: 'wfr_request_prime' };
@@ -367,11 +368,12 @@ it('joins dump-shaped paired tool sources through the real recorder into worker 
       <div data-content-search-unit-key="${turn}:2:assistant"><div data-markdown-text-style="assistant-message">Done</div></div>
       </div></div></div></main>`, { url: `https://chatgpt.com/c/${conversationId}`, runScripts: 'outside-only' });
     try {
-      const path = '/Chat On Steroids Core/link_fixture/agents';
+      const core = connectorName('core');
+      const path = `/${core}/link_fixture/agents`;
       const entry = { id: turn, conversationId, turn: { status: 'complete', messageIds: [user, result, final], items: [
         { type: 'user-message', messageId: user, message: 'Test' },
         { type: 'chatgpt-reasoning-group', items: [{ type: 'mcp-tool-call', callId: call, completed: true,
-          invocation: { server: 'Chat On Steroids Core', tool: 'agents', arguments: { secret: 'PRIVATE_ARGUMENT' } },
+          invocation: { server: core, tool: 'agents', arguments: { secret: 'PRIVATE_ARGUMENT' } },
           widgetStateSource: { messageId: result } }] },
         { type: 'assistant-message', messageId: final, content: 'Done', phase: 'final_answer', completed: true }
       ] } };
@@ -379,7 +381,7 @@ it('joins dump-shaped paired tool sources through the real recorder into worker 
         [call]: { id: call, message: { id: call, author: { role: 'assistant' }, recipient: 'api_tool.call_tool',
           content: { content_type: 'code', text: JSON.stringify({ path, args: { secret: 'PRIVATE_ARGUMENT' } }) }, metadata: { request_id: requestId } } },
         [result]: { id: result, message: { id: result, author: { role: 'tool' }, metadata: {
-          invoked_resource: { app_name: 'Chat On Steroids Core', resource_uri: path } } } }
+          invoked_resource: { app_name: core, resource_uri: path } } } }
       };
       const top = { memoizedProps: { client: { getQueryCache: () => ({ getAll: () => [
         { queryKey: ['chatgpt-conversation', conversationId], state: { data: { mapping } } }

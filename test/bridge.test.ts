@@ -83,6 +83,7 @@ const {
   BROWSER_RECOVERY_COOLDOWN_MS,
   DEFAULT_PORTS,
   revealChatInBrowser,
+  followChatInBackground,
   startBridge,
   stopBridge,
   sweepStaleSwarm,
@@ -111,6 +112,7 @@ const { completeProcessCall, createSession, deleteSession, findSessionByConversa
   '../src/main/session/store.js'
 );
 const sessionStoreModule = await import('../src/main/session/store.js');
+const { noteServedRequest, resetConnectorIdentityForTests } = await import('../src/main/connector-identity.js');
 const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { requestCorrelation, resetCorrelationRegistryForTests, restoreRequestCorrelations } = await import('../src/main/session/correlation.js');
 const { resetBlockedChatsForTests, setChatBlocked } = await import('../src/main/session/blocked-chats.js');
@@ -1082,6 +1084,59 @@ describe('active agent tab discard projection', () => {
 
     finishAgent({ conversationId: workerConversation }, 'the worker is sleeping now');
     expect((await request('GET', '/status')).body.nonDiscardableConversations).toEqual([]);
+  });
+});
+
+describe('a message sent into a running answer (#1301)', () => {
+  const conversationId = 'f0f01301-1111-4111-8111-111111111111';
+  const post = (events: unknown[]) => request('POST', '/events', { body: { conversationId, events } });
+
+  it('keeps the end of a turn the user\'s message continued, and only that', async () => {
+    const { readEvents } = await import('../src/main/session/store.js');
+    await pair();
+    const at = Date.now();
+    const opened = await post([
+      { kind: 'user_message', time: at, text: 'Run six commands', messageId: 'q-1301' },
+      { kind: 'turn_start', time: at + 1, turnId: 'g-1301-0-1' },
+      { kind: 'turn_end', time: at + 2, turnId: 'g-1301-0-1', outcome: 'interrupted', continued: true },
+      { kind: 'user_message', time: at + 2, text: 'Also add STEERED', messageId: 'steer-1301' },
+      { kind: 'turn_start', time: at + 3, turnId: 'g-1301-0-2' },
+      { kind: 'turn_end', time: at + 4, turnId: 'g-1301-0-2', outcome: 'completed', continued: 'yes' }
+    ]);
+    const ends = (await readEvents(opened.body.sessionId as string, { from: 0, limit: 100 })).filter(event => event.kind === 'turn_end');
+    expect(ends.map(event => [event.turnId, (event as { continued?: boolean }).continued])).toEqual([
+      ['g-1301-0-1', true], ['g-1301-0-2', undefined]
+    ]);
+  });
+
+  it('files an outline only under the turn its opening message belongs to', async () => {
+    const { readTurnTraces } = await import('../src/main/session/store.js');
+    await pair();
+    const at = Date.now();
+    const opened = await post([
+      { kind: 'user_message', time: at, text: 'Run six commands', messageId: 'q-1301-b' },
+      { kind: 'turn_start', time: at + 1, turnId: 'g-1301b-0-1' },
+      { kind: 'turn_end', time: at + 2, turnId: 'g-1301b-0-1', outcome: 'interrupted', continued: true },
+      { kind: 'user_message', time: at + 2, text: 'Also add STEERED', messageId: 'steer-1301-b' },
+      { kind: 'turn_start', time: at + 3, turnId: 'g-1301b-0-2' }
+    ]);
+    const sessionId = opened.body.sessionId as string;
+    const before = [{ kind: 'call', id: 'call-1', tool: 'exec_command', done: true }];
+    const after = [{ kind: 'say', text: 'Steering note received.', done: true }, { kind: 'call', id: 'call-3', tool: 'exec_command', done: true }];
+    await post([
+      { kind: 'turn_trace', time: at + 5, turnId: 'g-1301b-0-1', question: 'q-1301-b', trace: before },
+      { kind: 'turn_trace', time: at + 6, turnId: 'g-1301b-0-2', question: 'steer-1301-b', trace: after }
+    ]);
+    await vi.waitFor(async () => expect(await readTurnTraces(sessionId, ['g-1301b-0-1', 'g-1301b-0-2'])).toEqual({
+      'g-1301b-0-1': before, 'g-1301b-0-2': after }));
+    // The moment the page switches turns, the newer answer must not overwrite the earlier turn's outline.
+    await post([{ kind: 'turn_trace', time: at + 7, turnId: 'g-1301b-0-1', question: 'steer-1301-b', trace: after }]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect((await readTurnTraces(sessionId, ['g-1301b-0-1']))['g-1301b-0-1']).toEqual(before);
+    // A page that cannot name the question still files it, as before.
+    const updated = [...before, { kind: 'recap', text: 'Ran the first command' }];
+    await post([{ kind: 'turn_trace', time: at + 8, turnId: 'g-1301b-0-1', trace: updated }]);
+    await vi.waitFor(async () => expect((await readTurnTraces(sessionId, ['g-1301b-0-1']))['g-1301b-0-1']).toEqual(updated));
   });
 });
 
@@ -2644,6 +2699,34 @@ describe('automatic compaction', () => {
     }
   });
 
+  it('does not report a chat as stopped when ChatGPT deleted it: its own notice already says so', async () => {
+    const told: Array<{ title: string; body: string }> = [];
+    setStuckNotifier((title, body) => { told.push({ title, body }); return true; });
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const conversationId = 'a1a1a1a1-0000-4000-8000-00000000de03';
+      const deleted = 'This chat was deleted in ChatGPT. Start a new chat to continue.';
+      await request('POST', '/events', { body: { conversationId, events: [
+        { kind: 'user_message', time: Date.now(), text: 'one more thing', messageId: 'm-deleted' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'turn-deleted' }
+      ] } });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await request('POST', '/events', { body: { conversationId, events: [
+        { kind: 'chat_error', time: Date.now(), turnId: 'turn-deleted', recoverable: false, text: deleted },
+        { kind: 'turn_end', time: Date.now(), turnId: 'turn-deleted', outcome: 'failed', detail: deleted }
+      ] } });
+      await vi.advanceTimersByTimeAsync(PRO_SILENCE_MS + 30_000);
+      await sweepStaleSwarm(Date.now());
+      await vi.advanceTimersByTimeAsync(PRO_SILENCE_MS + 30_000);
+      await sweepStaleSwarm(Date.now());
+      expect(told.map(item => item.title)).not.toContain('A chat stopped');
+    } finally {
+      setStuckNotifier(null);
+      vi.useRealTimers();
+    }
+  });
+
   it('observes Astra per chat, refuses automatic tickets, and preserves manual compaction', async () => {
     await pair();
     const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac90';
@@ -3400,6 +3483,75 @@ describe('automatic compaction', () => {
       }
       expect(await stuckNotes()).toHaveLength(1);
       expect(continuationByToken(token)).toMatchObject({ state: 'awaiting-summary', sourceSend: { state: 'dispatched-unresolved' } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * 2026-10-10, native-Project E2E: an armed handoff click that never reached ChatGPT has no marker,
+ * so the transaction waited for one forever. A document loaded after the click that still shows
+ * the pre-click newest user message proves it was never received, and only that hands it back.
+ */
+describe('releasing a handoff click ChatGPT never received', () => {
+  async function armed(conversationId: string, before?: string) {
+    await pair();
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'keep going', messageId: `m-${conversationId}` }] }
+    });
+    const token = (await request('POST', '/compact', { body: { conversationId } })).body.token as string;
+    expect((await request('POST', '/compact', { body: { conversationId, token, sourceAttempt: true } })).body.allowed).toBe(true);
+    expect((await request('POST', '/compact', {
+      body: { conversationId, token, sourceDispatch: true, ...(before ? { before } : {}) }
+    })).body.armed).toBe(true);
+    return token;
+  }
+  const undelivered = (conversationId: string, token: string, newestUserMessage: string, documentSince: number) =>
+    request('POST', '/compact', { body: { conversationId, token, sourceUndelivered: true, newestUserMessage, documentSince } });
+
+  it('hands the click back once a later idle document still shows the pre-click newest message, and allows one new Send', async () => {
+    vi.useFakeTimers();
+    try {
+      const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ad01';
+      const token = await armed(conversationId, 'm-before');
+      const dispatchedAt = continuationByToken(token)!.sourceSend.dispatchedAt!;
+      await vi.advanceTimersByTimeAsync(20_000);
+      const released = await undelivered(conversationId, token, 'm-before', dispatchedAt + 10_000);
+      expect(released.status).toBe(200);
+      expect(continuationByToken(token)?.sourceSend.state).toBe('attempted-unresolved');
+      expect((await request('POST', '/compact', { body: { conversationId, token, sourceDispatch: true, before: 'm-before' } })).body.armed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['a newer user message is on the page (the click may have landed)', 'm-handoff', 10_000, 20_000],
+    ['the document predates the click', 'm-before', -1, 20_000],
+    ['the click was armed less than 15 s ago', 'm-before', 1_000, 5_000]
+  ])('keeps the click armed when %s', async (_why, newest, since, wait) => {
+    vi.useFakeTimers();
+    try {
+      const conversationId = `a1a1a1a1-0000-4000-8000-0000000ad1${String(wait).slice(0, 2)}`;
+      const token = await armed(conversationId, 'm-before');
+      const dispatchedAt = continuationByToken(token)!.sourceSend.dispatchedAt!;
+      await vi.advanceTimersByTimeAsync(wait);
+      expect((await undelivered(conversationId, token, newest, dispatchedAt + since)).status).toBe(409);
+      expect(continuationByToken(token)?.sourceSend.state).toBe('dispatched-unresolved');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a click armed without a recorded pre-click message (older pages) armed', async () => {
+    vi.useFakeTimers();
+    try {
+      const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ad03';
+      const token = await armed(conversationId);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect((await undelivered(conversationId, token, 'm-before', Date.now())).status).toBe(409);
+      expect(continuationByToken(token)?.sourceSend.state).toBe('dispatched-unresolved');
     } finally {
       vi.useRealTimers();
     }
@@ -15354,6 +15506,108 @@ describe('opening a chat in the browser that runs the extension (#882)', () => {
   });
 });
 
+describe('selecting a chat in the app selects its background tab (#1249)', () => {
+  const CHAT = 'abcdabcd-1111-4222-8333-555555555555';
+  const OTHER = 'abcdabcd-1111-4222-8333-666666666666';
+  const BROWSER_A = 'aaaaaaaaaaaaaaaa3333';
+  const BROWSER_B = 'bbbbbbbbbbbbbbbb4444';
+  const connect = async () => {
+    const socket = new WebSocket(base.replace('http:', 'ws:') + '/wake', { origin: EXTENSION_ORIGIN });
+    await once(socket, 'open');
+    const authenticated = once(socket, 'message'); socket.send(token!); await authenticated;
+    return socket;
+  };
+  const close = async (socket: WebSocket) => { const closed = once(socket, 'close'); socket.close(); await closed; };
+  const poll = async (browser: string, openConversations: string[] = []) =>
+    (await request('POST', '/status', { browser, body: { openConversations, canReveal: true } })).body;
+  const background = async (on: boolean) => {
+    const config = getConfig();
+    await saveConfig({ ...config, ui: { ...config.ui, backgroundChats: on } });
+  };
+
+  it('hands the newest selection once, only to the browser that has the chat open', async () => {
+    await pair();
+    await background(true);
+    const socket = await connect();
+    try {
+      await poll(BROWSER_A, [OTHER]);
+      await poll(BROWSER_B, [CHAT]);
+      const woken = once(socket, 'message');
+      followChatInBackground(OTHER);
+      followChatInBackground(CHAT);
+      expect(String((await woken)[0])).toBe('wake');
+      // A browser without the chat is never asked to open it.
+      expect((await poll(BROWSER_A, [OTHER])).follow).toBeUndefined();
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBe(CHAT);
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+    } finally { await close(socket); }
+  });
+
+  it('asks for nothing with Background chats off', async () => {
+    await pair();
+    await background(false);
+    const socket = await connect();
+    try {
+      await poll(BROWSER_B, [CHAT]);
+      followChatInBackground(CHAT);
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+    } finally { await close(socket); await background(true); }
+  });
+
+  it('lets an old selection lapse instead of acting on it later', async () => {
+    await pair();
+    await background(true);
+    const socket = await connect();
+    try {
+      await poll(BROWSER_B, []);
+      followChatInBackground(CHAT);
+      const later = Date.now() + 11_000;
+      const now = vi.spyOn(Date, 'now').mockReturnValue(later);
+      try {
+        expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+      } finally { now.mockRestore(); }
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+    } finally { await close(socket); }
+  });
+
+  const placement = async (value: 'window' | 'group') => {
+    const config = getConfig();
+    await saveConfig({ ...config, ui: { ...config.ui, backgroundPlacement: value } });
+  };
+
+  it('asks for no follow when background tabs go to a tab group', async () => {
+    await pair();
+    await background(true);
+    await placement('group');
+    const socket = await connect();
+    try {
+      await poll(BROWSER_B, [CHAT]);
+      followChatInBackground(CHAT);
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+    } finally { await close(socket); await placement('window'); }
+  });
+
+  it('drops a pending follow once the placement switches to a tab group', async () => {
+    await pair();
+    await background(true);
+    const socket = await connect();
+    try {
+      await poll(BROWSER_B, [CHAT]);
+      followChatInBackground(CHAT);
+      await placement('group');
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+    } finally { await close(socket); await placement('window'); }
+  });
+
+  it.each(['window', 'group'] as const)('publishes the background placement %s in /status', async (value) => {
+    await pair();
+    await placement(value);
+    try {
+      expect((await poll(BROWSER_B, [])).backgroundPlacement).toBe(value);
+    } finally { await placement('window'); }
+  });
+});
+
 describe('worker brief on a computer with its own connector names', () => {
   it('names this computer\'s Core for reports, and keeps the plain brief otherwise', async () => {
     // One ChatGPT account on several computers: "the agents tool" alone let a worker report through
@@ -15366,5 +15620,129 @@ describe('worker brief on a computer with its own connector names', () => {
       expect(workerBriefForTests('worker-1', 'Check the tests'))
         .toContain('Report to prime through the agents tool of COS ERP DB Core (Windows VM) — ');
     } finally { await saveConfig(previous); }
+  });
+});
+
+/**
+ * 2026-10-11: ChatGPT keeps a connector's app id across a rename (measured on VM 141). The page
+ * reports what it sees as app sightings; only a request this app served may teach an identity.
+ */
+describe('connector identity through the bridge', () => {
+  beforeEach(() => resetConnectorIdentityForTests());
+
+  it('learns a renamed Core from an app_sightings observation of a served request and publishes it', async () => {
+    await pair();
+    noteServedRequest('req-renamed', 'core');
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000c1d1';
+    await request('POST', '/events', { body: { conversationId, events: [{ kind: 'app_sightings', time: Date.now(), apps: [
+      { requestId: 'req-renamed', appId: 'asdk_app_6ac261da79588191af4e6096fadeeee2', linkId: 'link_6ac262533e048191933934eaee5cd69f', appName: 'My tools' },
+      { requestId: 'not-ours', appId: 'asdk_app_foreign', linkId: null, appName: 'Chat On Steroids Core' }
+    ] }] } });
+    const status = (await request('GET', '/status')).body;
+    expect(status.connectorApps.core).toEqual([{ appId: 'asdk_app_6ac261da79588191af4e6096fadeeee2', linkId: 'link_6ac262533e048191933934eaee5cd69f', name: 'My tools' }]);
+    expect(status.connectorApps.desktop).toEqual([]);
+  });
+
+  it('keeps the name a newer chat showed when an older chat still reports the old one', async () => {
+    await pair();
+    const app = { appId: 'asdk_app_6ac261da79588191af4e6096fadeeee2', linkId: 'link_6ac262533e048191933934eaee5cd69f' };
+    noteServedRequest('req-newer-chat', 'core');
+    noteServedRequest('req-older-chat', 'core');
+    await request('POST', '/events', { body: { conversationId: '6acb532d-fe08-83ed-96e2-e22cd7008cb8', events: [{ kind: 'app_sightings', time: Date.now(),
+      apps: [{ requestId: 'req-newer-chat', ...app, appName: 'Renamed' }] }] } });
+    await request('POST', '/events', { body: { conversationId: '6acb3e79-2cd4-83eb-b54b-f9d66653cf07', events: [{ kind: 'app_sightings', time: Date.now(),
+      apps: [{ requestId: 'req-older-chat', ...app, appName: 'Original' }] }] } });
+    expect((await request('GET', '/status')).body.connectorApps.core[0].name).toBe('Renamed');
+  });
+
+  it('does not store app_sightings as transcript content', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000c1d2';
+    await request('POST', '/events', { body: { conversationId, events: [{ kind: 'app_sightings', time: Date.now(), apps: [] }] } });
+    expect(await findSessionByConversation(conversationId)).toBeNull();
+  });
+});
+
+/** #1176: a new CoS project's native ChatGPT Project, and its new chats only in that Project. */
+describe('native ChatGPT Project for a new CoS project', () => {
+  const nativeId = `g-p-${'c'.repeat(32)}`;
+  async function newProject(name: string) {
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const { addProject } = await import('../src/main/projects.js');
+    const folder = path.join(dir, name);
+    await fs.mkdir(folder, { recursive: true });
+    await saveConfig({ ...suiteConfig, roots: [{ name: 'project', path: folder }] });
+    return addProject(folder);
+  }
+
+  it('lets only the page that claimed and armed it report the Project id', async () => {
+    await pair();
+    const project = await newProject('native-route');
+    const id = (project.chatgpt as { requestId: string }).requestId;
+    const create = (body: Record<string, unknown>) => request('POST', '/project-create', { body: { id, ...body } });
+    const pending = async () => ((await request('POST', '/status', { body: { openConversations: [] } })).body.projectCreateRequests as Array<{ id: string }>)
+      .filter(row => row.id === id);
+    expect(await pending()).toEqual([expect.objectContaining({ id, projectId: project.id, state: 'requested' })]);
+    expect((await create({ action: 'claim', client: 'doc-a' })).body.ok).toBe(true);
+    expect((await create({ action: 'arm', client: 'doc-b' })).body.ok).toBe(false);
+    expect((await create({ action: 'arm', client: 'doc-a' })).body.ok).toBe(true);
+    expect((await create({ action: 'done', client: 'doc-b', chatgptId: nativeId })).body.ok).toBe(false);
+    expect((await create({ action: 'done', client: 'doc-a', chatgptId: nativeId })).body.ok).toBe(true);
+    expect(await pending()).toEqual([]);
+  });
+
+  it("claims a new chat of a linked project only from that Project's page, never from the root", async () => {
+    await pair();
+    const input = await import('../src/main/session/input.js');
+    input.resetInputForTests();
+    await writeDurableNow('session-input', []);
+    const project = await newProject('native-claim');
+    const id = (project.chatgpt as { requestId: string }).requestId;
+    const row = await input.enqueueInput({ id: randomUUID(), projectId: project.id, sessionId: null, text: 'Start here', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null });
+    const claim = (body: Record<string, unknown>) => request('POST', '/input/claim', { body: { id: row.id, owner: '9:page:0', conversationId: null, ...body } });
+    // Not yet created: no page may take it, wherever it is.
+    expect((await claim({ project: nativeId })).body.input).toBeNull();
+    await request('POST', '/project-create', { body: { id, action: 'claim', client: 'doc' } });
+    await request('POST', '/project-create', { body: { id, action: 'arm', client: 'doc' } });
+    await request('POST', '/project-create', { body: { id, action: 'done', client: 'doc', chatgptId: nativeId } });
+    const offered = ((await request('POST', '/status', { body: { openConversations: [] } })).body.inputs as Array<{ id: string; project?: string }>)
+      .find(entry => entry.id === row.id);
+    expect(offered).toMatchObject({ project: nativeId });
+    expect((await claim({})).body.input).toBeNull();
+    expect((await claim({ project: `g-p-${'d'.repeat(32)}` })).body.input).toBeNull();
+    expect((await claim({ project: nativeId })).body.input).toMatchObject({ id: row.id });
+  });
+});
+
+/** A chat ChatGPT says it deleted (`conversation_deleted`, read by the page from ChatGPT's own answer). */
+describe('a chat deleted in ChatGPT', () => {
+  it('ends only the messages still waiting for that chat, with the real reason', async () => {
+    await pair();
+    const input = await import('../src/main/session/input.js');
+    input.resetInputForTests();
+    await writeDurableNow('session-input', []);
+    const gone = randomUUID(), other = randomUUID();
+    const deleted = await createSession({ conversationId: gone });
+    const alive = await createSession({ conversationId: other });
+    const enqueue = (sessionId: string, text: string) => input.enqueueInput({ id: randomUUID(), sessionId, text, mode: 'auto',
+      dueAt: Date.now(), model: null, reasoningEffort: null });
+    try {
+      const waiting = await enqueue(deleted.id, 'Into the deleted chat');
+      const kept = await enqueue(alive.id, 'Into a chat that still exists');
+      expect((await request('POST', '/conversation-deleted', { body: { conversationId: 'not a chat' } })).status).toBe(400);
+      const reply = await request('POST', '/conversation-deleted', { body: { conversationId: gone } });
+      expect(reply.body).toEqual({ ok: true, ended: 1 });
+      const rows = await input.listInputs();
+      expect(rows.find(row => row.id === waiting.id)).toMatchObject({ state: 'failed',
+        error: 'This chat was deleted in ChatGPT. Start a new chat to continue.' });
+      expect(rows.find(row => row.id === kept.id)).toMatchObject({ state: 'queued' });
+      expect(rows.find(row => row.id === kept.id)?.error).toBeUndefined();
+      // Said again (another page, a replay), it ends nothing more.
+      expect((await request('POST', '/conversation-deleted', { body: { conversationId: gone } })).body).toEqual({ ok: true, ended: 0 });
+    } finally {
+      input.resetInputForTests();
+      await writeDurableNow('session-input', []);
+    }
   });
 });

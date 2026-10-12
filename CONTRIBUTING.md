@@ -4,7 +4,7 @@ Chat On Steroids is a Windows/macOS/Linux beta maintained by one person. Bug rep
 
 ## Before a pull request
 
-For anything non-trivial, open an issue first so the intended behavior is clear. Security problems must be reported privately through [`SECURITY.md`](SECURITY.md), not as an issue or PR.
+No separate issue is needed: describe the problem and the change in the PR. For anything beyond a small fix, open a draft PR early and agree on the behavior there before building it out. Security problems must be reported privately through [`SECURITY.md`](SECURITY.md), not as an issue or PR.
 
 Keep changes narrow. Preserve existing permission, identity and recovery behavior unless the issue specifically requires changing it. Avoid unrelated formatting, generated output, local debugging material and private data. In screenshots, logs and examples, replace real usernames, local paths, chat text, IDs and credentials with obvious placeholders such as `C:\Users\you\project` or `/home/you/project`.
 
@@ -66,6 +66,8 @@ Release CI builds and smoke-tests every platform/architecture on a native runner
 The `canary` prerelease is a test build of `main`, rebuilt automatically after every change to `main` that can affect the app (documentation and test-only changes are skipped). A newer build replaces the previous one. It has no release notes and no support. Issues and pull requests are accepted only for problems that also happen on the latest stable release.
 
 ## Issues
+
+A bug report needs the exact app version, for example `2.1.32` (Settings → Activity in the app). "latest" is not enough: it changes with every release. A report without a version number is closed with the `needs-version` label and reopens by itself when the number is edited in.
 
 Issues are closed as soon as their fix is merged to `main`; the fix ships with the next release. When an issue is labeled `needs-info`, it waits for details from the reporter: after 7 days without a reply it gets one reminder, and 3 days later it is closed. Reply or reopen at any time with the details.
 

@@ -140,6 +140,8 @@ export interface UiPrefs {
   /** Maintenance may reuse existing tabs but cannot open helpers or missing chats. */
   browserOnly?: boolean;
   backgroundChats?: boolean;
+  /** Where background tabs go: the app's minimized window, or a collapsed tab group in the user's window (#128). */
+  backgroundPlacement?: 'window' | 'group';
   browserBridgePort?: import('./browser-bridge.js').BrowserBridgePort;
   /** Opt-in browser automation for changed connector tool schemas. */
   autoRefreshPlugins?: boolean;
@@ -469,6 +471,8 @@ export interface SurfaceStatus {
   id: SurfaceId;
   /** Exactly what the user should name the connector in ChatGPT. */
   connectorName: string;
+  /** What ChatGPT shows for it once a served call proved a different name (a rename); null otherwise. */
+  chatgptName?: string | null;
   /** Exactly what the user should paste as its description. */
   description: string;
   /** One line in the app's own voice, for the setup card. */

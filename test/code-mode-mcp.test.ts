@@ -23,6 +23,7 @@ import { noteExecOwner, forgetExecOwner } from '../src/main/codex/ownership.js';
 import * as ownership from '../src/main/codex/ownership.js';
 import type { ExecCommandToolOutput } from '../src/main/codex/unified-exec.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
+import { connectorName } from '../src/shared/connector-names.js';
 
 let directory: string, endpoint: McpEndpoint, ctx: ToolContext;
 /**
@@ -526,4 +527,12 @@ it('uses existing process custody for nested exec and write_stdin across a conve
   observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
   const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"owner\\r",yield_time_ms:1000}));`);
   expect(text(continued)).toContain('OWNED_RESULT');
+});
+
+it('explains a "not a function" from another connector\'s tool in a Core script (#1287)', async () => {
+  const who = await identity();
+  const response = await call(who.requestId, 'try { await tools.read_clipboard({}); } catch (error) { text(String(error)); }');
+  const all = text(response);
+  expect(all).toContain('not a function');
+  expect(all).toContain(`UNKNOWN_TOOL_NAMES: this script used tools.read_clipboard (a ${connectorName('desktop')} tool), which ${connectorName('core')} does not offer`);
 });

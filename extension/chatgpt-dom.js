@@ -2687,6 +2687,29 @@ var CLF_DOM = (() => {
     ownConnectors = list;
     return true;
   }
+  /** This install's proven connector apps ({ surface, appId, linkId, name }), from the app's status. */
+  let ownApps = [];
+  function setConnectorApps(value) {
+    const list = [];
+    for (const surface of ['core', 'desktop', 'plugins']) {
+      for (const app of (value && Array.isArray(value[surface]) ? value[surface] : []).slice(0, 4)) {
+        if (!app || typeof app.appId !== 'string' || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(app.appId)) continue;
+        list.push({ surface, appId: app.appId, linkId: typeof app.linkId === 'string' ? app.linkId : null,
+          name: typeof app.name === 'string' ? app.name : null });
+      }
+    }
+    const changed = JSON.stringify(list) !== JSON.stringify(ownApps);
+    ownApps = list;
+    return changed;
+  }
+  const connectorApps = () => ownApps.map(app => ({ ...app }));
+  /** The proven apps of the surface that a configured connector name belongs to (renames keep the id). */
+  function provenAppsFor(connectorName) {
+    const at = connectorNames().indexOf(connectorName);
+    if (at < 0) return [];
+    const surface = ['core', 'desktop', 'plugins'][at];
+    return ownApps.filter(app => app.surface === surface);
+  }
   /** This install's three names, or the plain ones while the app has not said. */
   const connectorNames = () => [...(ownConnectors || PLAIN_CONNECTORS)];
   /** The Plugins connector of any computer: it only selects that connector's larger action limits. */
@@ -2703,11 +2726,11 @@ var CLF_DOM = (() => {
         if (event.source === window && event.origin === location.origin && data?.source === 'clf-plugin-reply' && data.nonce === nonce && data.v === 1) finish(data.plugin);
       };
       const timer = setTimeout(() => finish(null), 1500);
-      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames() }, location.origin);
+      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames(), appIds: connectorApps() }, location.origin);
     });
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash) ||
       (!location.hash ? /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname) : null);
-    if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : snapshot.connectorName !== connectorName) ||
+    if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : !ownSnapshot(snapshot, connectorName)) ||
         !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 16) || JSON.stringify(snapshot.tools).length > 300000 ||
         snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !/^[a-z][a-z0-9_]{0,79}$/.test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
         new Set(snapshot.tools.map(tool => tool.name)).size !== snapshot.tools.length) return null;
@@ -2716,14 +2739,26 @@ var CLF_DOM = (() => {
       tools: snapshot.tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), refresh: buttons[0] || null,
       tunnelId: typeof snapshot.tunnelId === 'string' && /^tunnel_[a-zA-Z0-9]{8,80}$/.test(snapshot.tunnelId) ? snapshot.tunnelId : null, settled: snapshot.settled === true } : null;
   }
+  /**
+   * Whether a plugin settings page shows this connector: by a proven app id when one exists (a
+   * same-named app with another id is somebody else's), otherwise by the configured name as before.
+   */
+  function ownSnapshot(snapshot, connectorName) {
+    const proven = provenAppsFor(connectorName);
+    return proven.length ? proven.some(app => app.appId === snapshot.appId) : snapshot.connectorName === connectorName;
+  }
   function pluginInstalledButtons(connectorName) {
+    // The installed list shows only names. A renamed connector shows its proven current name; the
+    // page opened from the row is then checked by app id (ownSnapshot), so a name match is no proof.
+    const names = [connectorName, ...provenAppsFor(connectorName).map(app => app.name).filter(Boolean)];
+    const named = node => names.includes(text(node));
     return safe(() => {
       // The newer shell lists installed plugins on the /settings/plugins-settings page itself.
       if (location.pathname === '/settings/plugins-settings' && !location.hash) {
         const main = document.querySelector('main');
         if (!main) return null;
         const rows = [...main.querySelectorAll('button')].filter(button => !button.disabled && button.getClientRects().length > 0 &&
-          [...button.querySelectorAll('*')].some(node => !node.children.length && text(node) === connectorName));
+          [...button.querySelectorAll('*')].some(node => !node.children.length && named(node)));
         return rows.length ? rows : null;
       }
       const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel => panel.getClientRects().length > 0 &&
@@ -2734,7 +2769,7 @@ var CLF_DOM = (() => {
       const rows = [...panels[0].querySelectorAll('button')].filter(button => !button.disabled && button.getClientRects().length > 0 &&
         button.querySelector('[data-testid="plugin-icon-wrapper"]'));
       if (!rows.length) return null;
-      return rows.filter(button => [...button.querySelectorAll('*')].some(node => !node.children.length && text(node) === connectorName));
+      return rows.filter(button => [...button.querySelectorAll('*')].some(node => !node.children.length && named(node)));
     }, null);
   }
   function pluginManagementIdle() {
@@ -2827,7 +2862,7 @@ var CLF_DOM = (() => {
       };
       const timer = setTimeout(() => finish(null), 1500);
       window.addEventListener('message', receive);
-      window.postMessage({ source: 'clf-picker-ask', nonce, apps: connectorNames() }, location.origin);
+      window.postMessage({ source: 'clf-picker-ask', nonce, apps: connectorNames(), appIds: connectorApps() }, location.origin);
     });
   }
   /** UI only transports a requested selection. Provider state proves identity and availability. */
@@ -3136,6 +3171,8 @@ var CLF_DOM = (() => {
    */
   const PROJECT_SOURCE_READY_MS = 60_000;
   const PROJECT_TRANSITION_MS = 12_000;
+  /** Clicks again after ChatGPT's own route rewrite drops the first one; two rewrites are seen. */
+  const PROJECT_RECLICKS = 2;
 
   /**
    * Enter a Project through its source chat's native link. Cold /project loads can error.
@@ -3148,12 +3185,24 @@ var CLF_DOM = (() => {
       reportFailure('invalid-entry');
       return false;
     }
+    // The exact same-origin Project-home target is the native entry. ChatGPT has moved this
+    // control across several shells: its folder icon lost a test id in early October, then the
+    // link itself moved outside both <header> and [role="banner"]. Do not bind navigation to
+    // either wrapper. Instead reject quoted/transcript links and hidden kept pages, then require
+    // one visible provider link to this exact Project. Ambiguity still fails closed.
+    const projectLinks = () => [...document.querySelectorAll('a[href]')].filter(link =>
+      !link.closest(`${OWN_SURFACES}, ${TURN}`) && composerCssVisible(link) &&
+      new URL(link.href, location.href).origin === location.origin &&
+      projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
     return new Promise(resolve => {
       let clicked = false, done = false, lastObservation = 'source-not-ready';
+      // Where the source chat was when the link was clicked, and how many times its own route
+      // rewrite has since taken that click away.
+      let clickedPath = '', reclicks = 0;
       const interrupt = event => { if (event.isTrusted) finish(false, 'user-interrupted'); };
       const finish = (result, reason = 'unknown') => {
         if (done) return;
-        done = true; observer.disconnect(); clearTimeout(timer);
+        done = true; observer.disconnect(); clearTimeout(timer); clearInterval(routeWatch);
         document.removeEventListener('pointerdown', interrupt, true);
         document.removeEventListener('keydown', interrupt, true);
         if (!result) reportFailure(reason);
@@ -3182,6 +3231,22 @@ var CLF_DOM = (() => {
           return;
         }
         if (clicked) {
+          // A replacement tab opens the source at /c/<id>, and ChatGPT then rewrites that route
+          // twice (/g/<project>/c/<id>, then the same with the Project's name). A click that lands
+          // between the two is taken by the router and then dropped by its own second rewrite: the
+          // tab stays on the source chat and the entry timed out (measured 2026-10-10, 8 of 14
+          // Compact & resume attempts in a Project). The source route changing under the click is
+          // that drop, so the same single link is clicked again.
+          if (location.pathname !== clickedPath && reclicks < PROJECT_RECLICKS) {
+            const links = projectLinks();
+            if (links.length === 1) {
+              reclicks++;
+              clickedPath = location.pathname;
+              lastObservation = 'source-route-rewritten';
+              links[0].click();
+              return check();
+            }
+          }
           lastObservation = 'source-route';
           return;
         }
@@ -3194,20 +3259,13 @@ var CLF_DOM = (() => {
           lastObservation = 'source-not-ready';
           return;
         }
-        // The exact same-origin Project-home target is the native entry. ChatGPT has moved this
-        // control across several shells: its folder icon lost a test id in early October, then the
-        // link itself moved outside both <header> and [role="banner"]. Do not bind navigation to
-        // either wrapper. Instead reject quoted/transcript links and hidden kept pages, then require
-        // one visible provider link to this exact Project. Ambiguity still fails closed.
-        const links = [...document.querySelectorAll('a[href]')].filter(link =>
-          !link.closest(`${OWN_SURFACES}, ${TURN}`) && composerCssVisible(link) &&
-          new URL(link.href, location.href).origin === location.origin &&
-          projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
+        const links = projectLinks();
         if (links.length !== 1) {
           lastObservation = 'candidate-count-' + links.length;
           return;
         }
         clicked = true;
+        clickedPath = location.pathname;
         lastObservation = 'source-route';
         // Loading the source and following its link are separate page transitions.
         // Reuse the same deadline timer; source loading must not consume the budget
@@ -3222,6 +3280,8 @@ var CLF_DOM = (() => {
       };
       const observer = new MutationObserver(check);
       observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      // A route rewrite through history.replaceState changes no DOM by itself.
+      const routeWatch = setInterval(check, 250);
       let timer = setTimeout(
         () => finish(false, 'source-ready-timeout:last=' + lastObservation),
         PROJECT_SOURCE_READY_MS
@@ -3230,6 +3290,65 @@ var CLF_DOM = (() => {
       document.addEventListener('keydown', interrupt, true);
       check();
     });
+  }
+
+  /**
+   * ChatGPT's own "new Project" control in its sidebar, or null.
+   *
+   * Located by the attribute ChatGPT's sidebar action carries, not by its label, which is in the
+   * account's language (measured 2026-10-10: `data-app-action-sidebar-project-create`, labelled
+   * "Adicionar novo projeto" on a pt-BR account). Exactly one shown control, or nothing.
+   */
+  function projectCreateControl() {
+    return safe(() => {
+      const shown = [...document.querySelectorAll('button[data-app-action-sidebar-project-create]')]
+        .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 && !node.disabled);
+      return shown.length === 1 ? shown[0] : null;
+    }, null);
+  }
+
+  /**
+   * Opens ChatGPT's collapsed sidebar once so its New project control can show. A narrow window
+   * unmounts the sidebar, and the control lives only there.
+   */
+  function revealSidebar() {
+    return safe(() => {
+      const toggles = [...document.querySelectorAll('button[data-testid="open-sidebar-button"][aria-expanded="false"]')]
+        .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 && !node.disabled);
+      if (toggles.length !== 1) return false;
+      toggles[0].click();
+      return true;
+    }, false);
+  }
+
+  /** Every Project the page links to right now, by id: the account's Projects ChatGPT lists. */
+  function projectIdsShown() {
+    return safe(() => [...new Set([...document.querySelectorAll('a[href]')]
+      .map(link => projectHomeId(new URL(link.href, location.href).pathname)).filter(Boolean))], []);
+  }
+
+  /** ChatGPT's open "Create project" dialog: its name field and its one submit button. */
+  function projectCreateForm() {
+    return safe(() => {
+      const dialogs = [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')]
+        .filter(node => node.querySelector('input#chatgpt-project-name') && node.getClientRects().length > 0);
+      if (dialogs.length !== 1) return null;
+      const input = dialogs[0].querySelector('input#chatgpt-project-name');
+      const submits = [...dialogs[0].querySelectorAll('button[type="submit"]')];
+      return input && submits.length === 1 ? { dialog: dialogs[0], input, submit: submits[0] } : null;
+    }, null);
+  }
+
+  /** Types a Project name the way React sees a person typing it. */
+  function fillProjectName(input, name) {
+    return safe(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (!setter) return false;
+      input.focus();
+      setter.call(input, name);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return input.value === name;
+    }, false);
   }
 
   async function newChatControl(stillCurrent = () => true) {
@@ -3270,6 +3389,11 @@ var CLF_DOM = (() => {
     prepareChatModelSurface,
     modelPickerReadable,
     newChatControl,
+    projectCreateControl,
+    projectCreateForm,
+    revealSidebar,
+    projectIdsShown,
+    fillProjectName,
     projectHomeId,
     enterProject,
     visibleModelSelection,
@@ -3280,6 +3404,8 @@ var CLF_DOM = (() => {
     composerAttachmentNames,
     pluginRefreshView,
     setConnectorNames,
+    setConnectorApps,
+    connectorApps,
     connectorNames,
     pluginInstalledButtons,
     pluginManagementIdle,

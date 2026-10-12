@@ -2,6 +2,7 @@ import { GOAL_MARKER_INSTRUCTION } from '../src/shared/goal-templates.js';
 import { currentCoreInstructions } from '../src/main/mcp/instructions.js';
 import { prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js';
 import { finishInstruction } from '../src/shared/finish.js';
+import { connectorNames } from '../src/shared/connector-names.js';
 import { initSkillsPath } from '../src/main/skills.js';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
@@ -16,7 +17,7 @@ const handlers = new Map<string, Handler>();
 vi.mock('electron', () => ({
   ipcMain: { handle: (name: string, handler: Handler) => handlers.set(name, handler), removeHandler: (name: string) => handlers.delete(name) },
   BrowserWindow: class {}, clipboard: {}, dialog: {}, shell: {}, nativeTheme: { themeSource: 'system' },
-  app: { on: vi.fn(), getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
+  app: { on: vi.fn(), once: vi.fn(), getPath: () => '', getVersion: () => '0.0.0', getAppPath: () => process.cwd(), isPackaged: false },
   safeStorage: {
     isAsyncEncryptionAvailable: async () => true, getSelectedStorageBackend: () => 'gnome_libsecret',
     encryptStringAsync: async (text: string) => Buffer.from(text),
@@ -3012,13 +3013,9 @@ it('retires an opening send whose receipt never arrives after six hours, and not
 describe('this install\'s connector names', () => {
   it('reach the extension with every status reply, and follow a changed suffix at once', async () => {
     await saveConfig(defaultConfig());
-    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
-      core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins'
-    });
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual(connectorNames());
     await saveConfig({ ...defaultConfig(), connectorSuffix: 'Windows' });
-    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual({
-      core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)'
-    });
+    expect((await post('/status', { openConversations: [] })).body.connectorNames).toEqual(connectorNames('Windows'));
     await saveConfig(defaultConfig());
   });
 });

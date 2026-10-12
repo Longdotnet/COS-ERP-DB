@@ -1,4 +1,5 @@
 import { registerWorkspaceTerminalIpc } from './workspace-terminal-ipc.js';
+import { registerDictationIpc } from './dictation.js';
 import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connector-names.js';
 import { setStopNoticeTranslations } from './stuck-notice.js';
 import { setMainTextTranslations } from './main-texts.js';
@@ -75,7 +76,7 @@ import { readRecentLog, renderDiagnosticsReport, saveDiagnosticsReport, systemFa
 import { listSessions, readTurnTraces } from './session/store.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, getSessionProject, listProjects, projectWorkspace, removeProject, setProjectColor } from './projects.js';
+import { addProject, expireArmedProjectCreates, getSessionProject, listProjects, onProjectLinkChange, projectWorkspace, removeProject, retryProjectCreate, setProjectColor } from './projects.js';
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
@@ -92,7 +93,7 @@ import {
   companionDiagnostics,
   sessionInputActivity,
   recoveryHeldByCalls, recoveryInputAllowed,
-  sessionControlsFor, cancelAssistantRecovery, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, cancelSessionCompaction,
+  sessionControlsFor, cancelAssistantRecovery, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
   cancelWorkerCommands,
   chatUrl,
   revealChatInBrowser,
@@ -101,7 +102,8 @@ import {
   startBridge,
   stopBridge,
   sweepStaleSwarm,
-  unpair
+  unpair,
+  followChatInBackground
 } from './bridge.js';
 import { extensionDir } from './extension-path.js';
 import { APP_VERSION, extensionDownloadUrl } from './version.js';
@@ -213,6 +215,7 @@ const settingsPatch = z.object({
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
     backgroundChats: z.boolean().optional(),
+    backgroundPlacement: z.enum(['window', 'group']).optional(),
     browserBridgePort: browserBridgePortSchema.optional(),
     browserOnly: z.boolean().optional(),
     autoRefreshPlugins: z.boolean().optional(),
@@ -378,6 +381,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       finishAction: pick(current.ui.finishAction, base.ui.finishAction, wanted.ui.finishAction),
       finishLeadMinutes: pick(current.ui.finishLeadMinutes, base.ui.finishLeadMinutes, wanted.ui.finishLeadMinutes),
       backgroundChats: pick(current.ui.backgroundChats, base.ui.backgroundChats, wanted.ui.backgroundChats),
+      backgroundPlacement: pick(current.ui.backgroundPlacement, base.ui.backgroundPlacement, wanted.ui.backgroundPlacement),
       browserBridgePort: wanted.ui.browserBridgePort === undefined ? current.ui.browserBridgePort
         : pick(current.ui.browserBridgePort ?? 'auto', base.ui.browserBridgePort ?? 'auto', wanted.ui.browserBridgePort),
       browserOnly: pick(current.ui.browserOnly, base.ui.browserOnly, wanted.ui.browserOnly),
@@ -563,6 +567,7 @@ export async function openSessionChat(id: string): Promise<void> {
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
   registerDatabaseIpc(handle);
   registerWorkspaceTerminalIpc(getWindow);
+  registerDictationIpc(getWindow);
   // A session row remains visible until its delete IPC resolves. Fence Trust while deletion is
   // in flight so a second click cannot recreate permission after the row's durable revoke.
   const deletingSessionIds = new Set<string>();
@@ -872,6 +877,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       push('state:changed', state);
     }
     const project = await addProject(folder);
+    push('session:changed');
+    // Its native ChatGPT Project is created by the browser; tell it there is work.
+    if (project.chatgpt?.state === 'requested') wakeBrowserWork();
+    return project;
+  });
+  handle('projects:chatgpt-retry', async payload => {
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
+    const project = await retryProjectCreate(id);
+    if (project) wakeBrowserWork();
     push('session:changed');
     return project;
   });
@@ -1290,6 +1304,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return setSessionObjective(id, text, mode);
   });
   handle('sessions:compact', async (payload) => compactSession(sessionIdArg.parse(payload).id));
+  handle('sessions:resumeFromHandoff', async (payload) => {
+    const input = sessionIdArg.extend({ handoffId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i) }).strict().parse(payload);
+    return resumeFromSavedSummary(input.id, input.handoffId);
+  });
   handle('sessions:cancelCompaction', async (payload) => cancelSessionCompaction(sessionIdArg.parse(payload).id));
   handle('sessions:plan', async (payload) => {
     const { text, backend, requestId } = z.object({ text: z.string().trim().min(1).max(16000), backend: z.enum(['api', 'chatgpt']), requestId: z.string().uuid().optional() }).parse(payload);
@@ -1360,6 +1378,18 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('sessions:openChat', async (payload) => {
     const { id } = sessionIdArg.parse(payload);
     await openSessionChat(id);
+    return true;
+  });
+
+  // Selecting a chat in the app selects its tab in the Background chats window (#1249). Only
+  // the newest selection counts: a slower lookup for an earlier click must not win (#1267).
+  let followSelection = 0;
+  handle('sessions:followTab', async (payload) => {
+    const { id } = sessionIdArg.parse(payload);
+    const selection = ++followSelection;
+    const conversationId = (await getSession(id))?.conversationId;
+    if (selection !== followSelection) return true;
+    if (conversationId && /^[0-9a-z-]{8,64}$/i.test(conversationId)) followChatInBackground(conversationId);
     return true;
   });
 
@@ -1686,6 +1716,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   onBridgeChange(pushState);
   onCosBrowserSignInChange(pushState);
   onConnectorProofChange(pushState);
+  // A project's native ChatGPT Project changes from the browser; the sidebar and a waiting new chat say so.
+  onProjectLinkChange(() => push('session:changed'));
+  // A creation armed before the app last quit becomes uncertain on time, not on the browser's next pass.
+  void expireArmedProjectCreates().catch(() => undefined);
   registerPluginIpc(handle, getWindow, pushState);
   // Draft stages belong to session controls; state:changed only refreshes settings.
   onGoalChange(() => push('session:changed'));

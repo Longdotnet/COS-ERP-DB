@@ -19,6 +19,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { connectorNames } from '../src/shared/connector-names.js';
 
 let source = '';
 
@@ -40,6 +41,7 @@ interface Descriptor {
   hidden: number;
   localCount: number | null;
   answered: boolean;
+  own?: boolean;
 }
 
 // ------------------------------------------------------------------ fixtures
@@ -52,8 +54,9 @@ const THREAD = 'f0f00004-1111-4111-8111-111111111111';
  * metadata, and the fixture spells it exactly because the whole evidence pipeline once
  * matched a single hardcoded name that no longer existed.
  */
-const APP = 'Chat On Steroids Core';
-const DESKTOP_APP = 'Chat On Steroids Desktop';
+const APPS = connectorNames();
+const APP = APPS.core;
+const DESKTOP_APP = APPS.desktop;
 /** What the connector was called before 1.7.1 split it. Older chats still hold it. */
 const LEGACY_APP = 'TobisComputer';
 /** The connector's link id, as it appears in a request path. */
@@ -243,6 +246,7 @@ interface TurnCall {
 
 interface TurnEvidence {
   index: number;
+  sightings?: Array<{ requestId: string; appId: string; linkId: string | null; appName: string | null }>;
   turnId: string | null;
   conversationId?: string | null;
   conversationConflict?: boolean;
@@ -299,7 +303,9 @@ async function scan(
   turnSections: TurnFixture[] = [],
   repeatStableScan = false,
   /** This install's connector names, as the content script passes them with every ask. */
-  apps?: unknown
+  apps?: unknown,
+  /** This install's proven connector apps ({ surface, appId, linkId, name }), passed the same way. */
+  appIds?: unknown
 ): Promise<{
   rows: Descriptor[];
   version: number;
@@ -449,7 +455,7 @@ async function scan(
   // Dispatched rather than posted: jsdom's own postMessage does not set `source`, and the
   // helper refuses any message that did not come from this window.
   window.dispatchEvent(
-    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce, ...(apps === undefined ? {} : { apps }) }, source: window })
+    new window.MessageEvent('message', { data: { source: 'clf-fiber-ask', nonce, ...(apps === undefined ? {} : { apps }), ...(appIds === undefined ? {} : { appIds }) }, source: window })
   );
 
   const data = await reply;
@@ -576,7 +582,54 @@ describe('reading a row out of the page', () => {
       answered: true, requestId: 'wfr_01a009', createTime: 1786873669.5 }]);
   });
 
-  it.each(['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins', 'Chat On Steroids Backup', 'Gmail'])(
+  describe('a connector renamed in ChatGPT (app id, 2026-10-11)', () => {
+    const NAMES = [APPS.core, APPS.desktop, APPS.plugins];
+    const pair = (app: string, requestId: string, uri?: string) => {
+      const asked = request(`${requestId}-ask`, 'read', { app });
+      asked.metadata!.request_id = requestId;
+      const result = answer(`${requestId}-res`, asked.id, 'read', app);
+      result.metadata!.request_id = requestId;
+      result.author.name = 'api_tool.call_tool';
+      if (uri) (result.metadata!.invoked_resource as Record<string, unknown>).resource_uri = uri;
+      return [asked, result];
+    };
+
+    it('treats a renamed connector as ours by its learned app id and link', async () => {
+      const messages = pair('My tools', 'q1');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'renamed-turn', messages }], false, NAMES,
+        [{ surface: 'core', appId: ASDK, linkId: LINK, name: 'My tools' }]);
+      expect(turns[0]!.calls.map(call => call.tool)).toEqual(['read']);
+      expect(rows[0]).toMatchObject({ own: true });
+    });
+
+    it('does not claim a same-named app once the real app id is learned', async () => {
+      const messages = pair(APP, 'q2', '/asdk_app_foreign/link_foreign/read');
+      const content = messages[0]!.content as Record<string, string>;
+      content['text'] = content['text']!.replace(LINK, 'link_foreign');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'foreign-turn', messages }], false, NAMES,
+        [{ surface: 'core', appId: ASDK, linkId: LINK, name: APP }]);
+      expect(turns[0]?.calls ?? []).toEqual([]);
+      expect(rows[0]).toMatchObject({ own: false });
+    });
+
+    it('falls back to the names while nothing is learned', async () => {
+      const messages = pair(APP, 'q3');
+      const { rows, turns } = await scan([rowInTurn(messages, messages)], [{ id: 'names-turn', messages }], false, NAMES, []);
+      expect(turns[0]!.calls.map(call => call.tool)).toEqual(['read']);
+      expect(rows[0]).toMatchObject({ own: true });
+    });
+
+    it('reports a sighting for every connector result row, ours or not', async () => {
+      const messages = [...pair('My tools', 'q4'), ...pair('Gmail', 'q5', '/asdk_app_gmail/link_g/search')];
+      const { turns } = await scan([], [{ id: 'sighting-turn', messages }], false, NAMES, []);
+      expect(turns[0]!.sightings).toEqual([
+        { requestId: 'q4', appId: ASDK, linkId: LINK, appName: 'My tools' },
+        { requestId: 'q5', appId: 'asdk_app_gmail', linkId: 'link_g', appName: 'Gmail' }
+      ]);
+    });
+  });
+
+  it.each([APPS.core, APPS.desktop, APPS.plugins, 'COS ERP DB Backup', 'Gmail'])(
     'keeps result-only metadata scoped to the exact supported connector %s', async app => {
       const result = answer('result-scope', 'unused', 'read', app);
       result.author.name = 'api_tool.call_tool';
@@ -585,7 +638,7 @@ describe('reading a row out of the page', () => {
       // Duplicate provider objects are ambiguous, including result-only shapes.
       expect(turns[0]!.calls).toEqual([]);
       const single = await scan([], [{ id: 'result-scope-turn', messages: [result] }]);
-      expect(single.turns[0]!.calls).toHaveLength(['Chat On Steroids Backup', 'Gmail'].includes(app) ? 0 : 1);
+      expect(single.turns[0]!.calls).toHaveLength(['COS ERP DB Backup', 'Gmail'].includes(app) ? 0 : 1);
     });
 
   /**
@@ -608,10 +661,10 @@ describe('reading a row out of the page', () => {
    * install recognizes exactly its own names; the other computer's calls run there.
    */
   it.each([
-    ['this install\'s suffixed names', ['Chat On Steroids Core (Windows)', 'Chat On Steroids Desktop (Windows)', 'Chat On Steroids Plugins (Windows)'], 'Chat On Steroids Core (Windows)', true],
-    ['the plain name while this install uses a suffix', ['Chat On Steroids Core (Windows)', 'Chat On Steroids Desktop (Windows)', 'Chat On Steroids Plugins (Windows)'], APP, false],
-    ['another computer\'s suffixed name', ['Chat On Steroids Core', 'Chat On Steroids Desktop', 'Chat On Steroids Plugins'], 'Chat On Steroids Core (Mac)', false],
-    ['names that are not this app\'s, which are ignored', ['Chat On Steroids Backup', 'x', 'y'], APP, true]
+    ['this install\'s suffixed names', Object.values(connectorNames('Windows')), connectorNames('Windows').core, true],
+    ['the plain name while this install uses a suffix', Object.values(connectorNames('Windows')), APP, false],
+    ['another computer\'s suffixed name', Object.values(APPS), connectorNames('Mac').core, false],
+    ['names that are not this app\'s, which are ignored', ['COS ERP DB Backup', 'x', 'y'], APP, true]
   ])('recognizes calls by %s', async (_case, apps, app, ours) => {
     const ask = request('req-1', 'read_file', { app });
     const { rows } = await scan([row([ask, answer('res-1', 'req-1', 'read_file', app)])], [], false, apps);
@@ -732,15 +785,15 @@ describe('the calls a turn says it made', () => {
   });
 
   /**
-   * A name is not a prefix game. `Chat On Steroids Backup` shares every character of the
+   * A name is not a prefix game. `COS ERP DB Backup` shares every character of the
    * brand and is still a different integration; matching on the brand rather than on the
    * exact connector names would make this app vouch for its calls and file a stranger's
    * traffic into this chat's session.
    */
   it('refuses a connector whose name merely starts with this app’s brand', async () => {
     const messages = [
-      request('req-fake', 'read', { app: 'Chat On Steroids Backup' }),
-      answer('res-fake', 'req-fake', 'read', 'Chat On Steroids Backup'),
+      request('req-fake', 'read', { app: 'COS ERP DB Backup' }),
+      answer('res-fake', 'req-fake', 'read', 'COS ERP DB Backup'),
       request('req-mine', 'read')
     ];
     const { turns } = await scan([], [{ id: 'turn-lookalike', messages }]);
@@ -1748,6 +1801,7 @@ describe('what may leave the page', () => {
         'index',
         'localCount',
         'messageId',
+        'own',
         'path',
         'resource',
         'tool',

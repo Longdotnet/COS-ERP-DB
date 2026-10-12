@@ -14,6 +14,26 @@ interface Highlight { icon: string; title: () => string; text: () => string }
 interface Release { lead: () => string; highlights: Highlight[] }
 
 const RELEASES: Readonly<Record<string, Release>> = {
+  '2.1.34': {
+    lead: () => t('Goal on every plan, Compact & Resume in Projects, and a background window that stays.'),
+    highlights: [
+      { icon: 'i-target', title: () => t('Goal on every plan'), text: () => t('On plans without a model picker, such as Free, Goal and Loop follow-ups use the chat\'s current model instead of failing.') },
+      { icon: 'i-steps', title: () => t('Compact & Resume in Projects'), text: () => t('Moving a chat inside a ChatGPT Project to a new chat now completes, and the new chat stays in that Project.') },
+      { icon: 'i-browser', title: () => t('A background window that stays'), text: () => t('Background chats keep using the same window after the extension updates or reloads.') },
+      { icon: 'i-plug', title: () => t('Clearer connector hints'), text: () => t('When ChatGPT calls a tool its connector doesn\'t have, the result names the connector that has it.') },
+      { icon: 'i-terminal', title: () => t('Fewer repeated commands'), text: () => t('When ChatGPT starts a command that is still running in that chat, the result points it to the running one.') }
+    ]
+  },
+  '2.1.33': {
+    lead: () => t('Reuse a saved summary, see why a message waits, and a background window that follows you.'),
+    highlights: [
+      { icon: 'i-steps', title: () => t('Reuse a saved summary'), text: () => t('If Compact & Resume stops after ChatGPT wrote its summary, open the new chat with that summary instead of starting over.') },
+      { icon: 'i-clock', title: () => t('See why a message waits'), text: () => t('A queued message says when it is waiting for the browser extension or for a running tool call.') },
+      { icon: 'i-browser', title: () => t('The background window follows you'), text: () => t('With Background chats on, the chat you select in the app is the one its background window shows.') },
+      { icon: 'i-retry', title: () => t('Calmer when ChatGPT is busy'), text: () => t('When ChatGPT limits how fast history loads, recovery waits as long as ChatGPT asks instead of reloading again.') },
+      { icon: 'i-bolt', title: () => t('Lighter on your computer'), text: () => t('Open ChatGPT chats use much less CPU while they wait.') }
+    ]
+  },
   '2.1.32': {
     lead: () => t('Messages that reach the running answer, the choices ChatGPT asks you about, and a Stop that sticks.'),
     highlights: [

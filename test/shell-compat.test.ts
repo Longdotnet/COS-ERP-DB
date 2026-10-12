@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
+import { connectorName } from '../src/shared/connector-names.js';
 
 const domSource = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
 const fiberSource = readFileSync(new URL('../extension/fiber.js', import.meta.url), 'utf8');
@@ -15,6 +16,7 @@ const TURN = '22222222-2222-4222-8222-222222222222';
 const CALL = '33333333-3333-4333-8333-333333333333';
 const ANSWER = '44444444-4444-4444-8444-444444444444';
 const OTHER = '55555555-5555-4555-8555-555555555555';
+const CORE_APP = connectorName('core');
 let page: JSDOM;
 afterEach(() => page?.window.close());
 
@@ -42,7 +44,7 @@ function fixture() {
     { type: 'user-message', messageId: USER, serverMessageId: USER, message: 'hello' },
     { type: 'chatgpt-reasoning-group', items: [
       { type: 'reasoning', presentation: 'preamble', content: 'Commentary without a provider message id' },
-      { type: 'mcp-tool-call', callId: CALL, completed: false, invocation: { server: 'Chat On Steroids Core', tool: 'link_x/read', arguments: { private: 'NEVER_COPY_TOOL_ARGS' } }, result: null }
+      { type: 'mcp-tool-call', callId: CALL, completed: false, invocation: { server: CORE_APP, tool: 'link_x/read', arguments: { private: 'NEVER_COPY_TOOL_ARGS' } }, result: null }
     ] },
     { type: 'assistant-message', messageId: ANSWER, content: 'Answer', phase: 'final_answer', completed: false }
   ] as any[] } };
@@ -221,6 +223,13 @@ it('outlines a running turn in ChatGPT\'s order: sentences, this app\'s calls, r
   expect(JSON.stringify(trace)).not.toContain('PRIVATE_HIDDEN_GROUP');
   expect(JSON.stringify(trace)).not.toContain('NEVER_COPY_TOOL_ARGS');
 });
+it('names the user message that opened each turn, so its outline is filed under the right one (#1301)', async () => {
+  const f = fixture();
+  expect((await f.ask()).turns[0].question).toBe(USER);
+  // A turn whose first item is not a user message names none.
+  f.entry.turn.items.shift();
+  expect((await f.ask()).turns[0].question).toBeUndefined();
+});
 it('says what a running turn is doing with the open thought ChatGPT shows, and nothing once it ends', async () => {
   const f = fixture();
   // Observed 2026-10-08: the group's activeReasoning is the status line until the round closes.
@@ -371,7 +380,7 @@ it('reads request metadata only for the mounted shell message ids in the exact n
   const f = fixture();
   const message = { id: CALL, author: { role: 'assistant' }, recipient: 'api_tool.call_tool',
     metadata: { request_id: OTHER }, create_time: 1700000000,
-    content: { content_type: 'code', text: '{"path":"/Chat On Steroids Core/link_x/read","args":{"secret":"NEVER_COPY"}}' } };
+    content: { content_type: 'code', text: `{"path":"/${CORE_APP}/link_x/read","args":{"secret":"NEVER_COPY"}}` } };
   f.queries.push({ queryKey: ['chatgpt-conversation', THREAD], state: { data: { mapping: {
     [CALL]: { id: CALL, message },
     [OTHER]: { id: OTHER, message: { ...message, id: OTHER, metadata: { request_id: 'wfr_UNSELECTED' } } }
@@ -402,7 +411,7 @@ function liveShellMapping(f: ReturnType<typeof fixture>, compiler = false) {
   const mapping: any = {
     [USER]: plain(USER, 'user', 'hello'), [ANSWER]: plain(ANSWER, 'assistant', 'Answer', 'final'),
     [CALL]: { id: CALL, message: { id: CALL, author: { role: 'assistant' }, recipient: 'api_tool.call_tool',
-      metadata: { request_id: OTHER }, content: { content_type: 'code', text: '{"path":"/Chat On Steroids Core/link_x/read","args":{"private":"DO_NOT_COPY"}}' } } },
+      metadata: { request_id: OTHER }, content: { content_type: 'code', text: `{"path":"/${CORE_APP}/link_x/read","args":{"private":"DO_NOT_COPY"}}` } } },
     [thought]: { id: thought, message: { id: thought, author: { role: 'assistant' },
       content: { content_type: 'thoughts', thoughts: [{ summary: 'Inspecting the project', content: 'PRIVATE_REASONING_CONTENT' }] }, metadata: {} } },
     [preamble]: plain(preamble, 'assistant', 'I will inspect the project.', 'commentary')
@@ -683,10 +692,10 @@ function pairedShellCall(f: ReturnType<typeof fixture>) {
   const step = f.entry.turn.items[1].items.find((item: any) => item.type === 'mcp-tool-call');
   step.completed = true;
   step.widgetStateSource = { messageId: resultId };
-  step.invocationResourceUri = '/Chat On Steroids Core/link_x/read';
+  step.invocationResourceUri = `/${CORE_APP}/link_x/read`;
   mapping[resultId] = { id: resultId, parent: CALL, message: { id: resultId,
     author: { role: 'tool', name: 'api_tool.call_tool' }, recipient: 'all',
-    metadata: { invoked_resource: { app_name: 'Chat On Steroids Core', resource_uri: step.invocationResourceUri } },
+    metadata: { invoked_resource: { app_name: CORE_APP, resource_uri: step.invocationResourceUri } },
     content: { content_type: 'text', parts: ['PRIVATE_TOOL_RESULT'] } } };
   mapping[ANSWER].parent = resultId;
   f.entry.turn.messageIds = f.entry.turn.messageIds.map(id => id === CALL ? resultId : id);
@@ -718,8 +727,8 @@ it.each(['request', 'result', 'embedded'] as const)('keeps native paired shell r
 it.each(['unselected-source', 'wrong-tool', 'wrong-server', 'wrong-role', 'conflicting-request', 'duplicate-source'])('does not borrow paired shell invocation metadata from %s', async scenario => {
   const f = fixture(), { mapping, step, resultId } = pairedShellCall(f);
   if (scenario === 'unselected-source') step.widgetStateSource.messageId = OTHER;
-  if (scenario === 'wrong-tool') mapping[CALL].message.content.text = '{"path":"/Chat On Steroids Core/link_x/agents","args":{}}';
-  if (scenario === 'wrong-server') mapping[CALL].message.content.text = '{"path":"/Chat On Steroids Core Backup/link_x/read","args":{}}';
+  if (scenario === 'wrong-tool') mapping[CALL].message.content.text = `{"path":"/${CORE_APP}/link_x/agents","args":{}}`;
+  if (scenario === 'wrong-server') mapping[CALL].message.content.text = '{"path":"/COS ERP DB Core Backup/link_x/read","args":{}}';
   if (scenario === 'wrong-role') mapping[CALL].message.author.role = 'user';
   if (scenario === 'conflicting-request') mapping[resultId].message.metadata.request_id = 'wfr_conflicting_result';
   if (scenario === 'duplicate-source') f.entry.turn.items[1].items.push({ ...step, callId: OTHER });
@@ -742,9 +751,9 @@ it.each(['duplicate-cache', 'conflicting-conversation', 'duplicate-id', 'unavail
 });
 it('recognizes the shell recipient spelling without admitting similarly named connectors', async () => {
   const f = fixture(), step = f.entry.turn.items[1].items[1];
-  step.invocation.server = 'Chat_On_Steroids_Core'; step.invocation.tool = 'read';
+  step.invocation.server = 'COS_ERP_DB_Core'; step.invocation.tool = 'read';
   expect((await f.ask()).turns[0].calls).toHaveLength(1);
-  step.invocation.server = 'Chat_On_Steroids_Core_Backup';
+  step.invocation.server = 'COS_ERP_DB_Core_Backup';
   expect((await f.ask()).turns[0].calls).toEqual([]);
 });
 it('retires shell busy evidence when its owner becomes unreadable or another question is mounted', async () => {
@@ -1560,4 +1569,32 @@ it('reads a translated Extra High lane as xhigh, as the English label does', asy
   expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-thinking', reasoningEffort: 'xhigh' });
   lanes[2]!.labels.effort = 'Extra High';
   expect((await f.ask('clf-picker-ask')).picker.choices[2].effort).toBe('xhigh');
+});
+
+// Measured live 2026-10-11 (VM 141): ChatGPT's shell turns reach the app with stripped request
+// metadata, so app sightings must come from the shell's own mapping, or no connector is ever proven.
+it('reports app sightings for shell turns from the native mapping', async () => {
+  const f = fixture();
+  const { mapping, resultId } = pairedShellCall(f);
+  // ChatGPT stamps the result with its invocation's request id (live data); OTHER is the fixture's.
+  mapping[resultId].message.metadata.request_id = OTHER;
+  mapping[resultId].message.metadata.invoked_resource.resource_uri = '/asdk_app_x1/link_x/read';
+  const turn = (await f.ask()).turns[0];
+  expect(turn.sightings).toEqual([{ requestId: OTHER, appId: 'asdk_app_x1', linkId: 'link_x', appName: CORE_APP }]);
+  expect(JSON.stringify(turn)).not.toContain('PRIVATE_TOOL_RESULT');
+});
+
+// Measured live 2026-10-11: in a new chat the result row is in ChatGPT's mapping but not among the
+// turn's message ids, so it is found by this turn's own request id instead.
+it('reports an app sighting for a shell result outside the turn\'s message ids, matched by this turn\'s request id', async () => {
+  const f = fixture();
+  const { mapping, resultId } = pairedShellCall(f);
+  mapping[resultId].message.metadata.request_id = OTHER;
+  mapping[resultId].message.metadata.invoked_resource.resource_uri = '/asdk_app_x1/link_x/read';
+  f.entry.turn.messageIds = f.entry.turn.messageIds.map((id: string) => id === resultId ? CALL : id);
+  mapping['99999999-0000-4000-8000-000000000000'] = { id: '99999999-0000-4000-8000-000000000000', message: { id: '99999999-0000-4000-8000-000000000000',
+    author: { role: 'tool', name: 'api_tool.call_tool' }, recipient: 'all',
+    metadata: { request_id: 'another-turns-request', invoked_resource: { app_name: 'Gmail', resource_uri: '/asdk_app_gmail/link_g/search' } } } };
+  const turn = (await f.ask()).turns[0];
+  expect(turn.sightings).toEqual([{ requestId: OTHER, appId: 'asdk_app_x1', linkId: 'link_x', appName: CORE_APP }]);
 });

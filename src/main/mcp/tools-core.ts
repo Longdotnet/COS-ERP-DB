@@ -5,7 +5,7 @@ import { exportImage, ImageExportError } from '../image-export.js';
 import { awaitRequestCorrelation } from '../session/correlation.js';
 import { announceSessionFinish, sessionFinishDeadline } from '../session/finish.js';
 import { getConfig } from '../config.js';
-import { connectorName } from '../../shared/connector-names.js';
+import { liveConnectorName } from './surfaces.js';
 /**
  * The Core connector: reading, changing and running code on this PC.
  *
@@ -62,7 +62,8 @@ import {
   forgetExecOwner,
   MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecAttended,
-  noteExecOwner
+  noteExecOwner,
+  runningIdenticalExec
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
@@ -103,6 +104,7 @@ import {
   normalizePowerShellOperators,
   normalizeShellCommand,
   repairPowerShellQuoting,
+  execNotesText,
   withExecNotes
 } from '../exec-hints.js';
 import { childEnv } from '../exec.js';
@@ -501,7 +503,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (!conversationId) {
             // Name the Core that answered: with one ChatGPT account on several computers, ChatGPT
             // may send a chat's call to another computer's Core, which never sees that chat (#1097).
-            return fail(`${connectorName('core', getConfig().connectorSuffix)} could not tell which chat this save_image call came from, ` +
+            return fail(`${liveConnectorName('core')} could not tell which chat this save_image call came from, ` +
               'so it does not know which image to save. If the chat belongs to another computer, call save_image of that ' +
               'computer\'s Chat On Steroids Core instead. Otherwise call save_image directly as its own tool call, not from ' +
               'inside a JavaScript or exec step, and try again.');
@@ -907,6 +909,18 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
             }
 
+            // Read before this launch registers, so the new copy never names itself.
+            const identical = runningIdenticalExec(owner, commandDetail, dir.virtual);
+            if (identical.length) {
+              const ids = identical.map((row) => row.processId).join(', ');
+              const ageS = Math.max(0, Math.round((Date.now() - identical[0]!.startedAt) / 1000));
+              commandNotes.push(
+                `The same command in this folder is still running from earlier in this chat as session${identical.length > 1 ? 's' : ''} ${ids} ` +
+                  `(started ${ageS} s ago); this call started another copy. If this was a retry of a lost answer, ` +
+                  `read the running one with write_stdin(session_id=${identical[0]!.processId}, chars="") instead of starting more.`
+              );
+            }
+
             const processId = unifiedExecManager.allocateProcessId();
             liveProcessId = processId;
             // Process ids are deliberately small/reusable, while chat ownership lives in a
@@ -1026,9 +1040,16 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                   ? execRecoveryHints(rawCommands[0] ?? '', responseText, shell.shellType)
                   : [])
             ];
+            // ChatGPT gives the model this tool's structuredContent, not its text, so notes that
+            // only follow the text never reached it (a live retry asked to quote the repeated-
+            // command note quoted nothing, 2026-10-10). They travel in `supplemental_context`,
+            // the schema's field for app context that is not process output.
             return {
               content: [{ type: 'text' as const, text: withExecNotes(responseText, notes) }],
-              structuredContent: execCommandStructuredOutput(output)
+              structuredContent: {
+                ...execCommandStructuredOutput(output),
+                ...(notes.length > 0 ? { supplemental_context: execNotesText(notes) } : {})
+              }
             };
           } catch (error) {
             if (liveProcessId !== null) finishTerminalLive(liveProcessId, null);

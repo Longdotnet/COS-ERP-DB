@@ -3,11 +3,13 @@ import { cosSignInTransfer, SignInTransferError } from './cos-browser/sign-in-tr
 import { externalBrowserProof, noteExternalInstalled, noteExternalSignedIn, resetBrowserProofForTests } from './browser-proof.js';
 import { notePluginInstalled, notePluginMissing } from './connector-proof.js';
 import { connectorNames } from '../shared/connector-names.js';
+import { connectorApps, conversationCreatedAt, noteAppSightings, type AppSighting } from './connector-identity.js';
 import { messageReaction } from '../shared/message-reaction.js';
 import { browserControl } from './browser-control.js';
 import type { BrowserResult } from '../shared/browser-control.js';
 import { goalErrorKey, goalErrorMessage } from '../shared/goal-errors.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
+import { CONVERSATION_DELETED } from '../shared/chat-error.js';
 import { prepareSessionPrompt } from './session/prompt.js';
 import { pendingChatModelRequest, observeChatModels, requestChatModels } from './chat-models.js';
 import { isDeliberateEffort, isProModel } from '../shared/chat-models.js';
@@ -20,6 +22,7 @@ import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, coll
 import { pluginRefreshPublications, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import { tunnelRouteSettling } from './tunnel/route-settle.js';
+import { armProjectCreate, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, markProjectGone, pendingProjectCreates } from './projects.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 let browserWake: ReturnType<typeof attachBrowserWake> | null = null;
 import { browserWindowBounds, currentBrowserWorkArea } from './browser-window-layout.js';
@@ -27,7 +30,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, recordQueuedPickupAttemptNow, syncQueuedPickupRecoveryNow, deferSilenceInput, revokeSilenceInputs, endRecoveryInput, retryUnclaimedInput } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, recordQueuedPickupAttemptNow, syncQueuedPickupRecoveryNow, deferSilenceInput, revokeSilenceInputs, endRecoveryInput, retryUnclaimedInput, failInputsForDeletedConversation } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -210,8 +213,10 @@ import {
   supersededSourceConversations,
   dispatchContinuationDestinationSendNow,
   dispatchContinuationSourceSendNow,
+  releaseUndeliveredSourceDispatchNow,
   normalizeProjectId,
   openContinuationNow,
+  reopenWithHandoffNow,
   releaseContinuationDestinationSendNow,
   repairPrimeFromResumeShadow,
   resetContinuationsForTests,
@@ -741,6 +746,33 @@ function takeReveals(browser: string | null): string[] {
     entry.settle(true);
   }
   return [...new Set(taken.map(entry => entry.conversationId))];
+}
+
+/**
+ * The chat last selected in the app, for its tab in the background window (#1249). With
+ * Background chats on, chats live in a minimized window of their own, and switching chats in
+ * the app left that window showing whichever tab it had before. Only the newest selection
+ * counts, only a browser that already has the chat open receives it, and it lapses after a
+ * few seconds: a selection is never a reason to open, move or focus anything.
+ */
+const FOLLOW_TTL_MS = 10_000;
+let pendingFollow: { conversationId: string; at: number } | null = null;
+
+export function followChatInBackground(conversationId: string): void {
+  if (getConfig().ui.backgroundChats !== true || getConfig().ui.backgroundPlacement === 'group' ||
+      !browserWakeConnected() || !revealCapable()) return;
+  pendingFollow = { conversationId, at: Date.now() };
+  wakeBrowserWork();
+}
+
+function takeFollow(browser: string | null): string | null {
+  const entry = pendingFollow;
+  if (!entry || !browser) return null;
+  if (Date.now() - entry.at > FOLLOW_TTL_MS || getConfig().ui.backgroundChats !== true ||
+      getConfig().ui.backgroundPlacement === 'group') { pendingFollow = null; return null; }
+  if (!chatHolders(entry.conversationId).includes(browser)) return null;
+  pendingFollow = null;
+  return entry.conversationId;
 }
 
 /** An input goes to the browser holding its chat or, when none does, to the first one handed it. */
@@ -1304,7 +1336,9 @@ const OBSERVATION_KINDS = new Set([
   'chat_error',
   // Not stored as transcript content. These request records populate the exact
   // requestId -> conversationId correlation registry.
-  'tool_evidence'
+  'tool_evidence',
+  // Connector identity proof (connector-identity.ts); never transcript content.
+  'app_sightings'
 ]);
 const OUTCOMES = new Set(['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown']);
 const MAX_OBSERVATIONS = 200;
@@ -1413,6 +1447,20 @@ function parseObservations(input: unknown): ChatObservation[] {
       kind: kind as ChatObservation['kind'],
       time: time > now + 60_000 || time < earliestChatGpt ? now : time
     };
+    if (kind === 'app_sightings') {
+      const apps: AppSighting[] = [];
+      for (const rawApp of Array.isArray(item['apps']) ? item['apps'].slice(0, 200) : []) {
+        const app = rawApp && typeof rawApp === 'object' ? rawApp as Record<string, unknown> : null;
+        const requestId = typeof app?.['requestId'] === 'string' ? app['requestId'].slice(0, 100) : '';
+        const appId = typeof app?.['appId'] === 'string' ? app['appId'].slice(0, 200) : '';
+        if (!requestId || !appId) continue;
+        apps.push({ requestId, appId, linkId: typeof app?.['linkId'] === 'string' ? app['linkId'].slice(0, 200) : null,
+          appName: typeof app?.['appName'] === 'string' ? app['appName'].slice(0, 200) : null });
+      }
+      observation.apps = apps;
+      out.push(observation);
+      continue;
+    }
     if (item['authoredTime'] === true) observation.authoredTime = true;
     if ((kind === 'assistant_message' || kind === 'user_message') && typeof item['authoredAt'] === 'number' &&
         Number.isFinite(item['authoredAt']) && item['authoredAt'] >= earliestChatGpt && item['authoredAt'] <= now + 60_000) {
@@ -1526,6 +1574,8 @@ function parseObservations(input: unknown): ChatObservation[] {
       const trace = turnTrace(item['trace']);
       if (!trace || !observation.turnId) continue;
       observation.trace = trace;
+      // The user message that opened the page turn the outline was read from (#1301).
+      if (typeof item['question'] === 'string' && /^[A-Za-z0-9_:.-]{1,200}$/.test(item['question'])) observation.question = item['question'];
     }
     if (typeof item['renderedHtml'] === 'string') {
       // Keep the whole compact rendering of a stable final through /events.
@@ -1555,6 +1605,7 @@ function parseObservations(input: unknown): ChatObservation[] {
       observation.goalEligible = true;
     }
     if (typeof item['detail'] === 'string') observation.detail = item['detail'].slice(0, 500);
+    if (kind === 'turn_end' && item['continued'] === true) observation.continued = true;
     if (typeof item['recoverable'] === 'boolean') observation.recoverable = item['recoverable'];
     if (item['blocking'] === true) observation.blocking = true;
     if (kind === 'chat_error' && item['blocking'] === true && typeof item['retryAt'] === 'number' &&
@@ -2038,6 +2089,16 @@ export async function compactSession(sessionId: string): Promise<SessionControls
   }
   return sessionControlsFor(sessionId);
 }
+/** Compact & Resume again from the summary an abandoned run already captured (#1215). */
+export async function resumeFromSavedSummary(sessionId: string, handoffId: string): Promise<SessionControlsView> {
+  await controlledConversation(sessionId);
+  const opened = await reopenWithHandoffNow(sessionId, handoffId);
+  if (!opened) throw new Error('This summary can no longer be used. Start Compact & Resume again.');
+  queueResumeCommand(sessionId, opened.token);
+  await deliver();
+  changed();
+  return sessionControlsFor(sessionId);
+}
 export async function cancelSessionCompaction(sessionId: string): Promise<SessionControlsView> {
   await controlledConversation(sessionId);
   await cancelResumeNow(sessionId);
@@ -2365,6 +2426,35 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (ok) changed();
     return json(res, ok ? 200 : 409, { ok }, origin);
   }
+  // A new CoS project's native ChatGPT Project, created by one page through ChatGPT's own dialog.
+  // `client` is that page's per-document id: one page claims, arms before its click and reports
+  // the id the new Project's page shows. See `projects.ts` for what each state allows.
+  if (route === '/project-create' && req.method === 'POST') {
+    const raw = await readBody(req);
+    const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+    if (body.action === 'pending') return json(res, 200, { requests: await pendingProjectCreates() }, origin);
+    // A new chat's tab for a linked Project landed on ChatGPT's home: that Project is gone.
+    if (body.action === 'gone') {
+      const entry = typeof body.inputId === 'string' ? (await listInputs()).find(row => row.id === body.inputId) : undefined;
+      const ok = !!entry?.projectId && typeof body.chatgptId === 'string' && await markProjectGone(entry.projectId, body.chatgptId);
+      if (ok) logWarn('bridge: ChatGPT no longer opens a linked native Project; its project shows Retry');
+      return json(res, ok ? 200 : 409, { ok }, origin);
+    }
+    if (typeof body.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.id) ||
+        typeof body.client !== 'string' || !body.client || body.client.length > 64) return json(res, 400, { error: 'invalid_request' }, origin);
+    const client = body.client;
+    let ok = false;
+    if (body.action === 'claim') ok = await claimProjectCreate(body.id, client);
+    else if (body.action === 'arm') ok = await armProjectCreate(body.id, client);
+    else if (body.action === 'done' && typeof body.chatgptId === 'string') ok = await completeProjectCreate(body.id, client, body.chatgptId);
+    else if (body.action === 'fail' && typeof body.error === 'string') ok = await failProjectCreate(body.id, client, body.error.slice(0, 500));
+    if (ok) {
+      if (body.action === 'done') logInfo(`bridge: created the native ChatGPT Project for a new CoS project`);
+      if (body.action === 'fail') logWarn(`bridge: native ChatGPT Project creation failed — ${String(body.error).slice(0, 200)}`);
+      changed();
+    }
+    return json(res, ok ? 200 : 409, { ok }, origin);
+  }
   if (route === '/browser/preferences' && req.method === 'POST') {
     const accepted = acknowledgeBrowserPreferences(await readBody(req));
     return json(res, accepted ? 200 : 409, { ok: accepted }, origin);
@@ -2450,6 +2540,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (browser && req.method === 'POST') browserChats.set(browser, openSet);
     const canReveal = req.method === 'POST' && revealRequested;
     if (canReveal) revealBrowsers.set(browser ?? '', Date.now());
+    const follow = canReveal ? takeFollow(browser) : null;
     if (req.method === 'POST' && imageExportRequested) imageExportBrowsers.set(browser ?? '', Date.now());
     const pendingInputs = await pendingBrowserInputs();
     const pendingIds = new Set(pendingInputs.map(input => input.id));
@@ -2464,8 +2555,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         modelCatalogRequest: pendingChatModelRequest(),
         // This install's connector names, so the extension recognizes exactly its own traffic.
         connectorNames: connectorNames(getConfig().connectorSuffix),
+        // Apps proven to be this install's connectors, so a renamed connector is still recognized.
+        connectorApps: Object.fromEntries(Object.entries(connectorApps()).map(([surface, apps]) =>
+          [surface, apps.map(({ appId, linkId, name }) => ({ appId, linkId, name }))])),
         pluginRefreshRequests: getConfig().ui.autoRefreshPlugins === true ? pluginRefreshPublications().map(({ surface, schemaId, connectorName }) => ({ surface, schemaId, connectorName })) : [],
         browserPreferenceRequest: pendingBrowserPreferenceRequest(),
+        projectCreateRequests: await pendingProjectCreates(),
         inputOpeningIds: inputRows.filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).map(row => row.id),
         // A message for the running turn goes in while a call runs: ChatGPT keeps that call's result (#1231).
         // An existing chat waits out a new tunnel-client's takeover, or its next call waits ~2 min (#1220).
@@ -2478,6 +2573,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             .map(row => ({ id: row.id, owner: row.owner, lifetime: row.lifetime, close: true,
               retire: true, ...(row.conversationId ? { conversationId: row.conversationId } : {}) }))],
         background: getConfig().ui.backgroundChats === true,
+        // #128: where the companion puts background tabs. Unknown or absent means the window.
+        backgroundPlacement: getConfig().ui.backgroundPlacement === 'group' ? 'group' : 'window',
         browserOnly: getConfig().ui.browserOnly === true,
         browserWorkArea: currentBrowserWorkArea(),
         browserWindowBounds: browserWindowBounds(),
@@ -2488,6 +2585,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         revivals,
         placement: pendingBrowserPlacement(null, browser),
         ...(canReveal ? { reveals: takeReveals(browser) } : {}),
+        ...(follow ? { follow } : {}),
         ...(req.method === 'POST' && imageExportRequested ? { imageExports: pendingImageExports() } : {}),
         // A failure report closes this request. Reissuing the repair in the same response would
         // replace the visible failure with "Trying" before a renderer could ever observe it.
@@ -2530,6 +2628,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     notePluginInstalled('core');
     return json(res, 200, { ok: true }, origin);
+  }
+
+  // ChatGPT answered `conversation_deleted` for this exact chat (read by usage.js from its own
+  // response): the messages still waiting for it end with that reason. See failInputsForDeletedConversation.
+  if (route === '/conversation-deleted' && req.method === 'POST') {
+    const raw = await readBody(req);
+    const id = raw && typeof raw === 'object' ? conversationId((raw as Record<string, unknown>)['conversationId']) : null;
+    if (!id) return json(res, 400, { error: 'invalid_request' }, origin);
+    const ended = await failInputsForDeletedConversation(id);
+    logWarn(`bridge: ChatGPT says chat ${id} was deleted${ended ? `; ${ended} waiting message(s) ended` : ''}`);
+    return json(res, 200, { ok: true, ended }, origin);
   }
 
   if (route === '/usage' && req.method === 'POST') {
@@ -2622,6 +2731,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (target && tunnelRouteSettling()) return json(res, 200, { input: null }, origin);
     if (staleCompanion(req)) return json(res, 200, { input: null }, origin);
     if (!target && openingHeldElsewhere(body.id, browserOf(req))) return json(res, 200, { input: null }, origin);
+    // A new chat of a project with a native ChatGPT Project is claimed only from that Project's
+    // own page, which the page names; the root or another Project is never its destination.
+    if (!target) {
+      const entry = (await listInputs()).find(row => row.id === body.id);
+      const link = entry?.projectId && entry.purpose !== 'decision' && !entry.lifetime ? (await getProject(entry.projectId))?.chatgpt : undefined;
+      if (link && (link.state !== 'linked' || body.project !== link.id)) return json(res, 200, { input: null }, origin);
+    }
     const input = await claimBrowserInput(body.id, body.owner, target, body.requiresAuthorization === true);
     return json(res, 200, { input }, origin);
   }
@@ -2741,7 +2857,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // This reports attachment only. The recorder below owns actual work and replay deduplication.
     const revived = noteAgentAlive(id, 'page');
     if (revived?.report) await recordAgentMessage(revived.report, 'sent', id);
-    const observations = parseObservations(body['events']);
+    const parsed = parseObservations(body['events']);
+    // App sightings only teach connector identity (proof: a request this app served). They are
+    // never transcript content and on their own must not create or touch a session.
+    const sightings = parsed.flatMap(item => item.kind === 'app_sightings' ? item.apps ?? [] : []);
+    // A chat keeps the app name it began with, so the name from the newest chat wins (connector-identity.ts).
+    if (sightings.length && noteAppSightings(sightings, Date.now(), conversationCreatedAt(id) ?? Date.now())) {
+      const apps = connectorApps();
+      logInfo(`connector identity learned: ${(['core', 'desktop', 'plugins'] as const).map(s => `${s}=${apps[s][0]?.appId ?? '-'}`).join(' ')}`);
+      changed();
+    }
+    const observations = parsed.filter(item => item.kind !== 'app_sightings');
+    if (!observations.length && parsed.length) return json(res, 200, { ok: true, stored: 0 }, origin);
     observationWritesInFlight += 1;
     let committed: { sessionId: string | null; stored: number; wake: boolean } | undefined;
     try {
@@ -3499,8 +3626,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (body['sourceDispatch'] === true) {
       const entry = continuationByToken(checkpointToken);
       if (!entry || entry.from !== id) return json(res, 409, { error: 'no_such_continuation' }, origin);
-      const armed = await dispatchContinuationSourceSendNow(checkpointToken);
+      const before = typeof body['before'] === 'string' ? body['before'] : null;
+      const armed = await dispatchContinuationSourceSendNow(checkpointToken, before);
       return json(res, armed ? 200 : 409, armed ? { armed: true } : { error: 'source_send_reclaimed' }, origin);
+    }
+    // A later document's proof that the armed click never reached ChatGPT: it still shows, as
+    // the newest user message, the one that was newest before the click.
+    if (body['sourceUndelivered'] === true) {
+      const entry = continuationByToken(checkpointToken);
+      if (!entry || entry.from !== id) return json(res, 409, { error: 'no_such_continuation' }, origin);
+      const newest = typeof body['newestUserMessage'] === 'string' ? body['newestUserMessage'] : null;
+      const since = typeof body['documentSince'] === 'number' ? body['documentSince'] : 0;
+      const released = await releaseUndeliveredSourceDispatchNow(checkpointToken, newest, since);
+      if (!released) return json(res, 409, { error: 'source_send_not_releasable' }, origin);
+      logInfo(`bridge: the handoff click for ${entry.sessionId} never reached ChatGPT; it may be sent once more`);
+      changed();
+      return json(res, 200, { released: true, sourceSend: released, job: resumeJobFor(entry.sessionId) }, origin);
     }
     if (body['sourceAttempt'] === true) {
       const entry = continuationByToken(checkpointToken);
@@ -7943,6 +8084,10 @@ async function noteRecoveryObservations(
     if (proTerminal) endActivity(conversationId);
     else if (lastEnd === 'unknown' && terminalGrant?.model === 'unknown' && terminalGrant.sessionId === sessionId) {
       // Loss of browser completion evidence does not change the last meaningful-work clock.
+    } else if (lastEnd === 'failed' && ended?.detail === CONVERSATION_DELETED) {
+      // ChatGPT deleted this chat. Its own notice says so; a reload, a "send a message here" note
+      // or a stopped-chat notification would all point at a chat that no longer exists.
+      endActivity(conversationId);
     } else if ((lastEnd === 'failed' || lastEnd === 'stalled') && sessionId) {
       // Without the mark a `stalled` turn took the `endActivity` branch below instead — it left
       // the silence watch entirely, so nothing reached finishSilentChats, and nothing was said.
@@ -10730,6 +10875,7 @@ export function resetBridgeForTests(): void {
   revealBrowsers.clear();
   imageExportBrowsers.clear();
   for (const entry of pendingReveals.splice(0)) entry.settle(false);
+  pendingFollow = null;
   openingCustody.clear();
   extensionVersion = null;
   externalExtension = null;

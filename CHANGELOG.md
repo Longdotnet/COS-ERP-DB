@@ -9,6 +9,59 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.34] — Goal on every plan, and a background window that stays
+
+Goal and Loop now work on ChatGPT plans that don't show a model picker, such as the Free plan, and Compact & Resume works reliably inside ChatGPT Projects. The Background chats window survives extension updates, and ChatGPT gets clearer hints when it calls a tool on the wrong connector or starts a command that is already running.
+
+### ✨ Highlights
+
+- **Goal on every plan.** On plans without a model picker (for example the Free plan), every Goal or Loop follow-up used to fail with "Requested model or reasoning could not be confirmed". Follow-ups now use the model the chat already has.
+- **A background window that stays.** With **Background chats** on, the extension kept forgetting its background window whenever it updated or reloaded. New background chats then opened another window, and selecting a chat in the app no longer showed its tab there. The same window is now used again.
+- **Clearer when a tool is on another connector.** When ChatGPT runs a script that calls a Chat On Steroids tool its connector doesn't have, the result now names the connector that has it, instead of only "not a function". If your connectors share one Secure Tunnel ID, it also says that this sends calls to the wrong connector.
+- **Fewer repeated commands.** When ChatGPT starts a command that is still running in the same chat and folder, for example after a lost answer, the result now says so and how to read the running one, so copies don't pile up. The new command still runs.
+
+### 🛠 Fixed
+
+- **Compact & Resume in a ChatGPT Project** often stopped before the new chat opened (8 of 14 times in testing), because ChatGPT changes a Project chat's address while it loads. It now completes, and the new chat stays in the same Project. A handoff request ChatGPT never received is sent once more instead of waiting forever, an earlier attempt's request left in the message box no longer blocks the next try, and a tab opened for a failed attempt is closed again.
+- **ChatGPT now sees the notes on command results.** The hints that come with a command's result, such as which command in a batch failed, that a non-zero exit is an expected answer (for example a search with no matches), or how to recover from a common mistake, were only in a part of the result ChatGPT doesn't show the model. They now reach it.
+
+### 💛 Thank you
+
+To **@Haz4rdovisk** for the native-Project test run and the Compact & Resume fixes it led to, and to **@rishabhpunnackadan-ux** for the detailed reports behind the clearer connector hint and the repeated-command note.
+
+**Updating?** The extension updates itself once no chat is busy. If it stays on the old version, reload it once in `chrome://extensions`. On macOS, the app asks once for your login password so the new version can open its saved keys: choose **Always Allow**.
+
+## [2.1.33] — Reuse a saved summary, and see why a message waits
+
+When Compact & Resume stops after ChatGPT already wrote its summary, you can now open the new chat with that summary instead of starting over. A message that waits to be sent now says why, and with Background chats on, the background window shows the chat you selected in the app. Open ChatGPT chats use much less CPU while idle, and several long-run and Windows problems are fixed.
+
+### ✨ Highlights
+
+- **Reuse a saved summary.** If Compact & Resume stops after ChatGPT wrote its summary (you cancelled it, or the new chat couldn't open), its row in the timeline offers **Open a new chat with this summary**. The new chat gets the same summary; ChatGPT doesn't have to write it again.
+- **See why a message waits.** A queued message now says when it is waiting for the browser extension to connect, or for a tool call in that chat to finish, instead of showing only a clock.
+- **The background window follows you.** With **Background chats** on, selecting a chat in the app makes its tab the one shown in the background window. Chrome doesn't come to the front.
+- **Calmer when ChatGPT is busy.** When ChatGPT limits how fast chat history can be loaded, automatic recovery waits as long as ChatGPT asks instead of reloading again and again.
+- **Lighter on your computer.** Open ChatGPT chats use much less CPU while they wait.
+
+### 🛠 Fixed
+
+- **A message ChatGPT didn't take** when you sent it just as an answer was ending is now sent once more, instead of being left in ChatGPT's message box.
+- **Windows: quitting the app** with a terminal panel open, or right after closing one, could crash it. The app now waits for the terminal to close first.
+- **Windows: the installer** now says when it can't update an existing installation because of folder permissions, and what to do, instead of closing without a word.
+- **macOS: quitting** now works while the login-password prompt for the app's saved keys is still open.
+- **Local plugins** get more time for their first start, so a slow first start on Windows no longer leaves them in an error state.
+- **The update check** also works on networks where GitHub's API refuses it.
+- **"Skipped 1 unreadable recent event line(s)"** is reported once instead of several times a second. It means one line of a chat's history was cut off (for example when the app was stopped while writing); only that line is skipped.
+- **A Core tool called through the Plugins connector** now gets a refusal that names your Core connector, so ChatGPT can pick the right one.
+- **Saving a chat as Markdown** no longer cuts an emoji in half in the file name.
+- **Delivery errors** under a message are shown in the language of the app.
+
+### 💛 Thank you
+
+To **@lavalava45** for honoring ChatGPT's rate limits during recovery, to **@Inmerson** for the quieter unreadable-line warning, the emoji-safe file names and tighter Windows connector instructions, and to **@mvanhorn** for naming the right connector in Plugins refusals.
+
+**Updating?** The extension updates itself once no chat is busy. If it stays on the old version, reload it once in `chrome://extensions`. On macOS, the app asks once for your login password so the new version can open its saved keys: choose **Always Allow**.
+
 ## [2.1.32] — Messages that reach the running answer, and a Stop that sticks
 
 A message you send while ChatGPT is working now reaches the model: it goes into the running answer as a real ChatGPT message, even while a command runs. When ChatGPT asks you to pick an option, the timeline shows the question and its choices. Stop ends a turn for good, and a few long-run problems from 2.1.31 are fixed.

@@ -1821,8 +1821,11 @@ describe('desktop input delivery and helper ownership', () => {
     ['a malformed path', { path: 'https://evil.example/', name: 'COS ERP DB Core' }, null]
   ])('mentions %s on a desktop-delivered prompt (#861)', async (_case, report, expected) => {
     live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
+        core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins' } }),
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
     });
+    await settle();
     if (report) live.window.dispatchEvent(new live.window.MessageEvent('message', {
       source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: { type: 'cos-core-mention', ...report } }));
     live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
@@ -1902,6 +1905,106 @@ describe('desktop input delivery and helper ownership', () => {
     expect(mentions).toEqual([expected]);
   });
 
+  it('takes no Core for its own while the app has not named it', async () => {
+    // Seen live (2026-10-11): a suffixed computer's fresh tab got the plugin list before the app's
+    // names, matched the plain "Chat On Steroids Core" (the other computer's) and reported it as
+    // its own. The worker remembered it under this computer's name, and a later Compact & Resume
+    // bootstrap mentioned the other computer's Core, whose sandbox refused the chat's calls.
+    const asks: any[] = [];
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0 }),
+      core_plugin: (message: unknown) => { asks.push(message); return { ok: true, data: {} }; },
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
+    });
+    await settle();
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: { type: 'cos-core-mention', path: null, name: null,
+        candidates: [{ name: 'Chat On Steroids Core', path: 'app://asdk_app_mac1111' },
+          { name: 'Chat On Steroids Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: true } }));
+    await settle();
+    expect(asks).toEqual([]);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      live!.dom.reconfigure({ url: `https://chatgpt.com/c/${chatA}` });
+      userTurn(live!.document, 'unnamed-core-receipt', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    const adapter = (live.window as any).CLF_DOM;
+    const send = adapter.send;
+    const mentions: unknown[] = [];
+    adapter.send = (options: { mention?: unknown }) => { mentions.push(options.mention ?? null); return send({ ...options, mention: null }); };
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: true });
+    expect(mentions).toEqual([null]);
+    expect(asks).toEqual([]);
+  });
+
+  it('does not mention a remembered Core that another app id has been proven against', async () => {
+    // A sighting remembered under this computer's name before the fix above can name the other
+    // computer's app. The app's proven Core id outranks it.
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
+        core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)' },
+        connectorApps: { core: [{ appId: 'asdk_app_win2222', linkId: 'link_w', name: 'Chat On Steroids Core (Windows)' }], desktop: [], plugins: [] },
+        ownCoreApp: { appId: 'asdk_app_mac1111', name: 'Chat On Steroids Core (Windows)' } }),
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
+    });
+    await settle();
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      live!.dom.reconfigure({ url: `https://chatgpt.com/c/${chatA}` });
+      userTurn(live!.document, 'poisoned-core-receipt', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    const adapter = (live.window as any).CLF_DOM;
+    const send = adapter.send;
+    const mentions: unknown[] = [];
+    adapter.send = (options: { mention?: unknown }) => { mentions.push(options.mention ?? null); return send({ ...options, mention: null }); };
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: true });
+    expect(mentions).toEqual([null]);
+  });
+
+  it('hands the proven connector apps to fiber.js with every scan', async () => {
+    const asked: unknown[] = [];
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0,
+        connectorApps: { core: [{ appId: 'asdk_app_x1', linkId: 'link_x1', name: 'My tools' }], desktop: [], plugins: [] } })
+    });
+    live.window.addEventListener('message', (event: MessageEvent) => {
+      if (event.data?.source === 'clf-fiber-ask') asked.push(event.data.appIds);
+    });
+    await settle();
+    expect((live.window as any).CLF_DOM.connectorApps()).toEqual([{ surface: 'core', appId: 'asdk_app_x1', linkId: 'link_x1', name: 'My tools' }]);
+    userTurn(live.document, 'apps-user', 'hello');
+    live.hook.observe();
+    await vi.waitFor(() => expect(asked.at(-1)).toEqual([{ surface: 'core', appId: 'asdk_app_x1', linkId: 'link_x1', name: 'My tools' }]));
+  });
+
+  it('mentions a renamed Core by its proven app id and never reports it missing', async () => {
+    const asks: any[] = [];
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0,
+        connectorApps: { core: [{ appId: 'asdk_app_x1', linkId: 'link_x1', name: 'My tools' }], desktop: [], plugins: [] } }),
+      core_plugin: (message: unknown) => { asks.push(message); return { ok: true, data: {} }; },
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
+    });
+    await settle();
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: { type: 'cos-core-mention', path: null, name: null,
+        candidates: [{ name: 'My tools', path: 'app://asdk_app_x1' }, { name: 'Gmail', path: 'app://asdk_app_gmail' }], pluginList: true } }));
+    await settle();
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      live!.dom.reconfigure({ url: `https://chatgpt.com/c/${chatA}` });
+      userTurn(live!.document, 'renamed-core-receipt', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    const adapter = (live.window as any).CLF_DOM;
+    const send = adapter.send;
+    const mentions: unknown[] = [];
+    adapter.send = (options: { mention?: unknown }) => { mentions.push(options.mention ?? null); return send({ ...options, mention: null }); };
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: true });
+    expect(mentions).toEqual([{ path: 'app://asdk_app_x1', name: 'My tools' }]);
+    expect(asks.some(message => message?.missing === true)).toBe(false);
+    expect(asks).toContainEqual(expect.objectContaining({ type: 'core_plugin', appId: 'asdk_app_x1' }));
+  });
+
   it('keeps the plain names for a status reply that carries foreign or malformed names', async () => {
     live = await harness(`https://chatgpt.com/c/${chatA}`, {
       status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
@@ -1945,6 +2048,8 @@ describe('desktop input delivery and helper ownership', () => {
     // a person's request for a picture; every other message keeps the mention (setting on).
     const core = { path: 'app://asdk_app_6aa5b6651c3c81919f03cb5dc38bf019', name: 'Chat On Steroids Core' };
     live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      status: () => ({ connected: true, paired: true, port: 8765, pending: 0, connectorNames: {
+        core: 'Chat On Steroids Core', desktop: 'Chat On Steroids Desktop', plugins: 'Chat On Steroids Plugins' } }),
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, activeTurnId: null, userAnchors: [], mentionCore: true } }),
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.response ? { ok: true } : { input: claimed({ ...extra }) } })
     });
@@ -2164,6 +2269,23 @@ describe('desktop input delivery and helper ownership', () => {
     expect(failure?.error).toContain('Too many requests');
     expect(failure?.error).toContain('few minutes');
     expect(live.sent.some(message => message.type === 'desktop_input' && (message.ack || message.authorize))).toBe(false);
+  });
+
+  it('says a claimed message failed because ChatGPT deleted its chat, not because of the model', async () => {
+    // Measured 2026-10-11: the reopened tab of a deleted chat moves home while the message is
+    // claimed, and the model check after it failed as "Requested model or reasoning could not be confirmed".
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.fail ? { ok: true } : { input: claimed({ model: 'gpt-5.6-sol', reasoningEffort: 'high' }) } })
+    });
+    (live.window as any).CLF_DOM.selectModelSettings = async () => {
+      live!.window.dispatchEvent(new live!.window.MessageEvent('message', { source: live!.window as unknown as Window,
+        origin: 'https://chatgpt.com', data: { type: 'cos-conversation-deleted', conversationId: chatA, observedAt: 1 } }));
+      return false;
+    };
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    expect(live.sent.find(message => message.type === 'desktop_input' && message.fail)?.error)
+      .toBe('This chat was deleted in ChatGPT. Start a new chat to continue.');
+    expect(live.sent).toContainEqual(expect.objectContaining({ type: 'conversation_deleted', conversationId: chatA }));
   });
 
   it.each([false, true])('sends exact High settings only after picker confirmation (%s)', async (confirmed) => {
@@ -4150,7 +4272,10 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
         rawText: 'Checking ownership.',
         renderedHtml: '<p>Checking ownership.</p>'
       }],
-      activities: [{ messageId: 'thought-late-owner-0', label: 'Inspecting ownership' }]
+      activities: [{ messageId: 'thought-late-owner-0', label: 'Inspecting ownership' }],
+      // #1301: the outline names the user message that opened its page turn.
+      trace: [{ kind: 'say', text: 'Checking ownership.', done: false }],
+      question: 'q-late-owner'
     };
     await replyFiber([], [descriptor]);
     await live.hook.flush();
@@ -4178,6 +4303,7 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
     expect(emitted(live.sent, 'assistant_message').at(-1)!.event.turnId).toBe(opened);
     expect(emitted(live.sent, 'page_tool').at(-1)!.event.turnId).toBe(opened);
     expect(emitted(live.sent, 'tool_evidence').at(-1)!.event.turnId).toBe(opened);
+    expect(emitted(live.sent, 'turn_trace').at(-1)!.event).toMatchObject({ turnId: opened, question: 'q-late-owner' });
   });
 
   it('publishes one stable native activity id and revises only its label', async () => {
@@ -4535,18 +4661,23 @@ describe('the app-owned chronological stream', () => {
     // an idle chat took ~60 such writes a second (measured 2026-10-09).
     const owner = 'idle-owner';
     const rows = [{ seq: 1, time: 100, kind: 'turn_start', turnId: owner },
-      { seq: 2, time: 110, kind: 'tool_call', turnId: owner, callId: 'idle-call', tool: 'read', summary: { title: 'Read file' } },
-      { seq: 3, time: 200, kind: 'assistant_message', turnId: owner, messageId: 'idle-final', text: 'Done', final: true }];
+      // Three calls in a row form a tool group, whose header carries a count title.
+      ...[0, 1, 2].map(i => ({ seq: 2 + i, time: 110 + i, kind: 'tool_call', turnId: owner, callId: `idle-call-${i}`, tool: 'read', summary: { title: `Read file ${i}` } })),
+      { seq: 5, time: 200, kind: 'assistant_message', turnId: owner, messageId: 'idle-final', text: 'Done', final: true }];
     live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], resetActivity: true, stream: rows } }) });
     renderingOn(); const section = assistantTurn(live.document, 'idle-page', []);
     await bindRenderedFiberTurns([{ section, turn: { turnId: 'idle-page', messages: [{ messageId: 'idle-final',
       rawMessageId: 'idle-final', stable: true, rawText: 'Done', renderedHtml: '<p>Done</p>' }] } }]);
     await live.hook.pullActivity(); live.hook.renderStreams();
     expect(section.querySelectorAll('.clf-stream')).not.toHaveLength(0);
+    expect(section.querySelector('.clf-stream-group-head')).not.toBeNull();
     const records: MutationRecord[] = [];
     const observer = new (live.document.defaultView as unknown as { MutationObserver: typeof MutationObserver }).MutationObserver(list => records.push(...list));
     observer.observe(live.document.documentElement, { subtree: true, attributes: true, childList: true, characterData: true });
     live.hook.renderStreams(); live.hook.renderStreams();
+    // The compact control sits inside ChatGPT's composer: its unchanged repaint wrote the same
+    // labels and flags every second, waking the transcript observer as well.
+    live.hook.renderControl(); live.hook.renderControl();
     await Promise.resolve();
     records.push(...observer.takeRecords()); observer.disconnect();
     expect(records.map(record => `${(record.target as Element).className || (record.target as Element).tagName} ${record.type} ${record.attributeName ?? ''}`)).toEqual([]);
@@ -6555,6 +6686,50 @@ describe('the app-owned chronological stream', () => {
     await live.hook.pullActivity(); live.hook.renderStreams();
     expect(overwriteRows(section, '[data-clf-call="exact-block-call"]')).toHaveLength(1);
     expect(block.closest('[data-clf-native-hidden]') !== null).toBe(hidden);
+  });
+
+  it.each([
+    ['My tools', true, true],
+    ['Chat On Steroids Plugins', false, false]
+  ] as const)('trusts fiber.js\'s own verdict for a connector row (%s, own %s)', async (app, own, hidden) => {
+    // A connector renamed in ChatGPT is recognized by its app id in fiber.js (2026-10-11); a
+    // same-named app that fiber.js proved foreign stays native.
+    live = await harness(undefined, { activity: () => ({ ok: true, data: {
+      entries: [], userAnchors: [{ seq: 0, time: 50, messageId: 'm-own-block-owner' }], stream: [
+        { seq: 1, time: 100, kind: 'turn_start', turnId: 'own-block-owner' },
+        { seq: 2, time: 110, kind: 'tool_call', turnId: 'own-block-owner', callId: 'own-block-call',
+          requestId: 'wfr-own-block', tool: 'read_file', outcome: 'ok', summary: { title: 'Local exact call' } }
+      ]
+    } }) }); renderingOn();
+    userTurn(live.document, 'own-block-owner', 'Read the exact file', { sent: false });
+    const section = assistantTurn(live.document, 'own-block-page', ['Native connector row']);
+    const block = blocksOf(section)[0]!; section.setAttribute('data-clf-fiber-turn', '0'); block.setAttribute('data-clf-fiber', '0');
+    await replyFiber([{ v: fiberVersion, index: 0, messageId: 'fiber-own-block', tool: 'read_file',
+      path: `/${app}/link_x1/read_file`, app, answered: true, own, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }], [{
+      turnId: 'own-block-page', calls: [{ messageId: 'fiber-own-block', tool: 'read_file', order: 0,
+        answered: true, requestId: 'wfr-own-block' }]
+    }]);
+    await live.hook.pullActivity(); live.hook.renderStreams();
+    expect(block.closest('[data-clf-native-hidden]') !== null).toBe(hidden);
+  });
+
+  it('reports each new app sighting once, as an app_sightings observation', async () => {
+    live = await harness();
+    assistantTurn(live.document, 'sighting-page', []);
+    live.hook.observe();
+    await settle();
+    const turn = { turnId: 'sighting-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', calls: [], messages: [],
+      sightings: [{ requestId: 'q4', appId: 'asdk_app_x1', linkId: 'link_x1', appName: 'My tools' },
+        { requestId: 'bad', appId: 'not-an-app', linkId: null, appName: 'x' }] };
+    await replyFiber([], [turn]);
+    await live.hook.flush();
+    await settle();
+    await replyFiber([], [turn]);
+    await live.hook.flush();
+    await settle();
+    const sent = emitted(live.sent, 'app_sightings');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.event.apps).toEqual([{ requestId: 'q4', appId: 'asdk_app_x1', linkId: 'link_x1', appName: 'My tools' }]);
   });
 
   it.each([false, true])('hides result-only native duplicates only after mounted coverage for a shared request (same tool: %s)', async sameTool => {
@@ -8579,7 +8754,9 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(ends).toHaveLength(1);
     expect(ends[0]).toMatchObject({
       outcome: 'interrupted',
-      detail: 'a new user message replaced the unfinished turn'
+      detail: 'a new user message replaced the unfinished turn',
+      // ChatGPT carries an unfinished answer on past a message sent into it (#1301).
+      continued: true
     });
   });
 
@@ -8646,7 +8823,9 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(ends[0]!.turnId).toBe(firstGeneration);
     expect(ends[0]).toMatchObject({
       outcome: 'interrupted',
-      detail: 'a new user message replaced the unfinished turn'
+      detail: 'a new user message replaced the unfinished turn',
+      // ChatGPT carries an unfinished answer on past a message sent into it (#1301).
+      continued: true
     });
   });
 
@@ -8731,6 +8910,23 @@ describe('a stop button that goes missing while the turn is still running', () =
     const stalled = emitted(live.sent, 'chat_error').filter(row => /ten minutes/.test(String(row.event.text)));
     expect(stalled, kind === 'steered' ? 'live steered work was reported stalled' : 'unrelated work hid a stall')
       .toHaveLength(kind === 'steered' ? 0 : 1);
+  });
+
+  it('marks the end of a turn a message steered as continued (#1301)', async () => {
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0,
+        userAnchors: [{ seq: 1, time: 1_787_165_090_500, messageId: 'm-older-user' }] } })
+    });
+    userTurn(live.document, 'older-user', 'the question before', { sent: false });
+    await live.hook.pullActivity();
+    userTurn(live.document, 'steer-first', 'run the import', { sent: false });
+    startGenerating(live.document, { send: false });
+    for (let tick = 0; tick < 3; tick++) { live.hook.observe(); await settle(); }
+    const first = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    // Typed while it works: Stop never goes away, and ChatGPT carries the answer on.
+    userTurn(live.document, 'steer-second', 'also keep the tag', { sent: false });
+    for (let tick = 0; tick < 3; tick++) { live.hook.observe(); await settle(); }
+    expect(emitted(live.sent, 'turn_end').map(row => [row.event.turnId, row.event.continued])).toEqual([[first, true]]);
   });
 
   it('keeps an in-flight Fiber scan owned by the generation that requested it', async () => {
@@ -14149,6 +14345,39 @@ describe('the Compact & resume control', () => {
     expect(compacts.some(message => message.cancel)).toBe(false);
   });
 
+  it("replaces an earlier attempt's own unsent handoff request instead of refusing it as a user draft", async () => {
+    // Measured 2026-10-10: a cancelled attempt left "[[CLF-HANDOFF:<old>]]…" in the box, ChatGPT
+    // restored it on every load, and the next Compact & resume was refused as "a draft is already
+    // in ChatGPT".
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
+      compact: (message) => ({
+        ok: true,
+        data: message.sourceAttempt ? { allowed: true, checkpoint: { state: 'attempted-unresolved', messageId: null } }
+          : message.sourceDispatch ? { armed: true }
+          : message.sourceLost ? { aborted: true }
+          : {
+              started: true,
+              token: 'manual-after-residue',
+              prompt: '[[CLF-HANDOFF:manual-after-residue]]\n\nwrite the brief',
+              job: { sessionId: 's1', stage: 'handoff-pending', busy: true, handoffId: null, error: null }
+            }
+      })
+    });
+    live.hook.injectControl();
+    // The same instruction under the earlier attempt's marker; an edited one stays the person's
+    // draft ("preserves a stale COS handoff draft including user edits"). ChatGPT's editor keeps
+    // paragraphs as elements, so its text runs the marker straight into the instruction.
+    live.document.querySelector('#prompt-textarea')!.textContent = '[[CLF-HANDOFF:5WSsl9TgeKgVVLCILXp8cQ]]write the brief';
+
+    await live.hook.startCompact();
+
+    const compacts = live.sent.filter((message) => message.type === 'compact');
+    expect(compacts.some(message => typeof message.sourceError === 'string' && /A draft is already/.test(message.sourceError))).toBe(false);
+    expect(compacts.some(message => message.sourceDispatch === true)).toBe(true);
+    expect(composerText(live.document)).not.toContain('5WSsl9TgeKgVVLCILXp8cQ');
+  });
+
   it('durably retires an automatic ticket blocked by a persistent user draft without changing the draft', async () => {
     const automaticJob = {
       sessionId: 's-auto-page-error',
@@ -15382,6 +15611,52 @@ describe('the fresh chat the app opened', () => {
     await settle();
   });
 
+  it('mentions this install\'s own Core on the bootstrap before its first status reply', async () => {
+    // Seen live (2026-10-11): a computer with a suffix shares its ChatGPT account with another
+    // computer. Its resume tab sent the bootstrap before status arrived, matched the plain
+    // "Chat On Steroids Core" (the other computer's) and the new chat called that computer's tools.
+    let releaseStatus: () => void = () => undefined;
+    const statusHeld = new Promise((resolve) => {
+      releaseStatus = () => resolve({ connected: true, paired: true, port: 8765, pending: 0 });
+    });
+    const names = { core: 'Chat On Steroids Core (Windows)', desktop: 'Chat On Steroids Desktop (Windows)', plugins: 'Chat On Steroids Plugins (Windows)' };
+    let releaseRedeem: () => void = () => undefined;
+    const redeemHeld = new Promise((resolve) => {
+      releaseRedeem = () => resolve({
+        ok: true,
+        command: { id: 'cmd-own-core', type: 'resume', text: '[[CLF-RESUME:0123456789abcdef0123456789abcdef]]\n\nthe brief', agent: null },
+        identity: { connectorNames: names, connectorApps: { core: [], desktop: [], plugins: [] }, ownCoreApp: null }
+      });
+    });
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-own-core',
+      {
+        status: () => statusHeld,
+        redeem: () => redeemHeld,
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          dom.reconfigure({ url: 'https://chatgpt.com/c/12121212-3434-5656-7878-909090909091' });
+        });
+      }
+    );
+    const adapter = (live.window as any).CLF_DOM;
+    const send = adapter.send;
+    const mentions: unknown[] = [];
+    adapter.send = (options: { mention?: unknown }) => { mentions.push(options.mention ?? null); return send({ ...options, mention: null }); };
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window, origin: 'https://chatgpt.com', data: { type: 'cos-core-mention', path: null, name: null,
+        candidates: [{ name: 'Chat On Steroids Core', path: 'app://asdk_app_mac1111' },
+          { name: 'Chat On Steroids Core (Windows)', path: 'app://asdk_app_win2222' }], pluginList: true } }));
+    releaseRedeem();
+    await settle(200);
+    await settle();
+    expect(mentions).toEqual([{ path: 'app://asdk_app_win2222', name: 'Chat On Steroids Core (Windows)' }]);
+    releaseStatus();
+    await settle();
+  });
+
   it('redeems the one command its URL names and crosses the durable destination fence', async () => {
     let submitted = '';
     live = await harness(
@@ -16158,6 +16433,28 @@ describe('the fresh chat the app opened', () => {
     await settle(400);
     expect(proof).toMatchObject({ safe: mode === 'empty', conversationId: null });
     expect(await live.runtimeMessage({ type: 'clf-tab-close-check', conversationId: null,
+      failedCommand: { id: 'foreign-command', client: 'foreign-client' } })).toMatchObject({ safe: false });
+  });
+
+  it('proves a failed Project-entry source tab safe to retire, and only for its own command', async () => {
+    const source = '6aca5f65-65a0-83e9-990e-b7cc899edb50';
+    let release!: (value: unknown) => void;
+    const redeemed = new Promise(resolve => { release = resolve; });
+    let proof: any;
+    live = await harness(`https://chatgpt.com/c/${source}?clf=cmd-entry-failed&clf_project=1#clf=cmd-entry-failed&clf_project=1`, {
+      redeem: () => redeemed,
+      ack: async message => {
+        proof = await live!.runtimeMessage({ type: 'clf-tab-close-check', conversationId: source,
+          failedCommand: { id: message.id, client: message.client } });
+        return { ok: true };
+      }
+    });
+    (live.window as any).CLF_DOM.enterProject = async () => false;
+    release({ ok: true, command: { id: 'cmd-entry-failed', type: 'resume', text: 'the brief', agent: null,
+      projectEntry: { id: 'g-p-11111111222233334444555555555555', sourceConversationId: source } } });
+    await settle(400);
+    expect(proof).toMatchObject({ safe: true, conversationId: source });
+    expect(await live.runtimeMessage({ type: 'clf-tab-close-check', conversationId: source,
       failedCommand: { id: 'foreign-command', client: 'foreign-client' } })).toMatchObject({ safe: false });
   });
 
@@ -18128,6 +18425,78 @@ describe('one live isolated-world recorder per document', () => {
     expect(oldControl!.isConnected).toBe(false);
     expect(live.document.querySelector('[data-clf-composer]')).toBeNull();
     expect(live.listenerCounts()).toEqual({ runtime: 0, storage: 0 });
+  });
+
+  /** A Web Locks stand-in: `held` lists the locks whose callback promise has not settled yet. */
+  function fakeLocks() {
+    const held: string[] = [];
+    const request = vi.fn((name: string, callback: () => unknown) => {
+      held.push(name);
+      return Promise.resolve(callback()).then(() => { held.splice(held.indexOf(name), 1); });
+    });
+    return { request, held };
+  }
+  const withLocks = (locks: unknown) => (_document: Document, dom: JSDOM) => {
+    Object.defineProperty(dom.window.navigator, 'locks', { value: locks, configurable: true });
+  };
+
+  it('holds one uniquely named Web Lock when the worker says the tab sits in the app group (#128)', async () => {
+    const locks = fakeLocks();
+    live = await harness(undefined, { register_document: () => ({ ok: true, keepAwake: true }) }, withLocks(locks));
+    await settle();
+    expect(live.sent.some(message => message.type === 'register_document')).toBe(true);
+    expect(locks.request).toHaveBeenCalledTimes(1);
+    expect(locks.request.mock.calls[0]![0]).toMatch(/^chat-on-steroids-keep-awake-[a-z0-9]{8,}$/);
+    expect(locks.held).toHaveLength(1);
+  });
+
+  it('holds no lock for a tab outside the app group (#128)', async () => {
+    const locks = fakeLocks();
+    live = await harness(undefined, {}, withLocks(locks));
+    await settle();
+    expect(live.sent.some(message => message.type === 'register_document')).toBe(true);
+    expect(locks.request).not.toHaveBeenCalled();
+  });
+
+  it('takes and releases the keep-awake lock on the worker\'s word, once each (#128)', async () => {
+    const locks = fakeLocks();
+    live = await harness(undefined, {}, withLocks(locks));
+    await settle();
+    await expect(live.runtimeMessage({ type: 'clf-keep-awake', on: true })).resolves.toEqual({ ok: true, held: true });
+    await expect(live.runtimeMessage({ type: 'clf-keep-awake', on: true })).resolves.toEqual({ ok: true, held: true });
+    expect(locks.request).toHaveBeenCalledTimes(1);
+    await expect(live.runtimeMessage({ type: 'clf-keep-awake', on: false })).resolves.toEqual({ ok: true, held: false });
+    await settle();
+    expect(locks.held).toHaveLength(0);
+    await expect(live.runtimeMessage({ type: 'clf-keep-awake', on: true })).resolves.toEqual({ ok: true, held: true });
+    expect(locks.request).toHaveBeenCalledTimes(2);
+    expect(locks.request.mock.calls[1]![0]).not.toBe(locks.request.mock.calls[0]![0]);
+  });
+
+  it('answers without a lock where the browser has no Web Locks (#128)', async () => {
+    live = await harness(undefined, {}, withLocks(undefined));
+    await settle();
+    await expect(live.runtimeMessage({ type: 'clf-keep-awake', on: true })).resolves.toEqual({ ok: true, held: false });
+  });
+
+  it('passes on an app the response stream names for this chat, once per request (#1305)', async () => {
+    live = await harness();
+    await settle();
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const sighting = { requestId: '11111111-2222-4333-8444-555555555555', appId: 'asdk_app_6ac261da', linkId: 'link_6ac26253', appName: 'Chat On Steroids Core' };
+    const publish = (conversationId: string, sightings: unknown[]) => live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+      source: live!.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-app-sighting', conversationId, sightings }
+    }));
+    publish(chat, [sighting]); await settle();
+    publish(chat, [sighting]); await settle();
+    // Another chat's stream, a malformed id or a foreign page says nothing about this one.
+    publish('bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', [{ ...sighting, requestId: '22222222-2222-4333-8444-555555555555' }]); await settle();
+    publish(chat, [{ ...sighting, requestId: '33333333-2222-4333-8444-555555555555', appId: 'not-an-app' }]); await settle();
+    live.window.dispatchEvent(new live.window.MessageEvent('message', { source: live.window as unknown as Window, origin: 'https://evil.example',
+      data: { type: 'cos-app-sighting', conversationId: chat, sightings: [{ ...sighting, requestId: '44444444-2222-4333-8444-555555555555' }] } }));
+    await settle(); await live.hook.flush(); await settle();
+    expect(emitted(live.sent, 'app_sightings').map(row => row.event.apps)).toEqual([[sighting]]);
   });
 
   it('reports the recorder protocol version rather than the unrelated Fiber protocol version', async () => {
@@ -22535,6 +22904,18 @@ describe('ordinary Continue native recovery', () => {
     expect(live.sent.filter(message => message.type === 'desktop_input' && message.recoveryVeto)).toEqual(scenario === 'authorization'
       ? [] : [expect.objectContaining({ id, conversationId: chat, recoveryVeto: 'page-final' })]);
   });
+  it("does not hold a repair for this app's own unsent handoff request left in the box (2026-10-10)", async () => {
+    // A refused handoff left its request in the box; holding every later repair for it left the
+    // next Compact & resume waiting with nothing on screen. Its attempt replaces it, or refuses visibly.
+    live = await harness(`https://chatgpt.com/c/${chat}`);
+    await settle();
+    const composer = live.document.getElementById('prompt-textarea')!;
+    composer.textContent = '[[CLF-HANDOFF:IRpyIega8lPGQZNCPaB0tQ]]Chat On Steroids is compacting this conversation';
+    expect(await live.runtimeMessage({ type: 'clf-repair-check', conversationId: chat })).not.toMatchObject({ why: 'draft' });
+    composer.textContent = 'Chat On Steroids is compacting this conversation';
+    expect(await live.runtimeMessage({ type: 'clf-repair-check', conversationId: chat })).toMatchObject({ safe: false, why: 'draft' });
+  });
+
   it('names why a repair is held: an unsent draft in the message box, then nothing once it is cleared', async () => {
     live = await harness(`https://chatgpt.com/c/${chat}`);
     await settle();
@@ -22714,4 +23095,216 @@ it.each([false, true])('opens the first turn of a prompt sent with an app mentio
   await live.hook.flush();
   expect(emitted(live.sent, 'user_message')).toHaveLength(1);
   expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+});
+
+/**
+ * #1291 review: the undelivered-click release is the one path that can send a handoff twice, so
+ * its proof is read only from a settled page and twice. A transcript that hydrates in steps must
+ * never be read as "ChatGPT never received it".
+ */
+describe('releasing a handoff click ChatGPT never received (page)', () => {
+  const token = '0123456789abcdef0123456789abcdef';
+  const job = (stage = 'handoff-pending') => ({ sessionId: 's1', stage, automatic: false, busy: true, handoffId: null, error: null, token,
+    sourceSend: { state: 'dispatched-unresolved', messageId: null, before: 'm-before', dispatchedAt: 1_700_000_000_000 - 20_000 } });
+  let armed = false;
+  async function start(before: (document: Document) => void = () => undefined) {
+    const releases: Array<Record<string, any>> = [];
+    // The ticket arrives with the first explicit pull, after each test has shaped the page.
+    armed = false;
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: armed ? job() : null } }),
+      compact: message => {
+        if (message.sourceUndelivered) { releases.push(message); return { ok: true, data: { released: true, job: job('done') } }; }
+        return { ok: true, data: {} };
+      }
+    }, before);
+    return releases;
+  }
+  const drain = async () => { for (let i = 0; i < 6; i++) { await settle(); await new Promise(resolve => setTimeout(resolve, 0)); } };
+
+  it('releases once from a settled page that shows the pre-click question as newest twice', async () => {
+    const releases = await start(document => { userTurn(document, 'before', 'Keep going', { sent: false }); });
+    armed = true;
+    await live!.hook.pullActivity();
+    await drain();
+    expect(releases).toEqual([expect.objectContaining({ token, sourceUndelivered: true, newestUserMessage: 'm-before' })]);
+  });
+
+  it('does not release when the handoff turn appears between the two reads', async () => {
+    const releases = await start(document => { userTurn(document, 'before', 'Keep going', { sent: false }); });
+    const scheduled = live!.window.setTimeout;
+    live!.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 3_000) userTurn(live!.document, 'handoff', '[[CLF-HANDOFF:0123456789abcdef0123456789abcdef]]write the brief', { sent: false });
+      return scheduled(fn, ms);
+    }) as typeof scheduled;
+    armed = true;
+    await live!.hook.pullActivity();
+    await drain();
+    expect(releases).toEqual([]);
+  });
+
+  it('does not release from a transcript that hydrates empty and then shows the handoff turn', async () => {
+    const releases = await start();
+    armed = true;
+    const pull = live!.hook.pullActivity();
+    await settle();
+    // Empty while hydrating: no proof yet. Then the full transcript, with the handoff ChatGPT holds.
+    userTurn(live!.document, 'before', 'Keep going', { sent: false });
+    userTurn(live!.document, 'handoff', '[[CLF-HANDOFF:0123456789abcdef0123456789abcdef]]write the brief', { sent: false });
+    await pull;
+    await drain();
+    expect(releases).toEqual([]);
+  });
+});
+
+/** #1176: the helper page creates a new CoS project's native ChatGPT Project through ChatGPT's own dialog. */
+describe('creating a native ChatGPT Project', () => {
+  const request = { id: 'aaaaaaaa-1111-4222-8333-444444444444', name: 'my-app' };
+  const nativeId = `g-p-${'f'.repeat(32)}`;
+  const shown = (node: Element) => { (node as HTMLElement).getClientRects = () => [{ width: 100, height: 20 }] as unknown as DOMRectList; };
+  function nativeDialog(document: Document, dom: JSDOM, created = true, landsOn = nativeId) {
+    const button = document.createElement('button');
+    button.setAttribute('data-app-action-sidebar-project-create', ''); button.setAttribute('aria-label', 'Adicionar novo projeto');
+    shown(button); document.body.append(button);
+    button.addEventListener('click', () => {
+      const dialog = document.createElement('div');
+      dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true');
+      dialog.innerHTML = '<form><input id="chatgpt-project-name" name="project-name" type="text"><button type="submit" disabled>Criar projeto</button></form>';
+      shown(dialog); document.body.append(dialog);
+      const input = dialog.querySelector('input')!, submit = dialog.querySelector('button')!;
+      input.addEventListener('input', () => { submit.disabled = !input.value; });
+      submit.addEventListener('click', event => {
+        event.preventDefault();
+        if (!created) return;
+        dialog.remove();
+        dom.reconfigure({ url: `https://chatgpt.com/g/${landsOn}/project` });
+      });
+    });
+  }
+
+  it('claims, arms before the click, and reports only the id of the Project page ChatGPT opens', async () => {
+    const reports: Array<Record<string, any>> = [];
+    live = await harness(`https://chatgpt.com/?cos-project-create=${request.id}`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    }, (document, dom) => nativeDialog(document, dom));
+    expect(await live.runtimeMessage({ type: 'clf-project-create', request })).toEqual({ ok: true });
+    expect(reports.map(row => row.action)).toEqual(['claim', 'arm', 'done']);
+    expect(reports[2]).toMatchObject({ id: request.id, chatgptId: nativeId });
+    expect(await live.runtimeMessage({ type: 'clf-project-create-state', id: request.id })).toMatchObject({ safe: true });
+  });
+
+  it('fails the claimed request, before anything is armed, when ChatGPT shows no New project control', async () => {
+    const reports: Array<Record<string, any>> = [];
+    live = await harness(`https://chatgpt.com/?cos-project-create=${request.id}`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    });
+    const created = live.runtimeMessage({ type: 'clf-project-create', request });
+    await settle(21_000);
+    expect(await created).toEqual({ ok: false });
+    expect(reports.map(row => row.action)).toEqual(['claim', 'fail']);
+  });
+
+  it.each(['root', 'project'] as const)('claims a new chat of a linked project only on that Project page (%s)', async page => {
+    const inputId = 'cccccccc-1111-4222-8333-444444444444';
+    const project = `g-p-${'1'.repeat(32)}`;
+    const url = page === 'root' ? `https://chatgpt.com/?cos-input=${inputId}#cos-input=${inputId}`
+      : `https://chatgpt.com/g/${project}-my-app/project?cos-input=${inputId}#cos-input=${inputId}`;
+    live = await harness(url, { desktop_input: () => ({ ok: true, data: { input: null } }) });
+    await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null, project });
+    await settle(200);
+    const claims = live.sent.filter(message => message.type === 'desktop_input' && message.requiresAuthorization);
+    if (page === 'root') expect(claims).toEqual([]);
+    else expect(claims).toEqual([expect.objectContaining({ id: inputId, conversationId: null, project })]);
+  });
+
+  it("never takes a Project the sidebar already listed for the new one", async () => {
+    const known = `g-p-${'2'.repeat(32)}`;
+    const reports: Array<Record<string, any>> = [];
+    live = await harness(`https://chatgpt.com/?cos-project-create=${request.id}`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    }, (document, dom) => {
+      const link = document.createElement('a'); link.href = `/g/${known}-old/project`; link.textContent = 'Old project';
+      document.body.append(link);
+      nativeDialog(document, dom, true, known);
+    });
+    const created = live.runtimeMessage({ type: 'clf-project-create', request });
+    await settle(21_000);
+    expect(await created).toEqual({ ok: false });
+    expect(reports.map(row => row.action)).toEqual(['claim', 'arm', 'fail']);
+  });
+
+  it('clicks the native control once more when the first click opens no dialog, before arming anything', async () => {
+    const reports: Array<Record<string, any>> = [];
+    let clicks = 0;
+    live = await harness(`https://chatgpt.com/?cos-project-create=${request.id}`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    }, (document, dom) => {
+      nativeDialog(document, dom);
+      const control = document.querySelector('[data-app-action-sidebar-project-create]')!;
+      control.addEventListener('click', event => { if (++clicks === 1) event.stopImmediatePropagation(); }, true);
+    });
+    const created = live.runtimeMessage({ type: 'clf-project-create', request });
+    await settle(9_000);
+    expect(await created).toEqual({ ok: true });
+    expect(clicks).toBe(2);
+    expect(reports.map(row => row.action)).toEqual(['claim', 'arm', 'done']);
+  });
+
+  it('does nothing on a page that is not the helper for that exact request', async () => {
+    const reports: Array<Record<string, any>> = [];
+    live = await harness(`https://chatgpt.com/?cos-project-create=bbbbbbbb-1111-4222-8333-444444444444`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    }, (document, dom) => nativeDialog(document, dom));
+    expect(await live.runtimeMessage({ type: 'clf-project-create', request })).toEqual({ ok: false });
+    expect(reports).toEqual([]);
+  });
+});
+
+/** A chat deleted in ChatGPT, read by usage.js from ChatGPT's own `conversation_deleted` answer. */
+describe('a chat deleted in ChatGPT', () => {
+  const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const deleted = (conversationId: string) => live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+    source: live!.window as unknown as Window, origin: 'https://chatgpt.com',
+    data: { type: 'cos-conversation-deleted', conversationId, observedAt: 1 } }));
+
+  it('ends the open turn as failed with that reason and tells the app once', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    live.hook.observe(); await settle();
+    const [started] = emitted(live.sent, 'turn_start').map(entry => entry.event);
+    expect(started?.turnId).toBeTruthy();
+    deleted(chat); deleted(chat);
+    await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'chat_error').map(entry => entry.event)).toEqual([expect.objectContaining({
+      turnId: started.turnId, recoverable: false, text: 'This chat was deleted in ChatGPT. Start a new chat to continue.' })]);
+    expect(emitted(live.sent, 'turn_end').map(entry => entry.event)).toEqual([expect.objectContaining({
+      turnId: started.turnId, outcome: 'failed', detail: 'This chat was deleted in ChatGPT. Start a new chat to continue.' })]);
+    expect(live.sent.filter(message => message.type === 'conversation_deleted')).toEqual([
+      expect.objectContaining({ conversationId: chat })]);
+  });
+
+  it('ends a turn that opens after the answer: the send fails before the page shows its question', async () => {
+    // Measured 2026-10-11: ChatGPT answered the send 2.8 s before the question opened the turn.
+    live = await harness();
+    deleted(chat);
+    await settle();
+    startGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const [started] = emitted(live.sent, 'turn_start').map(entry => entry.event);
+    expect(started?.turnId).toBeTruthy();
+    expect(emitted(live.sent, 'turn_end').map(entry => entry.event)).toEqual([expect.objectContaining({
+      turnId: started.turnId, outcome: 'failed', detail: 'This chat was deleted in ChatGPT. Start a new chat to continue.' })]);
+    expect(emitted(live.sent, 'chat_error')).toHaveLength(1);
+  });
+
+  it('ignores a chat this page neither shows, records nor was opened for', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    live.hook.observe(); await settle();
+    deleted('11111111-2222-3333-4444-555555555555');
+    await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'chat_error')).toEqual([]);
+    expect(emitted(live.sent, 'turn_end')).toEqual([]);
+    expect(live.sent.some(message => message.type === 'conversation_deleted')).toBe(false);
+  });
 });

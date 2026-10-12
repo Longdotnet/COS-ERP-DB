@@ -480,7 +480,9 @@ export type SessionEvent =
    * call under the same server turn then proved it had not. Absent on the page's own starts.
    */
   | (BaseEvent & { kind: 'turn_start'; detail?: string })
-  | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed'; providerMessageId?: string })
+  | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed'; providerMessageId?: string;
+      /** The user sent a message into this running answer and ChatGPT carried the response on into the next turn (#1301). */
+      continued?: true })
   | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' | 'stream_gone' })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord; origin?: number })
   /**
@@ -515,6 +517,8 @@ export type SessionEvent =
       chars: number;
       /** What triggered it: manual compaction, resume, or an automatic suggestion. */
       reason: string;
+      /** The Compact & Resume run that saved it, so its timeline row can claim it (#1215). */
+      continuation?: string;
     });
 
 export type SessionEventKind = SessionEvent['kind'];

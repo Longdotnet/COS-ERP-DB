@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, questionHasMcpCall, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage } from './store.js';
-import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
+import { assignSessionProject, getProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
 import { logInfo, logWarn } from '../logger.js';
@@ -20,6 +20,7 @@ import { DEFAULT_HELPER_CHAT_MODEL, isAstraModel, isProModel } from '../../share
 import { inFlightToolCalls } from '../mcp/call-context.js';
 import { automaticFinishEnabled, goalDrivingMode, consumeGoalReplyForInputNow } from '../goal.js';
 import { finishInstruction } from '../../shared/finish.js';
+import { CONVERSATION_DELETED } from '../../shared/chat-error.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
@@ -1448,9 +1449,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1459,6 +1460,11 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
       if (!(await browserInputAllowed(entry))) continue;
       try {
         const conversationId = await target(entry);
+        // A new chat of a project with a native ChatGPT Project opens in that Project and nowhere
+        // else: it waits while the Project is being created or could not be, never the root.
+        const chatgptProject = !conversationId && entry.projectId && entry.purpose !== 'decision' && !entry.lifetime
+          ? (await getProject(entry.projectId))?.chatgpt : undefined;
+        if (chatgptProject && chatgptProject.state !== 'linked') continue;
         const [end] = !entry.silenceBoundary && manualInput(entry) && entry.sessionId
           ? await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];
         const silenceTurnId = entry.silenceBoundary?.turnId ?? (end?.kind === 'turn_end' && end.outcome === 'failed' &&
@@ -1469,7 +1475,8 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ...(entry.directTurn ? { directTurn: entry.directTurn } : {}),
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
             ? { supersededConversationId: entry.conversationId } : {}),
-          ...(entry.lifetime ? { lifetime: entry.lifetime } : {}) });
+          ...(entry.lifetime ? { lifetime: entry.lifetime } : {}),
+          ...(chatgptProject?.state === 'linked' ? { project: chatgptProject.id } : {}) });
       } catch { /* blocked/deleted stays user-visible */ }
     }
     return result;
@@ -1888,6 +1895,34 @@ export function failBrowserInput(id: string, owner: string, error: string, detai
     decisionWaiters.get(id)?.reject(new Error('goal_browser_send_failed: ' + error.slice(0, 200)));
     decisionWaiters.delete(id);
     return true;
+  });
+}
+
+/**
+ * Ends every message still waiting for a chat that ChatGPT says it deleted.
+ *
+ * Measured 2026-10-11: opening a deleted chat sends the tab to ChatGPT's home page, and a
+ * message for it waited in the queue with no status; one already claimed failed as "Requested
+ * model or reasoning could not be confirmed". Nothing can be delivered into that chat any more,
+ * so each one fails with the real reason instead of reopening it. Sent messages are untouched.
+ */
+export function failInputsForDeletedConversation(conversationId: string): Promise<number> {
+  return serial(async () => {
+    const current = await load();
+    const ended = new Set<string>();
+    for (const row of current) {
+      if (row.state !== 'queued' && row.state !== 'browser') continue;
+      let destination = row.conversationId;
+      if (!destination) { try { destination = await target(row); } catch { destination = null; } }
+      if (destination === conversationId) ended.add(row.id);
+    }
+    if (!ended.size) return 0;
+    await commit(current.map(row => ended.has(row.id) ? { ...row, state: 'failed', owner: null, error: CONVERSATION_DELETED } : row));
+    for (const id of ended) {
+      decisionWaiters.get(id)?.reject(new Error('goal_browser_send_failed: ' + CONVERSATION_DELETED));
+      decisionWaiters.delete(id);
+    }
+    return ended.size;
   });
 }
 

@@ -10,7 +10,6 @@
  * that server does not have, which is exactly the confusion the split exists to end.
  */
 
-import { LAUNCHES_WINDOWS_POWERSHELL_5 } from '../codex/tool-specs.js';
 import { CODING_INSTRUCTIONS } from './coding-instructions.js';
 import { skillCatalogInstructions } from '../skills.js';
 import { listSkillLibrary, skillLibraryInstructions } from '../skill-library.js';
@@ -116,21 +115,20 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
   if (caps.read || caps.browse || caps.metadata) lines.push(
     'read batches paths and lists folders/globs. Read whole files for orientation; otherwise use ranges. A start_line/end_line range applies to every file the call reads.',
   );
-  if (caps.read) lines.push('view_image inspects a local image. Use it when visual evidence matters.');
+  if (caps.read) lines.push('view_image inspects a local image when visual evidence matters.');
   if (caps.search) {
     lines.push('find searches repository filenames/text; then read relevant files/ranges.');
   }
   if (caps.command) {
     lines.push(
       'Use exec_command cmds for related builds/tests/git and shell-specific searches.',
-      'Set workdir to the project; use relative/native cmd paths.',
-      'write_stdin uses session_id for running terminals or completed_session_id for finished output, without rerunning work. Inspect exit/output; benign_exit marks expected non-zero.',
-      'If output truncates, narrow the command/read range.'
+      'Set workdir to the project; virtual paths work there. Inside cmd use relative or native paths.',
+      "write_stdin takes session_id: a running command's id, or pass a finished command's completed_session_id as session_id. Completed reads replay output without rerunning work. Inspect exit/output; benign_exit marks an expected non-zero result.",
+      'If output is truncated, narrow the command or read the relevant region.'
     );
     if (windows) lines.push(
-      'PowerShell does not expand * or ? for native programs. Regex \\x22 matches quotes; use script files for complex JavaScript. Pipe loops before Format-Table.',
-      'Use bundled rg. Avoid 2>&1 on native PowerShell commands; stderr is captured.',
-      ...(LAUNCHES_WINDOWS_POWERSHELL_5 ? ['This is Windows PowerShell 5.1, without && or ||. Use cmds or A; if ($?) { B }.'] : [])
+      'PowerShell does not expand * or ? for native programs. Regex \\x22 matches double quotes. Use script files for complex JavaScript; nested -Command/-e can corrupt quotes or expand variables. Pipe loops as @(foreach (...) { ... }) | Format-Table.',
+      'rg is bundled for shell-specific searches. Omit 2>&1 on native programs in PowerShell: stderr is captured; redirecting it can leave $? false after exit 0.'
     );
     else lines.push('exec_command uses the host’s normal POSIX shell (zsh/bash/sh unless requested otherwise). The bundled ripgrep directory is first on PATH.');
     if (config.commandAllowlist.enabled) lines.push(
