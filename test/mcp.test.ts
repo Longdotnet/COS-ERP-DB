@@ -24,10 +24,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import * as identity from '../src/main/connector-identity.js';
 import { connectorName } from '../src/shared/connector-names.js';
 import { effectiveCapabilities, defaultConfig, getConfig } from '../src/main/config.js';
-import { EXEC_COMMAND_CMD_DESCRIPTION, LAUNCHES_WINDOWS_POWERSHELL_5 } from '../src/main/codex/tool-specs.js';
+import { EXEC_COMMAND_CMD_DESCRIPTION, LAUNCHES_WINDOWS_POWERSHELL_5, WINDOWS_SHELL_GUIDANCE } from '../src/main/codex/tool-specs.js';
 import { skillCatalogInstructions } from '../src/main/skills.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
+import { publishPluginSurface, pluginRefreshStatuses, resetPluginRefreshForTests } from '../src/main/plugin-refresh.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
 import { serverInstructions } from '../src/main/mcp/instructions.js';
 import { CONNECTOR_BRAND, SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
@@ -438,6 +439,19 @@ describe('endpoint hardening', () => {
     expect(lastToolCallAt()).not.toBeNull();
   });
 
+  it('counts only successful provider calls as current-publication working evidence', async () => {
+    resetPluginRefreshForTests();
+    publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', [{ name: 'read', description: 'Read', inputSchema: { type: 'object' } }]);
+    try {
+      await rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } } }), selfTestHeaders());
+      expect((await pluginRefreshStatuses()).core?.responding).toBeUndefined();
+      await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/missing-file'] } });
+      expect((await pluginRefreshStatuses()).core?.responding).toBeUndefined();
+      await core('tools/call', { name: 'read', arguments: { paths: ['/workspace/notes.txt'] } });
+      expect((await pluginRefreshStatuses()).core).toMatchObject({ responding: true });
+    } finally { resetPluginRefreshForTests(); }
+  });
+
   it('counts a request to either surface as ChatGPT reaching this PC', async () => {
     expect(lastRequestAt()).toBeNull();
     await desktop('tools/list');
@@ -632,7 +646,8 @@ describe('surface boundaries', () => {
   it('advertises exactly Core’s tools on Core, with nothing from Desktop', async () => {
     everything();
     const names = toolNames(await core('tools/list'));
-    expect(names).toEqual(['agents', 'apply_patch', 'database', 'engineering', 'exec', 'exec_command', 'find', 'knowledge', 'read', 'save_image', 'update_plan', 'view_image', 'write_stdin']);
+    // The COS fork keeps bounded find and its ERP tools alongside shell execution; usage is upstream's read-only inspection tool.
+    expect(names).toEqual(['agents', 'apply_patch', 'database', 'engineering', 'exec', 'exec_command', 'find', 'knowledge', 'read', 'save_image', 'update_plan', 'usage', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -917,6 +932,27 @@ describe('surface boundaries', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('answers usage without the identity notice, which only matters for chat-bound work', async () => {
+    everything();
+    // usage reads nothing that belongs to a chat. It answers before the page's evidence for its
+    // request arrives, so it always looked unattributed, and the notice reached the model each time.
+    const usage = JSON.stringify((await core('tools/call', { name: 'usage', arguments: {} })).body.result?.content);
+    expect(usage).toContain('ChatGPT limits');
+    expect(usage).not.toContain('Identity notice');
+    // The same harness still marks chat-bound tools, so the call above really was unattributed.
+    const read = JSON.stringify((await core('tools/call', { name: 'read', arguments: { paths: ['/workspace'] } })).body.result?.content);
+    expect(read).toContain('Identity notice');
+  });
+
+  it('describes write_stdin by what it does, never by how its output should be treated', async () => {
+    everything();
+    // ChatGPT's safety check flagged "including automatic delivery; never reruns work" as a
+    // "Suspicious Instruction" and held a long run on an approval card (VM, 2026-10-15).
+    const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'write_stdin');
+    expect(tool?.description).toBeTruthy();
+    expect(tool!.description).not.toMatch(/automatic(ally)? deliver|never reruns|delivered automatically/i);
+  });
+
   it('saves a generated image only for a call it can tie to its chat (#889)', async () => {
     everything();
     const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'save_image');
@@ -939,8 +975,8 @@ describe('surface boundaries', () => {
     const coreTools = toolList(await core('tools/list'));
     const desktopTools = toolList(await desktop('tools/list'));
 
-    // Each populated surface includes code mode; bounded find, local knowledge and shell execution coexist.
-    expect(coreTools).toHaveLength(13);
+    // COS keeps bounded find and local ERP knowledge beside shell execution, plus upstream usage.
+    expect(coreTools).toHaveLength(14);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -966,7 +1002,18 @@ describe('surface boundaries', () => {
     // shared context once instead of per worker, to batch messages into one call, and to
     // hand back RESULT/CHANGES/VALIDATION/BLOCKERS — bytes spent once at discovery to save
     // a great many in every run that follows.
+    // #1417: ChatGPT's approval reviewer stopped long runs with "Suspicious instruction: the tool
+    // description tries to dictate the classification and the handling of sensitive or suspicious
+    // content". What we declare describes; it does not rule on risk. (Checked on the constant as
+    // well, because the Windows text is only part of the declaration on Windows.)
+    const RULES_ON_RISK = /safety rules|\bbenign|harmless|suspicious/i;
+    expect(WINDOWS_SHELL_GUIDANCE).not.toMatch(RULES_ON_RISK);
+    // The Windows notes were a list of prohibitions; other tools use these words to describe what they do.
+    expect(WINDOWS_SHELL_GUIDANCE).not.toMatch(/\bnever\b|\bdo not\b|\bdestructive\b/i);
+    // The advice itself stays.
+    for (const fact of ['-LiteralPath', 'Remove-Item', 'Move-Item', '-WindowStyle Hidden', 'cmd /c']) expect(WINDOWS_SHELL_GUIDANCE).toContain(fact);
     for (const tool of [...coreTools, ...desktopTools]) {
+      expect(JSON.stringify(tool), `${tool.name} declaration`).not.toMatch(RULES_ON_RISK);
       const bytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
       const budget =
         (BROWSER_TOOLS as readonly string[]).includes(tool.name)
@@ -985,8 +1032,8 @@ describe('surface boundaries', () => {
               ? 3_645
               : tool.name === 'exec_command'
                 // Windows carries `WINDOWS_SHELL_GUIDANCE` in the same description, and that text
-                // is quoted verbatim from Codex's own shell spec — it is not ours to trim to fit a
-                // budget. The non-Windows number is the one that says whether *our* additions have
+                // carries Codex's own shell advice in full (reworded for #1417) — it is not ours
+                // to trim to fit a budget. The non-Windows number is the one that says whether *our* additions have
                 // grown, so both are asserted rather than one loose bound covering both.
                 ? (process.platform === 'win32' ? 3_800 : 3_500)
                 : 3_000;
@@ -1207,7 +1254,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['database', 'engineering', 'exec', 'find', 'knowledge', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['database', 'engineering', 'exec', 'find', 'knowledge', 'read', 'usage', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -3747,6 +3794,9 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(later)).toContain(`Exit code: ${exitCode}`);
     expect(textOf(later)).toContain('background-e2e-once');
     expect(textOf(later)).not.toContain(`write_stdin(session_id=${sessionId}`);
+    // ChatGPT's safety check read "Delivered automatically" as the tool steering how its output
+    // is treated, and stopped a long run on an approval card (VM, 2026-10-15).
+    expect(textOf(later)).not.toMatch(/delivered automatically/i);
 
     // Publication receipts require a strictly later timestamp; loopback calls can
     // otherwise share one millisecond even though this response was already read.

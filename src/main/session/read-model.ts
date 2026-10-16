@@ -36,10 +36,10 @@ export async function readSession(id: string): Promise<SessionSummary | null> {
   return summary ? withActivity(summary) : null;
 }
 
-export async function readSessionList(options: { cursor?: SessionListCursor; limit: number }) {
+export async function readSessionList(options: { cursor?: SessionListCursor; limit: number; projectId?: string }) {
   const config = getConfig();
   await listInputs(); // Restore exact helper origins before the first sidebar page.
-  const page = await listSessionPage({ cursor: options.cursor, limit: options.limit });
+  const page = await listSessionPage({ cursor: options.cursor, limit: options.limit, ...(options.projectId ? { projectId: options.projectId } : {}) });
   // Older recordings omitted worker origins' parent IDs. The broker's exact
   // retained owner can repair that presentation without reviving a worker or
   // guessing from reusable names such as worker-1.
@@ -89,7 +89,8 @@ export async function readSessionEvents(
   if (options.from === undefined) {
     // Navigation uses immutable origins. `from` alone is a publication cursor
     // for live revisions and must never decide which history page owns a row.
-    const events = await readRecentEvents(id, cap, { before: options.before, after: options.after, kinds: options.kinds, orderByOrigin: true });
+    // A long turn's final answer is paged beside the turn's end, where it is drawn (`residenceOf`).
+    const events = await readRecentEvents(id, cap, { before: options.before, after: options.after, kinds: options.kinds, byResidence: true });
     const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), 0);
     return { summary, events, total: summary.events, nextFrom };
   }

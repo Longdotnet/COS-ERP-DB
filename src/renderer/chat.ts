@@ -1,5 +1,7 @@
 import { hasProviderDirective, resolvedCapture, withoutProviderDirectives } from '../shared/content-reference.js';
+import { completedDilText } from '../shared/dil-tables.js';
 import { initChatSearch, type ChatSearch } from './chat-search.js';
+import { initChatFind } from './chat-find.js';
 import { createWorkspaceTerminal } from './workspace-terminal.js';
 import { createWorkspaceDocks } from './workspace-docks.js';
 import { currentLanguage, ui, t } from './i18n.js';
@@ -58,22 +60,26 @@ import type {
   RunningToolActivity,
   SessionChange,
   SessionEvent,
+  SessionSearchLocation,
   SessionSummary,
   StoredText,
   SwarmState,
   WorkerWorktreeCleanupOffer,
-  TokenPressure
+  TokenPressure,
+  RecordingStorageLimitGiB
 } from '../shared/session.js';
 import {
   ATTRIBUTION_LABELS,
   CHAT_ACTIVE_MS,
   committedResumeAncestorsFromSummary,
   continuationMarkerOf,
+  DEFAULT_RECORDING_STORAGE_GIB,
+  RECORDING_STORAGE_LIMITS_GIB,
   TURN_OUTCOME_LABELS,
   foldProgress,
   toolCallSummary
 } from '../shared/session.js';
-import { chronological, positionOf } from '../shared/chronology.js';
+import { chronological, positionOf, residenceOf } from '../shared/chronology.js';
 import { recentChatActivity, sessionWorkingAt, workerReportedFinish } from '../shared/session-activity.js';
 import {
   DEFAULT_GOAL_MODEL,
@@ -85,11 +91,12 @@ import {
 import { DEFAULT_HANDOFF_LENGTH, DEFAULT_HANDOFF_PROMPT, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS, type HandoffLength } from '../shared/handoff.js';
 import { browserExtensionRequired, type AppState, type Config } from '../shared/types.js';
 import { $, ago, clockTime, compactNumber, disclosureChevron, el, icon, run, setIcon, toast } from './dom.js';
-import { APPROVAL_ANSWERED_TEXT, APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT } from '../shared/approval-wait.js';
+import { APPROVAL_ANSWERED_TEXT, APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT, type ApprovalCardView } from '../shared/approval-wait.js';
 import { openRowMenu, rowMenuOpenFor, toggleRowMenu, type RowMenuItem } from './row-menu.js';
 
 const api = window.api;
 let chatSearch: ChatSearch | null = null;
+let chatFind: ReturnType<typeof initChatFind> | null = null;
 
 /** Sprite id per tool-call family. Deliberately reuses the existing icon set. */
 const KIND_ICON: Record<ActivitySummary['kind'], string> = {
@@ -152,6 +159,11 @@ let sessionPageCursor: { updatedAt: number; id: string } | null = null;
 let sessionPageLoading = false;
 /** True after the user has explicitly paged beyond the newest page. */
 let loadedOlderSessions = false;
+/**
+ * Where each project's own history continues (#1190): absent until the project was first
+ * expanded, a cursor while it has older chats that are not loaded, null once all of them are.
+ */
+const projectHistory = new Map<string, { cursor: { updatedAt: number; id: string } | null; asked: boolean; loading: boolean }>();
 let activeId: string | null = null;
 let selectedId: string | null = null;
 let newChatSelected = true;
@@ -250,12 +262,12 @@ async function removeProjectFromSidebar(id: string): Promise<void> {
     // Reject list snapshots captured before this newer catalog commit.
     ++sessionsLoadGeneration;
     projects = projects.map(row => row.id === id ? removed : row);
-    expandedProjects.delete(id); projectVisibleCounts.delete(id);
+    expandedProjects.delete(id); projectVisibleCounts.delete(id); projectHistory.delete(id);
     if (selectedProjectId === id) {
       if (!selectedId) {
         const oldKey = draftKey();
         const authoredDraft = authoredComposerText();
-        selectedProjectId = null; selectionGeneration++; replaceComposerDraft();
+        selectedProjectId = null; selectionGeneration++; chatFind?.selectionChanged(); replaceComposerDraft();
         // Keep the visible draft and its attachments while moving to unfiled.
         inputDrafts.set(draftKey(), authoredDraft); inputDrafts.delete(oldKey); newChatTasks.delete(oldKey);
         skillPicker?.restore();
@@ -515,7 +527,9 @@ function onDictationEvent(event: DictationEvent): void {
     if (['stopped', 'idle', 'ended', 'complete'].includes(status)) { completedDictation(session, 'Dictation stopped.'); return; }
     if (!session.stopping) {
       dictationPhase = ['starting', 'initializing', 'requesting'].includes(status) ? 'starting' : 'listening';
-      dictationNotice = dictationPhase === 'starting' ? 'Preparing microphone…' : 'Listening…';
+      dictationNotice = dictationPhase === 'starting' ? 'Preparing microphone…'
+        : event.engine === 'legacy' ? 'Listening with basic accuracy. For punctuation and better results, turn on online speech recognition in Windows settings.'
+          : 'Listening…';
       paintDictation();
     }
   }
@@ -998,6 +1012,51 @@ function sessionRow(summary: SessionSummary): HTMLElement {
  */
 let renaming: { id: string; original: string; value: string; start: number; end: number } | null = null;
 
+/** Slash commands that act on the open chat; New Chat does not offer them. */
+const CHAT_COMMANDS = new Set(['rename', 'pin', 'status', 'compact']);
+function openChatSummary(): SessionSummary | null {
+  return selectedId === null ? null : sessions.find(row => row.id === selectedId) ?? null;
+}
+/** Puts a request in front of what is already typed, for the user to read and send. */
+function prefillComposer(text: string): void {
+  const input = $<HTMLTextAreaElement>('chatInput');
+  const rest = input.value.trim();
+  input.value = rest ? `${text}\n\n${rest}` : text;
+  input.setSelectionRange(input.value.length, input.value.length);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.focus();
+}
+function openSettingsTab(tab: string): void {
+  $('workspaceSettings').click();
+  document.querySelector<HTMLElement>(`[data-tab="${tab}"]`)?.click();
+}
+/** Codex's slash commands: each opens what the app already has, or prepares a request to send. */
+function runSlashCommand(name: string): void {
+  const chat = openChatSummary();
+  // The command's own click is still on its way to the outside-click handlers that close menus:
+  // open popups after it has passed.
+  const afterClick = (open: () => void): void => { window.setTimeout(open, 0); };
+  if (name === 'model' || name === 'reasoning') afterClick(() => {
+    const menu = $<HTMLDetailsElement>('modelMenu');
+    menu.open = true;
+    menu.querySelector<HTMLElement>('summary')?.focus();
+  });
+  else if (name === 'new') $('newChat').click();
+  else if (name === 'rename' && chat) startRename(chat);
+  else if (name === 'pin' && chat && pinnable(chat)) {
+    sidebarPins?.toggle(chat.id);
+    paintSessions();
+    toast(sidebarPins?.has(chat.id) ? t('Chat pinned') : t('Chat unpinned'));
+  } else if (name === 'pin') toast(t('This chat cannot be pinned yet.'));
+  else if (name === 'status') afterClick(() => { const meter = $('contextMeterButton'); if (meter.getAttribute('aria-expanded') !== 'true') meter.click(); });
+  else if (name === 'review') prefillComposer(t('Review the uncommitted changes in this project. Look for bugs, regressions and missing tests, and list what you find by severity with the file and line. Do not change any files.'));
+  else if (name === 'init') prefillComposer(t('Create an AGENTS.md for this project. Read the project first, then describe how it is built, tested and run, how it is laid out, and the conventions a coding agent should follow. Keep it short and accurate.'));
+  else if (name === 'usage') openSettingsTab('usage');
+  else if (name === 'feedback') openSettingsTab('activity');
+  else if (name === 'plugins') $('sidebarPlugins').click();
+  else if (name === 'pet') $('sidebarPets').click();
+}
+
 function startRename(summary: SessionSummary): void {
   const current = summary.title || '';
   renaming = { id: summary.id, original: current, value: current, start: 0, end: current.length };
@@ -1192,6 +1251,42 @@ async function loadMoreSessions(): Promise<void> {
   }
 }
 
+/** A chat the project's section can show: workers alone leave it looking empty. */
+function projectShowsChat(id: string): boolean {
+  return sessions.some(entry => projectGroup(entry.projectId) === id && entry.origin?.kind !== 'worker' &&
+    (!!entry.conversationId || entry.origin?.kind === 'desktop'));
+}
+
+/**
+ * Reads the next page of one project's own chats (#1190). Project headings come from the whole
+ * project list, but chats from the newest page of all history: a project whose chats are all
+ * older looked empty, and expanding it did nothing. Only that project's pages are read, so the
+ * cost is what the project holds, and the rest of the sidebar does not fill up with old chats.
+ * It never selects a chat. A failed read leaves the place as it was, for the next expand.
+ */
+async function loadProjectHistory(id: string): Promise<void> {
+  const state = projectHistory.get(id) ?? { cursor: null, asked: false, loading: false };
+  projectHistory.set(id, state);
+  if (state.loading || (state.asked && !state.cursor)) return;
+  state.loading = true;
+  try {
+    do {
+      const page = await run(api.listSessions({ projectId: id, limit: SESSION_PAGE_SIZE, ...(state.cursor ? { cursor: state.cursor } : {}) }));
+      if (!page) return;
+      state.asked = true;
+      state.cursor = page.nextCursor ?? null;
+      mergeSessionRows(page.sessions);
+      // Rows older than the newest page are now held: refreshes must keep them, as after scrolling.
+      loadedOlderSessions = true;
+      for (const entry of page.pressure) pressure.set(entry.id, entry);
+      paintSessions();
+      // A page of workers shows nothing; read on while the project is open and still looks empty.
+    } while (state.cursor && expandedProjects.has(id) && !projectShowsChat(id));
+  } finally {
+    state.loading = false;
+  }
+}
+
 function maybePageSessions(): void {
   if (!visible || !sessionPageCursor || sessions.length >= sessionTotal) return;
   const pane = $('sessionList').closest<HTMLElement>('.scroll');
@@ -1203,11 +1298,11 @@ function maybePageSessions(): void {
 
 let diagnosticsExpanded = false;
 
-function projectSortEntries(): Array<{ id: string; scope: string }> {
+function projectSortEntries(groupOf: typeof projectGroup = projectGroup): Array<{ id: string; scope: string }> {
   const ids = new Set(projects.filter(project => !project.ungrouped).map(project => project.id));
   for (const entry of sessions) {
     if (entry.origin?.kind === 'worker' || (!entry.conversationId && entry.origin?.kind !== 'desktop')) continue;
-    const id = projectGroup(entry.projectId);
+    const id = groupOf(entry.projectId);
     if (id) ids.add(id);
   }
   return [...ids].map(id => ({ id, scope: SIDEBAR_PROJECT_SCOPE }));
@@ -1239,7 +1334,10 @@ function paintSessions(): void {
   }
   const rows: HTMLElement[] = [];
   // A task and its expanded workers are one sidebar item for project pagination.
-  const projectRows = new Map<string, Array<{ rows: HTMLElement[]; selected: boolean }>>();
+  // Store lightweight owners until the visible page is known. Creating DOM for
+  // hundreds of older, off-page project tasks on every activity push stalls the renderer
+  // even though those nodes are immediately discarded by the project page limit.
+  const projectRows = new Map<string, Array<{ entry: SessionSummary; workers?: SessionSummary[]; selected: boolean }>>();
   const diagnostics: SessionSummary[] = [];
   const group = (key: string, workers: SessionSummary[], parentRow?: HTMLElement, target = rows): void => {
     const button = el('button', 'worker-toggle');
@@ -1251,27 +1349,40 @@ function paintSessions(): void {
     if (parentRow) { parentRow.append(button); parentRow.title += ` · ${button.title}`; } else target.push(button);
     if (expandedWorkers.has(key)) { const box = el('div', 'worker-group'); box.append(...workers.map(sessionRow)); target.push(box); }
   };
-  // Pinned chats lead their own list (#1133); each group keeps its own manual order.
-  const orderedSessions = [...new Set(sessions.map(entry => projectGroup(entry.projectId) ?? ''))].flatMap(scope => {
-    const members = sessions.filter(entry => (projectGroup(entry.projectId) ?? '') === scope);
-    const group = (pinned: boolean) => {
+  // Pinned chats lead their own list (#1133). Resolve project membership once for
+  // this paint: scanning all sessions for each project and then searching the project
+  // catalog for every comparison used to multiply work on frequent activity pushes.
+  // A missing project remains grouped, just as projectGroup() does; only an explicitly
+  // ungrouped project returns its chats to the ordinary list.
+  const ungrouped = new Set(projects.filter(project => project.ungrouped).map(project => project.id));
+  const groupOf = (id: string | null | undefined): string | null => id && !ungrouped.has(id) ? id : null;
+  const scoped = new Map<string, SessionSummary[]>();
+  for (const entry of sessions) {
+    const scope = groupOf(entry.projectId) ?? '';
+    const group = scoped.get(scope);
+    if (group) group.push(entry);
+    else scoped.set(scope, [entry]);
+  }
+  const orderedSessions = [...scoped].flatMap(([scope, members]) => {
+    const ordered = (pinned: boolean) => {
       const rows = members.filter(entry => pinnedChat(entry) === pinned);
       return sidebarOrder ? sidebarOrder.ordered(pinnedSortScope(scope, pinned), rows) : rows;
     };
-    return [...group(true), ...group(false)];
+    return [...ordered(true), ...ordered(false)];
   });
   for (const entry of orderedSessions) {
     if (entry.origin?.kind === 'worker') continue;
     if (!entry.conversationId && entry.origin?.kind !== 'desktop') { diagnostics.push(entry); continue; }
-    const projectId = projectGroup(entry.projectId);
-    const target: HTMLElement[] = projectId ? [] : rows;
-    const row = sessionRow(entry); target.push(row);
-    row.dataset.sortScope = pinnedSortScope(projectId ?? '', pinnedChat(entry));
-    const workers = children.get(entry.id); if (workers) group(entry.id, workers, row, target);
+    const projectId = groupOf(entry.projectId);
+    const workers = children.get(entry.id);
     if (projectId) {
       const tasks = projectRows.get(projectId) ?? [];
-      tasks.push({ rows: target, selected: entry.id === selectedId || workers?.some(worker => worker.id === selectedId) === true });
+      tasks.push({ entry, workers, selected: entry.id === selectedId || workers?.some(worker => worker.id === selectedId) === true });
       projectRows.set(projectId, tasks);
+    } else {
+      const row = sessionRow(entry); rows.push(row);
+      row.dataset.sortScope = pinnedSortScope('', pinnedChat(entry));
+      if (workers) group(entry.id, workers, row, rows);
     }
   }
   const otherWorkers = children.get('other-workers') ?? [];
@@ -1283,7 +1394,7 @@ function paintSessions(): void {
     history.addEventListener('toggle', () => { if (history.isConnected) history.open ? expandedWorkers.add('other-workers') : expandedWorkers.delete('other-workers'); });
     rows.push(history);
   }
-  const projectEntries = projectSortEntries();
+  const projectEntries = projectSortEntries(groupOf);
   const orderedProjects = sidebarOrder?.ordered(SIDEBAR_PROJECT_SCOPE, projectEntries) ?? projectEntries;
   const projectSections: HTMLElement[] = [];
   for (const { id } of orderedProjects) {
@@ -1306,6 +1417,7 @@ function paintSessions(): void {
       const open = !expandedProjects.has(id);
       if (open) expandedProjects.add(id); else expandedProjects.delete(id);
       section.open = open;
+      if (open) void loadProjectHistory(id);
     });
     if (project) {
       // One button for the project's actions, as in ChatGPT; a right click on the row opens the same menu.
@@ -1332,11 +1444,24 @@ function paintSessions(): void {
     const tasks = projectRows.get(id) ?? [];
     const count = projectVisibleCounts.get(id) ?? PROJECT_TASK_PAGE_SIZE;
     const shown = tasks.filter((task, index) => index < count || task.selected);
-    section.append(...shown.flatMap(task => task.rows));
-    if (shown.length < tasks.length) {
+    const shownRows: HTMLElement[] = [];
+    for (const task of shown) {
+      const row = sessionRow(task.entry);
+      row.dataset.sortScope = pinnedSortScope(id, pinnedChat(task.entry));
+      shownRows.push(row);
+      if (task.workers) group(task.entry.id, task.workers, row, shownRows);
+    }
+    section.append(...shownRows);
+    // The project's own older chats count as "more" too, once it is known to have some (#1190).
+    const older = !!projectHistory.get(id)?.cursor;
+    if (shown.length < tasks.length || older) {
       const more = el('button', 'btn project-show-more', () => t("Show more")) as HTMLButtonElement;
       more.type = 'button'; ui(more, 'aria-label', () => t("Show more tasks in {0}", [project?.name ?? t("this project")]));
-      more.addEventListener('click', () => { projectVisibleCounts.set(id, count + PROJECT_TASK_PAGE_INCREMENT); paintSessions(); });
+      more.addEventListener('click', () => {
+        projectVisibleCounts.set(id, count + PROJECT_TASK_PAGE_INCREMENT);
+        if (older && count + PROJECT_TASK_PAGE_INCREMENT > tasks.length) void loadProjectHistory(id);
+        paintSessions();
+      });
       section.append(more);
     }
     projectSections.push(section);
@@ -1428,7 +1553,7 @@ function canonicalMessageKey(event: SessionEvent): string | null {
 function mergeDetailDelta(delta: SessionEvent[]): void {
   if (delta.length === 0) return;
   const merged = [...events];
-  const floor = events.length ? Math.min(...events.map(positionOf)) : 0;
+  const floor = events.length ? Math.min(...events.map(residenceOf)) : 0;
   const messageRows = new Map<string, number>();
   for (let index = 0; index < merged.length; index++) {
     const key = canonicalMessageKey(merged[index]!);
@@ -1441,7 +1566,7 @@ function mergeDetailDelta(delta: SessionEvent[]): void {
     else {
       // An old canonical revision is not newly authored history. Its original
       // page still owns it; admitting it here would evict an unrelated live row.
-      if (positionOf(event) < floor) continue;
+      if (residenceOf(event) < floor) continue;
       if (key) messageRows.set(key, merged.length);
       merged.push(event);
     }
@@ -1543,8 +1668,19 @@ function pendingComposerInput(): InputEntry | undefined {
       pendingNewInput?.generation === selectionGeneration && pendingNewInput.id === entry.id));
 }
 let durationTimer: number | undefined;
+/** Whether the selected chat's running turn takes a message now (Send directly). */
+function canSendQueuedNow(): boolean {
+  return selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledCanSendDirectly;
+}
+/** The running turn whose delivery choice was last set to the Follow-up default. */
+let followUpTurn: string | null = null;
+/** Codex's "Follow-up behavior": messages typed during a turn wait for its end instead of joining it. */
+function followUpQueues(): boolean {
+  return deps.state()?.config.ui.followUp === 'queue';
+}
 function paintDeliveryControls(): void {
   paintGoalProgress();
+  for (const button of document.querySelectorAll<HTMLButtonElement>('#finishQueue .queue-send-now')) button.hidden = !canSendQueuedNow();
   const working = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledTurnId !== null;
   const queueAtFinish = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledQueueAtFinish;
   const canInject = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledCanInject;
@@ -1570,6 +1706,12 @@ function paintDeliveryControls(): void {
   const explicitInjection = (canInject && (!files.length || injectableAttachments(files))) ||
     (canSendDirectly && files.length > 0 && injectableAttachments(files));
   if (injectionAction) injectionAction.hidden = !explicitInjection;
+  // Each running turn starts from the Follow-up default; a choice made in the menu lasts for that turn.
+  const turnKey = working && (canInject || canSendDirectly || queueAtFinish) ? `${selectedId}:${controlledTurnId}` : null;
+  if (turnKey !== followUpTurn) {
+    followUpTurn = turnKey;
+    if (turnKey) $<HTMLSelectElement>('sendMode').value = followUpQueues() ? 'after-turn' : 'auto';
+  }
   if ($<HTMLSelectElement>('sendMode').value === 'tool' && !explicitInjection) $<HTMLSelectElement>('sendMode').value = 'auto';
   if (canInject && explicitInjection && $<HTMLSelectElement>('sendMode').value === 'auto') $<HTMLSelectElement>('sendMode').value = 'tool';
   if (!canInject && !canSendDirectly && !queueAtFinish) $<HTMLSelectElement>('sendMode').value = 'auto';
@@ -1584,7 +1726,7 @@ function paintDeliveryControls(): void {
   send.dataset.action = stop ? 'stop' : 'send';
   ui(send, 'aria-label', () => stop ? (controlledStopPending ? t("Stop requested") : t("Stop turn")) : t("Send message"));
   if (stop && !working && pending) ui(send, 'aria-label', () => t("Cancel delivery"));
-  const planAction = selectedId ? t("Queue plan at Session finish") : t("Start full plan");
+  const planAction = selectedId && !chatKnownIdle(selectedId) ? t("Queue plan at Session finish") : t("Start full plan");
   if (preparedPlan && !stop) send.setAttribute('aria-label', planAction);
   else if (planMode && !stop) ui(send, 'aria-label', () => t("Generate plan"));
   send.classList.toggle('is-plan-ready', !!preparedPlan && !stop);
@@ -1647,6 +1789,14 @@ type TaskPlanDraft = { text: string; requestId: string | null; stages: string[] 
 // Planning belongs to its draft key. Completed stages own their captured objective
 // independently of composer edits; existing sessions hand them to the durable queue.
 const taskPlans = new Map<string, TaskPlanDraft>();
+/**
+ * Whether this chat is known to have no turn running (#1428). A plan in a running chat waits for
+ * its Session finish; in an idle one that finish never comes, so the plan is shown and Enter
+ * starts it, as in a new chat. A chat whose state is not known here keeps waiting for its turn.
+ */
+function chatKnownIdle(sessionId: string): boolean {
+  return controlledSessionId === sessionId && controlledSelection === selectionGeneration && controlledTurnId === null;
+}
 function currentPreparedPlan(): (TaskPlanDraft & { stages: string[] }) | null {
   const plan = taskPlans.get(draftKey());
   return plan?.stages ? plan as TaskPlanDraft & { stages: string[] } : null;
@@ -1703,7 +1853,7 @@ async function createTaskPlan(backend: 'api' | 'chatgpt'): Promise<void> {
       // unchanged source draft, before queue admission can yield to new typing.
       inputDrafts.delete(key);
       if (draftKey() === key) { replaceComposerDraft(); input.value = ''; skillPicker?.restore(); }
-      if (sessionId) await queuePreparedPlan(key, plan as TaskPlanDraft & { stages: string[] }, sessionId, projectId);
+      if (sessionId && !chatKnownIdle(sessionId)) await queuePreparedPlan(key, plan as TaskPlanDraft & { stages: string[] }, sessionId, projectId);
     }
     else plan.error = result.error;
   } catch (error) {
@@ -1742,7 +1892,7 @@ function paintPreparedPlan(): void {
       if (plan.stages.length) { paintPreparedPlan(); paintDeliveryControls(); } else cancelTaskPlan();
     });
     edit.disabled = remove.disabled = field.disabled = plan.sending;
-    ui(heading, 'title', () => selectedId ? t("Queued at Session finish; edit or delete this checkpoint independently.") : index === 0 ? t("Send includes your complete request and the full plan. Later stages are queued as verification checkpoints.") : t("Included in the first message, then queued as a checkpoint at Session finish or after a completed answer when enabled."));
+    ui(heading, 'title', () => selectedId && !chatKnownIdle(selectedId) ? t("Queued at Session finish; edit or delete this checkpoint independently.") : index === 0 ? t("Send includes your complete request and the full plan. Later stages are queued as verification checkpoints.") : t("Included in the first message, then queued as a checkpoint at Session finish or after a completed answer when enabled."));
     heading.append(label, text, edit, remove); row.append(heading, field, error); return row;
   }));
 }
@@ -1750,8 +1900,14 @@ async function sendPreparedPlan(): Promise<void> {
   const key = draftKey(), plan = currentPreparedPlan();
   if (!plan || plan.sending) return;
   if (selectedId) {
-    await queuePreparedPlan(key, plan, selectedId, sessions.find(row => row.id === selectedId)?.projectId ?? null);
-    return;
+    // Decided when it is sent: the chat may have started or finished a turn since the plan was written.
+    const target = selectedId, selection = selectionGeneration;
+    await refreshSessionControls();
+    if (selectedId !== target || selectionGeneration !== selection || taskPlans.get(key) !== plan || plan.sending) return;
+    if (!chatKnownIdle(target)) {
+      await queuePreparedPlan(key, plan, target, sessions.find(row => row.id === target)?.projectId ?? null);
+      return;
+    }
   }
   const tasks = plan.stages.map(stage => stage.trim());
   if (!tasks.length || tasks.some(task => !task) || JSON.stringify(tasks).length > 12000) { toast(t("Keep every stage nonempty and the plan below 12,000 characters.")); return; }
@@ -1981,9 +2137,9 @@ async function loadDetail(navigate = false, olderBefore?: number, newerFrom?: nu
     } else if (prepend) {
       const boundary = olderBefore!;
       historyBefore = boundary;
-      const retained = events.filter(event => positionOf(event) >= boundary);
+      const retained = events.filter(event => residenceOf(event) >= boundary);
       events = retainTimelinePage(chronological(foldProgress([...folded, ...retained])), 'older');
-    } else events = chronological([...folded].sort((a, b) => positionOf(a) - positionOf(b)).slice(-MAX_TIMELINE_ROWS));
+    } else events = chronological([...folded].sort((a, b) => residenceOf(a) - residenceOf(b)).slice(-MAX_TIMELINE_ROWS));
     detailFor = wanted;
   }
   detailCursor = Math.max(opening ? 0 : detailCursor ?? 0,
@@ -2397,26 +2553,54 @@ const PILL_PLACEHOLDER = /^\uE000(\d{1,4})\uE001$/;
 /**
  * ChatGPT's writing block: `:::writing{variant="…" id="…" title="…"}`, the text, then `:::`.
  * ChatGPT draws it as a card; as plain Markdown it showed its raw directive. It renders as a
- * quote with its title in bold, a shape the sanitised message view already styles.
+ * quote, a shape the sanitised message view already styles, inside a panel whose header names it
+ * and carries a Copy button, as ChatGPT's card does (#1477). The quote opens with a marker
+ * paragraph naming its slot; `writingPanels` swaps that for the panel after sanitising.
  */
 const escapeHtml = (value: string): string =>
   value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
-const WRITING_BLOCK: TokenizerAndRendererExtension = {
-  name: 'writingBlock', level: 'block',
-  start: value => value.match(/^:::writing\b/m)?.index,
-  tokenizer(value) {
-    // Without its closing `:::` the block runs to the end of the message, as ChatGPT draws it:
-    // the block is still streaming, or the answer was stopped inside it.
-    const match = value.match(/^:::writing(\{[^}\n]*\})?[ \t]*\n([\s\S]*?)(?:\n:::[ \t]*(?:\n|$)|$)/);
-    if (!match) return undefined;
-    const title = match[1]?.match(/\btitle="([^"\n]*)"/)?.[1] ?? '';
-    return { type: 'writingBlock', raw: match[0], title, tokens: this.lexer.blockTokens(match[2] ?? '', []) };
-  },
-  renderer(token) {
-    const heading = token['title'] ? `<p><strong>${escapeHtml(String(token['title']))}</strong></p>` : '';
-    return `<blockquote>${heading}${this.parser.parse(token.tokens ?? [])}</blockquote>`;
+interface WritingSlot { label: string; source: string }
+const WRITING_MARKER = /^\uE010(\d{1,4})\uE011$/;
+function writingBlock(slots: WritingSlot[]): TokenizerAndRendererExtension {
+  return {
+    name: 'writingBlock', level: 'block',
+    start: value => value.match(/^:::writing\b/m)?.index,
+    tokenizer(value) {
+      // Without its closing `:::` the block runs to the end of the message, as ChatGPT draws it:
+      // the block is still streaming, or the answer was stopped inside it.
+      const match = value.match(/^:::writing(\{[^}\n]*\})?[ \t]*\n([\s\S]*?)(?:\n:::[ \t]*(?:\n|$)|$)/);
+      if (!match) return undefined;
+      const attribute = (name: string): string => match[1]?.match(new RegExp(`\\b${name}="([^"\\n]*)"`))?.[1] ?? '';
+      const slot = slots.push({ label: attribute('title') || attribute('subject'), source: (match[2] ?? '').trim() }) - 1;
+      return { type: 'writingBlock', raw: match[0], slot, tokens: this.lexer.blockTokens(match[2] ?? '', []) };
+    },
+    renderer(token) {
+      return `<blockquote><p>\uE010${Number(token['slot'])}\uE011</p>${this.parser.parse(token.tokens ?? [])}</blockquote>`;
+    }
+  };
+}
+
+/** Turns each marked writing-block quote into its panel: a header with its name and Copy. */
+function writingPanels(box: HTMLElement, slots: readonly WritingSlot[]): void {
+  for (const quote of box.querySelectorAll('blockquote')) {
+    const marker = quote.firstElementChild;
+    const slot = marker?.tagName === 'P' ? slots[Number(marker.textContent?.match(WRITING_MARKER)?.[1] ?? -1)] : undefined;
+    if (!slot) continue;
+    marker!.remove();
+    const panel = el('div', 'markdown-writing');
+    const header = el('div', 'tool-output-header');
+    header.append(icon('i-file-text', 'ico'), slot.label ? el('strong', '', slot.label) : el('strong', '', () => t('Text')));
+    const copy = el('button', 'tool-copy', () => t('Copy')) as HTMLButtonElement;
+    copy.type = 'button';
+    copy.addEventListener('click', () => void (async () => {
+      if (await run(api.writeClipboard(slot.source))) ui(copy, 'textContent', () => t('Copied'));
+      else toast(t('Could not copy text.'));
+    })());
+    header.append(copy);
+    quote.replaceWith(panel);
+    panel.append(header, quote);
   }
-};
+}
 
 /**
  * A native ChatGPT form is not safe to replay in Electron. The recorded markup can, however,
@@ -2502,7 +2686,8 @@ export function renderedMarkdown(source: string, capture?: StoredText, reference
   // Fiber's canonical text can be complete while a background provider tab still
   // paints its first words. Render this revision directly; captured DOM HTML is
   // never evidence that it contains the current message revision.
-  let text = withoutMessageReaction(source).slice(0, MAX_RENDERED_HTML_CHARS);
+  // A table ChatGPT drew in full but wrote with only its header (#1477) gets its recorded rows.
+  let text = completedDilText(withoutMessageReaction(source), capture).slice(0, MAX_RENDERED_HTML_CHARS);
   // A ChatGPT directive this app cannot draw (#574 and whatever ChatGPT adds next): the page's own
   // recorded rendering is the faithful presentation; without one, the directive lines are dropped.
   if (hasProviderDirective(text)) {
@@ -2515,8 +2700,9 @@ export function renderedMarkdown(source: string, capture?: StoredText, reference
   const byIndex = new Map((references ?? []).map(reference => [reference.index, reference]));
   let directives = 0;
   const math: MathSlots = { formulas: [] };
+  const writing: WritingSlot[] = [];
   // An inline tokenizer leaves literal citation examples inside code spans/fences intact.
-  const parser = new Marked({ gfm: true, extensions: [WRITING_BLOCK, ...mathExtensions(math), {
+  const parser = new Marked({ gfm: true, extensions: [writingBlock(writing), ...mathExtensions(math), {
     name: 'inlineReference', level: 'inline',
     start: value => { const at = value.search(/:{1,2}chatgpt-content-reference\{/); return at < 0 ? undefined : at; },
     tokenizer(value) { const match = value.match(INLINE_REFERENCE); return match ? { type: 'inlineReference', raw: match[0], probe: directives++ } : undefined; },
@@ -2560,6 +2746,7 @@ export function renderedMarkdown(source: string, capture?: StoredText, reference
   const html = parser.parse(separateDisplayMath(text), { async: false });
   const box = renderedMessage({ text: html, chars: html.length, truncated: html.length > MAX_RENDERED_HTML_CHARS }, text);
   drawMath(box, math);
+  writingPanels(box, writing);
   if (capture?.text && !capture.truncated && capture.text.length <= MAX_RENDERED_HTML_CHARS) {
     const template = document.createElement('template');
     template.innerHTML = capture.text;
@@ -2664,6 +2851,75 @@ export function renderedMessage(html: StoredText | null | undefined, fallback: s
     }
   }
   return box;
+}
+
+/**
+ * ChatGPT's tool approval card, answered in the app (2.1.38, the maintainer's request).
+ *
+ * Shows the card's own words as the page reported them (plain text, never markup) and offers Deny
+ * and Allow once for exactly that card; "always" is never offered. Where ChatGPT itself disabled
+ * Allow once ("External app access is unavailable in this conversation"), only Deny is offered.
+ * The click files one answer; the page presses the button only while it still shows that card, so
+ * the panel then follows the outcome until the row turns into "answered".
+ */
+function approvalCardPanel(sessionId: string): HTMLElement {
+  const panel = el('div', 'approval-card');
+  panel.hidden = true;
+  const words = el('div', 'approval-card-words');
+  const actions = el('div', 'approval-card-actions');
+  const status = el('p', 'approval-card-status');
+  status.hidden = true;
+  const deny = el('button', 'btn btn-solid', () => t('Deny')) as HTMLButtonElement;
+  const allow = el('button', 'btn btn-solid is-primary', () => t('Allow once')) as HTMLButtonElement;
+  deny.type = allow.type = 'button';
+  actions.append(deny, allow);
+  panel.append(words, actions, status);
+  let card: ApprovalCardView | null = null;
+  const say = (text: () => string): void => { status.hidden = false; ui(status, 'textContent', text); };
+  const show = (next: ApprovalCardView | null): void => {
+    card = next;
+    if (!next) { panel.hidden = true; return; }
+    panel.hidden = false;
+    words.replaceChildren(...next.lines.map((text, index) => el(index === 1 ? 'strong' : 'span', '', text)));
+    const pending = next.answer !== null && next.answer.outcome === null;
+    deny.disabled = pending;
+    allow.disabled = pending || !next.allow;
+    const outcome = next.answer?.outcome;
+    if (pending) say(() => t('Sending your answer to ChatGPT…'));
+    else if (outcome === 'card_changed') say(() => t('ChatGPT showed a different card by then. Nothing was pressed; answer the new one.'));
+    else if (outcome === 'unavailable') say(() => t('ChatGPT no longer offered that choice. Nothing was pressed.'));
+    else if (outcome === 'expired') say(() => t('The chat’s page did not take your answer in time. Nothing was pressed; open it in the browser to answer there.'));
+    else if (!next.allow) say(() => t('ChatGPT does not allow it in this chat. You can only deny it.'));
+    else status.hidden = true;
+  };
+  const refresh = async (): Promise<ApprovalCardView | null> => {
+    const reply = await api.approvalCard(sessionId);
+    const next = reply.ok ? reply.data : null;
+    if (panel.isConnected || next) show(next);
+    return next;
+  };
+  const answer = async (choice: 'allow' | 'deny'): Promise<void> => {
+    if (!card) return;
+    deny.disabled = allow.disabled = true;
+    const reply = await api.answerApproval(sessionId, card.id, choice);
+    if (!reply.ok || !reply.data.ok) {
+      await refresh();
+      if (!card || (reply.ok && !reply.data.ok && reply.data.error === 'card_changed'))
+        say(() => t('ChatGPT showed a different card by then. Nothing was pressed; answer the new one.'));
+      return;
+    }
+    say(() => t('Sending your answer to ChatGPT…'));
+    // The page takes the answer on its next poll (every 2 s while the card stands).
+    for (let attempt = 0; attempt < 40 && panel.isConnected; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const next = await refresh();
+      if (!next || (next.answer && next.answer.outcome !== null)) return;
+    }
+  };
+  deny.addEventListener('click', () => void answer('deny'));
+  allow.addEventListener('click', () => void answer('allow'));
+  void refresh();
+  return panel;
 }
 
 /**
@@ -2809,9 +3065,16 @@ function jumpToLatest(): void {
  */
 async function revealSearchMatch(id: string, query: string): Promise<void> {
   const selection = selectionGeneration;
-  const current = (): boolean => selection === selectionGeneration && selectedId === id;
   const location = await run(api.locateSearchMatch(id, query));
-  if (!location || !current()) return;
+  if (!location || selection !== selectionGeneration || selectedId !== id) return;
+  await revealChatLocation(id, location);
+}
+
+/** Scrolls the open chat to one recorded message, loading the history page around it when needed. */
+async function revealChatLocation(id: string, location: SessionSearchLocation): Promise<void> {
+  const selection = selectionGeneration;
+  const current = (): boolean => selection === selectionGeneration && selectedId === id;
+  if (!current()) return;
   // The chat's own first page, and the fill that follows it, settle first.
   for (const deadline = Date.now() + 5000; detailFor !== id || historyLoading || historyDemand !== null;) {
     if (Date.now() > deadline || !current()) return;
@@ -3010,8 +3273,8 @@ async function fillTimelineHistory(): Promise<void> {
         break;
       }
       const cursor = demand.direction < 0
-        ? events.reduce((oldest, event) => Math.min(oldest, positionOf(event)), Infinity)
-        : events.reduce((newest, event) => Math.max(newest, positionOf(event)), 0);
+        ? events.reduce((oldest, event) => Math.min(oldest, residenceOf(event)), Infinity)
+        : events.reduce((newest, event) => Math.max(newest, residenceOf(event)), 0);
       if (!Number.isFinite(cursor) || (demand.direction < 0 && (cursor <= 1 || cursor === historyStart))) {
         historyDemand = null;
         break;
@@ -3020,8 +3283,8 @@ async function fillTimelineHistory(): Promise<void> {
       if (demand.sessionId !== selectedId || demand.selection !== selectionGeneration || detailFor !== selectedId) continue;
       if (!loaded) { if (demand === historyDemand) historyDemand = null; continue; }
       const next = demand.direction < 0
-        ? events.reduce((oldest, event) => Math.min(oldest, positionOf(event)), Infinity)
-        : events.reduce((newest, event) => Math.max(newest, positionOf(event)), 0);
+        ? events.reduce((oldest, event) => Math.min(oldest, residenceOf(event)), Infinity)
+        : events.reduce((newest, event) => Math.max(newest, residenceOf(event)), 0);
       if (demand === historyDemand && demand.opening) {
         // Filling a newly selected tail has not navigated away from live work.
         // User input replaces the demand and owns its position from then on.
@@ -3210,7 +3473,8 @@ function paintMessageReaction(box: HTMLElement, value: unknown): void {
 
 /** The approval row in the interface language. Literal `t()` calls keep the catalog audit able to see each key. */
 function approvalRowText(text: string): string {
-  if (text === APPROVAL_WAITING_TEXT) return t('ChatGPT is waiting for you to allow or deny a tool call in this chat. Nothing continues until you answer it there.');
+  // The recorded English stays as it was written; since 2.1.38 the row offers the answer itself.
+  if (text === APPROVAL_WAITING_TEXT) return t('ChatGPT is waiting for you to allow or deny a tool call in this chat. Nothing continues until you answer it, here or in the browser.');
   if (text === APPROVAL_ANSWERED_TEXT) return t('The tool approval ChatGPT asked for in this chat was answered.');
   return text;
 }
@@ -3339,6 +3603,9 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
         open.append(icon('i-out'), el('span', '', () => t('Open in browser')));
         open.addEventListener('click', () => void run(api.openSessionChat(owner)));
         line.append(open);
+        const box = el('div', 'approval-wait-box');
+        box.append(line, approvalCardPanel(owner));
+        return box;
       }
       return line;
     }
@@ -3577,9 +3844,9 @@ function visibleEvents(): SessionEvent[] {
  * Keep the current visible rows plus the incoming stage; ordinary tall histories
  * still settle at 160 records. Dense collapsed activity has bounded extra room. */
 function retainTimelinePage(source: SessionEvent[], direction: 'older' | 'newer'): SessionEvent[] {
-  // Residency and navigation share the immutable origin domain. Display order
-  // can move a final across its turn's tools, but must not cut a hole in a page.
-  source = [...source].sort((a, b) => positionOf(a) - positionOf(b));
+  // Residency and navigation share one domain, the one the store pages by (`residenceOf`):
+  // immutable origins, except that a turn's final answer lives beside its turn's end.
+  source = [...source].sort((a, b) => residenceOf(a) - residenceOf(b));
   const pane = $('chatBody');
   const edge = pane.getBoundingClientRect().top;
   const protectedKeys = new Set<string>();
@@ -4475,6 +4742,8 @@ const turnStatusLine = turnLine('turn-worked turn-status');
  */
 /** Whether the latest turn was working at the last paint; the status line's class is never cleared. */
 let turnWorking = false;
+/** A redraw is scheduled to retire the running turn's lines after it ended. */
+let staleTurnRedraw = false;
 const turnNow = el('p', 'meta is-progress thinking-line turn-now');
 const turnNowIcon = el('span', 'turn-now-icon');
 const turnNowText = el('span', 'turn-now-text');
@@ -4868,6 +5137,11 @@ function placeTurnLines(rows: HTMLElement[], workedSeconds: ReadonlyMap<number, 
   const asks = rows.map((row, index) => ({ row, index, asked: Number(row.dataset.askedAt) }))
     .filter(entry => entry.row.matches('.ev-user_message') && Number.isFinite(entry.asked));
   const pending = messageOnItsWay();
+  // A message sent while a turn already runs does not open that turn: the turn keeps its line under its
+  // own question. Parked after the pending message, the line said the chat had moved on to it, and the
+  // rows jumped again once it was delivered or cancelled (2026-10-12). Only a message that will open
+  // the work parks the line after it.
+  const runningBefore = working && openTurnId(events) !== null;
   // A page of history read further up ends before the chat does: its newest question is not the one
   // the running turn answers, so it keeps its own worked line and the live one stays off it.
   const live = working && timelineReachesEnd();
@@ -4876,12 +5150,16 @@ function placeTurnLines(rows: HTMLElement[], workedSeconds: ReadonlyMap<number, 
   for (let i = asks.length - 1; i >= 0; i--) {
     const { index, asked } = asks[i]!;
     const latest = i === asks.length - 1;
-    if (latest && live && !pending) { rows.splice(index + 1, 0, turnStatusLine); rows.push(turnNow); continue; }
+    if (latest && live && (!pending || runningBefore)) { rows.splice(index + 1, 0, turnStatusLine); rows.push(turnNow); continue; }
     const seconds = workedSeconds.get(asked);
     if (seconds === undefined || (latest && live)) continue;
     rows.splice(index + 1, 0, workedLine(asked, seconds)); used.add(String(asked));
   }
   for (const key of workedLines.keys()) if (!used.has(key)) workedLines.delete(key);
+  // A long turn pushes its question out of the loaded rows: every row left is that turn's work, so its
+  // line heads them, where the question would put it. Parked after the queue it sat under the newest
+  // action and jumped back up whenever the question was loaded again (2026-10-12).
+  if (live && !pending && asks.length === 0 && (historyBefore !== null || totalEvents > events.length) && rows.length > 0) { rows.unshift(turnStatusLine); rows.push(turnNow); }
   const inTimeline = rows.includes(turnStatusLine);
   if (!inTimeline) parkTurnStatus(working);
   if (working && status) paintTurnStatus(status);
@@ -4940,6 +5218,16 @@ function paintStateLine(): void {
   const developer = deps.state()?.config.ui.developerMode;
   if (!developer && !turnStatusLine.closest('#timeline')) parkTurnStatus(working === true);
   if (!developer && working === true) paintTurnStatus({ text: note.textContent ?? '', tone, working, ticking });
+  // The turn's end can reach this line after the rows were last drawn: the header already said
+  // "Worked for", while the timeline kept "Working for" and "Thinking" frozen until the next event
+  // (2026-10-12). Only a redraw of the rows retires them; one, after this repaint. The guard holds
+  // until the stale state itself ends: a redraw that cannot retire the lines (no rows to redraw)
+  // would otherwise schedule the next one from its own repaint, forever.
+  if (developer || working === true || !turnWorking) staleTurnRedraw = false;
+  else if (!staleTurnRedraw) {
+    staleTurnRedraw = true;
+    queueMicrotask(() => { if (turnWorking && stateLine().working !== true) paintDetail(); });
+  }
   // The turn lines carry the caption outside developer mode; the header keeps developer detail.
   note.classList.toggle('is-mirrored', !developer);
   const recovering = paintRecoveryStatus();
@@ -5150,9 +5438,8 @@ function paintSwarm(state: SwarmState): void {
           top.append(clear);
         }
         const sub = el('div', 'model-sub');
-        const bits = [t("{0} pending", [agent.pending]), t("{0} delivered", [agent.delivered])];
-        if (agent.conversationId) bits.push(t("chat bound"));
-        sub.textContent = bits.join(' · ');
+        ui(sub, 'textContent', () => [t("{0} pending", [agent.pending]), t("{0} delivered", [agent.delivered]),
+          ...(agent.conversationId ? [t("chat bound")] : [])].join(' · '));
         row.append(top, sub);
         if (agent.task) row.append(el('p', 'hint', agent.task));
         // Why it failed, not just that it did. A worker only reaches this state when its
@@ -5272,7 +5559,10 @@ export function chatSettingsPatch(current: Config): {
       retainDays: 0,
       // Both follow the single threshold above rather than being typed separately.
       advisoryTokens: threshold,
-      limitTokens: urgentFrom(threshold)
+      limitTokens: urgentFrom(threshold),
+      storageLimitGiB: (RECORDING_STORAGE_LIMITS_GIB as readonly number[]).includes(Number($<HTMLSelectElement>('recordingStorageLimit').value))
+        ? Number($<HTMLSelectElement>('recordingStorageLimit').value) as RecordingStorageLimitGiB
+        : current.sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB
     },
     compaction: {
       auto: $<HTMLInputElement>('autoCompact').checked,
@@ -5295,7 +5585,8 @@ export function chatSettingsPatch(current: Config): {
       recoverAgentTabs: $<HTMLInputElement>('recoverAgentTabs').checked,
       waitForSubAgents: $<HTMLInputElement>('waitForSubAgents').checked,
       autoWorktrees: $<HTMLInputElement>('autoWorktrees').checked,
-      endSleepingWorkerProcesses: $<HTMLInputElement>('endSleepingWorkerProcesses').checked
+      endSleepingWorkerProcesses: $<HTMLInputElement>('endSleepingWorkerProcesses').checked,
+      archiveWorkerChats: $<HTMLInputElement>('archiveWorkerChats').checked
     },
     goal: {
       enabled: current.goal.enabled, mode: current.goal.mode,
@@ -5685,10 +5976,10 @@ function applyAutoCompactHint(config: Config): void {
  * expire by age.
  */
 const CHAT_INPUTS = [
-  'chatBrowser', 'browserBridgePort',
+  'chatBrowser', 'cosBrowserMinimize', 'browserBridgePort',
   'goalIncludeToolCalls',
   'planBackend',
-  'finishTool', 'finishLeadMinutes', 'defaultChatModel', 'defaultChatReasoning', 'workerModel', 'workerReasoning', 'autoSelectSkills', 'backgroundChats', 'backgroundPlacement', 'browserOnly', 'autoRefreshPlugins',
+  'finishTool', 'finishLeadMinutes', 'rotateTurnMinutes', 'localAppUsage', 'defaultChatModel', 'defaultChatReasoning', 'workerModel', 'workerReasoning', 'autoSelectSkills', 'backgroundChats', 'backgroundPlacement', 'browserOnly', 'autoRefreshPlugins',
   'goalBackend',
   'loopBackend',
   'helperModel', 'helperReasoning',
@@ -5701,6 +5992,7 @@ const CHAT_INPUTS = [
   'waitForSubAgents',
   'autoWorktrees',
   'endSleepingWorkerProcesses',
+  'archiveWorkerChats',
   'autoContinue',
   'goalProvider',
   'goalBaseUrl',
@@ -5708,6 +6000,7 @@ const CHAT_INPUTS = [
   'goalReasoning',
   'handoffPrompt',
   'handoffLength',
+  'recordingStorageLimit',
   'goalPrompt',
   'goalObjectivePrompt',
   'goalLoopPrompt'
@@ -5770,6 +6063,11 @@ export function chatApply(state: AppState, previous?: Config): void {
     config.compaction.handoffLength ?? DEFAULT_HANDOFF_LENGTH,
     previous?.compaction.handoffLength
   );
+  applyChatValue(
+    $<HTMLSelectElement>('recordingStorageLimit'),
+    String(config.sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB),
+    previous === undefined ? undefined : String(previous.sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB)
+  );
   applyAutoCompactHint(config);
   $<HTMLInputElement>('autoCompactTokens').disabled = !config.compaction.auto;
 
@@ -5809,6 +6107,11 @@ export function chatApply(state: AppState, previous?: Config): void {
     $<HTMLInputElement>('endSleepingWorkerProcesses'),
     config.multiAgent.endSleepingWorkerProcesses === true,
     previous?.multiAgent.endSleepingWorkerProcesses
+  );
+  applyChatChecked(
+    $<HTMLInputElement>('archiveWorkerChats'),
+    config.multiAgent.archiveWorkerChats === true,
+    previous?.multiAgent.archiveWorkerChats
   );
 
   // The model and reasoning selects are painted by applyChatModels above, which resolves a saved
@@ -5876,8 +6179,13 @@ function scheduleReload(change?: SessionChange): void {
   }, 400);
 }
 
-/** Retired automatic drafts belong to their creation time, never the live composer queue. */
+/**
+ * Retired automatic drafts belong to their creation time, never the live composer queue. A dropped
+ * fresh-turn continue (#1402) is one too, cancelled or failed: the app files it again by itself, and
+ * failed ones kept at the end of the chat read as its newest messages long after (2026-10-15).
+ */
 function historicalAutomaticInput(entry: InputEntry): boolean {
+  if (entry.purpose === 'rotation') return (entry.state === 'cancelled' || entry.state === 'failed') && !!entry.error;
   return (!!entry.recovery || (!!entry.finishOwner && !entry.finishOwner.userRequested)) &&
     entry.state === 'cancelled' && !!entry.error;
 }
@@ -5986,7 +6294,7 @@ function paintPendingInputs(): void {
   // A pre-acceptance or failed-materialization row belongs only to its exact draft.
   // A fresh New Chat never inherits another opening.
   const unbound = (entry: InputEntry) => selectedId === null && pendingNewInput?.id === entry.id && pendingNewInput.generation === selectionGeneration && !entry.deliveredSessionId && entry.purpose !== 'decision' && ['queued', 'browser'].includes(entry.state);
-  const notice = (entry: InputEntry) => belongsToSelection(entry) && entry.purpose !== 'decision' &&
+  const notice = (entry: InputEntry) => belongsToSelection(entry) && entry.purpose !== 'decision' && entry.purpose !== 'rotation' &&
     ['failed', 'cancelled'].includes(entry.state) && !!entry.error && !dismissedInputNotices.has(entry.id);
   const anchored = (entry: InputEntry) => detailFor === selectedId && (events.some(event =>
     event.kind === 'user_message' && (event.inputId === entry.id ||
@@ -6082,6 +6390,24 @@ async function refreshInputQueue(): Promise<void> {
         } else cancel.disabled = false;
       };
       if (entry.recovery) { card.append(cancel); return card; }
+      // Like Codex's Steer: send a message that waits for the end of the turn into the turn now.
+      if (entry.mode === 'after-turn' && !entry.attachments?.length && !entry.images?.length && !entry.stages?.length) {
+        const now = dockAction(() => t("Send now"), 'i-arrow-up', () => {});
+        now.classList.add('queue-send-now');
+        ui(now, 'title', () => t("Send into the running turn now"));
+        now.hidden = !canSendQueuedNow();
+        now.onclick = async () => {
+          if (now.disabled || !card.isConnected || selection !== selectionGeneration) return;
+          now.disabled = true;
+          const sent = await run(api.sendQueuedInputNow(entry.id));
+          if (!card.isConnected || selection !== selectionGeneration) return;
+          if (sent === false) toast(t("The turn ended before this message could join it. It stays queued."));
+          if (sent !== true) now.disabled = false;
+          inputQueueGeneration++;
+          void refreshInputQueue();
+        };
+        card.append(now);
+      }
       const queueSessionSummary = sessions.find(row => row.id === selectedId);
       const modelSelection = queueSessionSummary?.selectedModel;
       if (entry.mode === 'finish' && modelSelection?.conversationId === queueSessionSummary?.conversationId && isAstraModel(modelSelection?.model, modelSelection?.reasoningEffort)) {
@@ -6229,7 +6555,7 @@ async function stopCurrentTurn(): Promise<void> {
   finally { if (selectedId === id && selectionGeneration === generation) { controlledStopPending = false; void refreshSessionControls(); } }
 }
 let composerDiscoveryGeneration = 0;
-async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?: string, controlAction = false): Promise<boolean | void> {
+async function sendComposer(delivery?: 'finish' | 'auto' | 'after-turn', plan?: string[], planObjective?: string, controlAction = false): Promise<boolean | void> {
   const input = $<HTMLTextAreaElement>('chatInput');
   const key = draftKey();
   const projectId = selectedId ? sessions.find(row => row.id === selectedId)?.projectId ?? null : selectedProjectId;
@@ -6401,7 +6727,7 @@ function showView(name: string): void {
 function selectSession(id: string): void {
   const ownerChanged = id !== selectedId;
   rememberDraft();
-  selectionGeneration++; replaceComposerDraft();
+  selectionGeneration++; chatFind?.selectionChanged(); replaceComposerDraft();
   inputQueueGeneration++;
   $('finishQueue').replaceChildren(); $('finishQueue').hidden = true;
   newChatSelected = false;
@@ -6444,7 +6770,7 @@ function selectSession(id: string): void {
 }
 
 function selectNewChat(projectId: string | null = null): void {
-  rememberDraft(); selectionGeneration++; replaceComposerDraft(); pendingNewInput = null;
+  rememberDraft(); selectionGeneration++; chatFind?.selectionChanged(); replaceComposerDraft(); pendingNewInput = null;
   inputQueueGeneration++;
   $('finishQueue').replaceChildren(); $('finishQueue').hidden = true;
   newChatSelected = true; selectedId = null; selectedProjectId = projectId; detailFor = null; detailCursor = null;
@@ -6733,9 +7059,13 @@ export function initChat(next: Deps): void {
     list: scope => api.skillLibrary(scope), command: name => {
       if (name === 'plan') { $('createPlan').click(); return; }
       if (name === 'compact') { $('compactSession').click(); return; }
-      const automation = $<HTMLSelectElement>('chatAutomation'); automation.value = name;
-      automation.dispatchEvent(new Event('change', { bubbles: true }));
-    } });
+      if (name === 'goal' || name === 'loop') {
+        const automation = $<HTMLSelectElement>('chatAutomation'); automation.value = name;
+        automation.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
+      runSlashCommand(name);
+    }, commandAvailable: name => !CHAT_COMMANDS.has(name) || openChatSummary() !== null });
   skillPicker.restore();
   $('generateFinishGoal').addEventListener('click', async () => {
     const button = $<HTMLButtonElement>('generateFinishGoal'), id = selectedId, turnId = controlledTurnId;
@@ -6814,7 +7144,17 @@ export function initChat(next: Deps): void {
   });
   $('chatInput').addEventListener('keydown', (event) => {
     if (skillPicker?.keydown(event)) return;
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (currentPreparedPlan() || authoredComposerText().trim() || imageDrafts.get(draftKey())?.length) $<HTMLFormElement>('composer').requestSubmit(); }
+    // Codex's "Enter key behavior": Enter sends, or only Cmd/Ctrl+Enter does and Enter adds a line.
+    const enterSends = deps.state()?.config.ui.enterSends !== false || event.metaKey || event.ctrlKey;
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && enterSends) { event.preventDefault(); if (currentPreparedPlan() || authoredComposerText().trim() || imageDrafts.get(draftKey())?.length) $<HTMLFormElement>('composer').requestSubmit(); }
+    // Cmd/Ctrl+Shift+Enter sends the other way than the Follow-up default (Codex does the same).
+    else if (event.key === 'Enter' && event.shiftKey && (event.metaKey || event.ctrlKey) && !event.isComposing) {
+      event.preventDefault();
+      if (!authoredComposerText().trim() && !imageDrafts.get(draftKey())?.length) return;
+      if ($('sendOptions').hidden || currentPreparedPlan() || taskPlans.has(draftKey())) { $<HTMLFormElement>('composer').requestSubmit(); return; }
+      retireDictation();
+      void sendComposer($<HTMLSelectElement>('sendMode').value === 'after-turn' ? 'auto' : 'after-turn');
+    }
   });
   $('composerSettings').addEventListener('toggle', paintTaskActions);
   $('composerSettings').querySelector('summary')!.addEventListener('click', () => {
@@ -6942,6 +7282,11 @@ export function initChat(next: Deps): void {
     } else void sendComposer(undefined, undefined, undefined, controlAction);
   });
 
+  chatFind = initChatFind({
+    selectedId: () => selectedId,
+    find: async (id, query) => (await run(api.findInChat(id, query))) ?? null,
+    reveal: revealChatLocation
+  });
   chatSearch = initChatSearch({
     select: (id, match) => {
       if (id !== selectedId) { pendingNewInput = null; selectSession(id); }

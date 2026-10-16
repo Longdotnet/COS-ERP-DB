@@ -6,9 +6,11 @@ import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js
  */
 
 import path from 'node:path';
-import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, powerMonitor, screen, session } from 'electron';
+import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, powerMonitor, powerSaveBlocker, screen, session } from 'electron';
+import { createKeepAwake, installKeepAwake } from './keep-awake.js';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { initConnectorProofPath, loadConnectorProof, notePluginInstalled } from './connector-proof.js';
+import { initWorkerArchivePath, loadWorkerArchive, queueWorkerArchives } from './worker-archive.js';
 import { initBrowserProofPath, loadBrowserProof } from './browser-proof.js';
 import { enrolledPluginSurfaces } from './plugin-refresh.js';
 import {
@@ -21,9 +23,12 @@ import {
   shutdownConnection,
   suspendConnectionLossNotices
 } from './connection.js';
+import { setSystemProxyResolver } from './tunnel/index.js';
+import { configureAppProxy, refreshAppProxy } from './app-proxy.js';
 import { openSessionChat, registerIpc } from './ipc.js';
 import { getChatModels, restoreChatModels, startChatModelDiscovery } from './chat-models.js';
-import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLogOnCrash } from './logger.js';
+import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, onLog, snapshotLogOnCrash } from './logger.js';
+import { noteRuntimeEvent, tallyLogEntry } from './diagnostics-facts.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { workspaceTerminalsExited } from './workspace-terminal.js';
 import { initSecretsPath, keychainReadPending } from './secrets.js';
@@ -31,9 +36,11 @@ import { mainText, mainTextTranslations, onMainTextsChange, restoreMainTextTrans
 import { isMainText } from '../shared/main-texts.js';
 import { executableFingerprint, initKeychainNotice } from './keychain-notice.js';
 import { pluginManager } from './plugins/manager.js';
-import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
+import { sessionActivityExpiresAt, setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
 import { setStuckNotifier } from './stuck-notice.js';
-import { flushSessions, initSessionStore } from './session/store.js';
+import { flushSessions, getSession, initSessionStore, listSessions, readRecentEvents, setRecordingStorageLimit } from './session/store.js';
+import { createTurnNotifier } from './turn-notifications.js';
+import { DEFAULT_RECORDING_STORAGE_GIB } from '../shared/session.js';
 import { initSkillsPath } from './skills.js';
 import { initUvRuntime } from './plugins/uv-runtime.js';
 import { initPetLibrary } from './pet-library.js';
@@ -41,6 +48,7 @@ import { shutdownPetOverlay, startPetOverlay } from './pet-overlay.js';
 import { usageOverview } from './session/usage.js';
 import {
   flushRecorder,
+  onSessionChange,
   queueDeterministicAttributionRepair,
   setAgentBinder,
   setAgentConversationLookup
@@ -51,6 +59,7 @@ import {
   bindConversation,
   onRetiredWorkersPersist,
   onRetiredWorkersPersistNow,
+  onWorkerChatsRetired,
   onSwarmPersist,
   onSwarmPersistNow,
   pauseSwarmForDisable,
@@ -75,6 +84,9 @@ import {
   GOAL_OBJECTIVES_STATE,
   GOAL_REPLIES_STATE,
   GOAL_SWITCHES_STATE,
+  GOAL_HELPER_SIZE_STATE,
+  restoreGoalHelperSize,
+  goalSwitchEnabledFor,
   restoreGoalObjectives,
   restoreGoalReplies,
   restoreGoalSwitches,
@@ -91,7 +103,9 @@ import {
 import { runShutdownSequence } from './shutdown.js';
 import { startAgentRuntimeGc, stopAgentRuntimeGc } from './runtime-gc.js';
 import { restoreManagedWorktrees } from './worktrees/index.js';
-import { applyStagedUpdate, startUpdateChecks } from './update.js';
+import { applyStagedUpdate, ELEVATION_ANSWER_MS, installingVersion, onInstallerTakeover, onUpdateHandoffStep, startUpdateChecks } from './update.js';
+import { setUpdateProgressStep, showUpdateProgress, untilInstallerTakesOver } from './update-progress.js';
+import { resumeUpdateRefresh } from './update-all.js';
 import { UI_BASE_ZOOM, windowLayoutForDisplays, windowPlacementWasMaximized, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { openInPreferredBrowser } from './browser.js';
 import { loadedCosBrowser, onCosBrowserLoaded, syncCosBrowser } from './cos-browser/selection.js';
@@ -264,6 +278,8 @@ function createWindow(): void {
   }
 }
 
+/** When a Session-finish or stuck notice last went out per chat, so a turn-done notice does not repeat it. */
+const chatNoticeAt = new Map<string, number>();
 function showWindow(): void {
   // Defense in depth for every current or future native activation source. The explicit gate
   // below additionally protects the long pre-window startup interval, while this invariant makes
@@ -280,6 +296,7 @@ function showWindow(): void {
 
 setFinishNotifier((title, body, sessionId, turnId) => {
   if (window?.isFocused() || !Notification.isSupported()) return false;
+  chatNoticeAt.set(sessionId, Date.now());
   const write = (): void => {
     showWindow();
     if (!window) return;
@@ -303,6 +320,7 @@ setStuckNotifier((title, body, sessionId, opens = 'app') => {
   // A person looking at the app already has the timeline note this accompanies; interrupting
   // them with the same sentence is noise, exactly as the finish notice treats a focused window.
   if (window?.isFocused() || !Notification.isSupported()) return false;
+  chatNoticeAt.set(sessionId, Date.now());
   const notice = new Notification({ title, body });
   notice.on('click', () => {
     if (opens === 'browser') {
@@ -356,7 +374,7 @@ function refreshTray(): void {
   const offline = state === 'offline';
   // Offline keeps the running icon: the bridge is up, the internet is not.
   const running = connected || offline;
-  const label = mainText(connected ? 'Connected' : offline ? 'No internet' : 'Not connected');
+  const label = mainText(connected ? 'Connected' : offline ? (getStatus().offlineCause === 'service' ? 'OpenAI outage' : 'No internet') : 'Not connected');
   tray.setImage(trayIcon(running));
   // Not lowercased: that would break translated nouns ("Keine Internetverbindung").
   tray.setToolTip(`${cosErpDbIdentity.displayName} — ${label}`);
@@ -401,6 +419,11 @@ void app.whenReady().then(async () => {
   if (!shouldBeginAppBootstrap(hasSingleInstanceLock, quitting)) return;
   powerMonitor.on('suspend', suspendConnectionLossNotices);
   powerMonitor.on('resume', resumeConnectionLossNotices);
+  // Counted for the diagnostics report: kinds of warnings, ended page and helper processes, sleep.
+  onLog(tallyLogEntry);
+  powerMonitor.on('suspend', () => noteRuntimeEvent('sleep'));
+  app.on('render-process-gone', (_event, _contents, details) => noteRuntimeEvent(`page process gone: ${details.reason}`));
+  app.on('child-process-gone', (_event, details) => noteRuntimeEvent(`${details.type} process gone: ${details.reason}`));
   const userData = app.getPath('userData');
   initLogFile(path.join(userData, 'app.log'));
   process.on('uncaughtExceptionMonitor', (error, origin) => {
@@ -408,6 +431,7 @@ void app.whenReady().then(async () => {
   });
   initConfigPath(userData);
   initConnectorProofPath(userData);
+  initWorkerArchivePath(userData);
   initBrowserProofPath(userData);
   initSecretsPath(userData);
   initCosErpDbSubsystems(userData);
@@ -417,6 +441,8 @@ void app.whenReady().then(async () => {
     fingerprint: () => executableFingerprint(app.getVersion())
   });
   initSessionStore(userData);
+  // The tunnel program reads proxies only from its environment; the system's setting comes from here (#1255).
+  setSystemProxyResolver(url => session.defaultSession.resolveProxy(url));
   try { await initSkillsPath(userData); }
   catch (error) { logWarn(`Skills library unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   initDurableStore(userData);
@@ -432,11 +458,61 @@ void app.whenReady().then(async () => {
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
+  setRecordingStorageLimit(getConfig().sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB);
   await loadConnectorProof();
+  await loadWorkerArchive();
+  // Worker chats the broker retired for good are archived in ChatGPT when the setting is on (#1460).
+  onWorkerChatsRetired((conversationIds) => queueWorkerArchives(conversationIds));
   await loadBrowserProof();
   // Plugins ChatGPT already showed the refresh feature are created: Setup need not wait for a call.
   for (const surface of await enrolledPluginSurfaces()) notePluginInstalled(surface);
   await pluginManager.initialize(userData);
+  // Codex's "Prevent sleep while running": a sleeping computer stops a long run (#1086).
+  const keepAwake = createKeepAwake({
+    sessions: async () => (await listSessions()).map(summary => ({ ...summary, activityExpiresAt: sessionActivityExpiresAt(summary) })),
+    enabled: () => getConfig().ui.keepAwake !== false,
+    screen: () => getConfig().ui.keepScreenAwake === true,
+    blocker: {
+      start: kind => powerSaveBlocker.start(kind === 'screen' ? 'prevent-display-sleep' : 'prevent-app-suspension'),
+      stop: id => { if (powerSaveBlocker.isStarted(id)) powerSaveBlocker.stop(id); }
+    }
+  });
+  installKeepAwake(keepAwake);
+  onSessionChange(() => void keepAwake.refresh());
+  setInterval(() => void keepAwake.refresh(), 60_000).unref();
+  void keepAwake.refresh();
+  // Codex's turn-completion notifications: a finished answer in a background window.
+  const turnNotifier = createTurnNotifier({
+    getSession,
+    lastAnswer: async id => {
+      const [answer] = await readRecentEvents(id, 1, { kinds: ['assistant_message'] });
+      return answer?.kind === 'assistant_message' ? answer.message.text : null;
+    },
+    enabled: () => getConfig().ui.turnNotifications !== false && Notification.isSupported(),
+    focused: () => window?.isFocused() === true,
+    automated: conversationId => goalSwitchEnabledFor(conversationId),
+    recentlyNotified: id => Date.now() - (chatNoticeAt.get(id) ?? 0) < 120_000,
+    show: (title, body, sessionId) => {
+      const notice = new Notification({ title, body });
+      notice.on('click', () => {
+        showWindow();
+        if (!window) return;
+        const target = window.webContents;
+        const open = (): void => { if (!target.isDestroyed()) target.send('session:write', sessionId); };
+        if (target.isLoadingMainFrame()) target.once('did-finish-load', open); else open();
+      });
+      notice.show();
+    }
+  });
+  turnNotifier.seed(await listSessions().catch(() => []));
+  onSessionChange(change => void turnNotifier.handle(change.sessionIds ?? []));
+  // The app's own requests follow the system proxy too, not only the tunnel (#1255).
+  configureAppProxy(url => session.defaultSession.resolveProxy(url), () => [
+    ...(getConfig().goal.provider.kind === 'custom' ? [getConfig().goal.provider.baseUrl] : []),
+    ...pluginManager.remoteEndpoints()
+  ]);
+  await refreshAppProxy();
+  setInterval(() => void refreshAppProxy(), 2 * 60_000).unref();
   if (windowActivation.isDisabled()) return;
   try { applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
   catch (error) { logWarn(`Windows login startup: ${error instanceof Error ? error.message : String(error)}`); }
@@ -453,6 +529,7 @@ void app.whenReady().then(async () => {
   const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalReplies(savedGoalReplies);
+  restoreGoalHelperSize(await readDurable(GOAL_HELPER_SIZE_STATE));
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();
@@ -616,6 +693,7 @@ void app.whenReady().then(async () => {
     startControlApi().catch((error: Error) => logWarn(`control API did not start: ${error.message}`));
   }
   if (getConfig().ui.autoConnect) void connect();
+  void resumeUpdateRefresh().catch((error: Error) => logWarn(`update refresh did not resume: ${error.message}`));
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
   // window that is already on screen. Everything it learns arrives through the ordinary state
@@ -667,6 +745,14 @@ app.on('will-quit', (event) => {
   stopInputStartup();
   tray?.destroy();
   tray = null;
+  // A person who pressed Restart and install sees what happens until the installer takes over;
+  // the main window is already gone here (2.1.38).
+  const installing = installingVersion();
+  if (installing) {
+    onUpdateHandoffStep(setUpdateProgressStep);
+    onInstallerTakeover(() => untilInstallerTakesOver());
+    showUpdateProgress(installing);
+  }
 
   void runShutdownSequence(
     [
@@ -695,7 +781,9 @@ app.on('will-quit', (event) => {
       // staged update is handed to the platform's installer here, so the next start of the app
       // is the new version. Nothing is staged unless it downloaded whole and matched the
       // release's published SHA-256, and applying it cannot fail loudly - see update.ts.
-      { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
+      // An install folder that needs an administrator waits here for Windows' permission prompt
+      // (#1492); exiting earlier would end that prompt with the app. Other handoffs take moments.
+      { name: 'update handoff', budgetMs: ELEVATION_ANSWER_MS + 5_000, run: () => [applyStagedUpdate()] }
     ],
     {
       info: logInfo,

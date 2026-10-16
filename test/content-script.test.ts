@@ -696,6 +696,67 @@ describe('desktop input delivery and helper ownership', () => {
     expect(live.sent.filter(message => message.ack)).toHaveLength(change === 'accepted' ? 1 : 0);
     if (change === 'draft') expect(composerText(live.document)).toBe('My own draft');
   });
+  // 2026-10-15, the user's Mac chat: while ChatGPT thinks or runs tools it offers only Stop, no
+  // Send (measured live), so every automatic continue for a long turn timed out unsent and the
+  // turns broke at 41 and 52 minutes anyway. A rotation then does what #1402 decided by hand:
+  // Stop right after the tool result and send Continue. A person's own message never stops a turn.
+  it.each(['rotation', 'user'] as const)('stops a thinking turn for its automatic continue only (%s)', async purpose => {
+    let directTurn: { id: string; startedAt: number };
+    live = await nonProHarness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => {
+        if (message.authorize || message.ack || message.fail) return { ok: true, data: { ok: true } };
+        return { ok: true, data: { input: claimed({ directTurn, purpose }) } };
+      }
+    });
+    startGenerating(live.document);
+    live.hook.observe(); await live.hook.flush();
+    const start = emitted(live.sent, 'turn_start').at(-1)!;
+    directTurn = { id: start.event.turnId as string, startedAt: start.event.time as number };
+    const send = live.document.querySelector('[data-testid="send-button"]')!;
+    const actions = send.parentElement!;
+    const sends = watchSend(live.document);
+    send.addEventListener('click', () => {
+      userTurn(live!.document, 'rotation-continue', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    send.remove(); // Thinking: only Stop is offered.
+    const stop = live.document.querySelector('[data-testid="stop-button"]')!;
+    Object.defineProperty(stop, 'getClientRects', { value: () => [{ width: 32, height: 32 }] });
+    const stops = vi.fn(() => { actions.append(send); void settleTurn(live!); });
+    stop.addEventListener('click', stops);
+    const result = await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, directTurn });
+    expect(stops).toHaveBeenCalledTimes(purpose === 'rotation' ? 1 : 0);
+    expect(sends()).toBe(purpose === 'rotation' ? 1 : 0);
+    expect(result).toEqual({ ok: purpose === 'rotation' });
+    expect(live.sent.filter(message => message.ack)).toHaveLength(purpose === 'rotation' ? 1 : 0);
+  });
+  // 2026-10-15, live on the VM: in the first turn of a chat the app opened, ChatGPT shows no row
+  // for the question (#942), and every automatic continue was refused before its claim because
+  // the page could not name the last user message. The page's own turn id is the proof instead.
+  it('takes an automatic continue into a first turn whose question is not shown', async () => {
+    let directTurn: { id: string; startedAt: number };
+    live = await nonProHarness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => {
+        if (message.authorize || message.ack || message.fail) return { ok: true, data: { ok: true } };
+        return { ok: true, data: { input: claimed({ directTurn, purpose: 'rotation' }) } };
+      }
+    });
+    startGenerating(live.document);
+    live.hook.observe(); await live.hook.flush();
+    const start = emitted(live.sent, 'turn_start').at(-1)!;
+    directTurn = { id: start.event.turnId as string, startedAt: start.event.time as number };
+    // ChatGPT redraws the new chat without its question while the turn keeps running.
+    for (const row of live.document.querySelectorAll('[data-message-author-role="user"]')) row.closest('[data-testid^="conversation-turn"]')?.remove() ?? row.remove();
+    live.hook.observe(); await live.hook.flush();
+    const sends = watchSend(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'rotation-continue', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, directTurn })).toEqual({ ok: true });
+    expect(sends()).toBe(1);
+    expect(live.sent.filter(message => message.ack)).toHaveLength(1);
+  });
   it('sends a message into the running turn while one of its calls is still running (#1231)', async () => {
     let directTurn: { id: string; startedAt: number };
     live = await nonProHarness(`https://chatgpt.com/c/${chatA}`, {
@@ -855,6 +916,128 @@ describe('desktop input delivery and helper ownership', () => {
     startGenerating(live.document, { send: false });
     await settle(); live.hook.observe(); await settle(); await live.hook.flush();
     expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+  });
+
+  it.each(['a fresh tab', 'an open chat'] as const)('confirms a hidden new chat\'s first Send when its address arrives after the request and nothing redraws (from %s)', async start => {
+    // 2026-10-15, Firefox: an app-opened new chat waits in a minimized window, where ChatGPT
+    // barely redraws. Its Send request named the question at once, but the address moved to
+    // /c/<id> seconds later, and with no page change after that the receipt waited 40–95 s for
+    // a redraw (once it never came). The page's own once-a-second check sees the new address.
+    const submitted = 'Hidden-tab question: reply with exactly the word ready.';
+    const questionId = '6ac024bb-486c-83e8-bf8e-4be1147847d1';
+    live = await harness(start === 'a fresh tab' ? `https://chatgpt.com/?cos-input=${inputId}` : `https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize
+        ? { ok: true } : message.ack ? { ok: true } : { input: claimed({ text: submitted }) } })
+    });
+    live.dom.reconfigure({ url: `https://chatgpt.com/?cos-input=${inputId}` });
+    live.hook.observe();
+    let clicked!: () => void;
+    const click = new Promise<void>(resolve => { clicked = resolve; });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      // The request goes out while the address is still the new-chat page.
+      live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+        source: live!.window as unknown as Window, origin: 'https://chatgpt.com',
+        data: { type: 'cos-send-request', messageIds: [questionId], observedAt: Date.now() } }));
+      clicked();
+    });
+    const delivered = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null });
+    await click;
+    await settle();
+    expect(live.sent.filter(message => message.ack)).toHaveLength(0);
+    // Only the address changes; the page draws nothing.
+    live.dom.reconfigure({ url: `https://chatgpt.com/c/${chatB}` });
+    live.hook.observe();
+    expect(await delivered).toEqual({ ok: true });
+    expect(live.sent.filter(message => message.fail)).toHaveLength(0);
+    expect(live.sent.filter(message => message.ack)).toEqual([expect.objectContaining({ messageId: questionId, conversationId: chatB })]);
+  });
+
+  it('confirms a hidden new chat\'s first Send when the extension reports its new address', async () => {
+    // The page's own check can be held back for long in a hidden tab; the extension's
+    // background sees the address change and tells this page directly.
+    const submitted = 'Hidden-tab question told by the extension: reply with exactly the word ready.';
+    const questionId = '6ac024bb-486c-83e8-bf8e-4be1147847d3';
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize
+        ? { ok: true } : message.ack ? { ok: true } : { input: claimed({ text: submitted }) } })
+    });
+    live.hook.observe();
+    let clicked!: () => void;
+    const click = new Promise<void>(resolve => { clicked = resolve; });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+        source: live!.window as unknown as Window, origin: 'https://chatgpt.com',
+        data: { type: 'cos-send-request', messageIds: [questionId], observedAt: Date.now() } }));
+      clicked();
+    });
+    const delivered = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null });
+    await click;
+    await settle();
+    live.dom.reconfigure({ url: `https://chatgpt.com/c/${chatB}` });
+    expect(await live.runtimeMessage({ type: 'clf-route-changed' })).toEqual({ ok: true });
+    expect(await delivered).toEqual({ ok: true });
+    expect(live.sent.filter(message => message.ack)).toEqual([expect.objectContaining({ messageId: questionId, conversationId: chatB })]);
+  });
+
+  it.each(['a fresh tab', 'an open chat'] as const)('gives a hidden new chat\'s answer its turn when the answer was final before the Send receipt (from %s)', async start => {
+    // 2026-10-15, Firefox: in a minimized window the page's checks ran seconds apart. By the
+    // time it saw /c/<id>, ChatGPT had already finished the answer, and the same check that
+    // proved the Send also recorded that final answer without a turn: no Copy, Export or Goal.
+    const submitted = 'Hidden-tab fast answer: reply with exactly the word ready.';
+    const questionId = '6ac024bb-486c-83e8-bf8e-4be1147847d2';
+    let holdActivity = false;
+    let releaseActivity: ((value: unknown) => void) | undefined;
+    live = await harness(start === 'a fresh tab' ? `https://chatgpt.com/?cos-input=${inputId}` : `https://chatgpt.com/c/${chatA}`, {
+      activity: () => holdActivity
+        ? new Promise(resolve => { releaseActivity = resolve; })
+        : ({ ok: true, data: { entries: [], stream: [], nextSince: 0, activeTurnId: null, userAnchors: [] } }),
+      desktop_input: message => ({ ok: true, data: message.authorize
+        ? { ok: true } : message.ack ? { ok: true } : { input: claimed({ text: submitted }) } })
+    });
+    live.dom.reconfigure({ url: `https://chatgpt.com/?cos-input=${inputId}` });
+    live.hook.observe();
+    let clicked!: () => void;
+    const click = new Promise<void>(resolve => { clicked = resolve; });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+        source: live!.window as unknown as Window, origin: 'https://chatgpt.com',
+        data: { type: 'cos-send-request', messageIds: [questionId], observedAt: Date.now() } }));
+      clicked();
+    });
+    const delivered = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null });
+    await click;
+    await settle();
+    // Next check: the address has moved and the whole answer is already there.
+    const answer = assistantTurn(live.document, 'hidden-answer', []);
+    prose(live.document, answer, 'hidden-message', 'ready');
+    live.dom.reconfigure({ url: `https://chatgpt.com/c/${chatB}` });
+    await bindFiberTurns([{ section: answer, turn: { turnId: 'hidden-answer', conversationId: chatB, endMessageId: 'hidden-message',
+      messages: [{ role: 'assistant', messageId: 'hidden-message', rawMessageId: 'hidden-message', rawText: 'ready' }] } }]);
+    live.hook.observe();
+    expect(await delivered).toEqual({ ok: true });
+    for (let pass = 0; pass < 2; pass++) {
+      live.hook.observe(); await settle();
+      await new Promise(resolve => live!.window.setTimeout(resolve, 3_000));
+    }
+    holdActivity = true;
+    live.hook.observe(); await settle();
+    releaseActivity?.({ ok: true, data: { entries: [], stream: [], nextSince: 1, activeTurnId: null, userAnchors: [] } });
+    holdActivity = false;
+    await settle(); live.hook.observe(); await settle(); await live.hook.flush();
+    for (let pass = 0; pass < 6; pass++) {
+      await bindFiberTurns([{ section: answer, turn: { turnId: 'hidden-answer', conversationId: chatB, endMessageId: 'hidden-message',
+        messages: [{ role: 'assistant', messageId: 'hidden-message', rawMessageId: 'hidden-message', rawText: 'ready' }] } }]);
+      live.hook.observe(); await settle();
+      await new Promise(resolve => live!.window.setTimeout(resolve, 3_000));
+    }
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+    const ends = emitted(live.sent, 'turn_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]!.event).toMatchObject({ outcome: 'completed' });
+    // An earlier unowned sighting may come first; the recorder promotes it to the turn's own.
+    const finals = emitted(live.sent, 'assistant_message').filter(sent => sent.event.final && sent.event.messageId === 'hidden-message');
+    expect(finals.at(-1)?.event.turnId).toBe(emitted(live.sent, 'turn_start')[0]!.event.turnId);
   });
 
   it('does not open a turn from an accepted Send when no new answer or generation follows it', async () => {
@@ -2986,8 +3169,10 @@ async function replyFiber(
   // deliver the request, so this one case runs on real timers.
   const instant = window.setTimeout;
   window.setTimeout = (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms);
+  let answered = false;
   const onAsk = (event: any) => {
     if (!event.data || event.data.source !== 'clf-fiber-ask') return;
+    answered = true;
     const scanToken = event.data.nonce;
     // Tests manually mark the exact DOM↔descriptor joins they intend. Upgrade those legacy
     // numeric fixtures to the shipped scan-token stamp at reply time, matching what fiber.js
@@ -3032,6 +3217,10 @@ async function replyFiber(
   try {
     if (observeOnly) {
       active.hook.observe();
+      // The scan's question travels as a posted message, so it arrives on a later task. A fixed
+      // 100 ms used to stand for "asked and answered", and on a loaded CI runner the question
+      // sometimes had not even arrived yet (canary 2026-10-13, macOS). Wait for the answer itself.
+      await vi.waitFor(() => { if (!answered) throw new Error('the scan has not asked yet'); }, { timeout: 10_000, interval: 5 });
       await new Promise(resolve => globalThis.setTimeout(resolve, 100));
     } else await active.hook.refreshFiber(settled);
   } finally {
@@ -3302,6 +3491,18 @@ function resumeSignal(h: Harness, type: 'cos-resume-request' | 'cos-resume-respo
   h.window.dispatchEvent(new h.window.MessageEvent('message', { source: h.window as unknown as Window,
     origin: h.window.location.origin, data: { type, id, conversationId, status, streamOpened } }));
 }
+
+describe('page checks for the diagnostics report', () => {
+  // 2026-10-15: the background asks the most recently used ChatGPT tab which controls it still has.
+  it('answers with booleans and the page language only', async () => {
+    live = await harness();
+    live.document.documentElement.lang = 'es';
+    const answer = await live.runtimeMessage({ type: 'clf-page-checks' }) as Record<string, unknown>;
+    expect(Object.keys(answer).sort()).toEqual(['composer', 'language', 'modelMenu', 'plusMenu', 'sendArea']);
+    expect(answer.language).toBe('es');
+    for (const key of ['composer', 'sendArea', 'modelMenu', 'plusMenu']) expect(typeof answer[key]).toBe('boolean');
+  });
+});
 
 describe('H2 resume transport evidence', () => {
   it('H2 records stream_gone immediately in a non-English page without ending a live generation', async () => {
@@ -10427,7 +10628,12 @@ describe('a content script reloaded into a turn already in flight', () => {
     expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
   });
 
-  it.each([[false, 1], [true, 0]])('treats a clean, lasting regeneration of the settled question as a turn (failure banner: %s)', async (banner, starts) => {
+  it.each([[null, 1], ['Message delivery timed out. Please try again.', 0],
+    // A German account, 2026-10-14: these banners were not read as failures, so every recovery
+    // reload claimed a phantom turn for the dead question and cancelled its own Continue.
+    ['Zeitüberschreitung bei der Übermittlung der Nachricht. Bitte versuche es erneut.', 0],
+    ['Verbindung unterbrochen. Warten auf die vollständige Antwort.', 0]
+  ] as const)('treats a clean, lasting regeneration of the settled question as a turn (failure banner: %s)', async (banner, starts) => {
     // A Compact & Resume brief rewritten by ChatGPT's Retry after "Resume stream unavailable"
     // is a real generation of the same question; a phantom shows the failure banner instead.
     live = await harness(
@@ -10436,7 +10642,7 @@ describe('a content script reloaded into a turn already in flight', () => {
       midTurn
     );
     await live.hook.pullActivity();
-    if (banner) alertBanner(live.document, 'Message delivery timed out. Please try again.');
+    if (banner) alertBanner(live.document, banner);
     for (let at = 0; at < 7; at++) {
       live.hook.observe();
       await settle();
@@ -13566,6 +13772,9 @@ describe('content-script localization', () => {
     live.hook.toggleMenu();
 
     const control = live.document.querySelector('.clf-compact-btn') as HTMLElement;
+    // The gear is built from DOM nodes, not innerHTML (Mozilla review): still a full SVG with its two shapes.
+    expect(control.querySelector('svg circle')?.getAttribute('r')).toBe('3.1');
+    expect(control.querySelector('svg path')?.getAttribute('d')?.startsWith('M19.4 15a1.65')).toBe(true);
     const menu = live.document.querySelector('.clf-menu') as HTMLElement;
     expect(control.getAttribute('aria-label')).toBe('Chat On Steroids ayarları');
     expect(menu.getAttribute('aria-label')).toBe('Chat On Steroids ayarları');
@@ -16000,6 +16209,8 @@ describe('the fresh chat the app opened', () => {
         error: expect.stringMatching(/page changed|fresh chat|navigation/i)
       })
     ]);
+    // A changed target is not a slow page: it is not offered as a transient failure.
+    expect(live.sent.find((message) => message.type === 'ack')?.detail).toBeUndefined();
   });
 
   it('abandons a redeemed bootstrap when recorder takeover supersedes its document owner', async () => {
@@ -17212,7 +17423,9 @@ describe('the fresh chat the app opened', () => {
         id: 'cmd-enter-noop',
         status: 'failed',
         // #882: the failure names the step Send reached, here a Send button that never enabled.
-        error: 'ChatGPT did not accept the bootstrap send (send-not-ready)'
+        error: 'ChatGPT did not accept the bootstrap send (send-not-ready)',
+        // #1086: refused before the native click, so nothing was sent and a wake may be retried.
+        detail: 'transient'
       })
     ]);
     expect(live.sent.some((message) => message.type === 'ack' && message.status === 'sent')).toBe(false);
@@ -23363,5 +23576,45 @@ describe('a chat deleted in ChatGPT', () => {
     expect(emitted(live.sent, 'chat_error')).toEqual([]);
     expect(emitted(live.sent, 'turn_end')).toEqual([]);
     expect(live.sent.some(message => message.type === 'conversation_deleted')).toBe(false);
+  });
+});
+
+/** A retired worker chat, archived with ChatGPT's own reversible archive when the setting is on (#1460). */
+describe('archiving a retired worker chat', () => {
+  it('archives exactly that chat in this account and nothing else', async () => {
+    live = await harness('https://chatgpt.com/');
+    const chat = 'aaaaaaaa-1111-4222-8333-444444444444';
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: string }> = [];
+    let patchStatus = 200;
+    (live.window as any).fetch = vi.fn(async (url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) => {
+      calls.push({ url: String(url), method: init.method ?? 'GET', headers: init.headers ?? {}, ...(init.body ? { body: init.body } : {}) });
+      if (String(url).endsWith('/api/auth/session')) return { ok: true, status: 200, json: async () => ({ accessToken: 'token-1', account: { id: 'account-1' } }) };
+      return { ok: patchStatus < 300, status: patchStatus, json: async () => ({ success: patchStatus < 300 }) };
+    });
+
+    expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: chat.toUpperCase() })).toEqual({ outcome: 'archived' });
+    expect(calls).toEqual([
+      { url: 'https://chatgpt.com/api/auth/session', method: 'GET', headers: {} },
+      { url: `https://chatgpt.com/backend-api/conversation/${chat}`, method: 'PATCH',
+        headers: { Authorization: 'Bearer token-1', 'Content-Type': 'application/json', 'ChatGPT-Account-Id': 'account-1' },
+        body: JSON.stringify({ is_archived: true }) }
+    ]);
+
+    patchStatus = 429;
+    expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: chat })).toEqual({ outcome: 'failed' });
+    calls.length = 0;
+    expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: '../conversations' })).toEqual({ outcome: 'failed' });
+    expect(calls).toEqual([]);
+  });
+
+  it('fails without a ChatGPT sign-in, before touching the chat', async () => {
+    live = await harness('https://chatgpt.com/');
+    const calls: string[] = [];
+    (live.window as any).fetch = vi.fn(async (url: string) => {
+      calls.push(String(url));
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
+    expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: 'aaaaaaaa-1111-4222-8333-444444444444' })).toEqual({ outcome: 'failed' });
+    expect(calls).toEqual(['https://chatgpt.com/api/auth/session']);
   });
 });

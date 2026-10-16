@@ -920,6 +920,26 @@ describe('popup-only ChatGPT session transfer', () => {
     expect(requests).toHaveLength(1);
   });
 
+  // Without access to chatgpt.com no content script runs: the extension pairs and takes work, but
+  // nothing on the page ever answers. Firefox shows this after a revoked permission, Chrome with
+  // site access "On click"; measured on the VM 2026-10-14, a new chat then sat unclaimed.
+  it.each([[true, true], [false, false], [undefined, undefined]] as const)('reports whether it may access ChatGPT (%s)', async (granted, reported) => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetch = vi.fn(async (input: string, init?: Record<string, unknown>) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') { if (init?.body) bodies.push(JSON.parse(String(init.body))); return response(200, { ok: true, repairs: [] }); }
+      return response(404, {});
+    });
+    const contains = vi.fn(async (_query: { origins?: string[] }) => granted as boolean);
+    const worker = loadWorker({ local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(), fetch,
+      ...(granted === undefined ? {} : { permissions: { contains } }) });
+    await worker.fireAlarm();
+    expect(bodies.length).toBeGreaterThan(0);
+    expect(bodies.at(-1)!.chatgptAccess).toBe(reported);
+    if (granted !== undefined) expect(contains).toHaveBeenCalledWith({ origins: ['https://chatgpt.com/*'] });
+  });
+
   it('reports the browser presence with ChatGPT’s answer, asking once per page load', async () => {
     const presence: unknown[] = [];
     const fetch = vi.fn(async (input: string, init?: Record<string, unknown>) => {
@@ -5884,8 +5904,13 @@ it.each([
   ['assistant-error', { ok: true, draft: false, streaming: false, assistantError: false }, 0],
   ['assistant-error', { ok: true, draft: false, streaming: false }, 1],
   ['assistant-error', null, 1],
-  ['silence', { ok: true, draft: false, streaming: true }, 1]
-])('for reason %s and page status %j reloads %i time(s)', async (reason, status, reloads) => {
+  ['silence', { ok: true, draft: false, streaming: true }, 1],
+  // 2026-10-12: a silent chat still showing ChatGPT's transport error is left for Stop + Continue.
+  ['silence', { ok: true, draft: false, streaming: true, assistantError: true }, 0],
+  ['silence', { ok: true, draft: false, streaming: false, assistantError: false }, 1],
+  // With automatic recovery off and no Goal no Continue follows, so the reload stays.
+  ['silence', { ok: true, draft: false, streaming: true, assistantError: true }, 1, false]
+])('for reason %s and page status %j reloads %i time(s)', async (reason, status, reloads, continueFollows = true) => {
   const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
   const tab = { id: 76, url: `https://chatgpt.com/c/${conversationId}`, discarded: false, frozen: false };
   const reload = vi.fn();
@@ -5899,11 +5924,12 @@ it.each([
     chrome: { tabs: { query: async () => [tab], reload, get: async () => tab, update: vi.fn() } },
     CHATGPT_TAB_URLS: ['https://chatgpt.com/*']
   });
-  await repair([{ conversationId, token: `stream-${reason}`, reason, suspended: false }], {});
+  await repair([{ conversationId, token: `stream-${reason}`, reason, suspended: false, continueFollows }], {});
   expect(reload).toHaveBeenCalledTimes(reloads);
   const reported = call.mock.calls.map((args: unknown[]) => String(args[0]));
-  if (reason === 'assistant-error' && status?.ok === true && status.streaming !== true &&
-      'assistantError' in status && status.assistantError === false) {
+  if ((reason === 'assistant-error' && status?.ok === true && status.streaming !== true &&
+      'assistantError' in status && status.assistantError === false) ||
+      (reason === 'silence' && continueFollows && status?.ok === true && 'assistantError' in status && status.assistantError === true)) {
     expect(reported.some((url) => url.includes('repaired=') && url.includes('repairAction=preserved'))).toBe(true);
     expect(reported.filter((url) => url.includes('repairFailed='))).toHaveLength(0);
   } else {
@@ -6005,5 +6031,85 @@ describe('this install\'s connector names', () => {
     names = { core: 'COS ERP DB Core', desktop: 'COS ERP DB Desktop', plugins: 'COS ERP DB Plugins' };
     await worker.fireAlarm();
     expect((await worker.send({ type: 'status' }) as any).connectorNames).toEqual(names);
+  });
+});
+
+describe('archiving retired worker chats (#1460)', () => {
+  const chat = 'aaaaaaaa-1111-4222-8333-444444444444';
+  function archiveWorker(outcome: unknown) {
+    const results: unknown[] = [];
+    let next: string | null = chat;
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/worker-archive/next') { const id = next; next = null; return response(200, { conversationId: id }); }
+        if (route === '/worker-archive/result') { results.push(JSON.parse(String(init.body))); return response(200, { ok: true }); }
+        return response(200, {});
+      },
+      tabsSendMessage: async (_tabId, message) => message.type === 'clf-archive-chat' ? outcome : { ok: true }
+    });
+    return { worker, results };
+  }
+
+  it('archives the next chat from a registered ChatGPT page and reports what it said', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'archived' });
+    await worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await worker.registerTab(1);
+    await worker.fireAlarm();
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(1, { type: 'clf-archive-chat', conversationId: chat }, expect.objectContaining({ documentId: expect.any(String) }));
+    expect(results).toEqual([{ conversationId: chat, outcome: 'archived' }]);
+  });
+
+  it('defers when no ChatGPT page of this extension is open', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'archived' });
+    await worker.fireAlarm();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ type: 'clf-archive-chat' }), expect.anything());
+    expect(results).toEqual([{ conversationId: chat, outcome: 'deferred' }]);
+  });
+
+  it('reports a failure the page could not explain as failed', async () => {
+    const { worker, results } = archiveWorker({ outcome: 'deleted' });
+    await worker.createTab({ id: 1, url: 'https://chatgpt.com/' });
+    await worker.registerTab(1);
+    await worker.fireAlarm();
+    expect(results).toEqual([{ conversationId: chat, outcome: 'failed' }]);
+  });
+});
+
+describe('a ChatGPT page that moves to a new address', () => {
+  const chat = 'bbbbbbbb-1111-4222-8333-444444444444';
+  function routeWorker() {
+    return loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      fetch: async (input) => new URL(input).pathname === '/hello'
+        ? response(200, { app: 'chat-on-steroids', paired: true }) : response(200, {})
+    });
+  }
+  const routeNotices = (worker: ReturnType<typeof routeWorker>) =>
+    worker.tabsSendMessage.mock.calls.filter(call => (call[1] as { type?: string }).type === 'clf-route-changed');
+
+  it('tells that same page at once, so a hidden tab need not wait for its own throttled timer', async () => {
+    // 2026-10-15, Firefox: an app-opened chat in a minimized window moved to /c/<id> while its
+    // own once-a-second check ran far less often, so its Send receipt came late.
+    const worker = routeWorker();
+    const documentId = 'route-document-1';
+    await worker.registerTab(5, documentId);
+    const url = `https://chatgpt.com/c/${chat}`;
+    worker.scriptingExecuteScript.mockImplementation(async () => [{ frameId: 0, documentId, result: url }]);
+    worker.updateTab(5, { url }, { id: 5, windowId: 7, url });
+    await vi.waitFor(() => expect(routeNotices(worker)).toEqual([[5, { type: 'clf-route-changed' }, { documentId }]]));
+  });
+
+  it('tells nothing to a page the address change did not happen in', async () => {
+    const worker = routeWorker();
+    await worker.registerTab(5, 'route-document-1');
+    const url = `https://chatgpt.com/c/${chat}`;
+    // Another document answers: the change was a new page load, not this page's own route.
+    worker.scriptingExecuteScript.mockImplementation(async () => [{ frameId: 0, documentId: 'route-document-2', result: url }]);
+    worker.updateTab(5, { url }, { id: 5, windowId: 7, url });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(routeNotices(worker)).toEqual([]);
   });
 });

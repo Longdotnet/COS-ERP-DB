@@ -84,17 +84,38 @@ describe('captured ChatGPT rendered HTML', () => {
   it('renders ChatGPT\'s writing block as a titled quote instead of its raw directive', () => {
     const rendered = renderedMarkdown(':::writing{variant="standard" id="58321" title="Clear <rewrite>"}\nWe want the app to be **faster**.\n:::\n\nAfter the block.');
     const quote = rendered.querySelector('blockquote')!;
-    expect(quote.querySelector('strong')?.textContent).toBe('Clear <rewrite>');
+    expect(rendered.querySelector('.markdown-writing .tool-output-header strong')?.textContent).toBe('Clear <rewrite>');
     expect(quote.textContent).toContain('We want the app to be faster.');
-    expect(quote.querySelectorAll('strong')).toHaveLength(2);
+    expect(quote.querySelectorAll('strong')).toHaveLength(1);
     expect(rendered.textContent).not.toContain(':::');
     expect(rendered.textContent).toContain('After the block.');
     // A block still streaming, or an answer stopped inside it, has no closing `:::` yet. ChatGPT
     // draws it as the block to the end of the message; it showed here as its raw directive.
     const open = renderedMarkdown(':::writing{variant="document" title="The Keeper"}\nElias kept the light.\n\nThen Mara came.');
-    expect(open.querySelector('blockquote strong')?.textContent).toBe('The Keeper');
+    expect(open.querySelector('.markdown-writing .tool-output-header strong')?.textContent).toBe('The Keeper');
     expect(open.querySelector('blockquote')?.textContent).toContain('Then Mara came.');
     expect(open.textContent).not.toContain(':::writing');
+  });
+
+  // #1477: ChatGPT gives a writing block its own Copy button; the app showed a quote with nothing to copy it by.
+  it('gives a writing block a Copy button that copies the block\'s own text, Markdown included', async () => {
+    const writeClipboard = vi.fn(async () => ({ ok: true, data: true }));
+    // chat.ts holds the api object it found at import; give that object the call.
+    Object.assign((dom.window as unknown as { api: object }).api, { writeClipboard });
+    const rendered = renderedMarkdown('Here is the email.\n\n:::writing{id="48317" variant="email" subject="New release is out"}\nHi, the new release is **out**.\n\n- Notes are online\n:::\n\nAnything else?');
+    const panels = rendered.querySelectorAll('.markdown-writing');
+    expect(panels).toHaveLength(1);
+    expect(panels[0]!.querySelector('.tool-output-header strong')?.textContent).toBe('New release is out');
+    const copy = panels[0]!.querySelector<HTMLButtonElement>('.tool-copy')!;
+    expect(copy.textContent).toBe('Copy');
+    copy.click();
+    await vi.waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('Hi, the new release is **out**.\n\n- Notes are online'));
+    expect(rendered.textContent).toContain('Here is the email.');
+    expect(rendered.textContent).toContain('Anything else?');
+    expect(rendered.textContent).not.toContain(':::');
+    // An untitled block still gets the panel, named by what it is.
+    const plain = renderedMarkdown(':::writing{variant="standard"}\nJust text.\n:::');
+    expect(plain.querySelector('.markdown-writing .tool-output-header strong')?.textContent).toBe('Text');
   });
 
   it('shows the page\'s resolved content for a content-reference reply instead of the raw pointer (#574)', () => {
@@ -531,6 +552,19 @@ c & d
     expect(separateDisplayMath('A:\n$$\nx\n=\ny\n$$\nB')).toBe('A:\n\n$$\nx\n=\ny\n$$\nB');
     expect(separateDisplayMath('```\ntext\n$$\n```\nC:\n\\[\nz\n\\]')).toBe('```\ntext\n$$\n```\nC:\n\n\\[\nz\n\\]');
     expect(separateDisplayMath('Price $5 and $6.')).toBe('Price $5 and $6.');
+  });
+
+  it('draws a GPT-6 answer read from its fallback text: aligned blocks, \\\\[10pt] and inline formulas (#1342)', () => {
+    // The reply as the extension hands it over once formulas keep their LaTeX (recorded 2026-10-12).
+    const rendered = renderedMarkdown("The Lindhard dielectric function, as discussed in *Solid State Physics* by Ashcroft and Mermin, describes the electronic screening response of a noninteracting electron gas.\n\n\\[\n\\begin{aligned}\n\\varepsilon(\\mathbf{q},\\omega)\n\\\\\n=\n\\\\\n1-\\frac{4\\pi e^2}{q^2}\n\\frac{2}{V}\n\\sum_{\\mathbf{k}}\n\\frac{\nf\\!\\left(\\epsilon_{\\mathbf{k}+\\mathbf{q}}\\right)\n-\nf\\!\\left(\\epsilon_{\\mathbf{k}}\\right)\n}{\n\\epsilon_{\\mathbf{k}+\\mathbf{q}}\n-\n\\epsilon_{\\mathbf{k}}\n-\n\\hbar(\\omega+i0^+)\n}\n\\end{aligned}\n\\]\n\nHere, \\(\\mathbf{q}\\) is the wave vector of the perturbation, with magnitude \\(q=|\\mathbf{q}|\\).\n\n\\[\n\\begin{aligned}\n\\epsilon_{\\mathbf{k}} &= \\frac{\\hbar^2 k^2}{2m}\n\\\\[10pt]\nf(\\epsilon) &= \\frac{1}{e^{(\\epsilon-\\mu)/(k_B T)}+1}\n\\end{aligned}\n\\]\n\n[ok] 2^10 = 1024 a_b *star*");
+    expect(rendered.querySelectorAll('.math-display .katex-display')).toHaveLength(2);
+    expect(rendered.querySelectorAll('.math-inline .katex')).toHaveLength(2);
+    expect(rendered.querySelector('h1, h2, .is-source')).toBeNull();
+    // What is drawn, not the source KaTeX keeps for screen readers.
+    const shown = [...rendered.querySelectorAll('.katex-html')].map(node => node.textContent).join(' ');
+    expect(shown).toContain('ℏ');
+    expect(shown).not.toContain(String.raw`\frac`);
+    expect(rendered.querySelector('p:last-of-type')!.textContent).toContain('[ok] 2^10 = 1024 a_b');
   });
 
   it('shows the name of a person or place ChatGPT links, instead of dropping it', () => {

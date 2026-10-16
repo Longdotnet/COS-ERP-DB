@@ -35,6 +35,10 @@ vi.mock('electron', () => ({
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
 vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: vi.fn(async () => 'chrome.exe') }));
+const surfacePaths = vi.hoisted(() => ({ forget: vi.fn(async () => undefined) }));
+vi.mock('../src/main/mcp/persistent-paths.js', () => ({
+  loadSurfaceTokens: vi.fn(async () => ({})), rememberSurfaceTokens: vi.fn(async () => true), forgetSurfaceTokens: surfacePaths.forget
+}));
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests } = await import('../src/main/secrets.js');
@@ -64,6 +68,7 @@ const {
 } = await import('../src/main/agents.js');
 const { registerIpc, cleanSessionName } = await import('../src/main/ipc.js');
 const { openInPreferredBrowser } = await import('../src/main/browser.js');
+const bridgeModule = await import('../src/main/bridge.js');
 const { app, nativeTheme, safeStorage, shell, dialog } = await import('electron');
 const { extensionDownloadUrl } = await import('../src/main/version.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
@@ -100,7 +105,7 @@ it('keeps the reported interface language and the extension preferences through 
   expect(getConfig().ui.browserPreferences).toEqual({ overwrite: false, durations: true });
 });
 
-it.each(['playfulStatus', 'followOutput'] as const)('saves the %s display switch from Settings', async key => {
+it.each(['playfulStatus', 'playfulContinue', 'followOutput'] as const)('saves the %s display switch from Settings', async key => {
   // Both are plain ui booleans saved by the general Settings save. The save schema dropped keys
   // it did not list, so a switch that was not listed reverted on the next state push.
   const base = getConfig();
@@ -393,6 +398,17 @@ it('publishes the owning session when delivered input history is revised in plac
   }
 });
 
+// #924: turning stable connector URLs off forgets the stored tokens; turning it on keeps the running ones.
+it('forgets the stored connector URL tokens when the option is turned off', async () => {
+  surfacePaths.forget.mockClear();
+  expect(await save({ ...getConfig(), mcp: { instructions: getConfig().mcp.instructions, persistentUrls: true } })).toMatchObject({ ok: true });
+  expect(getConfig().mcp.persistentUrls).toBe(true);
+  expect(surfacePaths.forget).not.toHaveBeenCalled();
+  expect(await save({ ...getConfig(), mcp: { instructions: getConfig().mcp.instructions, persistentUrls: false } })).toMatchObject({ ok: true });
+  expect(getConfig().mcp.persistentUrls).toBe(false);
+  expect(surfacePaths.forget).toHaveBeenCalledTimes(1);
+});
+
 it('stages clipboard image bytes with a preview through the general attachment owner', async () => {
   const drop = (payload: unknown) => handlers.get('sessions:dropFiles')!(null, payload) as Promise<any>;
   expect(await drop({ files: [] })).toMatchObject({ ok: false });
@@ -651,6 +667,7 @@ describe('explicit settings replace the published tool contract', () => {
       const before = snapshot();
       const beforeState = await handlers.get('state:get')!(null, undefined) as any;
       expect(beforeState.data.connectorSchemas.core).toBe(before.schemaId);
+      expect(beforeState.data.connectorRefresh.core).toEqual({ schemaId: before.schemaId, state: 'unknown' });
       const tool = kind === 'finish' ? 'session_finish' : 'exec_command';
       expect(before.tools.map(row => row.name)).toContain(tool);
       expect(before.tools.map(row => row.name)).not.toContain('session');
@@ -955,14 +972,14 @@ describe('settings writes from more than one UI', () => {
     const base = defaultConfig(); await saveConfig(base);
     const wanted = { ...base, mcp: { instructions: 'Use the approved project only.' }, ui: { ...base.ui, browserOnly: true } };
     expect((await save(wanted, base)).ok).toBe(true);
-    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).mcp).toEqual(wanted.mcp);
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8')).mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     expect(getConfig().ui.browserOnly).toBe(true);
     expect((await save({ ...base, ui: { ...base.ui, minimizeToTray: !base.ui.minimizeToTray } }, base)).ok).toBe(true);
-    expect(getConfig().mcp).toEqual(wanted.mcp);
+    expect(getConfig().mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     expect(getConfig().ui.browserOnly).toBe(true);
     const legacy = { ...base } as any; delete legacy.mcp;
     expect((await save(legacy, legacy)).ok).toBe(true);
-    expect(getConfig().mcp).toEqual(wanted.mcp);
+    expect(getConfig().mcp).toEqual({ ...wanted.mcp, persistentUrls: false });
     const current = getConfig();
     expect((await save({ ...current, mcp: { instructions: '' } }, current)).ok).toBe(true);
     expect(getConfig().mcp.instructions).toBe('');
@@ -1302,6 +1319,34 @@ describe('every link the window offers', () => {
     }
   });
 
+  it("hands Setup's extensions address over by clipboard, because browsers ignore their own pages from outside", async () => {
+    const { clipboard } = await import('electron');
+    const write = vi.spyOn(clipboard, 'writeText');
+    try {
+      for (const browser of ['chrome', 'edge', 'brave'] as const) {
+        write.mockClear();
+        vi.mocked(openInPreferredBrowser).mockClear();
+        expect(await handlers.get('browser:setupOpen')!(null, { browser, page: 'extensions' })).toEqual({ ok: true, data: true });
+        expect(write).toHaveBeenCalledWith(`${browser}://extensions`);
+        // Only a blank tab to paste into: the browser would open its internal page as a new tab instead.
+        expect(openInPreferredBrowser).toHaveBeenCalledWith('about:blank', { browser, reveal: true });
+      }
+      // A copy that fails is reported, and no browser comes up for an address that is not there.
+      write.mockClear();
+      vi.mocked(openInPreferredBrowser).mockClear();
+      write.mockRejectedValueOnce(new Error('clipboard unavailable') as never);
+      expect(await handlers.get('browser:setupOpen')!(null, { browser: 'chrome', page: 'extensions' })).toMatchObject({ ok: false });
+      expect(openInPreferredBrowser).not.toHaveBeenCalled();
+      write.mockClear();
+      vi.mocked(openInPreferredBrowser).mockClear();
+      await handlers.get('browser:setupOpen')!(null, { browser: 'edge', page: 'chatgpt' });
+      expect(openInPreferredBrowser).toHaveBeenCalledWith('https://chatgpt.com/', { browser: 'edge', reveal: true });
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it('serializes non-Error throws into a real IPC error string', async () => {
     vi.mocked(shell.openExternal).mockRejectedValueOnce('Windows shell refused the request');
     const reply = (await handlers.get('link:open')!(null, {
@@ -1319,6 +1364,53 @@ describe('every link the window offers', () => {
  * press that closed the window and installed nothing would be worse than no button at all.
  */
 describe('installing a downloaded update on request', () => {
+  it('reports the failed app check after requesting the running connectors without quitting or changing settings', async () => {
+    const updater = await import('../src/main/update.js');
+    const connections = await import('../src/main/connection.js');
+    const refresh = await import('../src/main/plugin-refresh.js');
+    const connected = vi.spyOn(connections, 'connect').mockResolvedValue(undefined);
+    const requested = vi.spyOn(refresh, 'requestPluginRefreshes').mockResolvedValue(undefined);
+    const checked = vi.spyOn(updater, 'checkForUpdates').mockResolvedValue(undefined);
+    const status = vi.spyOn(updater, 'updateStatus').mockReturnValue({ current: '2.1.31', latest: null, stage: 'failed', checkedAt: null, error: 'Network unavailable' });
+    const before = structuredClone(getConfig()), quits = quitToInstallCalls;
+    try {
+      const reply = await handlers.get('update:all')!(null, undefined);
+      expect(reply).toEqual({ ok: false, error: 'Network unavailable' });
+      expect(checked).toHaveBeenCalledTimes(1);
+      expect(connected).toHaveBeenCalledTimes(1);
+      expect(requested).toHaveBeenCalledWith('2.1.31', expect.arrayContaining(['core']));
+      expect(quitToInstallCalls).toBe(quits); expect(getConfig()).toEqual(before);
+    } finally { checked.mockRestore(); status.mockRestore(); connected.mockRestore(); requested.mockRestore(); }
+  });
+  it.each([
+    ['unapproved', undefined], ['other-version', '98.0.0'], ['approve', '99.0.0'], ['changed-installer', '99.0.0']
+  ] as const)('restarts only for the version the app approved: %s', async (outcome, approved) => {
+    // The question is asked in the app's own dialog; the window calls again with that version.
+    const updater = await import('../src/main/update.js');
+    const refresh = await import('../src/main/plugin-refresh.js');
+    const checked = vi.spyOn(updater, 'checkForUpdates').mockResolvedValue(undefined);
+    const status = vi.spyOn(updater, 'updateStatus').mockReturnValue({ current: '2.1.35', latest: '99.0.0', stage: 'ready', checkedAt: 1, error: null });
+    const marked = vi.spyOn(updater, 'markInstallOnQuit').mockReturnValue(outcome !== 'changed-installer');
+    const requested = vi.spyOn(refresh, 'requestPluginRefreshes').mockResolvedValue(undefined);
+    const quits = quitToInstallCalls;
+    try {
+      const reply = await handlers.get('update:all')!(null, approved);
+      expect(dialog.showMessageBox).not.toHaveBeenCalled();
+      if (outcome === 'unapproved' || outcome === 'other-version') {
+        expect(reply).toEqual({ ok: true, data: 'confirm' });
+        expect(requested).not.toHaveBeenCalled(); expect(marked).not.toHaveBeenCalled(); expect(quitToInstallCalls).toBe(quits);
+      } else {
+        expect(marked).toHaveBeenCalledExactlyOnceWith('99.0.0');
+        if (outcome === 'approve') {
+          expect(reply).toEqual({ ok: true, data: 'restarting' }); expect(quitToInstallCalls).toBe(quits + 1);
+        } else {
+          expect(reply).toMatchObject({ ok: false }); expect(quitToInstallCalls).toBe(quits);
+        }
+      }
+    } finally {
+      checked.mockRestore(); status.mockRestore(); marked.mockRestore(); requested.mockRestore();
+    }
+  });
   it('refuses, and does not quit, when nothing has been downloaded', async () => {
     const before = quitToInstallCalls;
     const reply = (await handlers.get('update:install')!(null, undefined)) as { ok: boolean; error: string };
@@ -1994,6 +2086,47 @@ describe('session IPC contracts', () => {
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/no valid ChatGPT conversation/i);
   });
+
+  it.each([
+    ['cos', true],
+    ['cos', false],
+    ['chrome', true],
+    ['chrome', false],
+    ['edge', true],
+    ['edge', false],
+    ['brave', true],
+    ['brave', false]
+  ] as const)(
+    'routes history chat with preference %s when extension claim is %s',
+    async (browser, extensionClaimsChat) => {
+      const original = getConfig();
+      const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      const session = await createSession({ title: 'route by browser preference', conversationId });
+      const reveal = vi.spyOn(bridgeModule, 'revealChatInBrowser').mockResolvedValue(extensionClaimsChat);
+      try {
+        await saveConfig({ ...original, ui: { ...original.ui, chatBrowser: browser } });
+        vi.mocked(openInPreferredBrowser).mockClear();
+
+        const reply = await handlers.get('sessions:openChat')!(null, { id: session.id }) as any;
+
+        expect(reply.ok, reply.error).toBe(true);
+        const url = `https://chatgpt.com/c/${conversationId}`;
+        if (browser === 'cos') {
+          expect(reveal).not.toHaveBeenCalled();
+          expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+        } else if (extensionClaimsChat) {
+          expect(reveal).toHaveBeenCalledWith(conversationId);
+          expect(openInPreferredBrowser).not.toHaveBeenCalled();
+        } else {
+          expect(reveal).toHaveBeenCalledWith(conversationId);
+          expect(openInPreferredBrowser).toHaveBeenCalledWith(url, { reveal: true });
+        }
+      } finally {
+        reveal.mockRestore();
+        await saveConfig(original);
+      }
+    }
+  );
 });
 
 it('follows only the newest chat selection when an earlier lookup finishes last (#1249, #1267)', async () => {
@@ -2231,4 +2364,49 @@ describe('native worker checkout cleanup confirmation', () => {
       expect(refused).toEqual({ ok: false, error: 'The checkout changed while you were reviewing it. No files were removed.' });
     });
   });
+});
+
+it('projects reloaded unreadable ledger health through state:get and recovers only through explicit reset', async () => {
+  const file = path.join(dir, 'state', 'plugin-refresh.json');
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, '{broken');
+  initDurableStore(dir);
+  const broken: any = await handlers.get('state:get')!(null, undefined);
+  expect(broken).toMatchObject({ ok: true, data: { pluginRefreshUnreadable: true } });
+  expect(await fs.readFile(file, 'utf8')).toBe('{broken');
+  const reset: any = await handlers.get('plugin-refresh:reset')!(null, undefined);
+  expect(reset).toMatchObject({ ok: true, data: { pluginRefreshUnreadable: false } });
+  expect(await readDurable('plugin-refresh')).toEqual([]);
+  const backups = (await fs.readdir(path.dirname(file))).filter(name => name.startsWith('plugin-refresh.recovery-'));
+  expect(await fs.readFile(path.join(path.dirname(file), backups.at(-1)!), 'utf8')).toBe('{broken');
+});
+
+// #1406: the recording store held a fixed 2 GB. Settings now offers larger sizes, applied at once.
+it('saves the recording storage size and applies it to the store', async () => {
+  const store = await import('../src/main/session/store.js');
+  await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 10 } });
+  expect(getConfig().sessions.storageLimitGiB).toBe(10);
+  expect(await store.getImageStorage()).toMatchObject({ limitBytes: 10 * 2 ** 30 });
+  // Only offered sizes are accepted.
+  expect(await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 3 } })).toMatchObject({ ok: false, error: 'Invalid input' });
+  expect(getConfig().sessions.storageLimitGiB).toBe(10);
+  await save({ ...getConfig(), sessions: { ...getConfig().sessions, storageLimitGiB: 2 } });
+  expect(await store.getImageStorage()).toMatchObject({ limitBytes: 2 * 2 ** 30 });
+});
+
+// Most installs from before Automatic plugin refresh existed have it saved as off without ever
+// choosing that. The app asks once; the answer is kept either way, and a settings save keeps it.
+it('records the one-time answer to the automatic plugin refresh offer', async () => {
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
+  expect(getConfig().ui.autoRefreshPluginsAsked).toBe(false);
+  const declined: any = await handlers.get('pluginRefresh:offer')!(null, { turnOn: false });
+  expect(declined).toMatchObject({ ok: true, data: { config: { ui: { autoRefreshPlugins: false, autoRefreshPluginsAsked: true } } } });
+  // A later settings save from the window does not bring the question back.
+  await save({ ...getConfig(), ui: { ...getConfig().ui, theme: 'light' } });
+  expect(getConfig().ui.autoRefreshPluginsAsked).toBe(true);
+
+  await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
+  const accepted: any = await handlers.get('pluginRefresh:offer')!(null, { turnOn: true });
+  expect(accepted).toMatchObject({ ok: true, data: { config: { ui: { autoRefreshPlugins: true, autoRefreshPluginsAsked: true } } } });
+  expect(await handlers.get('pluginRefresh:offer')!(null, { turnOn: 'yes' })).toMatchObject({ ok: false });
 });

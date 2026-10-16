@@ -717,6 +717,26 @@ describe('Core app mention on app-owned sends (#861)', () => {
     expect(clicked.textContent!.trim().startsWith('Exact app prompt')).toBe(true);
     expect(api.messages().find(message => message.role === 'user')?.text).toBe('Exact app prompt');
   });
+  it('clicks Send once the editor drew the token while this page\'s timers are held back', async () => {
+    // 2026-10-15, Firefox: in the minimized window that holds app-opened chats, a 0 ms timer
+    // fired 25 s late. The editor had drawn the token at once; the wait for one task was the delay.
+    (dom.window as unknown as { MessageChannel: typeof MessageChannel }).MessageChannel = MessageChannel;
+    let clicked = false;
+    button.addEventListener('click', () => {
+      clicked = true;
+      dom.reconfigure({ url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+      mentionedUser('Exact app prompt'); box.replaceChildren();
+    });
+    const result = api.send({ mention });
+    // Real tasks pass; no timer of this page fires.
+    for (let task = 0; task < 5 && !clicked; task++) await new Promise(resolve => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => { channel.port1.close(); resolve(null); };
+      channel.port2.postMessage(null);
+    });
+    expect(clicked).toBe(true);
+    expect(await result).toBe(true);
+  });
   it('removes its own token again when Send is not accepted', async () => {
     const result = api.send({ mention, acceptanceTimeoutMs: 1000 });
     await vi.advanceTimersByTimeAsync(1100);
@@ -1243,6 +1263,74 @@ describe('native image readiness', () => {
 });
 
 
+describe('transport failures in German', () => {
+  // Measured 2026-10-14 on a German account: a long answer whose stream broke showed
+  // "Verbindung unterbrochen…" after every reload, and its end the delivery timeout alert with
+  // "Erneut versuchen". Neither was a failure, so each recovery reload claimed a phantom turn.
+  it('recognises the delivery timeout alert with its localized Retry', () => {
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.innerHTML = '<p>Zeitüberschreitung bei der Übermittlung der Nachricht. Bitte versuche es erneut.</p><button>Erneut versuchen</button>';
+    document.body.append(alert);
+    expect(api.errors()).toEqual([expect.objectContaining({ recoverable: true })]);
+    alert.remove();
+  });
+
+  it('recognises the interrupted-connection notice', () => {
+    const card = document.createElement('div');
+    card.innerHTML = '<p>Verbindung unterbrochen. Warten auf die vollständige Antwort.</p><button>Erneut versuchen</button>';
+    document.body.append(card);
+    expect(api.errors()).toEqual([
+      expect.objectContaining({ text: 'Verbindung unterbrochen. Warten auf die vollständige Antwort.', recoverable: true })
+    ]);
+    card.remove();
+  });
+
+  it('still ignores other German announcements', () => {
+    for (const text of ['Einstellungen gespeichert', 'Die Verbindung wurde unterbrochen, als ich den Server neu startete.']) {
+      const alert = document.createElement('div');
+      alert.setAttribute('role', 'alert');
+      alert.textContent = text;
+      document.body.append(alert);
+      expect(api.errors(), text).toEqual([]);
+      alert.remove();
+    }
+  });
+});
+
+describe('transport failures in Portuguese', () => {
+  // Measured 2026-10-12 on a pt-BR account: a send ChatGPT could not deliver showed this alert with
+  // its Retry button, and the dropped answer "Conexão interrompida…". Read only in English, neither
+  // was a failure, so the undelivered message counted as sent and nothing retried it.
+  it('recognises the delivery timeout alert with its localized Retry', () => {
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.innerHTML = '<p>A entrega da mensagem atingiu o tempo limite. Tente novamente.</p><button>Tentar novamente</button>';
+    document.body.append(alert);
+    expect(api.errors()).toEqual([expect.objectContaining({ recoverable: true })]);
+    alert.remove();
+  });
+
+  it('recognises the interrupted-connection card by its Retry control', () => {
+    const card = document.createElement('div');
+    card.innerHTML = '<p>Conexão interrompida. Aguardando a resposta completa </p><button>Tentar novamente</button>';
+    document.body.append(card);
+    expect(api.errors()).toEqual([
+      expect.objectContaining({ text: 'Conexão interrompida. Aguardando a resposta completa', recoverable: true })
+    ]);
+    card.remove();
+  });
+
+  it('still ignores other Portuguese announcements', () => {
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.textContent = 'Configurações salvas';
+    document.body.append(alert);
+    expect(api.errors()).toEqual([]);
+    alert.remove();
+  });
+});
+
 describe('transport-card scan cost', () => {
   it('skips hundreds of sidebar buttons without reading innerText and still finds the real card', () => {
     const sidebar = document.createElement('nav');
@@ -1509,5 +1597,29 @@ describe('locale-independent provider composer evidence', () => {
     expect(tool.getAttribute('data-clf-native-hidden')).toBe('1');
     expect(disclosure.getAttribute('data-clf-native-hidden')).toBe('1');
     expect(action.closest('[data-clf-native-hidden]')).toBeNull();
+  });
+});
+
+// 2026-10-15: the diagnostics report says which of ChatGPT's controls the extension still finds,
+// so a report after ChatGPT changed its page says what broke without a follow-up question.
+describe('page checks for the diagnostics report', () => {
+  type Checks = { composer: boolean; sendArea: boolean; modelMenu: boolean; plusMenu: boolean; language: string | null };
+  const checks = () => (api as unknown as { pageChecks(): Checks }).pageChecks();
+
+  it('finds the composer, its send area and the model menu on a normal page, and names the page language', () => {
+    document.documentElement.lang = 'de-DE';
+    const plus = document.createElement('button'); plus.id = 'composer-plus-btn'; document.querySelector('form')!.prepend(plus);
+    expect(checks()).toEqual({ composer: true, sendArea: true, modelMenu: true, plusMenu: true, language: 'de-DE' });
+    // Measured 2026-10-15: the current composer's + button has no id, only its navigation target.
+    plus.removeAttribute('id'); plus.setAttribute('data-composer-navigation-target', 'add-context');
+    expect(checks().plusMenu).toBe(true);
+    plus.remove();
+    expect(checks().plusMenu).toBe(false);
+  });
+
+  it('says what is missing when ChatGPT moved things, and reports no text from the page', () => {
+    document.querySelector('form')!.remove();
+    document.documentElement.lang = 'en <script>';
+    expect(checks()).toEqual({ composer: false, sendArea: false, modelMenu: false, plusMenu: false, language: null });
   });
 });

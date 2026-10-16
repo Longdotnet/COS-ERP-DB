@@ -894,8 +894,10 @@
    */
   const SENT_REQUEST_MS = 10_000;
   const sentRequests = [];
-  function sentRequestSince(since) {
-    const sent = sentRequests.find(entry => entry.epoch === epoch && entry.at >= since);
+  // A Send started in this document's earlier epoch keeps its request when the first route of
+  // the chat it opened advances the epoch (submittedSendLifetime holds that send through it).
+  function sentRequestSince(since, sendEpoch = epoch) {
+    const sent = sentRequests.find(entry => entry.epoch === sendEpoch && entry.at >= since);
     return sent && sent.at - since <= SENT_REQUEST_MS ? { id: sent.id } : null;
   }
   /** Temporary-planner-only fallback for an accepted user row left on the immediately older Fiber scan. */
@@ -2698,6 +2700,7 @@
     genNode = null;
   }
 
+  let observedRoute = null;
   function observe() {
     // This duplicate source document is only the native Project entry point. Its transcript
     // belongs to A's original recorder; do not adopt it while preparing the fresh composer.
@@ -2756,6 +2759,11 @@
           pendingObjectiveSend = opening.receipt;
           pendingObjectiveSend.current = submittedSendLifetime(id, epoch);
         }
+        // A Send the app already accepted for exactly this new chat moves with it, so its answer
+        // still opens the first turn. A hidden tab can prove the Send (ChatGPT's request and the
+        // new address) before this page adopts that address (2026-10-15).
+        const acceptedSend = userSendReceipt?.accepted;
+        if (acceptedSend && acceptedSend.conversationId === id && acceptedSend.epoch === epoch - 1) acceptedSend.epoch = epoch;
         // The same question boot asks, at the same moment boot asks it: which of this chat's
         // user messages does the app already hold? resetConversation() has just armed the
         // identity gate, and until it is answered this document reads no transcript at all,
@@ -2792,6 +2800,14 @@
     }
     publishHistoryRateLimit();
     flushStreamRequestOrigins();
+    // A Send waiting on its receipt re-checks once this document has taken a new address. A
+    // hidden tab (Firefox's minimized window for app-opened chats) can move to /c/<id> without
+    // drawing anything, and the receipt then waited for the next redraw: 40-95 s, once never
+    // (2026-10-15). After the adoption above, so the receipt belongs to the new chat's epoch.
+    if (id !== observedRoute) {
+      observedRoute = id;
+      if (id) for (const check of pageViewChecks) void check();
+    }
     // Route assignment and authored text can arrive in either order. This receipt is
     // evaluated on the existing observer, rather than only on the one route-change edge.
     if (id && pendingObjectiveSend?.accepted && pendingObjectiveSend.current()) {
@@ -6925,6 +6941,30 @@
     }
   }
 
+  /**
+   * ChatGPT's tool approval card, answered from the app (2.1.38). Each card element gets one id for
+   * as long as it stands; the app files an answer for that id, and this document presses Deny or
+   * Allow once only while it still shows that very card. Each answer token is carried out once, and
+   * its outcome travels back on the next poll.
+   */
+  const approvalCardIds = new WeakMap();
+  const approvalTokensDone = new Set();
+  let approvalResult = null;
+  function currentApprovalCard() {
+    const card = CLF_DOM.approvalCard();
+    if (!card) return null;
+    if (!approvalCardIds.has(card.node)) approvalCardIds.set(card.node, crypto.randomUUID());
+    return { id: approvalCardIds.get(card.node), lines: card.lines, allow: card.allow, node: card.node };
+  }
+  function answerApproval(answer) {
+    if (!answer || typeof answer.token !== 'string' || approvalTokensDone.has(answer.token)) return;
+    approvalTokensDone.add(answer.token);
+    const card = currentApprovalCard();
+    const outcome = card && card.id === answer.cardId ? CLF_DOM.answerApprovalCard(card.node, answer.choice) : 'card_changed';
+    approvalResult = { token: answer.token, outcome };
+    setTimeout(() => void pullActivity(), 400);
+  }
+
   async function pullActivity() {
     if (!CLF_DOM.conversationId()) {
       // A New Chat has no feed: /activity is addressed by conversation, and this composer is
@@ -6940,6 +6980,8 @@
     const forId = conversationId;
     const forEpoch = epoch;
     const current = () => alive && conversationId === forId && epoch === forEpoch;
+    const approvalCard = currentApprovalCard();
+    const sentResult = approvalResult;
     try {
       const reply = await ask({
         type: 'activity',
@@ -6950,9 +6992,13 @@
         // This document's own open turn, which it closes itself on end_turn or after ten
         // minutes without progress. Keeps a long-thinking worker from being slept as silent.
         generating,
-        // ChatGPT's own approval card: the turn waits for a person, so the app tells them.
-        approval: CLF_DOM.approvalWaiting()
+        // ChatGPT's own approval card: the turn waits for a person, so the app tells them and
+        // shows its words, and an answer given in the app comes back on this same feed.
+        approval: Boolean(approvalCard),
+        ...(approvalCard ? { approvalCard: { id: approvalCard.id, lines: approvalCard.lines, allow: approvalCard.allow } } : {}),
+        ...(sentResult ? { approvalResult: sentResult } : {})
       });
+      if (sentResult && reply && reply.ok === true && approvalResult === sentResult) approvalResult = null;
       if (!reply || reply.ok !== true || !reply.data) {
         // Keep waiting only for failures that can genuinely mean "the local app/worker is
         // not reachable yet". A structured application refusal is an answer to the identity
@@ -6963,6 +7009,7 @@
       }
       if (!current()) return;
       const data = reply.data;
+      if (data.approvalAnswer) answerApproval(data.approvalAnswer);
       // Popup-only. `sessionId` is the app saying it has a session for this exact chat,
       // which is the difference between "delivered" and "the app is actually recording it".
       observed.session = typeof data.sessionId === 'string' ? data.sessionId : null;
@@ -7826,17 +7873,23 @@
    * outlines in `currentColor`, and this has to sit in a row of them without announcing that
    * it came from somewhere else.
    */
-  const ICON =
-    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
-    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-    '<circle cx="12" cy="12" r="3.1"/>' +
-    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 ' +
-    '1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 ' +
-    '0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 ' +
-    '0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 ' +
-    '0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 ' +
-    '2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>' +
-    '</svg>';
+  /**
+   * The gear on the compact button, built from DOM nodes rather than markup: Mozilla's add-on
+   * review flags any `innerHTML` assignment, and the Firefox package shares this file.
+   */
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const ICON_PATH = 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z';
+  function gearIcon() {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    for (const [name, value] of [['width', '20'], ['height', '20'], ['viewBox', '0 0 24 24'], ['fill', 'none'], ['stroke', 'currentColor'],
+      ['stroke-width', '1.7'], ['stroke-linecap', 'round'], ['stroke-linejoin', 'round'], ['aria-hidden', 'true']]) svg.setAttribute(name, value);
+    const circle = document.createElementNS(SVG_NS, 'circle');
+    circle.setAttribute('cx', '12'); circle.setAttribute('cy', '12'); circle.setAttribute('r', '3.1');
+    const gear = document.createElementNS(SVG_NS, 'path');
+    gear.setAttribute('d', ICON_PATH);
+    svg.append(circle, gear);
+    return svg;
+  }
 
   /** The switch itself, one per settings row. Two nodes so the knob can slide. */
   function buildSwitch() {
@@ -7892,7 +7945,7 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'clf-compact-btn';
-    button.innerHTML = ICON;
+    button.append(gearIcon());
 
     /**
      * The context meter: a bar around the button that fills as the conversation does.
@@ -11886,10 +11939,12 @@
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
     step('composer');
     const readyComposer = await waitForComposer();
+    // `transient`: this page redeemed the command, loaded the chat and typed nothing, so a wake
+    // may be tried again without counting against the chat (#1086).
     if (!readyComposer) return void (await fail(t(
       'content_bootstrap_composer_unavailable',
       'ChatGPT never exposed a usable composer for bootstrap'
-    )));
+    ), 'transient'));
     if (await failIfRetargeted()) return;
 
     if (boot.model || boot.reasoningEffort) step('model');
@@ -11910,7 +11965,7 @@
       return void (await fail(t(
         'content_bootstrap_composer_unavailable',
         'ChatGPT never re-exposed a usable composer after model selection'
-      )));
+      ), 'transient'));
     }
     const selectionConfirmedAt = Date.now();
     const publishBootstrapSelection = async (id) => {
@@ -12103,7 +12158,9 @@
       // to send (#864). Clear only our own unchanged text; anything the user typed stays.
       await bootstrapDraft.clear();
       const notAccepted = t('content_bootstrap_send_not_accepted', 'ChatGPT did not accept the bootstrap send');
-      return void (await fail(sendRefusal ? `${notAccepted} (${sendRefusal})` : notAccepted));
+      // Refusals decided before the native Send click: nothing reached ChatGPT (#1086).
+      const beforeSend = ['draft-changed', 'page-busy', 'mention-changed', 'send-not-ready'].includes(sendRefusal);
+      return void (await fail(sendRefusal ? `${notAccepted} (${sendRefusal})` : notAccepted, beforeSend ? 'transient' : undefined));
     }
     agent = boot.agent || null;
     agentCommandId = agent && typeof boot.id === 'string' ? boot.id : null;
@@ -12271,7 +12328,9 @@
 
   function currentActivityPullDelay() {
     const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
-    const active = nativeBusy || Boolean(job && job.busy) || pendingTools > 0;
+    // A standing approval card polls at the active cadence even hidden: an answer given in the app
+    // waits for this document's next poll.
+    const active = nativeBusy || Boolean(job && job.busy) || pendingTools > 0 || CLF_DOM.approvalWaiting();
     // A goal draft lives entirely on this feed — its streamed text is what the stage panel
     // shows, and the finished message only arrives here — so it polls at the live cadence
     // even in a hidden tab, which is exactly the tab this feature runs in.
@@ -12806,7 +12865,8 @@
       (!message.recovery || sendAttempted || !stopRequestedAt) &&
       (!sourceQuiet || sendAttempted || (turnProgressRevision === sourceActivity && turnId === sourceTurn &&
         CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser)) &&
-      (!message.directTurn || sendAttempted || (CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser &&
+      // A first turn's question can be missing from the page (#942); its turn id alone names it.
+      (!message.directTurn || sendAttempted || ((sourceUser === undefined || CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser) &&
         (!turnId || turnId === sourceTurn)));
     // Which onTarget condition failed, in its order, for the release report (#820). A pickup that
     // kept being withdrawn for 17 minutes could not say whether its page moved or its chat changed (#882).
@@ -12814,7 +12874,8 @@
       if (!alive) return 'page-closed';
       if (epoch !== forEpoch || CLF_DOM.conversationId() !== target) return 'left-chat';
       if (message.recovery && !sendAttempted && stopRequestedAt) return 'stop-requested';
-      const newUser = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id !== sourceUser;
+      const newUser = !(message.directTurn && sourceUser === undefined) &&
+        CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id !== sourceUser;
       if ((sourceQuiet || message.directTurn) && !sendAttempted && newUser) return 'new-user-message';
       if ((sourceQuiet || message.directTurn) && !sendAttempted && turnId && turnId !== sourceTurn) return 'turn-changed';
       if (sourceQuiet && !sendAttempted && turnProgressRevision !== sourceActivity) return 'turn-progressed';
@@ -12870,8 +12931,11 @@
         return false;
       }
     }
+    // The running turn is named by the page's own turn id. Its question is usually shown too, but
+    // not in the first turn of a chat the app opened (#942, live 2026-10-15), and refusing there
+    // left every automatic continue of a new chat unsent.
     if (message.directTurn && (!target || ((generating || CLF_DOM.generating()) &&
-        (!sourceUser || sourceTurn !== message.directTurn.id)))) return false;
+        (!sourceTurn || sourceTurn !== message.directTurn.id)))) return false;
     // A new chat of a project with a native ChatGPT Project is typed only on that Project's own
     // page, never at the root; ChatGPT may rewrite that route, so its marker can be in the hash.
     const project = typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : null;
@@ -13070,6 +13134,21 @@
       // comparison never matched, and that first turn got no ACK, no turn start and no turn end
       // for Goal or Loop to act on. The bootstrap comparison is exact either way (raw, then one
       // unescape); a person's own sends keep the raw comparison in matchesUserSendReceipt.
+      // While ChatGPT thinks or runs a tool it offers only Stop, no Send (measured 2026-10-15 on
+      // the user's Mac: every automatic continue for a long turn timed out unsent, and the turns
+      // broke at 41 and 52 minutes anyway). The automatic continue then does what #1402 decided by
+      // hand: Stop right after the tool result, then send Continue as the next message. A person's
+      // own message is never allowed to stop a turn; it waits for the turn's end instead.
+      let intoTurn = !!message.directTurn;
+      if (intoTurn && input.purpose === 'rotation' && CLF_DOM.generating() &&
+          !await waitPageView(() => !!CLF_DOM.sendButton(), onTarget, 3000)) {
+        if (!CLF_DOM.stopGeneration(onTarget) ||
+            !await waitPageView(() => !CLF_DOM.generating() && !!CLF_DOM.sendButton() && draft.current(), onTarget, 20000)) return fail(t(
+          'content_delivery_rotation_not_stopped',
+          'ChatGPT offered no Send in the running answer, and stopping it for the automatic continue did not finish.'
+        ));
+        intoTurn = false;
+      }
       const nativeSend = () => sendSubmittedText(sendingTarget, false, async sendCurrent => {
         // Preserve the outbox's revocable claim until the actual native Send is ready.
         if (input.recovery && !await recoveryPageUnfinished(() => sendCurrent() && onTarget() && draft.current(), withdrawWhy)) return false;
@@ -13100,7 +13179,7 @@
       // ChatGPT switches its own image tool off for a message that mentions an app).
       input.purpose === 'decision' || (input.coreMention === false && !input.recovery && !agent) ? null
         : input.recovery || agent || mentionCore ? currentCoreMention() : null,
-      sentRequestSince, !!message.directTurn);
+      since => sentRequestSince(since, forEpoch), intoTurn);
       // #744: one retry when the editor was replaced before anything asked to send it.
       if (!(await nativeSend()) &&
           !(!authorizing && !sendAttempted && !receipt && !draft.current() && draftCurrent() && await nativeSend())) {
@@ -13250,6 +13329,27 @@
    * page, which ChatGPT opens by itself after creating it.
    */
   let projectCreateBusy = false;
+  /**
+   * Archives one retired worker chat with ChatGPT's own reversible archive (#1460): the chat
+   * leaves the chat list and can be restored from ChatGPT's settings. One request for one exact
+   * chat of the signed-in account; nothing is deleted and nothing else is touched.
+   */
+  async function archiveWorkerChat(conversationId) {
+    const id = String(conversationId || '').toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) return 'failed';
+    const signedIn = await fetch(`${location.origin}/api/auth/session`, { credentials: 'include' });
+    const session = signedIn.ok ? await signedIn.json() : null;
+    const token = typeof session?.accessToken === 'string' ? session.accessToken : '';
+    if (!token) return 'failed';
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    // A workspace chat belongs to that workspace's account, which ChatGPT names in this header.
+    if (typeof session.account?.id === 'string' && session.account.id) headers['ChatGPT-Account-Id'] = session.account.id;
+    const archived = await fetch(`${location.origin}/backend-api/conversation/${id}`, {
+      method: 'PATCH', credentials: 'include', headers, body: JSON.stringify({ is_archived: true })
+    });
+    return archived.ok ? 'archived' : 'failed';
+  }
+
   async function createChatgptProject(request) {
     if (projectCreateBusy || !request || !/^[a-f0-9-]{36}$/i.test(String(request.id)) || typeof request.name !== 'string' || !request.name) return false;
     const marked = () => alive && location.pathname === '/' && new URL(location.href).searchParams.get('cos-project-create') === request.id;
@@ -13295,9 +13395,11 @@
   async function refreshManagedPlugin(request) {
     if (pluginRefreshBusy || !request || !/^[a-f0-9-]{36}$/i.test(request.id) || !ownsPluginRefreshPage(request.id)) return false;
     pluginRefreshBusy = true;
-    const requestEpoch = epoch;
-    const ownsRequest = () => epoch === requestEpoch && ownsPluginRefreshPage(request.id);
-    const fail = error => ask({ type: 'plugin_refresh', action: 'fail', id: request.id, error });
+    const requestEpoch = epoch, requestHref = location.href;
+    // Settings routes share a conversation epoch. A different marked settings URL is
+    // still a navigation, never permission to act or attribute this page's failed read.
+    const ownsRequest = () => epoch === requestEpoch && location.href === requestHref && ownsPluginRefreshPage(request.id);
+    const fail = error => ownsRequest() ? ask({ type: 'plugin_refresh', action: 'fail', id: request.id, error }, ownsRequest) : null;
     const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
     const schemaKey = tools => Array.isArray(tools) ? canonical(tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })).sort((a, b) => a.name.localeCompare(b.name))) : null;
     try {
@@ -13305,23 +13407,44 @@
       const listUrl = new URL(location.href);
       const pathList = listUrl.pathname === '/settings/plugins-settings' && !listUrl.hash;
       if (pathList || (listUrl.pathname === '/' && listUrl.hash === '#settings/Plugins')) {
-        if (request.appId) {
+        const installedAppId = request.observeOnly === true ? request.appId ?? null : null;
+        const installedSurface = installedAppId ? request.surface ?? null : null;
+        if (request.appId && !installedAppId) {
           const url = new URL(location.href);
           if (pathList) url.pathname = `/settings/plugins-settings/plugin_${request.appId}`;
           else url.hash = `settings/Plugins/plugin_${request.appId}`;
           if (!current()) return false;
           location.assign(url.href); return true;
         }
-        const buttons = await waitPageView(() => CLF_DOM.pluginInstalledButtons(request.connectorName), current, 8000);
-        if (!buttons || !current()) return false;
-        if (buttons.length !== 1) {
+        let linkHref = null;
+        const buttons = await waitPageView(() => {
+          const found = CLF_DOM.pluginInstalledButtons(request.connectorName, installedAppId, installedSurface);
+          linkHref = found?.length === 1 && found[0].tagName === 'A' ? found[0].href : null;
+          return found;
+        }, current, 8000);
+        if (!current()) return false;
+        if (!buttons && !installedAppId) return false;
+        if (!buttons || buttons.length !== 1 || (installedAppId && buttons[0].tagName !== 'A')) {
           await fail(t(
             'content_connector_identity_ambiguous',
-            'Installed connector identity is unavailable or ambiguous'
+            'Installed plugin identity is unavailable or ambiguous'
           ));
           return false;
         }
-        buttons[0].click();
+        const button = buttons[0];
+        if (button.tagName === 'A') {
+          // The native installed link already names an exact management route. Recheck
+          // the same visible owner across the await and carry custody into navigation;
+          // reading the destination's schema is a later step, not a prerequisite here.
+          const found = CLF_DOM.pluginInstalledButtons(request.connectorName, installedAppId, installedSurface);
+          if (!current() || !button.isConnected || found?.length !== 1 || found[0] !== button || button.href !== linkHref) return false;
+          const url = new URL(linkHref, requestHref);
+          const route = /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname);
+          if (url.origin !== listUrl.origin || !route || url.hash || (installedAppId && route[1] !== installedAppId)) return false;
+          url.searchParams.set('cos-plugin-refresh', request.id);
+          location.assign(url.href); return true;
+        }
+        button.click();
         // The provider's installed-row navigation drops the query marker. This
         // already-owned discovery may learn its resulting exact App Id, but cannot
         // claim Refresh until the management document has its marker again.
@@ -13359,7 +13482,7 @@
         // cause in the durable row, which is the opposite of the point.
         if (current()) await fail(t(
           'content_connector_settings_unreadable',
-          'The connector settings card could not be read on the page this request owns'
+          'The plugin settings card could not be read on the page this request owns'
         ));
         return false;
       }
@@ -13367,7 +13490,7 @@
       if (request.appId && view.appId !== request.appId) {
         await fail(t(
           'content_connector_settings_unverified',
-          'Exact connector settings could not be verified'
+          'Exact plugin settings could not be verified'
         ));
         return false;
       }
@@ -13375,28 +13498,37 @@
       const stillCurrent = () => current() && epoch === ownedEpoch && pluginViewAppId(location.href) === appId;
       const before = schemaKey(view.tools), expected = schemaKey(request.tools);
       if (before === expected) {
-        return (await ask({ type: 'plugin_refresh', action: 'current', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }))?.data?.ok === true && stillCurrent();
+        return (await ask({ type: 'plugin_refresh', action: 'current', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }, stillCurrent))?.data?.ok === true && stillCurrent();
+      }
+      if (request.observeOnly) {
+        await fail(t('content_connector_settings_unverified', 'Exact plugin settings could not be verified'));
+        return false;
       }
       if (!view.refresh || view.refresh.disabled) {
         const error = t(
           'content_connector_schema_no_refresh',
-          'Connector schema differs, but ChatGPT exposes no Refresh control. Recreate or republish this custom app to load the current tool schema.'
+          'Plugin schema differs, but ChatGPT exposes no Refresh control. Recreate or republish this plugin to load the current tool schema.'
         );
-        return (await ask({ type: 'plugin_refresh', action: 'manual', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId, error }))?.data?.ok === true && stillCurrent();
+        return (await ask({ type: 'plugin_refresh', action: 'manual', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId, error }, stillCurrent))?.data?.ok === true && stillCurrent();
       }
-      const claimed = await ask({ type: 'plugin_refresh', action: 'claim', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId });
+      const claimed = await ask({ type: 'plugin_refresh', action: 'claim', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }, stillCurrent);
       if (!claimed?.data?.ok || !stillCurrent() || view.refresh.isConnected === false || view.refresh.disabled) {
         await fail(t(
           'content_connector_refresh_claim_unconfirmed',
-          'Connector refresh claim or page ownership was not confirmed'
+          'Plugin refresh claim or page ownership was not confirmed'
         ));
         return false;
       }
       view.refresh.click(); // the durable main-process attempt owns this one click
+      // The page does not show the tool list, so the new tools arriving changes no element: a
+      // wait that looked only on page changes saw them when the Refresh button turned active
+      // again, about 10 s later, and gave up at 12 s. Measured on Windows 2026-10-13, it recorded
+      // a refresh that had worked as failed in 2 of 3 runs. Look every half second, for up to a
+      // minute (the worker leaves a busy tab open); the one click stays one click.
       const after = await waitPageView(async () => {
         const next = await CLF_DOM.pluginRefreshView(request.connectorName, request.tools, appId);
         return next && before !== expected && schemaKey(next.tools) === expected ? next : null;
-      }, stillCurrent, 12000);
+      }, stillCurrent, 60000, 500);
       if (!after) {
         await fail(t(
           'content_connector_refresh_schema_unchanged',
@@ -13404,9 +13536,9 @@
         ));
         return false;
       }
-      return (await ask({ type: 'plugin_refresh', action: 'complete', id: request.id, appId, tools: after.tools, versionId: after.versionId }))?.data?.ok === true;
+      return (await ask({ type: 'plugin_refresh', action: 'complete', id: request.id, appId, tools: after.tools, versionId: after.versionId }, stillCurrent))?.data?.ok === true;
     } catch {
-      await fail(t('content_connector_refresh_unverified', 'Connector refresh could not be verified'));
+      await fail(t('content_connector_refresh_unverified', 'Plugin refresh could not be verified'));
       return false;
     }
     finally { pluginRefreshBusy = false; }
@@ -13526,6 +13658,10 @@
       // background.js uses this only to distinguish a live isolated-world recorder from the
       // dead context Chrome leaves behind when an unpacked extension is reloaded while the
       // ChatGPT document stays open. No page/session data crosses in this health check.
+      if (message.type === 'clf-archive-chat') {
+        void archiveWorkerChat(message.conversationId).then(outcome => sendResponse({ outcome })).catch(() => sendResponse({ outcome: 'failed' }));
+        return true;
+      }
       if (message.type === 'clf-stop-turn') {
         void stopAppTurn(message).then(ok => sendResponse({ ok })).catch(() => sendResponse({ ok: false }));
         return true;
@@ -13579,6 +13715,15 @@
         sendResponse({ ok: true, held: setKeepAwake(message.on === true) });
         return false;
       }
+      if (message.type === 'clf-route-changed') {
+        // The extension saw this page take a new address. A hidden tab's own observe tick can be
+        // held back for long; this observation runs now (2026-10-15).
+        if (recorderHandle.healthy()) {
+          try { observe(); } catch { /* The regular tick observes again. */ }
+        }
+        sendResponse({ ok: true });
+        return false;
+      }
       if (message.type === 'clf-recorder-ping') {
         // `busy`: this page is mid-turn or mid-handoff, so the extension must not reload under it.
         sendResponse({ ok: true, recorderVersion: RECORDER_VERSION,
@@ -13607,6 +13752,11 @@
           await pullActivity();
         })().catch(() => {}).then(() => sendResponse({ accepted: resumePendingCompactionFromRepair(message.conversationId) }));
         return true;
+      }
+      // Diagnostics report: which of ChatGPT's controls this page still has. Booleans only.
+      if (message.type === 'clf-page-checks') {
+        sendResponse(CLF_DOM.pageChecks());
+        return false;
       }
       // Popup diagnostics. Ids and counters only — no prose, no transcript, no page text.
       if (message.type === 'clf-page-status') {

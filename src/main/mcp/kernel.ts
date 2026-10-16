@@ -1,5 +1,6 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
 import { noteConnectorUse } from '../connector-proof.js';
+import { beginPluginToolCall } from '../plugin-refresh.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -25,7 +26,7 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
 
 import { rawPromises as fs } from '../rawfs.js';
 import { randomUUID } from 'node:crypto';
-import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
+import { beginToolTiming, inboundRequestId, inboundPublication, inboundProviderRequest } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
@@ -48,6 +49,7 @@ import { isUserSkillVirtualPath, resolveUserSkillPath } from '../user-skills.js'
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
+import { noteToolCall, toolOutcome } from '../diagnostics-facts.js';
 import {
   AgentError,
   IdentityLostError,
@@ -524,6 +526,9 @@ async function withBackgroundExecRecovery(
  * between a completed local operation, its unknown attribution, and an undelivered agent
  * message: none of those facts implies that completed work is about to disappear.
  */
+/** Tools whose answer does not depend on which chat called them. */
+const IDENTITY_FREE_TOOLS: ReadonlySet<string> = new Set(['usage']);
+
 function withUnattributedNotice(
   conversationId: string | null | undefined,
   result: ToolResult,
@@ -649,12 +654,14 @@ export async function dispatch(
   };
   // Every call runs through here, so the proof is installed before any call can be running.
   setRequestOwner(requestOwner);
+  const confirmUse = !parent && inboundProviderRequest() ? beginPluginToolCall(surface) : null;
   try {
     const result = await trackMcpRequest(() =>
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
     if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
+    if (!result.isError) confirmUse?.();
     return result;
   } catch (error) {
     if (!parent) context.publication!.failed = true;
@@ -688,6 +695,7 @@ async function dispatchTracked(
 ): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   const markTiming = beginToolTiming();
+  const callStartedAt = Date.now();
   // Recorded here rather than in `guard` because only this layer knows which server
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
@@ -1026,6 +1034,8 @@ async function dispatchTracked(
         : invokeHandler()
   );
   markTiming('handler');
+  // Nested exec children are counted under their own names, like direct calls.
+  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
   if (identityRefusals.has(result)) rememberIdentityRefusal(requestId, name);
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
@@ -1087,7 +1097,10 @@ async function dispatchTracked(
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
   const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
-  let delivered = nested ? baseResult : withUnattributedNotice(
+  // A tool that reads nothing belonging to a chat (usage) answers before the page's evidence
+  // for its request arrives; the attribution notice would only add noise to every such answer.
+  const identityFree = IDENTITY_FREE_TOOLS.has(name);
+  let delivered = nested ? baseResult : identityFree ? (deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish)) : withUnattributedNotice(
     context.caller.conversationId,
     deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish),
     context.caller.requestId,

@@ -62,16 +62,27 @@ annotations cannot prove that an external process is unable to mutate. Tool anno
 otherwise relayed without making them more permissive.
 
 The Plugins surface forwards complete JSON schemas and MCP results through the SDK and the
-existing request attribution/recording dispatcher. Upstream tool names are preserved; conflicting declarations are excluded rather than renamed. Publication is normally bounded by 250 KB of schemas,
-with a separate 256-tool emergency ceiling for pathological catalogs. Catalogs larger than 64 tools
-can therefore be published in full when their complete schemas remain within the byte budget. The
-installed tool list distinguishes enabled tools from those actually published within the limit.
+existing request attribution/recording dispatcher. Upstream tool names are preserved; conflicting declarations are excluded rather than renamed. Publication is bounded by 256 tools and
+250 KB of schemas across all enabled plugins; tools past that are listed as not exposed. A server may
+declare more (up to 2,048 tools or 8 MB, an emergency guard against pathological catalogs): it is
+installed, publishes what fits, and switching tools off on its page makes room for the ones you want.
+The installed tool list distinguishes enabled tools from those actually published within the limit.
 Transport failures never automatically retry tool calls. A failed mutation can already have
 taken effect; inspect its state before deciding to retry.
 
 Fresh installs contain no plugins. Installed and enabled plugins keep their connection for the app's lifetime, until disabled or uninstalled. App startup restores those connections in the background without waiting for external server discovery before showing chats. Cached tool declarations remain available during startup; every call rechecks current enabled policy.
 
 Restart reconnects/discovers a server. Configure changes its settings and write-only credentials.
+Each plugin also has **Longest call** in Configure: a per-installation MCP tool deadline in seconds,
+default **120 seconds** and configurable from 1 second up to **30 minutes**. It is stored separately
+from the server's environment variables and restored after app restart. Changing only Longest call
+does not reconnect the plugin or interrupt a tool already running; that call keeps its previously
+chosen deadline. Calls with or without progress are bounded by the same total deadline. MCP
+progress extends the SDK's idle timer, while a separate abort signal enforces the overall maximum.
+On timeout the SDK sends cancellation for just that request; CoS neither disconnects an otherwise
+healthy plugin nor automatically retries a potentially completed operation. ChatGPT may have its
+own shorter waiting limit: changing Longest call locally does not guarantee ChatGPT will wait for
+the full 30 minutes or show a late result in the original conversation.
 Update stages a replacement and requires a successful connection before committing it; failure
 restores the prior installation. Package versions stay pinned to reviewed recipes; custom version
 changes use Configure. Uninstall stops the process and removes installation data and credentials.

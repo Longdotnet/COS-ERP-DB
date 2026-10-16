@@ -1373,7 +1373,8 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
           ? 'recording storage limit reached'
           : message === 'Session image exceeds the recording limit' ? 'recording image size limit' : 'recording write failed';
         imageRecordingReasons.add(reason);
-        logWarn(`session image not stored: ${reason}`);
+        // The store reports being full once, as a state (#1406); other reasons keep their line.
+        if (message !== 'Global session asset quota exceeded') logWarn(`session image not stored: ${reason}`);
       }
     }
 
@@ -2364,11 +2365,12 @@ async function recordChatObservationsNow(
         const recent = await readRecentEvents(sessionId, 32, { kinds: ['chat_error'], maxBytes: 256 * 1024 });
         // A history limit that keeps answering the same way is one notice, not one per retry: on
         // 2026-10-11 a throttled history wrote eight identical blocking notices in eight minutes. The
-        // same limit is said again only after another error came in between, or after half an hour.
-        // Only the history limit (it carries its Retry-After): the provider access dialog keeps
-        // being recorded again after 30 s, as before.
+        // same limit is said again only after another blocking error came in between, or after half an
+        // hour. A passing transport failure (a stream 404) does not change the limit, and repeating it
+        // after each one still stacked the same notice (2026-10-12). Only the history limit (it carries
+        // its Retry-After): the provider access dialog keeps being recorded again after 30 s, as before.
         const newest = recent.reduce<SessionEvent | undefined>((latest, event) =>
-          event.kind === 'chat_error' && (!latest || event.seq > latest.seq) ? event : latest, undefined);
+          event.kind === 'chat_error' && event.blocking === true && (!latest || event.seq > latest.seq) ? event : latest, undefined);
         if (item.blocking === true && Number.isFinite(item.retryAt) && newest?.kind === 'chat_error' && newest.blocking === true &&
             item.time - newest.time <= 30 * 60_000 &&
             chatErrorMessageKey(newest.message.text, newest.recoverable === true) === text) continue;
@@ -2387,6 +2389,9 @@ async function recordChatObservationsNow(
           ...(item.reason === 'thinking_failed' || item.reason === 'stream_gone' ? { reason: item.reason } : {}),
           ...(typeof item.recoverable === 'boolean' ? { recoverable: item.recoverable } : {}),
           ...(typeof item.blocking === 'boolean' ? { blocking: item.blocking } : {}),
+          // The same bounds the bridge applies before it honors a Retry-After.
+          ...(item.blocking === true && Number.isFinite(item.retryAt) && item.retryAt! > item.time &&
+            item.retryAt! - item.time <= 24 * 60 * 60_000 ? { retryAt: item.retryAt } : {}),
           message: await storeText(sessionId, item.text ?? '', 2000)
         });
         activity.meaningful = true;

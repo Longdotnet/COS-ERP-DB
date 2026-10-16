@@ -83,7 +83,7 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-const { startTunnel } = await import('../src/main/tunnel/index.js');
+const { startTunnel, setSystemProxyResolver } = await import('../src/main/tunnel/index.js');
 const { ROUTE_SETTLE_MS, resetRouteSettleForTests, tunnelRouteSettling } = await import('../src/main/tunnel/route-settle.js');
 
 const settings = {
@@ -102,9 +102,42 @@ beforeEach(() => {
   fixture.termination.release = null;
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  setSystemProxyResolver(null);
 });
 
 describe('OpenAI tunnel process ownership', () => {
+  // #1255: without this, a computer that reaches the internet through a system proxy could not
+  // connect the tunnel unless the person set HTTPS_PROXY before starting the app.
+  it('starts the tunnel program with the system proxy, and without one when there is none or the lookup fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('missing', { status: 404 })));
+    const envOf = async (): Promise<Record<string, string>> => {
+      const before = fixture.spawn.mock.calls.length;
+      const handle = await startTunnel({ localUrl: 'http://127.0.0.1:1234/mcp/core/token', settings, apiKey: 'test', report: () => {} });
+      await vi.waitFor(() => expect(fixture.spawn).toHaveBeenCalledTimes(before + 1));
+      const call = fixture.spawn.mock.calls.at(-1) as unknown as [string, string[], { env: Record<string, string> }];
+      await handle.stop();
+      return call[2].env;
+    };
+    expect(await envOf()).not.toHaveProperty('HTTPS_PROXY');
+
+    const asked: string[] = [];
+    setSystemProxyResolver(async url => { asked.push(url); return 'PROXY 127.0.0.1:7890'; });
+    expect(await envOf()).toMatchObject({ HTTPS_PROXY: 'http://127.0.0.1:7890', NO_PROXY: 'localhost,127.0.0.1,::1' });
+    expect(asked).toEqual(['https://api.openai.com/']);
+
+    setSystemProxyResolver(async () => 'DIRECT');
+    expect(await envOf()).not.toHaveProperty('HTTPS_PROXY');
+    setSystemProxyResolver(async () => { throw new Error('proxy service unavailable'); });
+    expect(await envOf()).not.toHaveProperty('HTTPS_PROXY');
+    // A lookup that never answers (an unreachable PAC script) must not keep the tunnel from starting.
+    vi.useFakeTimers();
+    setSystemProxyResolver(() => new Promise<string>(() => {}));
+    const pending = envOf();
+    await vi.advanceTimersByTimeAsync(3_100);
+    expect(await pending).not.toHaveProperty('HTTPS_PROXY');
+    vi.useRealTimers();
+  });
+
   it('serves each run\'s fresh MCP path through the same tunnel id', async () => {
     // ChatGPT's plugin names the tunnel, not a URL: tunnel-client is told this run's local URL,
     // token path included, so the per-start token never reaches ChatGPT and a plugin created in an
@@ -113,6 +146,7 @@ describe('OpenAI tunnel process ownership', () => {
     const runs: Array<{ args: string[]; url: string }> = [];
     for (const localUrl of ['http://127.0.0.1:1234/mcp/core/first-run-token', 'http://127.0.0.1:1234/mcp/core/second-run-token']) {
       const handle = await startTunnel({ localUrl, settings, apiKey: 'test', report: () => {} });
+      await vi.waitFor(() => expect(fixture.spawn).toHaveBeenCalledTimes(runs.length + 1));
       const call = fixture.spawn.mock.calls.at(-1) as unknown as [string, string[], { env: Record<string, string> }];
       runs.push({ args: call[1], url: call[2].env.MCP_SERVER_URL ?? '' });
       await handle.stop();
@@ -185,6 +219,39 @@ describe('OpenAI tunnel process ownership', () => {
     }
   });
 
+  // 2026-10-15 from 17:17 UTC on two machines: OpenAI's tunnel service answered every poll with
+  // 503/504 and the app said "No internet" while this computer's internet worked.
+  it('says OpenAI\'s tunnel service is down, not the internet, when the control plane answers with 5xx', async () => {
+    vi.useFakeTimers();
+    const reports: any[] = [];
+    const startedAt = Date.now();
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/readyz') return new Response('ok');
+      if (url.pathname === '/metrics') return new Response(`commands_poll_last_successful_timestamp_seconds ${Math.floor(startedAt / 1000)}\ncommands_poll_errors_total 4\n`);
+      if (url.pathname === '/api/status') return Response.json({ uptime_seconds: 50, channels: [] });
+      return new Response('missing', { status: 404 });
+    }));
+    const handle = await startTunnel({ localUrl: 'http://127.0.0.1:1234/secret', settings, apiKey: 'test', report: r => reports.push(r) });
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      fixture.health.url = 'http://127.0.0.1:34567';
+      await vi.advanceTimersByTimeAsync(1_000);
+      const child = fixture.children[0];
+      for (let minute = 0; minute < 4; minute += 1) {
+        child.stderr.emit('data', Buffer.from('WARN poll failed; backing off: controlplane client: unexpected status 503: tunnel_transport_unavailable: Tunnel transport temporarily unavailable\n'));
+        await vi.advanceTimersByTimeAsync(60_000);
+      }
+      const offline = reports.filter(r => r.state === 'offline').at(-1);
+      expect(offline).toBeDefined();
+      expect(offline.offlineCause).toBe('service');
+      expect(offline.detail).toContain('internet works');
+      expect(offline.detail).not.toContain('cannot reach OpenAI');
+    } finally {
+      await handle.stop();
+    }
+  });
+
   it('classifies structured control-plane context together with its network error', async () => {
     vi.useFakeTimers();
     const reports: any[] = [];
@@ -206,6 +273,14 @@ describe('OpenAI tunnel process ownership', () => {
     child.stderr.emit('data', Buffer.from(JSON.stringify({ level: 'WARN', msg: 'poll failed; backing off', error: 'dial tcp: i/o timeout' }) + '\n'));
     await vi.advanceTimersByTimeAsync(45_000);
     expect(reports.at(-1).state).toBe('offline');
+    const { updateReadiness } = await import('../src/renderer/update-readiness-state.js');
+    const core = updateReadiness({
+      update: { current: '2.1.36', latest: null, stage: 'idle', checkedAt: 1 },
+      bridge: { running: true, paired: true, present: true, extensionVersion: '2.1.36' },
+      status: { ...reports.at(-1), surfaces: [] }
+    } as any).find(row => row.id === 'core')!;
+    expect(core.reason).toContain('ChatGPT cannot use the plugin');
+    expect(core.reason).not.toMatch(/\bconnector\b/i);
     expect(fixture.children).toHaveLength(1);
     await handle.stop();
   });

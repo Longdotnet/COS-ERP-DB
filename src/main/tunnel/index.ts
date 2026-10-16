@@ -21,11 +21,47 @@ import { childEnv, terminateProcessTree } from '../exec.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { ago, POLL_FRESH_MS, readClientStatus, readPollHealth } from './health.js';
 import { locateBinary } from './locate.js';
+import { proxyEnvironment, proxyForLog } from './proxy.js';
 import { noteTunnelClientConnected } from './route-settle.js';
+
+type ProxyResolver = (url: string) => Promise<string>;
+let resolveSystemProxy: ProxyResolver | null = null;
+const PROXY_LOOKUP_MS = 3_000;
+/** Where tunnel-client connects out to; the system's proxy rules are asked about this address. */
+const TUNNEL_CONTROL_PLANE = 'https://api.openai.com/';
+
+/** Main supplies the browser engine's proxy lookup. Without it, only the environment is read. */
+export function setSystemProxyResolver(resolver: ProxyResolver | null): void {
+  resolveSystemProxy = resolver;
+}
+
+/** The proxy variables tunnel-client needs on this computer (#1255); see `proxy.ts`. */
+async function tunnelProxyEnvironment(tag: string): Promise<Record<string, string>> {
+  let resolution = 'DIRECT';
+  if (resolveSystemProxy) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // A proxy script that cannot be fetched may take long to answer; the tunnel does not wait for it.
+      resolution = await Promise.race([
+        resolveSystemProxy(TUNNEL_CONTROL_PLANE),
+        new Promise<string>(resolve => { timer = setTimeout(() => resolve('DIRECT'), PROXY_LOOKUP_MS); })
+      ]);
+    } catch (err) {
+      logWarn(`${tag}: the system proxy could not be read: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  const variables = proxyEnvironment(resolution, process.env);
+  if (variables['HTTPS_PROXY']) logInfo(`${tag}: tunnel-client connects through the proxy ${proxyForLog(variables['HTTPS_PROXY'])}`);
+  return variables;
+}
 
 export interface TunnelReport {
   state: ConnectionState;
   detail: string;
+  /** Offline because OpenAI's tunnel service answered with errors, not because of this computer's network. */
+  offlineCause?: 'service';
   publicUrl?: string | null;
   /** Epoch ms of the last proven round trip to OpenAI, when the adapter knows one. */
   handshakeAt?: number | null;
@@ -94,6 +130,14 @@ function lineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
 }
 
 /** Only a rejected control-plane request can invalidate the tunnel credentials. */
+/** A log field as text: an object is spelled out, never "[object Object]". */
+export function tunnelEventText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object') { try { return JSON.stringify(value); } catch { return ''; } }
+  return String(value as number | boolean | bigint);
+}
+
 function tunnelAuthRejected(message: string, error: string, statusCode?: unknown): boolean {
   const controlPlane = /^(?:poll failed(?:;\s*backing off)?|tunnel metadata fetch failed)$/i.test(message) ||
     /\bcontrolplane (?:client|responder):/i.test(error);
@@ -114,6 +158,8 @@ function tunnelAuthRejected(message: string, error: string, statusCode?: unknown
  * a local health check that stays green throughout an outage, because from its point
  * of view nothing local has failed.
  */
+/** How long a 5xx answer from OpenAI's control plane still explains an outage. */
+const SERVICE_ERROR_FRESH_MS = 3 * 60_000;
 const CONTROL_PLANE_POLL = /\bpoll (?:failed|timed out(?:;\s*backing off)?)\b/i;
 const UNREACHABLE_NETWORK =
   /no such host|dial tcp|i\/o timeout|timed out|context deadline exceeded|connection (was )?(aborted|refused|reset)|network is (unreachable|down)|no route to host|tls handshake timeout|temporary failure in name resolution|forcibly closed/i;
@@ -126,6 +172,18 @@ export function describeNetworkError(raw: string): string {
   if (/timeout|timed out|context deadline exceeded/i.test(raw)) return 'the connection timed out';
   if (/network is (unreachable|down)|no route to host/i.test(raw)) return 'the network is unreachable';
   return 'a network error';
+}
+
+/**
+ * The HTTP status OpenAI's control plane answered a poll with when its tunnel service itself is
+ * failing (5xx), or null. An answer is proof this computer reached OpenAI: the internet works.
+ */
+export function controlPlaneServiceStatus(raw: string): number | null {
+  const text = String(raw || '');
+  if (!CONTROL_PLANE_POLL.test(text)) return null;
+  const status = /\bunexpected status(?: code)?\s*:?\s*(5\d\d)\b/i.exec(text);
+  if (status) return Number(status[1]);
+  return /\btunnel_transport_unavailable\b/i.test(text) ? 503 : null;
 }
 
 /** True when this machine can still resolve OpenAI's control plane. */
@@ -287,6 +345,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     proc: ChildProcess;
     lastError: string;
     unreachableReason: string;
+    /** The last time OpenAI's control plane answered a poll with a 5xx, and that status. */
+    serviceError: { at: number; status: number } | null;
     outage: UnreachableRun;
     lastHandshake: number | null;
     /** When /readyz first failed in the current run of failures; 0 when it is answering. */
@@ -338,11 +398,17 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     if (first) {
       logWarn(`${tag} offline: ${run.unreachableReason} (last verified handshake ${ago(run.lastHandshake)})`);
     }
+    // OpenAI answering with 5xx in the last few minutes means the service is down, not this
+    // computer's network (2026-10-15: "No internet" while only OpenAI's tunnel service failed).
+    const service = run.serviceError && Date.now() - run.serviceError.at < SERVICE_ERROR_FRESH_MS ? run.serviceError : null;
     // The state may be unchanged while the health snapshot advances. Re-report it so the UI
     // never freezes on the first offline sample.
     opts.report({
       state: 'offline',
-      detail: `This PC cannot reach OpenAI — ${run.unreachableReason}. Last verified handshake ${ago(run.lastHandshake)}. ChatGPT cannot use the connector until it is back; the tunnel keeps retrying on its own.`,
+      ...(service ? { offlineCause: 'service' as const } : {}),
+      detail: service
+        ? `OpenAI's tunnel service is not working right now (it answered HTTP ${service.status}). This computer's internet works. Last verified handshake ${ago(run.lastHandshake)}. ChatGPT cannot use the plugin until OpenAI's service is back; the tunnel keeps retrying on its own.`
+        : `This PC cannot reach OpenAI — ${run.unreachableReason}. Last verified handshake ${ago(run.lastHandshake)}. ChatGPT cannot use the plugin until it is back; the tunnel keeps retrying on its own.`,
       handshakeAt: run.lastHandshake,
       health: run.health
     });
@@ -515,6 +581,9 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     // A stale URL from the previous run would otherwise be read as this run's.
     await fs.rm(healthFile, { force: true }).catch(() => {});
     if (stopped || current) return;
+    // Read on every launch: a proxy switched on or off applies from the next reconnect.
+    const proxy = await tunnelProxyEnvironment(tag);
+    if (stopped || current) return;
 
     opts.report({
       state: 'connecting-tunnel',
@@ -532,7 +601,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       env: childEnv({
         CONTROL_PLANE_API_KEY: opts.apiKey ?? '',
         MCP_SERVER_URL: `url=${opts.localUrl},channel=main`,
-        ...(discoveryHeaders ? { MCP_DISCOVERY_EXTRA_HEADERS: discoveryHeaders } : {})
+        ...(discoveryHeaders ? { MCP_DISCOVERY_EXTRA_HEADERS: discoveryHeaders } : {}),
+        ...proxy
       }),
       windowsHide: true,
       // Own a POSIX process group so stopTree terminates any helpers the client starts.
@@ -544,6 +614,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       proc,
       lastError: '',
       unreachableReason: '',
+      serviceError: null,
       outage: NO_OUTAGE,
       lastHandshake: null,
       unreadySince: 0,
@@ -574,8 +645,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       // warnings are followed by a healthy /readyz and are not actionable for users.
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
-        const level = String(event['level'] ?? '').toUpperCase();
-        const message = String(event['msg'] ?? 'tunnel-client event');
+        const level = tunnelEventText(event['level']).toUpperCase();
+        const message = tunnelEventText(event['msg']) || 'tunnel-client event';
         if (
           level === 'WARN' &&
           message === 'harpoon host auto-registration failed' &&
@@ -585,12 +656,14 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
         }
         if (isBenignHarpoonChannelEvent(level, message, event)) return;
         if (level === 'ERROR' || level === 'FATAL' || level === 'WARN') {
-          const errText = event['error'] ? String(event['error']) : '';
+          const errText = tunnelEventText(event['error']);
           if (tunnelAuthRejected(message, errText, event['status_code'])) {
             rejectAuthentication();
             return;
           }
           run.lastError = `${level} ${message}${errText ? `: ${errText}` : ''}`.slice(0, 400);
+          const serviceStatus = controlPlaneServiceStatus(`${message}: ${errText}`);
+          if (serviceStatus !== null) run.serviceError = { at: Date.now(), status: serviceStatus };
           if (isUnreachableError(`${message}: ${errText}`)) {
             // Retry chatter. noteUnreachable logs one plain line per run rather than a
             // socket dump per attempt, and the state it leads to is decided in `watch`.
@@ -609,6 +682,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
           return;
         }
         run.lastError = line.slice(0, 400);
+        const serviceStatus = controlPlaneServiceStatus(line);
+        if (serviceStatus !== null) run.serviceError = { at: Date.now(), status: serviceStatus };
         if (isUnreachableError(line)) noteUnreachable(run, line);
         else logWarn(`${tag}: ${run.lastError}`);
       }

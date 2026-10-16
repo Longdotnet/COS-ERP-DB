@@ -957,7 +957,7 @@ it('saves strict chat allowlisting and disables the unattributed switch while st
 
 it('keeps project keyboard focus across activity repaint without taking composer focus or reloading on disclosure', async () => {
   const { project, session } = projectSidebarFixture();
-  const listSessions = vi.fn(async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } }));
+  const listSessions = vi.fn(async (_options?: { projectId?: string }) => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } }));
   const mounted = await mountChat({}, [], {
     listProjects: async () => ({ ok: true, data: [project] }), listSessions
   });
@@ -965,10 +965,14 @@ it('keeps project keyboard focus across activity repaint without taking composer
   const heading = () => doc.querySelector<HTMLElement>(`[data-project-id="${project.id}"] > summary`)!;
   await vi.waitFor(() => expect(heading()).not.toBeNull());
   await settle();
-  const reads = listSessions.mock.calls.length;
+  // Reads of the whole list. Opening a project reads one page of that project itself (#1190),
+  // which is not a reload of the sidebar.
+  const wholeListReads = () => listSessions.mock.calls.filter(([options]) => !options?.projectId).length;
+  const reads = wholeListReads();
   heading().focus(); heading().click();
   await settle();
-  expect(listSessions).toHaveBeenCalledTimes(reads);
+  expect(wholeListReads()).toBe(reads);
+  expect(listSessions.mock.calls.filter(([options]) => options?.projectId === project.id)).toHaveLength(1);
   expect(doc.activeElement).toBe(heading());
   mounted.push(structuredClone(mounted.state));
   expect(doc.activeElement).toBe(heading());
@@ -980,7 +984,7 @@ it('keeps project keyboard focus across activity repaint without taking composer
   const { chatVisible } = await import('../src/renderer/chat.js');
   chatVisible(false); chatVisible(true);
   await settle();
-  expect(listSessions).toHaveBeenCalledTimes(reads + 1);
+  expect(wholeListReads()).toBe(reads + 1);
 });
 
 // Adapted from @Haz4rdovisk's #345: typed Setup values used to reach the app only on blur, so a
@@ -1163,6 +1167,14 @@ it('shows connection status once and keeps diagnostics out of the desktop popove
     // A state change is announced once, politely.
     expect(doc.getElementById('connectionAnnounce')!.textContent).toBe(title);
   }
+
+  // 2026-10-15: OpenAI's tunnel service answered with 503/504 for hours while the internet worked;
+  // "No internet" sent people to check their network for nothing.
+  mounted.push({ ...mounted.state, status: { ...mounted.state.status, state: 'offline', offlineCause: 'service' } });
+  expect(popover.querySelector('.connection-popover-head')!.textContent?.trim()).toBe('OpenAI outage');
+  expect(label.textContent).toBe('OpenAI outage');
+  expect(doc.getElementById('connectionAnnounce')!.textContent).toBe('OpenAI outage');
+  mounted.push({ ...mounted.state, status: { ...mounted.state.status, state: 'disconnected', offlineCause: null } });
 
   const { setLanguage } = await import('../src/renderer/i18n.js');
   setLanguage('pt-BR');
@@ -1891,6 +1903,87 @@ it('requires external installation before choosing the built-in browser and sign
   expect(mounted.calls.at(-1)?.ui?.chatBrowser).toBe('edge');
 });
 
+it('walks the extension install in each browser\'s own words and pictures', async () => {
+  const opened: Array<[string, string]> = [];
+  const mounted = await mountChat({}, [], { openSetupBrowser: (browser: string, page: string) => { opened.push([browser, page]); return Promise.resolve({ ok: true, data: true }); } });
+  const text = (id: string) => document.getElementById(id)!.textContent;
+  const img = (id: string) => document.querySelector<HTMLImageElement>(`#${id} img`);
+  const chrome = structuredClone(mounted.state);
+  chrome.config.ui = { ...chrome.config.ui, chatBrowser: 'chrome' };
+  mounted.push(chrome);
+  expect(text('extensionStepOpen')).toBe('Open the extensions page in Chrome');
+  expect(text('setupExtensionAddress')).toBe('chrome://extensions');
+  expect(text('extensionStepDev')).toBe('Turn on “Developer mode”');
+  expect(text('extensionStepLoad')).toBe('Click “Load unpacked” and choose the extension folder');
+  expect(document.getElementById('extensionStepDevWhere')!.hidden).toBe(true);
+  // Chrome's own page, with the place to click outlined where Chrome draws it.
+  expect(img('extensionPictureDev')!.getAttribute('src')).toContain('chrome-en-dev');
+  expect(img('extensionPictureDev')!.alt).toBe('The extensions page in Chrome, with “Developer mode” outlined');
+  expect(img('extensionPictureLoad')!.getAttribute('src')).toContain('chrome-en-load');
+  expect(document.querySelector<HTMLElement>('#extensionPictureDev .ext-spot')!.style.left).toBe('63.7%');
+
+  // Edge's own page, laid out differently (the switch sits in its sidebar), with the hint for where.
+  (document.querySelector('[data-external-browser="edge"]') as HTMLButtonElement).click();
+  expect(text('setupExtensionAddress')).toBe('edge://extensions');
+  expect(text('extensionStepOpen')).toBe('Open the extensions page in Edge');
+  expect(img('extensionPictureDev')!.getAttribute('src')).toContain('edge-en-dev');
+  expect(img('extensionPictureLoad')!.getAttribute('src')).toContain('edge-en-load');
+  expect(img('extensionPictureLoad')!.alt).toBe('The extensions page in Edge, with “Load unpacked” outlined');
+  expect(document.getElementById('extensionStepDevWhere')!.hidden).toBe(false);
+  expect(text('extensionStepOpenHint')).toBe('Click the address to copy it, then paste it into the address bar in Edge and press Enter.');
+  // Browsers ignore their own pages from the command line, so the app copies the address.
+  (document.getElementById('openExtensionSettings') as HTMLButtonElement).click();
+  await settle();
+  expect(opened).toEqual([['edge', 'extensions']]);
+  expect(text('extensionStepOpenHint')).toBe('Copied. Paste it into the address bar in Edge and press Enter.');
+
+  // Brave has its own captures.
+  (document.querySelector('[data-external-browser="brave"]') as HTMLButtonElement).click();
+  expect(text('setupExtensionAddress')).toBe('brave://extensions');
+  expect(img('extensionPictureDev')!.getAttribute('src')).toContain('brave-en-dev');
+  expect(img('extensionPictureLoad')!.getAttribute('src')).toContain('brave-en-load');
+
+  // In German, Chrome's German page and Chrome's German words, quoted the German way.
+  (document.querySelector('[data-external-browser="chrome"]') as HTMLButtonElement).click();
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  expect(text('extensionStepDev')).toBe('Schalte „Entwicklermodus“ ein');
+  expect(text('extensionStepLoad')).toBe('Klicke auf „Entpackte Erweiterung laden“ und wähle den Erweiterungsordner');
+  expect(img('extensionPictureDev')!.getAttribute('src')).toContain('chrome-de-dev');
+  // Edge words the same button differently in German.
+  (document.querySelector('[data-external-browser="edge"]') as HTMLButtonElement).click();
+  expect(text('extensionStepLoad')).toBe('Klicke auf „Entpackte Dateien laden“ und wähle den Erweiterungsordner');
+  expect(img('extensionPictureLoad')!.getAttribute('src')).toContain('edge-de-load');
+  setLanguage('en');
+});
+
+// Firefox (2.1.38) installs the signed add-on from this version's release, so its steps differ.
+it('walks the Firefox add-on install, without Developer mode or a folder', async () => {
+  const opened: Array<[string, string]> = [];
+  const mounted = await mountChat({}, [], { openSetupBrowser: (browser: string, page: string) => { opened.push([browser, page]); return Promise.resolve({ ok: true, data: true }); } });
+  const shown = (id: string) => !document.getElementById(id)!.closest('li')!.hidden;
+  const chrome = structuredClone(mounted.state);
+  chrome.config.ui = { ...chrome.config.ui, chatBrowser: 'chrome' };
+  mounted.push(chrome);
+  expect([shown('extensionStepOpen'), shown('extensionStepDev'), shown('extensionStepLoad'), shown('extensionStepAddon')]).toEqual([true, true, true, false]);
+  (document.querySelector('[data-external-browser="firefox"]') as HTMLButtonElement).click();
+  expect([shown('extensionStepOpen'), shown('extensionStepDev'), shown('extensionStepLoad'), shown('extensionStepAddon'), shown('extensionStepChatGpt')])
+    .toEqual([false, false, false, true, true]);
+  expect(document.getElementById('extensionStepAddon')!.textContent).toBe('Add the Chat On Steroids add-on to Firefox');
+  expect(document.getElementById('extensionStepChatGpt')!.textContent).toBe('Open ChatGPT in Firefox');
+  expect(document.querySelector<HTMLImageElement>('#setupExternalIcon')!.src).toContain('firefox');
+  // The unpacked folder and its ZIP are for Chromium browsers only.
+  expect(document.querySelector<HTMLElement>('#browserExtensionStage .extension-help')!.hidden).toBe(true);
+  (document.getElementById('openFirefoxAddon') as HTMLButtonElement).click();
+  await settle();
+  expect(opened).toEqual([['firefox', 'extensions']]);
+  // Back to Chrome, its steps return.
+  (document.querySelector('[data-external-browser="chrome"]') as HTMLButtonElement).click();
+  expect([shown('extensionStepOpen'), shown('extensionStepAddon')]).toEqual([true, false]);
+  expect(document.querySelector<HTMLElement>('#browserExtensionStage .extension-help')!.hidden).toBe(false);
+  expect(document.querySelector<HTMLOptionElement>('#chatBrowser option[value="firefox"]')?.textContent).toBe('Mozilla Firefox');
+});
+
 it('preserves optional Desktop disclosures and inline screenshots across status pushes', async () => {
   const mounted = await mountChat();
   const state = structuredClone(mounted.state) as any;
@@ -1910,19 +2003,110 @@ it('preserves optional Desktop disclosures and inline screenshots across status 
   field.querySelector('summary')!.click();
   const guide = doc.querySelector('[data-setup-guide="tunnel"]')!;
   expect(guide.querySelectorAll('img')).toHaveLength(2);
-  expect(doc.querySelectorAll('[data-setup-guide="developer"] img')).toHaveLength(1);
+  // ChatGPT no longer has a Developer mode switch: no guide for one.
+  expect(doc.querySelector('[data-setup-guide="developer"]')).toBeNull();
   expect(doc.querySelectorAll('[data-setup-guide="plugin"] img')).toHaveLength(4);
   // Each picture's places are the step's numbered moves.
   expect([...guide.querySelectorAll('.guide-move')].map(move => move.textContent)).toEqual(
-    ['1Name it', '2Pick your ChatGPT workspace', '3Click Create', '4Copy the tunnel ID']);
+    ['1Name it', '2Pick your ChatGPT workspace', '3Click “Create”', '4Copy the tunnel ID']);
   const image = guide.querySelector('img')!;
   mounted.push(structuredClone(state));
   expect(field.open).toBe(true);
   expect(guide.querySelector('img')).toBe(image);
-  expect(image.src).toContain('tunnel-create.png');
+  expect(image.src).toContain('tunnel-create-en');
   expect(mounted.calls).toEqual([]);
   mounted.push(structuredClone(state));
   expect(field.open).toBe(true);
+});
+
+it("shows ChatGPT's own screens and words in the app's language, and the Platform's English ones", async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  const moves = (group: string) => [...doc.querySelectorAll(`[data-setup-guide="${group}"] .guide-move, #pluginMoves .guide-move`)]
+    .filter(move => group !== 'plugin' || move.closest('#pluginMoves')).map(move => move.querySelector('.guide-move-text')!.textContent);
+  const pictures = (group: string) => [...doc.querySelectorAll<HTMLImageElement>(`[data-setup-guide="${group}"] img`)].map(img => img.getAttribute('src'));
+  expect(moves('plugin').slice(0, 5)).toEqual(['“Add” → “Add custom MCP server”', 'Paste the name exactly', '“Tunnel”, then your tunnel ID',
+    '“No authentication”', '“I understand and want to continue”, then “Create as a plugin”']);
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  // ChatGPT's German menu and dialog, quoted the German way; rebuilt without a reload.
+  expect(moves('plugin').slice(0, 5)).toEqual(['„Hinzufügen“ → „Benutzerdefinierten MCP-Server hinzufügen“', 'Den Namen exakt einfügen',
+    '„Tunnel“, dann deine Tunnel-ID', '„Keine Authentifizierung“', '„Ich habe das verstanden und möchte weitermachen“, dann „Als Plugin erstellen“']);
+  expect(pictures('plugin').slice(0, 2).every(src => /plugin-(add|new)-de/.test(src!))).toBe(true);
+  expect(doc.querySelectorAll('#pluginMoves .guide-moves')).toHaveLength(1);
+  // The OpenAI Platform is English: its pictures and labels stay English, translated around them.
+  expect(moves('tunnel')).toContain('Auf „Create“ klicken');
+  expect(pictures('key').every(src => /api-key-(create|tunnels)-en/.test(src!))).toBe(true);
+  setLanguage('en');
+});
+
+it('judges Setup from the saved settings on the first paint, and numbers its steps as the rail does', async () => {
+  // A finished setup: tunnel saved and key stored. The first paint read the tunnel field before it
+  // was filled from the settings, so Setup looked unfinished and Connect was disabled until the
+  // next state update.
+  const mounted = await mountChat({ hasApiKey: true });
+  const doc = mounted.window.document;
+  expect((doc.getElementById('tunnelId') as HTMLInputElement).value).toBe('tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  expect(doc.getElementById('setupBadge')!.hidden).toBe(true);
+  expect((doc.getElementById('wizConnect') as HTMLButtonElement).disabled).toBe(false);
+
+  // The hints name the step by its place in the rail: Tunnel is 4 and API key 5 since Access joined.
+  const rail = [...doc.querySelectorAll<HTMLElement>('.setup-rail [data-rail-step]')].map(button => button.dataset.railStep);
+  expect(rail.indexOf('tunnel') + 1).toBe(4);
+  const noTunnel = structuredClone(mounted.state);
+  noTunnel.config.tunnel.tunnelId = '';
+  mounted.push(noTunnel);
+  (doc.getElementById('tunnelId') as HTMLInputElement).value = '';
+  mounted.push(structuredClone(noTunnel));
+  expect((doc.getElementById('wizConnect') as HTMLButtonElement).title).toBe('Create a tunnel and paste its ID — step 4.');
+  const noKey = structuredClone(mounted.state);
+  noKey.hasApiKey = false;
+  mounted.push(noKey);
+  expect((doc.getElementById('wizConnect') as HTMLButtonElement).title).toBe('Add a restricted API key — step 5.');
+});
+
+it("names ChatGPT's sign-in button by the label ChatGPT shows in the app's language", async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  const moves = (group: string) => [...doc.querySelectorAll(`[data-setup-guide="${group}"] .guide-move-text`)].map(move => move.textContent);
+  expect(moves('signin')).toContain('Click “Log in”');
+  expect(moves('external-browser')).toContain('Click “Log in”');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  // ChatGPT's German page says "Anmelden"; the step used to send people looking for "Log in".
+  expect(moves('signin')).toContain('Auf „Anmelden“ klicken');
+  expect(moves('external-browser')).toContain('Auf „Anmelden“ klicken');
+  setLanguage('ja');
+  expect(moves('signin').some(text => text!.includes('「ログイン」'))).toBe(true);
+  setLanguage('en');
+});
+
+it('says a switched-off permission group is off in the app\'s language', async () => {
+  const mounted = await mountChat();
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, capabilities: {
+    ...mounted.state.config.capabilities, screen: false, control: false, clipboardRead: false, clipboardWrite: false
+  } } });
+  const doc = mounted.window.document;
+  const count = (group: string) => doc.querySelector(`[data-group="${group}"] .group-count`)?.textContent;
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  // The summary of a group with nothing on was the bare English word "off" in every language.
+  expect(count('desktop')).toBe('aus');
+  setLanguage('en');
+  expect(count('desktop')).toBe('off');
+});
+
+it("keeps a worker's delivery line in the app's language when the language changes", async () => {
+  const worker = { id: 'worker-1', role: 'worker', label: 'Docs', task: 'Update the docs', jobTitle: 'Docs', runId: 'run-1', reasoningEffort: null, model: null, state: 'active',
+    createdAt: 1, activatedAt: 2, finishedAt: null, result: null, pending: 0, awaitingAck: 0, delivered: 1, conversationId: 'worker-chat', primeConversationId: 'prime-chat', detachedAt: null };
+  const mounted = await mountChat({}, [], { getSwarm: async () => ({ ok: true, data: { enabled: true, running: true, runId: 'run-1', agents: [worker], maxWorkers: 2, pendingReports: 0 } }) });
+  const line = () => mounted.window.document.querySelector('#swarmList .model-sub')?.textContent;
+  await vi.waitFor(() => expect(line()).toBe('0 pending · 1 delivered · chat bound'));
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  // The line was joined once when the list was painted, so it stayed English.
+  expect(line()).toBe('0 ausstehend · 1 zugestellt · Chat verknüpft');
+  setLanguage('en');
 });
 
 it('highlights missing required setup fields while respecting drafts and a stored API key', async () => {
@@ -2030,7 +2214,7 @@ it('counts a plugin ChatGPT used in an earlier run, so a restart does not reopen
 // Mounts the whole app many times over; under a fully parallel suite that alone can pass 30 s.
 it('recognizes a finished first step after a restart from live or lasting evidence, without a click', async () => {
   type External = { present: boolean; version: string | null; lastSeenAt: number | null; signedIn?: boolean | null;
-    proof?: { version: string; signedIn: boolean } | null };
+    proof?: { version: string; signedIn: boolean } | null; chatgptAccess?: boolean };
   // Each scenario is a fresh launch: main.ts binds to the window it is first imported into.
   const launch = async (overrides: Record<string, unknown> = {}) => { vi.resetModules(); return mountChat(overrides, []); };
   const scenario = async (browser: 'chrome' | 'cos', external: External | null, extra: Record<string, unknown> = {}) => {
@@ -2057,6 +2241,10 @@ it('recognizes a finished first step after a restart from live or lasting eviden
   // Chrome open with no ChatGPT tab: no live answer, the lasting one stands.
   result = await scenario('chrome', { present: true, version: app, lastSeenAt: now, signedIn: null, proof: { version: app, signedIn: true } });
   expect(result).toMatchObject({ done: true, status: 'Extension connected and up to date' });
+  // Connected, but the browser keeps it off chatgpt.com: nothing could run on a ChatGPT page.
+  result = await scenario('chrome', { present: true, version: app, lastSeenAt: now, signedIn: null, proof: { version: app, signedIn: true }, chatgptAccess: false });
+  expect(result).toMatchObject({ done: false, choosing: false, status: 'The extension may not open ChatGPT' });
+  expect(document.getElementById('extensionSetupDetail')!.textContent).toContain('chatgpt.com');
   // A live signed-out answer wins over the lasting one.
   result = await scenario('chrome', { present: true, version: app, lastSeenAt: now, signedIn: false, proof: { version: app, signedIn: true } });
   expect(result.done).toBe(false);
@@ -2181,7 +2369,7 @@ it('keeps the app-wide options on the General page, not in Setup, and saves them
   const doc = mounted.window.document;
   const general = doc.querySelector('[data-panel="general"]')!;
   const setup = doc.querySelector('[data-panel="setup"]')!;
-  for (const id of ['followOutput', 'playfulStatus', 'mentionCore', 'privacyScreenshots', 'developerMode', 'controlApiEnabled', 'controlApiAllowActions']) {
+  for (const id of ['followOutput', 'playfulStatus', 'playfulContinue', 'mentionCore', 'privacyScreenshots', 'developerMode', 'controlApiEnabled', 'controlApiAllowActions']) {
     expect(general.contains(doc.getElementById(id)), id).toBe(true);
     expect(setup.contains(doc.getElementById(id)), id).toBe(false);
   }
@@ -2195,6 +2383,28 @@ it('keeps the app-wide options on the General page, not in Setup, and saves them
   follow.checked = false;
   follow.dispatchEvent(new mounted.window.Event('change', { bubbles: true }));
   await vi.waitFor(() => expect(mounted.calls.at(-1)?.ui.followOutput).toBe(false));
+});
+
+// #924 / #1401: stable connector URLs for a tunnel of one's own, opt-in, only with secure storage.
+it('saves the stable connector URL option from For developers, and only with secure storage', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  const box = doc.getElementById('mcpPersistentUrls') as HTMLInputElement;
+  expect(doc.querySelector('[data-panel="general"]')!.contains(box)).toBe(true);
+  expect(box.checked).toBe(false);
+  const instructions = mounted.state.config.mcp?.instructions ?? '';
+  box.checked = true;
+  box.dispatchEvent(new mounted.window.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls.at(-1)?.mcp).toEqual({ instructions, persistentUrls: true }));
+  const unavailable = structuredClone(mounted.state) as any;
+  unavailable.secureStorage = { available: false };
+  unavailable.config.mcp = { instructions, persistentUrls: false };
+  mounted.push(unavailable);
+  expect(box.disabled).toBe(true);
+  // Already on without the store: it stays usable, so it can always be turned off.
+  unavailable.config.mcp = { instructions, persistentUrls: true };
+  mounted.push(structuredClone(unavailable));
+  expect(box.disabled).toBe(false);
 });
 
 it('always requires the live browser because recording is an invariant', async () => {
@@ -2294,6 +2504,283 @@ it('says nothing about being current until the check has actually answered', asy
 /**
  * A staged update is not "up to date", and it is not a failure either.
  */
+it('keeps update readiness actions stable and does not start update or connection work on pushes', async () => {
+  const installUpdate = vi.fn(), connect = vi.fn(), refreshUpdate = vi.fn(), updateAll = vi.fn();
+  const { window: w, state, push } = await mountChat({}, [], { installUpdate, connect, refreshUpdate, updateAll });
+  const button = w.document.getElementById('updateReviewSetup') as HTMLButtonElement;
+  expect(button).not.toBeNull();
+  button.focus(); push(structuredClone(state));
+  expect(w.document.activeElement).toBe(button);
+  expect(installUpdate).not.toHaveBeenCalled(); expect(connect).not.toHaveBeenCalled(); expect(refreshUpdate).not.toHaveBeenCalled();
+  expect(updateAll).not.toHaveBeenCalled();
+  button.click();
+  expect(w.document.querySelector('[data-panel="setup"]')!.classList.contains('is-active')).toBe(true);
+});
+
+it('draws the Update status disclosures with the app\'s own chevron', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  // Every other disclosure in the app uses the chevron icon; these used a text "▸" and the
+  // browser's own ▼ marker.
+  expect(doc.querySelector('#updateReadinessToggle .disclosure-chevron')).not.toBeNull();
+  expect(doc.querySelector('#updateReadinessDetails > summary .disclosure-chevron.details-chevron')).not.toBeNull();
+  expect(doc.getElementById('updateReadinessToggle')!.textContent).not.toContain('▸');
+});
+
+it('shows update failure causes and next steps without using stale connector diagnostics', async () => {
+  const { window: w, state, push } = await mountChat();
+  const next = structuredClone(state) as any;
+  const core = { id: 'core', connectorName: 'Core', description: 'Core', cardSummary: 'Files and terminal',
+    optional: false, available: true, state: 'live', detail: '', tools: ['read'], localUrl: null,
+    publicUrl: null, lastRequestAt: null, lastToolCallAt: null };
+  next.update = { ...next.update, stage: 'failed', error: 'GitHub returned 503' };
+  next.bridge = { ...next.bridge, running: true, paired: true, present: false, extensionVersion: '0.0.1' };
+  next.status = { ...next.status, state: 'offline', detail: 'Network unavailable',
+    surfaces: [{ ...core, state: 'error', detail: 'Network unavailable' }] };
+  const row = (id: string) => w.document.querySelector(`[data-update-part="${id}"]`)!.textContent!;
+  push(next);
+  expect(row('app')).toContain('GitHub returned 503');
+  expect(row('app')).toContain('current app');
+  expect(row('extension')).toContain('active chats');
+  expect(row('core')).toContain('Network unavailable');
+  expect(row('core')).toContain('Review setup');
+  next.status.surfaces = []; push(next);
+  expect(row('core')).toContain('Network unavailable');
+  expect(w.document.querySelector('[data-update-part="core"]')!.classList.contains('is-bad')).toBe(true);
+  next.status.detail = ''; push(next);
+  expect(row('core')).toContain('Review setup');
+  next.status.surfaces = [{ ...core }];
+  next.status.state = 'connected'; next.status.surfaces[0].state = 'live';
+  next.connectorSchemas = { core: 'current' };
+  next.connectorRefresh = { core: { schemaId: 'current', state: 'failed', failure: 'inspection' } };
+  push(next);
+  expect(row('core')).toContain('Could not inspect');
+  expect(row('core')).toContain('Plugin check failed');
+  expect(row('core')).toContain("settings in ChatGPT");
+  expect(row('core')).toContain('Diagnostics report');
+  next.connectorRefresh.core.failure = 'confirmation'; push(next);
+  expect(row('core')).toContain('Could not confirm');
+  next.connectorRefresh.core = { schemaId: 'current', state: 'failed', failure: 'migration', responding: true }; push(next);
+  expect(row('core')).toContain('Plugin check failed');
+  expect(row('core')).toContain('saved plugin');
+  expect(row('core')).toContain('refresh this existing plugin');
+  expect(row('core')).not.toContain('recreate');
+  expect(w.document.querySelector('[data-update-part="core"]')!.classList.contains('is-bad')).toBe(true);
+  expect(w.document.getElementById('updateReadinessSummary')!.dataset.ready).toBe('false');
+  next.connectorRefresh.core.failure = 'confirmation';
+  next.connectorRefresh.core.schemaId = 'old'; push(next);
+  expect(row('core')).not.toContain('Could not confirm');
+  next.connectorRefresh.core = { schemaId: 'current', state: 'manual' }; push(next);
+  expect(row('core')).toContain("ChatGPT's plugin settings");
+  expect(row('core')).toContain('refresh or recreate');
+  expect(row('core')).toContain('Update all to recheck');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('ja');
+  expect(row('core')).toContain('更新または作り直し');
+  expect(row('core')).toContain('まとめて更新');
+  setLanguage('en');
+});
+
+it('asks in the app\'s own dialog before Update all restarts, with Keep working first', async () => {
+  // 2026-10-15: the question was a bare system message box, unlike anything else in the app.
+  const updateAll = vi.fn()
+    .mockResolvedValueOnce({ ok: true, data: 'confirm' })
+    .mockResolvedValueOnce({ ok: true, data: 'confirm' })
+    .mockResolvedValueOnce({ ok: true, data: 'restarting' });
+  const { window: w, state, push } = await mountChat({}, [], { updateAll });
+  const next = structuredClone(state) as any;
+  next.update = { ...next.update, latest: '2.1.99', stage: 'ready' };
+  push(next);
+  const button = w.document.getElementById('updateAll') as HTMLButtonElement;
+  const dialog = () => w.document.getElementById('updateRestartDialog') as HTMLDialogElement | null;
+  button.click();
+  await vi.waitFor(() => expect(dialog()?.open).toBe(true));
+  expect(updateAll).toHaveBeenNthCalledWith(1);
+  expect(dialog()!.classList.contains('whats-new-dialog')).toBe(true);
+  expect(dialog()!.textContent).toContain('2.1.99');
+  expect(w.document.activeElement?.textContent).toBe('Keep working');
+  (w.document.activeElement as HTMLButtonElement).click();
+  await vi.waitFor(() => expect(dialog()).toBeNull());
+  expect(updateAll).toHaveBeenCalledTimes(1);
+  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  button.click();
+  await vi.waitFor(() => expect(dialog()?.open).toBe(true));
+  const restart = [...dialog()!.querySelectorAll('button')].find(item => item.textContent === 'Restart and install')!;
+  restart.click();
+  await vi.waitFor(() => expect(updateAll).toHaveBeenCalledTimes(3));
+  expect(updateAll).toHaveBeenLastCalledWith('2.1.99');
+  await vi.waitFor(() => expect(dialog()).toBeNull());
+});
+
+it.each(['reply', 'transport'])('keeps an Update all %s failure visible across pushes until explicit retry', async kind => {
+  let resolve!: (reply: any) => void;
+  const updateAll = vi.fn().mockImplementationOnce(() => kind === 'reply'
+    ? Promise.resolve({ ok: false, error: 'Network unavailable' }) : Promise.reject(new Error('Network unavailable')))
+    .mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  const { window: w, state, push } = await mountChat({}, [], { updateAll });
+  const button = w.document.getElementById('updateAll') as HTMLButtonElement;
+  const details = w.document.getElementById('updateReadinessDetails') as HTMLDetailsElement;
+  details.open = false;
+  button.click();
+  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  const error = w.document.getElementById('updateAllError')!;
+  expect(error.hidden).toBe(false);
+  expect(error.textContent).toContain('Network unavailable');
+  expect(error.textContent).toContain('Update all to retry');
+  expect(details.open).toBe(true);
+  details.open = false; // A new failure asks for attention; the person can still collapse it.
+  expect(details.open).toBe(false);
+  expect(details.contains(error)).toBe(false);
+  expect(details.contains(w.document.getElementById('updateAllNotice'))).toBe(false);
+  push(structuredClone(state));
+  expect(error.hidden).toBe(false);
+  expect(details.open).toBe(false);
+  expect(updateAll).toHaveBeenCalledTimes(1);
+  button.click();
+  expect(error.hidden).toBe(true);
+  resolve({ ok: true, data: 'checking-connectors' });
+  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  expect(error.hidden).toBe(true);
+});
+
+// One test per language: all 13 in one test took 6 s here and ran past the 30 s limit on the
+// slower macOS x64 release runner (2.1.38 publish, 2026-10-15).
+it.each(['en', 'de', 'es', 'fr', 'ja', 'ko', 'pt-BR', 'pt-PT', 'ru', 'tr', 'vi', 'zh-CN', 'zh-TW'] as const)(
+  'localizes updater network failures in the card, both banner paths and retained errors (%s)', async locale => {
+  const updateAll = vi.fn().mockResolvedValue({ ok: false, error: 'GitHub could not be reached' });
+  const { window: w, state, push } = await mountChat({}, [], { updateAll });
+  const { setLanguage, t } = await import('../src/renderer/i18n.js');
+  const button = w.document.getElementById('updateAll') as HTMLButtonElement;
+  const error = w.document.getElementById('updateAllError')!;
+  setLanguage(locale);
+  try {
+    const next = structuredClone(state);
+    next.update.stage = 'failed'; next.update.error = 'GitHub could not be reached';
+    const reason = t('GitHub could not be reached. Check your connection');
+    for (const latest of [null, '99.0.0']) {
+      next.update.latest = latest; push(structuredClone(next));
+      expect(w.document.querySelector('[data-update-part="app"]')!.textContent).toContain(reason);
+      for (const id of ['updateText', 'updateLine']) expect(w.document.getElementById(id)!.textContent).toContain(reason);
+    }
+    button.click(); await vi.waitFor(() => expect(button.disabled).toBe(false));
+    expect(error.hidden).toBe(false);
+    expect(error.textContent).toContain(reason);
+    expect(error.textContent).toContain(t('Choose Update all to retry.'));
+    push(structuredClone(next));
+    expect(error.hidden).toBe(false);
+    expect(updateAll).toHaveBeenCalledTimes(1);
+    updateAll.mockResolvedValueOnce({ ok: true, data: 'checking-connectors' });
+    button.click(); await vi.waitFor(() => expect(button.disabled).toBe(false));
+    expect(error.hidden).toBe(true);
+  } finally { setLanguage('en'); }
+});
+
+it('translates updater reasons and retained recovery guidance when the language changes', async () => {
+  const updateAll = vi.fn().mockResolvedValue({ ok: false, error: 'Could not read plugin-refresh state' });
+  const { window: w, state, push } = await mountChat({}, [], { updateAll });
+  const { setLanguage, t } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  const next = structuredClone(state);
+  next.update.stage = 'failed'; next.update.error = 'Update check failed';
+  push(next);
+  expect(w.document.querySelector('[data-update-part="app"] .is-warn')!.textContent).toBe(t('Update check failed'));
+  const button = w.document.getElementById('updateAll') as HTMLButtonElement;
+  button.click(); await vi.waitFor(() => expect(button.disabled).toBe(false));
+  const error = w.document.getElementById('updateAllError')!;
+  expect(error.textContent).not.toContain('Could not read plugin-refresh state');
+  expect(error.textContent).toContain(t('Save a Diagnostics report from Activity for help with recovery. The saved state has been kept.'));
+  setLanguage('ja');
+  expect(error.textContent).toContain('診断レポート');
+  expect(w.document.querySelector('[data-update-part="app"] .is-warn')!.textContent).toBe('更新の確認に失敗しました');
+  push(next);
+  expect(updateAll).toHaveBeenCalledTimes(1);
+  expect(error.hidden).toBe(false);
+  setLanguage('en');
+});
+
+it.each(['cancelled', 'failed', 'transport'])('offers the existing diagnostics action after an unreadable-state failure and keeps a %s report from retrying updates', async outcome => {
+  let finish!: (reply: any) => void;
+  let reject!: (error: Error) => void;
+  const saveDiagnosticsReport = vi.fn(() => new Promise((done, fail) => { finish = done; reject = fail; }));
+  const updateAll = vi.fn().mockResolvedValueOnce({ ok: false, error: 'Could not read plugin-refresh state' })
+    .mockResolvedValueOnce({ ok: true, data: 'checking-connectors' });
+  const { window: w, state, push } = await mountChat({}, [], { updateAll, saveDiagnosticsReport });
+  const update = w.document.getElementById('updateAll') as HTMLButtonElement;
+  const shortcut = w.document.getElementById('updateDiagnosticsReport') as HTMLButtonElement;
+  const original = w.document.getElementById('saveDiagnosticsReport') as HTMLButtonElement;
+  expect(shortcut.hidden).toBe(true);
+  update.click(); await vi.waitFor(() => expect(update.disabled).toBe(false));
+  expect(shortcut.hidden).toBe(false);
+  shortcut.click(); original.click();
+  expect(saveDiagnosticsReport).toHaveBeenCalledTimes(1);
+  expect(shortcut.disabled).toBe(true); expect(original.disabled).toBe(true);
+  push(structuredClone(state));
+  expect(shortcut.disabled).toBe(true);
+  if (outcome === 'transport') reject(new Error('Fixture report transport error'));
+  else finish(outcome === 'cancelled' ? { ok: true, data: { saved: false } } : { ok: false, error: 'Fixture report error' });
+  await vi.waitFor(() => expect(shortcut.disabled).toBe(false));
+  expect(original.disabled).toBe(false);
+  expect(w.document.getElementById('updateAllError')!.hidden).toBe(false);
+  expect(updateAll).toHaveBeenCalledTimes(1);
+  update.click(); await vi.waitFor(() => expect(update.disabled).toBe(false));
+  expect(shortcut.hidden).toBe(true);
+  expect(saveDiagnosticsReport).toHaveBeenCalledTimes(1);
+});
+
+it('runs Update all once on explicit click and keeps it busy across state pushes, then allows retry', async () => {
+  let resolve!: (reply: any) => void;
+  const updateAll = vi.fn(() => new Promise<any>(done => { resolve = done; }));
+  const { window: w, state, push } = await mountChat({}, [], { updateAll });
+  const button = w.document.getElementById('updateAll') as HTMLButtonElement;
+  expect(button).not.toBeNull();
+  expect(w.document.querySelector('.update-readiness')!.textContent).toContain('asked before the app restarts');
+  expect(button.getAttribute('aria-describedby')).toBe('updateAllNotice');
+  button.click(); button.click(); push(structuredClone(state));
+  expect(updateAll).toHaveBeenCalledTimes(1); expect(button.disabled).toBe(true);
+  expect(button.textContent).toBe('Updating…'); expect(button.getAttribute('aria-busy')).toBe('true');
+  resolve({ ok: false, error: 'Network unavailable' });
+  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  expect(button.textContent).toBe('Update all');
+  button.click(); expect(updateAll).toHaveBeenCalledTimes(2);
+  resolve({ ok: true, data: 'manual' });
+  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  expect(w.document.body.textContent).toContain('Download link opened. Install the app to continue');
+  button.click(); resolve({ ok: true, data: 'checking-connectors' });
+  await vi.waitFor(() => expect(button.disabled).toBe(false));
+  expect(w.document.querySelector('.toast')!.textContent).toContain(w.document.getElementById('updateReadinessCard') ? 'Update status' : 'Checking…');
+});
+
+it.each(['reply', 'transport', 'read-state'])('localizes and retains the update command %s error across state pushes', async kind => {
+  const source = kind === 'read-state' ? 'Could not read plugin-refresh state' : 'latest answered 503';
+  const updateAll = vi.fn(() => kind === 'transport' ? Promise.reject(new Error(source)) : Promise.resolve({ ok: false, error: source }));
+  const { window: w, state, push } = await mountChat({}, [], { updateAll });
+  w.document.querySelector<HTMLButtonElement>('[data-language="ja"]')!.click();
+  const button = w.document.getElementById('updateAll') as HTMLButtonElement;
+  button.click(); await vi.waitFor(() => expect(button.disabled).toBe(false));
+  push(structuredClone(state));
+  expect(w.document.getElementById('updateAllError')!.hidden).toBe(false);
+  expect(w.document.getElementById('updateAllError')!.textContent).toContain(kind === 'read-state' ? '診断レポート' : '503');
+  expect(w.document.body.textContent).not.toContain(source);
+  expect(updateAll).toHaveBeenCalledTimes(1);
+});
+
+// #1490: a silently failed installer left the next start on the old version with nothing said.
+it('says when the last update did not install, in place of the ready line', async () => {
+  const mounted = await mountChat();
+  const state = structuredClone(mounted.state) as any;
+  state.update = { current: '2.0.2', latest: '2.0.3', stage: 'ready', error: null, checkedAt: Date.now(), notInstalled: '2.0.3' };
+  mounted.push(state);
+  const line = mounted.window.document.getElementById('updateLine')!;
+  expect(line.textContent).toContain('Chat On Steroids 2.0.3 did not install; this is still 2.0.2.');
+  // The same version ready again: the notice already says to choose Install, once.
+  expect(line.textContent).not.toContain('is downloaded and ready');
+  expect(line.className).toContain('bad');
+  // Before the next check has found it again: never "Up to date" over a failed install.
+  mounted.push({ ...structuredClone(state), update: { ...state.update, latest: null, stage: 'idle' } });
+  expect(line.textContent).toContain('did not install');
+  expect(line.textContent).not.toContain('Up to date');
+});
+
 it('reports a staged update in the Activity line and the header bar', async () => {
   const mounted = await mountChat();
   const staged = structuredClone(mounted.state) as any;
@@ -2367,6 +2854,21 @@ it('asks for an extension reload only when the extension is older than this app'
   mounted.push(ahead);
   expect(notice.hidden, 'a newer extension is not a downgrade prompt').toBe(true);
   expect(action.hidden).toBe(true);
+});
+
+// 2.1.39 release round: the VM's Firefox still ran the 2.1.38 add-on, and the notice told the person
+// to reload the extension from the app's folder. Firefox runs the signed add-on and updates it itself.
+it('tells a Firefox user how Firefox updates its add-on instead of pointing at the app folder', async () => {
+  const mounted = await mountChat({
+    bridge: {
+      running: true, port: 8765, paired: true, present: true, lastSeenAt: Date.now(), extensionVersion: '2.0.1',
+      externalExtension: { present: true, version: '2.0.1', lastSeenAt: Date.now(), engine: 'gecko' }
+    }
+  });
+  const text = mounted.window.document.getElementById('updateText')!.textContent!;
+  expect(text).toContain('2.0.1');
+  expect(text).toContain('about:addons');
+  expect(text).not.toContain('folder');
 });
 
 it('shows a missing-extension reminder while connected and clears it after the companion reports in', async () => {
@@ -2556,6 +3058,19 @@ it('offers the handoff length, starting at the thorough default, and saves a sho
   await settle();
   expect(mounted.calls.at(-1)?.compaction.handoffLength).toBe('short');
   expect(mounted.calls.at(-1)?.compaction.handoffPrompt).toBe(DEFAULT_HANDOFF_PROMPT);
+});
+
+// #1406: the recording store's size used to be fixed at 2 GB.
+it('offers the recording storage sizes, starting at 2 GB, and saves a larger choice', async () => {
+  const mounted = await mountChat({ hasGoalKey: true });
+  const size = mounted.window.document.getElementById('recordingStorageLimit') as HTMLSelectElement;
+  expect(size.value).toBe('2');
+  expect([...size.options].map(option => option.value)).toEqual(['2', '5', '10', '20', '50']);
+  size.value = '10';
+  size.dispatchEvent(new mounted.window.Event('change'));
+  await settle();
+  await settle();
+  expect(mounted.calls.at(-1)?.sessions.storageLimitGiB).toBe(10);
 });
 
 /**
@@ -2980,4 +3495,146 @@ it('shows a computer name set elsewhere and opens its section, so the suffixed c
   await settle();
   expect((doc.getElementById('connectorSuffix') as HTMLInputElement).value).toBe('Windows');
   expect((doc.getElementById('connectorSuffixField') as HTMLDetailsElement).open).toBe(true);
+});
+
+it('shows unreadable refresh state and allows one explicit reset, including failure and retry', async () => {
+  let finish!: (value: any) => void;
+  const reset = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+  const mounted = await mountChat({ pluginRefreshUnreadable: true }, [], { resetPluginRefresh: reset });
+  const doc = mounted.window.document;
+  const recovery = doc.getElementById('pluginRefreshRecovery')!;
+  const button = doc.getElementById('pluginRefreshReset') as HTMLButtonElement;
+  expect(recovery.hidden).toBe(false);
+  expect(recovery.textContent).toContain('Could not read plugin-refresh state');
+  expect(reset).not.toHaveBeenCalled();
+  button.click(); button.click();
+  expect(button.disabled).toBe(true); expect(reset).toHaveBeenCalledTimes(1);
+  mounted.push({ ...mounted.state, pluginRefreshUnreadable: true });
+  expect(button.disabled).toBe(true);
+  finish({ ok: false, error: 'private filesystem diagnostics' }); await settle();
+  expect(recovery.hidden).toBe(false); expect(button.disabled).toBe(false);
+  expect(recovery.textContent).toContain('Could not reset plugin-refresh state');
+  expect(recovery.textContent).not.toContain('private filesystem');
+  mounted.push({ ...mounted.state, pluginRefreshUnreadable: false });
+  expect(recovery.hidden).toBe(true);
+  mounted.push({ ...mounted.state, pluginRefreshUnreadable: true });
+  expect(recovery.textContent).toContain('Could not read plugin-refresh state');
+  button.click(); expect(reset).toHaveBeenCalledTimes(2);
+  finish({ ok: true, data: { ...mounted.state, pluginRefreshUnreadable: false } }); await settle();
+  expect(recovery.hidden).toBe(true);
+  button.click(); expect(reset).toHaveBeenCalledTimes(2);
+});
+
+// Codex's turn-completion notifications: on unless switched off in General.
+it('notifies when a chat finishes unless switched off', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const notify = w.document.getElementById('turnNotifications') as HTMLInputElement;
+  expect(notify.checked).toBe(true);
+  notify.checked = false;
+  notify.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.ui.turnNotifications).toBe(false);
+});
+
+// #1402: long turns continue in a fresh one, every 30 minutes unless changed or off.
+it('starts a fresh turn after 30 minutes unless changed, and saves Off', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const rotate = w.document.getElementById('rotateTurnMinutes') as HTMLSelectElement;
+  expect(rotate.value).toBe('30');
+  expect([...rotate.options].map(option => option.value)).toEqual(['0', '20', '30', '45', '60']);
+  rotate.value = '0';
+  rotate.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.ui.rotateTurnMinutes).toBe(0);
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, rotateTurnMinutes: 45 } } });
+  expect(rotate.value).toBe('45');
+});
+
+// 2.1.39 release round: a value the list does not offer (1 minute, set in the config for a test)
+// became Off as soon as any other setting was saved, because the select had no such option.
+it('keeps a configured fresh-turn interval the list does not offer when another setting is saved', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, rotateTurnMinutes: 1 } } });
+  const rotate = w.document.getElementById('rotateTurnMinutes') as HTMLSelectElement;
+  expect(rotate.value).toBe('1');
+  expect(rotate.selectedOptions[0]!.textContent).toBe('1 min');
+  const notify = w.document.getElementById('turnNotifications') as HTMLInputElement;
+  notify.checked = !notify.checked;
+  notify.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.ui.rotateTurnMinutes).toBe(1);
+});
+
+// Codex's "Follow-up behavior", in General.
+it('offers the follow-up behavior, starting at joining the running turn, and saves waiting', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const followUp = w.document.getElementById('followUp') as HTMLSelectElement;
+  expect(followUp.value).toBe('steer');
+  expect([...followUp.options].map(option => option.value)).toEqual(['steer', 'queue']);
+  followUp.value = 'queue';
+  followUp.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.ui.followUp).toBe('queue');
+});
+
+// Codex's "Prevent sleep while running": the computer by default, the screen too on request, or off.
+it('keeps the computer awake while a chat works, the screen too when chosen, or neither', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const keepAwake = w.document.getElementById('keepAwake') as HTMLSelectElement;
+  expect(keepAwake.value).toBe('computer');
+  for (const [value, saved] of [['screen', { keepAwake: true, keepScreenAwake: true }], ['off', { keepAwake: false, keepScreenAwake: false }],
+    ['computer', { keepAwake: true, keepScreenAwake: false }]] as const) {
+    keepAwake.value = value;
+    keepAwake.dispatchEvent(new w.Event('change', { bubbles: true }));
+    await settle();
+    expect(mounted.calls.at(-1)?.ui, value).toMatchObject(saved);
+  }
+});
+
+// The maintainer's idea (2026-10-14): where a minimized built-in browser goes. Only shown for that browser.
+it('offers where the built-in browser minimizes to, only while it is the chosen browser, and saves the tray', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const choice = w.document.getElementById('cosBrowserMinimize') as HTMLSelectElement;
+  expect(choice.closest('.setting')!.hasAttribute('hidden')).toBe(true);
+  const state = structuredClone(mounted.state);
+  state.config.ui = { ...state.config.ui, chatBrowser: 'cos' };
+  mounted.push(state);
+  await settle();
+  expect(choice.closest('.setting')!.hasAttribute('hidden')).toBe(false);
+  expect(choice.value).toBe('taskbar');
+  expect([...choice.options].map(option => option.value)).toEqual(['taskbar', 'tray']);
+  choice.value = 'tray';
+  choice.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.ui.cosBrowserMinimize).toBe('tray');
+});
+
+// Codex's "Enter key behavior", in General.
+it('offers which key sends, starting at Enter, and saves Cmd/Ctrl+Enter', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const enter = w.document.getElementById('enterSends') as HTMLSelectElement;
+  expect(enter.value).toBe('enter');
+  enter.value = 'modifier';
+  enter.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.ui.enterSends).toBe(false);
+});
+
+// #1460: worker chats leave ChatGPT's chat list once retired, only when switched on.
+it('offers archiving retired worker chats, off by default, and saves it', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const archive = w.document.getElementById('archiveWorkerChats') as HTMLInputElement;
+  expect(archive.checked).toBe(false);
+  archive.checked = true;
+  archive.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.multiAgent.archiveWorkerChats).toBe(true);
 });

@@ -123,7 +123,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
     lines.push(
       'Use exec_command cmds for related builds/tests/git and shell-specific searches.',
       'Set workdir to the project; virtual paths work there. Inside cmd use relative or native paths.',
-      "write_stdin takes session_id: a running command's id, or pass a finished command's completed_session_id as session_id. Completed reads replay output without rerunning work. Inspect exit/output; benign_exit marks an expected non-zero result.",
+      "write_stdin takes session_id: a running command's id, or pass a finished command's completed_session_id as session_id. Completed reads replay output without rerunning work. Inspect exit/output; expected_exit marks an expected non-zero result.",
       'If output is truncated, narrow the command or read the relevant region.'
     );
     if (windows) lines.push(
