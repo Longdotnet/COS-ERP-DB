@@ -79,6 +79,14 @@ export interface SessionList {
   activeId: string | null;
   /** ChatGPT conversation ids the user has blocked from using local tools. */
   blocked: string[];
+  /** ChatGPT conversation ids whose page shows ChatGPT's tool approval card, waiting for the user. */
+  approval: string[];
+  /**
+   * ChatGPT conversation ids whose recovery stopped after its last pickup reload while the input,
+   * Continue or Goal/Loop step it was collecting is still owed: the user has to act. The same chats
+   * whose `SessionControlsView.recovery` holds a `pickup-stopped` countdown.
+   */
+  recoveryStopped: string[];
   /** ChatGPT conversation ids explicitly trusted for strict allowlisting. */
   trusted?: string[];
   pressure: Array<TokenPressure & { id: string }>;
@@ -245,11 +253,12 @@ const api = {
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
   saveDiagnosticsReport: () => call<{ saved: false } | { saved: true; name: string }>('diagnostics:saveReport'),
   requestDesktopAccessibility: () => call<AppState>('desktop:requestAccessibility'),
+  repairDesktopAccess: () => call<AppState>('desktop:repairPermissions'),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
   getLogJson: () => call<string>('log:json'),
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
-  exportMarkdown: (request: { id: string; scope: 'answer' | 'session'; turnId?: string; target: 'clipboard' | 'file' }) =>
+  exportMarkdown: (request: { id: string; scope: 'answer' | 'session'; turnId?: string; messageId?: string; target: 'clipboard' | 'file' }) =>
     call<{ done: 'copied' } | { done: 'saved'; name: string } | { done: 'cancelled' }>('sessions:exportMarkdown', request),
   // `external`: the system's own browser even for a page the CoS browser would open.
   openLink: (url: string, options: { external?: boolean } = {}) => call<boolean>('link:open', { url, ...(options.external ? { external: true } : {}) }),
@@ -273,6 +282,7 @@ const api = {
     call<SessionList>('sessions:list', options ?? {}),
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
+  addRemoteProject: (address: string, folder: string) => call<LocalProject>('projects:addRemote', { address, folder }),
   retryChatgptProject: (id: string) => call<LocalProject | null>('projects:chatgpt-retry', { id }),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
   setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
@@ -306,7 +316,7 @@ const api = {
   getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
   getImageStorage: () => call<ImageStorageInfo>('sessions:imageStorage'),
   clearImageStorage: (mode: ImageStorageClearMode) => call<ImageStorageClearResult>('sessions:clearImageStorage', { mode }),
-    getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number }) =>
+    getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number; actions?: boolean }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),
   stopSessionTurn: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:stopTurn', { id, expectedTurnId }),
   releaseSessionFinish: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:releaseFinish', { id, expectedTurnId }),
@@ -372,6 +382,7 @@ const api = {
   /** Chats matching every word of `query`, by title first, then by what was said in them. */
   searchSessions: (query: string) => call<SessionSearchReply>('sessions:search', { query }),
   locateSearchMatch: (id: string, query: string) => call<SessionSearchLocation | null>('sessions:locate-match', { id, query }),
+  locateMessage: (id: string, messageId: string) => call<SessionSearchLocation | null>('sessions:locate-message', { id, messageId }),
   findInChat: (id: string, query: string) => call<SessionSearchLocation[]>('sessions:find', { id, query }),
   /** The chat's own name in the app; null clears it and ChatGPT's title shows again. */
   renameSession: (id: string, title: string | null) => call<boolean>('sessions:rename', { id, title }),

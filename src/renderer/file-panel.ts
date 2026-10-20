@@ -5,9 +5,10 @@ import type { ProjectDirectoryListing, ProjectFileEntry, ProjectFileKind, Projec
 import type { ProjectGitChange, ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot, ProjectGitStatus } from '../shared/project-git.js';
 import { safeExternalLink } from '../shared/external-link.js';
 import { marked } from 'marked';
-import { currentLanguage, t, ui } from './i18n.js';
+import { currentLanguage, onLanguageChange, t, tn, ui } from './i18n.js';
 import { disclosureChevron, el, icon, run, toast } from './dom.js';
 import { attachWorkPanelResize } from './work-panel-resize.js';
+import { createSearchPopup } from './search-popup.js';
 import { sanitizeHtmlTree } from './sanitize-html.js';
 import type { ProjectCodeEditor, ProjectDiffViewer } from './file-code-editor.js';
 import type { ProjectPdfViewer } from './file-pdf-viewer.js';
@@ -103,6 +104,8 @@ function actionButton(label: () => string, glyph: string, action: () => void | P
   button.type = 'button';
   button.append(icon(glyph), el('span', '', label));
   ui(button, 'title', label);
+  // The label can be hidden when the toolbar is narrow; the name stays (fitToolbarActions).
+  ui(button, 'aria-label', label);
   button.addEventListener('click', () => void action());
   return button;
 }
@@ -228,6 +231,14 @@ export function createFilePanel(options: FilePanelOptions) {
     toolbarActions.append(newFile, newFolder, rename, remove, reveal, changes);
     toolbar.append(toolbarActions, refresh);
   }
+  // Labels that do not fit hid the last actions behind an invisible scrollbar (German: Delete,
+  // Reveal and Changes). Show icons only then; each button keeps its title and accessible name.
+  const fitToolbarActions = (): void => {
+    toolbarActions.classList.remove('is-compact');
+    toolbarActions.classList.toggle('is-compact', toolbarActions.scrollWidth > toolbarActions.clientWidth + 1);
+  };
+  if (typeof ResizeObserver === 'function') new ResizeObserver(fitToolbarActions).observe(toolbar);
+  onLanguageChange(() => { updateChangesButton(); fitToolbarActions(); });
 
   const body = el('div', 'file-panel-body');
   const tree = el('div', 'file-tree'); tree.setAttribute('role', 'tree');
@@ -309,7 +320,23 @@ export function createFilePanel(options: FilePanelOptions) {
   let reviewGeneration = 0;
   let gitSnapshot: ProjectGitSnapshot | null = null;
   let selectedBaseRef: string | null = null;
-  let branchMenu: HTMLElement | null = null;
+  const branchPopup = createSearchPopup({
+    trigger: () => branchTrigger, className: 'file-branch',
+    label: () => t('Compare branches'), placeholder: () => t('Search branches…'), empty: () => t('No branches found'),
+    choices: () => [{ ref: '', label: t('Working tree') }, ...(gitSnapshot?.branches ?? [])].map(choice => ({
+      label: choice.label, selected: choice.ref === (selectedBaseRef ?? ''),
+      ...(choice.ref.startsWith('refs/remotes/') ? { title: t('Locally cached remote branch; no automatic fetch') } : {}),
+      pick: () => {
+        if (selectedBaseRef === (choice.ref || null)) return;
+        selectedBaseRef = choice.ref || null;
+        gitDiffGeneration++; gitDiffPath = null; gitDiffValue = null;
+        gitSnapshot = null;
+        destroyDiffViewer(); render();
+        void reconcileGitChanges();
+      }
+    })),
+    notes: () => gitSnapshot?.branchesTruncated ? [t('More branches exist than can be shown.')] : []
+  });
   let gitLoading = false;
   let gitGeneration = 0;
   let gitDiffGeneration = 0;
@@ -434,7 +461,7 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function editablePreview(value: ProjectFilePreview): value is ProjectFilePreview & { text: string; revision: string } {
-    return !value.binary && value.text !== null && !value.truncated && typeof value.revision === 'string';
+    return !project?.remote && !value.binary && value.text !== null && !value.truncated && typeof value.revision === 'string';
   }
 
   async function leaveEditorIfNeeded(): Promise<boolean> {
@@ -539,6 +566,10 @@ export function createFilePanel(options: FilePanelOptions) {
   function updateActions(): void {
     const target = actionSelection();
     const inFiles = mode === 'files';
+    // A project on a server (#1469) is browsed and previewed here; v1 changes its files only
+    // through ChatGPT's tools, so actions that could only fail there are not offered.
+    const onServer = Boolean(project?.remote);
+    for (const button of [newFile, newFolder, rename, remove, reveal]) button.hidden = onServer;
     const mutable = inFiles && Boolean(project) && target.path !== '' &&
       (target.kind === 'file' || target.kind === 'directory');
     rename.disabled = !mutable;
@@ -600,6 +631,7 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function gitStatusLabel(status: ProjectGitStatus): string {
+    if (status === 'C') return t('Conflict');
     if (status === 'U') return t('Untracked');
     if (status === 'A') return t('Added');
     if (status === 'D') return t('Deleted');
@@ -640,6 +672,8 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function folderGitStatus(statuses: ReadonlySet<ProjectGitStatus>): ProjectGitStatus {
+    // A folder holding a conflict says so, whatever else changed in it.
+    if (statuses.has('C')) return 'C';
     return statuses.size === 1 ? [...statuses][0]! : 'M';
   }
 
@@ -976,9 +1010,9 @@ export function createFilePanel(options: FilePanelOptions) {
       surfaceClass = 'has-pdf-viewer';
       content = pdfHost;
     } else if (value.binary) {
-      content = el('p', 'file-preview-empty', value.note ?? (() => t('Binary file · preview unavailable')));
+      content = el('p', 'file-preview-empty', () => value.note ? t(value.note) : t('Binary file · preview unavailable'));
     } else if (value.text === null) {
-      content = el('p', 'file-preview-empty', value.note ?? t('Preview unavailable'));
+      content = el('p', 'file-preview-empty', () => value.note ? t(value.note) : t('Preview unavailable'));
     } else if (/\.(?:md|markdown)$/i.test(value.name)) {
       content = markdownPreview(value.text);
     } else {
@@ -1019,6 +1053,7 @@ export function createFilePanel(options: FilePanelOptions) {
     const label = count > 0 ? t('Changes ({0})', [count]) : t('Changes');
     changes.title = label;
     changes.setAttribute('aria-label', label);
+    fitToolbarActions();
   }
 
   function changeStats(change: ProjectGitChange): HTMLElement {
@@ -1026,7 +1061,7 @@ export function createFilePanel(options: FilePanelOptions) {
     if (change.status === 'U') {
       stats.title = t('All lines in this untracked file');
       stats.append(el('span', 'is-muted', change.binary ? t('Binary') :
-        change.additions === null ? '—' : change.additions === 1 ? t('1 line') : t('{0} lines', [change.additions])));
+        change.additions === null ? '—' : tn('{0} line', '{0} lines', change.additions)));
       return stats;
     }
     stats.title = gitSnapshot?.comparison ? t('Changes from comparison base') : t('Changes since HEAD');
@@ -1069,7 +1104,7 @@ export function createFilePanel(options: FilePanelOptions) {
       return;
     }
     const groups: Array<[ProjectGitStatus, string]> = [
-      ['M', t('Modified')], ['A', t('Added')], ['D', t('Deleted')],
+      ['C', t('Conflicts')], ['M', t('Modified')], ['A', t('Added')], ['D', t('Deleted')],
       ['R', t('Renamed')], ['U', t('Untracked')]
     ];
     for (const [status, label] of groups) {
@@ -1206,7 +1241,7 @@ export function createFilePanel(options: FilePanelOptions) {
     meta.append(el('span', '', status), language);
     if (('binary' in value && (value.binary || value.tooLarge)) || value.baseText === null || value.currentText === null) {
       language.remove();
-      replacePreview(head, meta, el('p', 'file-preview-empty', 'note' in value ? value.note ?? (() => t('Diff preview unavailable')) : () => t('Diff preview unavailable')));
+      replacePreview(head, meta, el('p', 'file-preview-empty', () => 'note' in value && value.note ? t(value.note) : t('Diff preview unavailable')));
       preview.hidden = false;
       return;
     }
@@ -1374,6 +1409,12 @@ export function createFilePanel(options: FilePanelOptions) {
     updateActions();
     syncWatches();
   }
+
+  // Group titles, counts and row labels are plain text; repaint them when the language changes.
+  onLanguageChange(() => {
+    renderTree();
+    if (mode === 'changes' && gitDiffPath === null) renderChangesList();
+  });
 
   function watchedDirectories(): string[] {
     if (!project) return [];
@@ -1580,84 +1621,11 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   refresh.onclick = () => void (mode === 'changes' ? reconcileGitChanges(true) : refreshAll());
-  function closeBranchMenu(restoreFocus = false): void {
-    if (!branchMenu) return;
-    const leaving = branchMenu; branchMenu = null;
-    // Leave like the other menus: a short fade while it stops taking input, then removal.
-    leaving.inert = true; leaving.classList.add('is-leaving');
-    const motion = !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches && typeof leaving.animate === 'function';
-    if (motion) void leaving.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(-4px)' }], { duration: 120, easing: 'ease-in' })
-      .finished.catch(() => undefined).then(() => leaving.remove());
-    else leaving.remove();
-    document.removeEventListener('pointerdown', dismissBranchMenu, true);
-    document.removeEventListener('keydown', branchMenuKeydown, true);
-    window.removeEventListener('resize', dismissBranchMenuOnResize);
-    branchTrigger.setAttribute('aria-expanded', 'false');
-    if (restoreFocus) branchTrigger.focus();
-  }
-  function dismissBranchMenu(event: PointerEvent): void {
-    if (branchMenu && !branchMenu.contains(event.target as Node) && !branchTrigger.contains(event.target as Node)) closeBranchMenu();
-  }
-  function branchMenuKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeBranchMenu(true); }
-  }
-  function dismissBranchMenuOnResize(): void { closeBranchMenu(); }
+  function closeBranchMenu(restoreFocus = false): void { branchPopup.close(restoreFocus); }
   branchTrigger.addEventListener('click', () => {
-    if (branchMenu) { closeBranchMenu(); return; }
+    if (branchPopup.open) { closeBranchMenu(); return; }
     if (!project || (gitSnapshot?.state !== 'ready' && !selectedBaseRef)) return;
-    const menu = el('div', 'file-branch-menu');
-    menu.setAttribute('role', 'dialog');
-    menu.setAttribute('aria-label', t('Compare branches'));
-    const search = el('input', 'file-branch-search') as HTMLInputElement;
-    search.type = 'search'; search.placeholder = t('Search branches…');
-    search.setAttribute('aria-label', t('Search branches…'));
-    const items = el('div', 'file-branch-items');
-    const renderItems = (): void => {
-      items.replaceChildren();
-      const query = search.value.trim().toLocaleLowerCase();
-      const choices = [{ ref: '', label: t('Working tree') }, ...(gitSnapshot?.branches ?? [])];
-      for (const choice of choices.filter(entry => entry.label.toLocaleLowerCase().includes(query))) {
-        const option = el('button', 'file-branch-option') as HTMLButtonElement;
-        option.type = 'button';
-        if (choice.ref.startsWith('refs/remotes/')) option.title = t('Locally cached remote branch; no automatic fetch');
-        option.append(el('span', '', choice.label));
-        if (choice.ref === (selectedBaseRef ?? '')) option.append(icon('i-check'));
-        option.addEventListener('click', () => {
-          closeBranchMenu();
-          if (selectedBaseRef === (choice.ref || null)) return;
-          selectedBaseRef = choice.ref || null;
-          gitDiffGeneration++; gitDiffPath = null; gitDiffValue = null;
-          gitSnapshot = null;
-          destroyDiffViewer(); render();
-          void reconcileGitChanges();
-        });
-        items.append(option);
-      }
-      if (!items.childElementCount) items.append(el('p', 'file-branch-empty', () => t('No branches found')));
-      if (gitSnapshot?.branchesTruncated) items.append(el('p', 'file-branch-empty', () => t('More branches exist than can be shown.')));
-    };
-    search.addEventListener('input', renderItems);
-    search.addEventListener('keydown', event => {
-      if (event.key === 'ArrowDown') { event.preventDefault(); items.querySelector<HTMLButtonElement>('button')?.focus(); }
-      if (event.key === 'Enter') { event.preventDefault(); items.querySelector<HTMLButtonElement>('button')?.click(); }
-    });
-    items.addEventListener('keydown', event => {
-      const buttons = [...items.querySelectorAll<HTMLButtonElement>('button')];
-      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault(); buttons[Math.max(0, Math.min(buttons.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus();
-      }
-    });
-    menu.append(search, items);
-    const rect = branchTrigger.getBoundingClientRect();
-    menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 300))}px`;
-    menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 270))}px`;
-    document.body.append(menu); branchMenu = menu;
-    branchTrigger.setAttribute('aria-expanded', 'true');
-    document.addEventListener('pointerdown', dismissBranchMenu, true);
-    document.addEventListener('keydown', branchMenuKeydown, true);
-    window.addEventListener('resize', dismissBranchMenuOnResize);
-    renderItems(); search.focus();
+    branchPopup.show();
   });
   pane.addEventListener('keydown', event => {
     if (editingPath && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {

@@ -1,5 +1,8 @@
 import { initBrowserSetup } from './setup-browser.js';
-import { currentLanguage, ui, uiText, t, initLanguage, onLanguageChange } from './i18n.js';
+import { currentLanguage, ui, uiText, t, tn, initLanguage, onLanguageChange } from './i18n.js';
+import { workerName } from './agent-panel.js';
+import { primaryShiftShortcut, primaryShortcut } from './shortcuts.js';
+import { desktopAccessProblem, paintDesktopAccessNotice } from './desktop-access-notice.js';
 import { chatgptNameLine } from './connector-name.js';
 import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connector-names.js';
 import { displayLocalServer } from './local-url.js';
@@ -71,6 +74,10 @@ const api = window.api;
 // First: main announces a Keychain read before it starts and may not get through again until it ends.
 initKeychainNotice(api);
 initLanguage();
+// Composer key hints name this computer's keys only: a Windows user never reads ⌘ first.
+ui($('followUpHint'), 'textContent', () => t('What a message you send while ChatGPT works does by default. {0} sends it the other way.', [primaryShiftShortcut(t('Enter'))]));
+ui($('enterSendsHint'), 'textContent', () => t('Which key sends what you type. With {0}, Enter starts a new line.', [primaryShortcut(t('Enter'))]));
+ui($('enterSendsModifier'), 'textContent', () => primaryShortcut(t('Enter')));
 let pluginRefreshResetBusy = false;
 let pluginRefreshResetFailed = false;
 function paintPluginRefreshRecovery(next: AppState): void {
@@ -357,7 +364,6 @@ $('sidebarPets').addEventListener('click', () => showTab('pets'));
 $('sidebarSkills').addEventListener('click', () => showTab('skills'));
 api.onPetOverlayOpenOwner(screen => showTab(screen));
 $('addProject').addEventListener('click', () => showTab('chat'));
-$('composerFolder').addEventListener('click', () => $('addProject').click());
 let zoomFactor = 1;
 let zoomEdited = false;
 void api.getZoom().then(result => {
@@ -617,8 +623,8 @@ function paintGroups(): void {
         : on.length === 0
           ? t('off')
           : on.length === group.caps.length
-            ? t(on.length === 1 ? '{0} permission' : '{0} permissions', [on.length])
-            : t("{0} of {1} permissions", [on.length, group.caps.length]));
+            ? tn('{0} permission', '{0} permissions', on.length)
+            : tn("{0} of {1} permission", "{0} of {1} permissions", group.caps.length, [on.length, group.caps.length]));
 
     root.classList.toggle('is-on', on.length > 0);
     root.classList.toggle('is-locked', usable.length === 0);
@@ -633,7 +639,7 @@ function paintGroups(): void {
   // focused/dirty-field guard. Recopying state here undid that protection and visibly
   // flipped a user's just-clicked toggle back when an unsolicited stale state push
   // arrived before save completed, so this only reads them.
-  for (const [id, onText] of [['agents', 'agents tool exposed']] as Array<[string, string]>) {
+  for (const [id, onText] of [['agents', 'on']] as Array<[string, string]>) {
     const root = document.querySelector<HTMLElement>(`[data-group="${id}"]`);
     if (!root) continue;
     const box = root.querySelector<HTMLInputElement>('.sw input')!;
@@ -661,15 +667,26 @@ function paintDesktopAccess(next: AppState): void {
   box.hidden = missing.length === 0;
   if (box.hidden) return;
 
+  const problem = desktopAccessProblem(next);
+  const stale = problem?.stale === true;
+  // Repair resets only this app's own entry and asks again, so it is safe whether or not an
+  // earlier grant is remembered; the first version that remembers grants knows of none.
+  const repairable = problem?.missing === true;
   ui($('desktopAccessTitle'), 'textContent', () => t("Desktop access needs attention"));
   ui($('desktopAccessDetail'), 'textContent', () => t("{0}. These are live verdicts from the native backend executing inside Chat On Steroids. ", [missing.join(' · ')]) +
-    t("Grant the missing macOS permission, then fully quit and reopen the app."));
+    (stale
+      ? t("macOS still shows Chat On Steroids as allowed, but that permission belongs to an earlier version: without a developer signature, every update is a new app to macOS. Choose Repair permissions, allow it when macOS asks, then fully quit and reopen the app.")
+      : repairable
+        ? t("Choose Repair permissions and allow it when macOS asks, then fully quit and reopen the app. Repair also fixes a permission that System Settings shows as allowed but that no longer applies after an update.")
+        : t("Grant the missing macOS permission, then fully quit and reopen the app.")));
+  $<HTMLButtonElement>('repairDesktopAccess').hidden = !repairable;
   $<HTMLButtonElement>('openDesktopScreen').hidden =
     !needsScreen || access.screen === 'granted';
   $<HTMLButtonElement>('openDesktopAccessibility').hidden =
     !needsAccessibility || access.accessibility === 'granted';
+  // Repair asks for Accessibility again itself; a second request button would only compete with it.
   $<HTMLButtonElement>('requestDesktopAccessibility').hidden =
-    !needsAccessibility || access.accessibility === 'granted';
+    !needsAccessibility || access.accessibility === 'granted' || repairable;
 }
 
 /**
@@ -760,6 +777,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       playfulContinue: $<HTMLInputElement>('playfulContinue').checked,
       followOutput: $<HTMLInputElement>('followOutput').checked,
       mentionCore: $<HTMLInputElement>('mentionCore').checked,
+      mentionPlugins: $<HTMLInputElement>('mentionPlugins').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
       theme: over.theme ?? previous.ui.theme,
       appearance: over.appearance ?? previous.ui.appearance
@@ -1250,7 +1268,7 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
   }
   if (stale) {
     // Firefox runs the add-on Mozilla signed and updates it itself; the app's folder is not what it loads.
-    const firefox = bridge.externalExtension?.engine === 'gecko' && bridge.externalExtension.version === stale;
+    const firefox = bridge.extensionEngine === 'gecko' || (bridge.externalExtension?.engine === 'gecko' && bridge.externalExtension.version === stale);
     lines.push(
       t("Update your browser extension: {0} → {1}. ", [stale, update.current]) +
         (firefox
@@ -1626,6 +1644,7 @@ function apply(next: AppState): void {
   readCommandAllowlist();
   paintGroups();
   paintDesktopAccess(next);
+  paintDesktopAccessNotice(next, { repair: () => void repairDesktopAccess(), open: () => showTab('home') });
 
   // ---- folders
   paintRoots(config.roots);
@@ -1698,6 +1717,7 @@ function apply(next: AppState): void {
   applyChecked($<HTMLInputElement>('playfulContinue'), config.ui.playfulContinue === true, previousState?.config.ui.playfulContinue);
   applyChecked($<HTMLInputElement>('followOutput'), config.ui.followOutput !== false, previousState?.config.ui.followOutput);
   applyChecked($<HTMLInputElement>('mentionCore'), config.ui.mentionCore !== false, previousState?.config.ui.mentionCore);
+  applyChecked($<HTMLInputElement>('mentionPlugins'), config.ui.mentionPlugins === true, previousState?.config.ui.mentionPlugins);
   applyChecked($<HTMLInputElement>('controlApiEnabled'), config.controlApi?.enabled === true, previousState?.config.controlApi?.enabled);
   applyChecked($<HTMLInputElement>('mcpPersistentUrls'), config.mcp?.persistentUrls === true, previousState?.config.mcp?.persistentUrls);
   // Stable URLs live only in the OS-backed secret store; without it they keep rotating.
@@ -1715,7 +1735,9 @@ function apply(next: AppState): void {
     config.ui.privacyScreenshots,
     previousState?.config.ui.privacyScreenshots
   );
-  $('privacyScreenshotsSetting').hidden = !(next.platform?.desktopAutomation ?? true);
+  // Only macOS screenshots can show the whole screen; on Windows every capture is one window
+  // already, so the switch would change nothing there.
+  $('privacyScreenshotsSetting').hidden = !(next.platform?.desktopAutomation ?? true) || next.platform?.family !== 'macos';
   if (next.platform?.family === 'macos') {
     ui($('backgroundRunningCopy'), 'textContent', () => t("Leave it running while you use its plugins in ChatGPT. It stays available from the menu bar and Dock when you close the window."));
     ui($('minimizeToTrayCopy'), 'textContent', () => t("Hide the window to the menu bar when closed"));
@@ -1864,8 +1886,8 @@ function apply(next: AppState): void {
   progress.setAttribute('aria-valuenow', String(finished));
   progress.classList.toggle('is-complete', finished === shown.length);
   ui($('setupProgressText'), 'textContent', () => finished === shown.length
-    ? t('All {0} steps done', [shown.length])
-    : t('{0} of {1} steps done', [finished, shown.length]));
+    ? tn('{0} step done', 'All {0} steps done', shown.length)
+    : tn('{0} of {1} step done', '{0} of {1} steps done', shown.length, [finished, shown.length]));
 
   // One step open at a time: the one the user picked, else the first unfinished. Past the last
   // task comes Ready, which reads every check back, so a finished setup opens on its proof.
@@ -2291,7 +2313,7 @@ function paintProblems(): void {
   for (const id of ['homeProblems', 'logProblems']) {
     const badge = $(id);
     badge.hidden = problems === 0;
-    ui(badge, 'textContent', () => t(problems === 1 ? '{0} problem' : '{0} problems', [problems]));
+    ui(badge, 'textContent', () => tn('{0} problem', '{0} problems', problems));
   }
 }
 
@@ -2356,6 +2378,18 @@ for (const id of FEEDS) {
   });
 }
 
+/** A feed with no row to show says why, instead of an empty box. */
+function paintFeedEmpty(): void {
+  for (const id of FEEDS) {
+    const view = $(id);
+    const rows = [...view.querySelectorAll<HTMLElement>('p')];
+    const onlyBad = view.classList.contains('only-bad');
+    const visible = rows.some(row => !row.hidden && (!onlyBad || row.classList.contains('bad')));
+    view.classList.toggle('is-empty', !visible);
+    ui(view, 'data-empty', () => rows.length ? t('Nothing matches this filter.') : t('Nothing has happened yet.'));
+  }
+}
+
 function addLogLine(entry: LogEntry): void {
   let evicted = false;
   for (const id of FEEDS) {
@@ -2374,6 +2408,7 @@ function addLogLine(entry: LogEntry): void {
   // A quiet run of 500 info lines retires old problems just as surely as a new one adds
   // to them, so both directions have to repaint.
   if (entry.level !== 'info' || evicted) paintProblems();
+  paintFeedEmpty();
 }
 
 $('logFilter').addEventListener('click', (event) => {
@@ -2383,6 +2418,7 @@ $('logFilter').addEventListener('click', (event) => {
     other.classList.toggle('is-sel', other === button);
   }
   $('fullFeed').classList.toggle('only-bad', button.dataset.filter === 'bad');
+  paintFeedEmpty();
   // Hiding most of the rows changes what "the bottom" is, so re-pin rather than leaving
   // the view parked at an offset that now belongs to a line the filter removed.
   stickToNewest('fullFeed');
@@ -2400,6 +2436,7 @@ function applyAgentFilter(): void {
   for (const row of $('fullFeed').querySelectorAll<HTMLElement>('p')) {
     row.hidden = agentFilter !== null && (row.dataset.agent ?? null) !== agentFilter;
   }
+  paintFeedEmpty();
 }
 
 function paintAgentFilter(swarm: SwarmState): void {
@@ -2414,8 +2451,10 @@ function paintAgentFilter(swarm: SwarmState): void {
     return;
   }
   // Prime first, then workers in creation order — the order the broker reports them.
-  const choices: Array<{ id: string | null; label: string }> = [{ id: null, label: t("All") }];
-  for (const agent of swarm.agents) choices.push({ id: agent.id, label: agent.label || agent.id });
+  const choices: Array<{ id: string | null; label: () => string }> = [{ id: null, label: () => t("All") }];
+  for (const agent of swarm.agents) {
+    choices.push({ id: agent.id, label: () => agent.role === 'prime' ? t('Main chat') : workerName(agent.id, agent.label) });
+  }
   if (agentFilter !== null && !swarm.agents.some((agent) => agent.id === agentFilter)) {
     agentFilter = null;
   }
@@ -2423,7 +2462,7 @@ function paintAgentFilter(swarm: SwarmState): void {
     ...choices.map((choice) => {
       const button = document.createElement('button');
       button.type = 'button';
-      button.textContent = choice.label;
+      ui(button, 'textContent', choice.label);
       button.classList.toggle('is-sel', choice.id === agentFilter);
       button.addEventListener('click', () => {
         agentFilter = choice.id;
@@ -2511,6 +2550,16 @@ async function runChecks(): Promise<void> {
 }
 
 $('runChecks').addEventListener('click', () => void runChecks());
+async function repairDesktopAccess(): Promise<void> {
+  for (const id of ['repairDesktopAccess', 'desktopAccessNoticeRepair']) $<HTMLButtonElement>(id).disabled = true;
+  try {
+    const next = await run(api.repairDesktopAccess());
+    if (next) apply(next);
+  } finally {
+    for (const id of ['repairDesktopAccess', 'desktopAccessNoticeRepair']) $<HTMLButtonElement>(id).disabled = false;
+  }
+}
+$('repairDesktopAccess').addEventListener('click', () => void repairDesktopAccess());
 $('requestDesktopAccessibility').addEventListener('click', async () => {
   const button = $<HTMLButtonElement>('requestDesktopAccessibility');
   button.disabled = true;
@@ -2760,6 +2809,7 @@ for (const id of [
   'enterSends',
   'turnNotifications',
   'mentionCore',
+  'mentionPlugins',
   'controlApiEnabled',
   'controlApiAllowActions',
   'mcpPersistentUrls',
@@ -2838,6 +2888,7 @@ void (async () => {
     const left = shown.get(key(entry)) ?? 0;
     if (left > 0) shown.set(key(entry), left - 1); else addLogLine(entry);
   }
+  paintFeedEmpty();
   const swarm = await run(api.getSwarm());
   if (swarm) paintAgentFilter(swarm);
 })();

@@ -161,6 +161,12 @@
         <span>The tools of a Chat On Steroids plugin changed. Refresh that plugin in ChatGPT; this is separate from the browser extension.</span>
         <button class="btn btn-icon" id="dismissPluginRefreshReminder" type="button" title="Dismiss reminder" aria-label="Dismiss reminder"><i class="ico ph ph-x" aria-hidden="true"></i></button>
       </div>
+      <div class="notice" id="desktopAccessNotice" role="status" hidden>
+        <i class="ico ph ph-warning" aria-hidden="true"></i>
+        <span id="desktopAccessNoticeText"></span>
+        <button class="btn btn-quiet" id="desktopAccessNoticeRepair" type="button" hidden>Repair permissions</button>
+        <button class="btn btn-quiet" id="desktopAccessNoticeOpen" type="button">Open settings</button>
+      </div>
       <div class="notice" id="credentialsUnreadable" role="alert" hidden>
         <i class="ico ph ph-lock-key" aria-hidden="true"></i>
         <span>The keys saved on this computer could not be read, so new keys cannot be saved. If restarting the app does not help, you can start fresh.</span>
@@ -190,18 +196,19 @@
               <div class="settings-surface pane appearance-settings-card">
                 <label class="setting"><span class="setting-text"><b>Follow new output</b><em>Stay at the end of the chat while answers grow, here and on ChatGPT. Scrolling up pauses it.</em></span><input id="followOutput" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Notify when a chat finishes</b><em>A notification when a chat's answer is done while this window is in the background. Workers and chats with Goal or Loop on don't notify.</em></span><input id="turnNotifications" type="checkbox" /></label>
-                <label class="setting"><span class="setting-text"><b>Messages during a running turn</b><em>What a message you send while ChatGPT works does by default. ⌘⇧Enter (Ctrl+Shift+Enter on Windows and Linux) sends it the other way.</em></span><select id="followUp"><option value="steer">Join the running turn</option><option value="queue">Wait until the turn ends</option></select></label>
-                <label class="setting"><span class="setting-text"><b>Send messages with</b><em>Which key sends what you type. With ⌘Enter (Ctrl+Enter on Windows and Linux), Enter starts a new line.</em></span><select id="enterSends"><option value="enter">Enter</option><option value="modifier">⌘Enter / Ctrl+Enter</option></select></label>
-                <label class="setting"><span class="setting-text"><b>Keep awake while a chat works</b><em>Stops the computer from going to sleep, so long runs keep going. Some Windows laptops still sleep once the screen turns off; for those, choose The computer and screen.</em></span><select id="keepAwake"><option value="off">Off</option><option value="computer">The computer</option><option value="screen">The computer and screen</option></select></label>
+                <label class="setting"><span class="setting-text"><b>Messages during a running turn</b><em id="followUpHint" translate="no"></em></span><select id="followUp"><option value="steer">Join the running turn</option><option value="queue">Wait until the turn ends</option></select></label>
+                <label class="setting"><span class="setting-text"><b>Send messages with</b><em id="enterSendsHint" translate="no"></em></span><select id="enterSends"><option value="enter">Enter</option><option value="modifier" id="enterSendsModifier" translate="no"></option></select></label>
+                <label class="setting"><span class="setting-text"><b>Keep awake while a chat works</b><em>Stops the computer from going to sleep, so long runs keep going. Some Windows laptops still sleep once the screen turns off; for those, choose “The computer and screen”.</em></span><select id="keepAwake"><option value="off">Off</option><option value="computer">The computer</option><option value="screen">The computer and screen</option></select></label>
                 <label class="setting"><span class="setting-text"><b>Playful status words</b><em>Show rotating gym jokes instead of “Working”.</em></span><input id="playfulStatus" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Playful asides in automatic Continue</b><em>Add a random fun fact or meme joke to each automatic Continue, marked for the model to ignore.</em></span><input id="playfulContinue" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Mention COS ERP DB Core</b><em>Makes sure ChatGPT can use this app in every chat. Turn it off if ChatGPT starts plain questions with an unneeded tool call. Workers, Goal, Loop and Continue always keep the mention.</em></span><input id="mentionCore" type="checkbox" /></label>
+                <label class="setting"><span class="setting-text"><b>Mention Plugins instead of Core</b><em>Ordinary messages the app sends mention COS ERP DB Plugins. Goal, Loop, workers and recovery always mention Core. Messages you send in ChatGPT itself are unchanged.</em></span><input id="mentionPlugins" type="checkbox" /></label>
               </div>
             </section>
             <section class="appearance-section" id="privacyScreenshotsSetting">
               <header class="settings-section-head"><div><h2>Privacy</h2><p>What ChatGPT sees of your screen.</p></div></header>
               <div class="settings-surface pane appearance-settings-card">
-                <label class="setting"><span class="setting-text"><b>Privacy screenshots</b><em>Screenshots show the active window by default instead of the whole screen.</em></span><input id="privacyScreenshots" type="checkbox" /></label>
+                <label class="setting"><span class="setting-text"><b>Screenshot only the active window</b><em>For privacy, ChatGPT's screenshots show the window in front instead of the whole screen.</em></span><input id="privacyScreenshots" type="checkbox" /></label>
               </div>
             </section>
             <section class="appearance-section">
@@ -253,6 +260,23 @@
               </div>
             </section>
             <section class="appearance-section">
+              <header class="settings-section-head"><div><h2>Layout</h2><p>Choose how your chats are arranged in the sidebar.</p></div></header>
+              <div class="settings-surface pane appearance-settings-card">
+              <div class="setting layout-setting"><span class="setting-text"><b id="sidebarLayoutTitle">Sidebar layout</b><em>Switch at any time. Your chats stay as they are.</em></span>
+                <div class="layout-choice" role="radiogroup" aria-labelledby="sidebarLayoutTitle">
+                  <label class="layout-option"><input type="radio" name="appearanceSidebarLayout" id="appearanceLayoutProjects" value="projects" />
+                    <span class="layout-preview" aria-hidden="true"><img class="for-light" src="./layout-previews/projects-light.png" alt="" /><img class="for-dark" src="./layout-previews/projects-dark.png" alt="" /></span>
+                    <span class="layout-option-text"><b>Projects</b><em>Chats sit under their project folders.</em></span>
+                  </label>
+                  <label class="layout-option"><input type="radio" name="appearanceSidebarLayout" id="appearanceLayoutInbox" value="inbox" />
+                    <span class="layout-preview" aria-hidden="true"><img class="for-light" src="./layout-previews/inbox-light.png" alt="" /><img class="for-dark" src="./layout-previews/inbox-dark.png" alt="" /></span>
+                    <span class="layout-option-text"><b>Inbox</b><em>All chats in one list, active ones on top.</em></span>
+                  </label>
+                </div>
+              </div>
+              </div>
+            </section>
+            <section class="appearance-section">
               <header class="settings-section-head"><div><h2>Preferences</h2><p>Language and setup profiles stay independent of appearance.</p></div></header>
               <div class="settings-surface pane appearance-settings-card">
                 <label class="setting" for="uiLanguage"><span class="setting-text"><b>Language</b><em>Changes the app interface immediately. Your messages stay as written.</em></span><select id="uiLanguage" class="language-select" translate="no"><option value="de" lang="de">Deutsch</option><option value="en" lang="en">English</option><option value="es" lang="es">Español</option><option value="fr" lang="fr">Français</option><option value="pt-BR" lang="pt-BR">Português (Brasil)</option><option value="pt-PT" lang="pt-PT">Português (Portugal)</option><option value="ru" lang="ru">Русский</option><option value="tr" lang="tr">Türkçe</option><option value="vi" lang="vi">Tiếng Việt</option><option value="ja" lang="ja">日本語</option><option value="ko" lang="ko">한국어</option><option value="zh-CN" lang="zh-CN">简体中文</option><option value="zh-TW" lang="zh-TW">繁體中文</option></select></label>
@@ -272,7 +296,7 @@
           <div class="plugins-content">
           <header class="plugin-page-head"><div><h1>Plugins</h1><p>Bring your favorite tools into the conversation.</p></div><div class="plugin-search-actions"><label class="plugin-search"><i class="ico ph ph-magnifying-glass" aria-hidden="true"></i><input id="pluginsSearch" type="search" placeholder="Search plugins" aria-label="Search plugins" /></label><button class="btn plugin-add" id="pluginsAdd" type="button" aria-label="Add a plugin" title="Add a plugin"><i class="ico ph ph-plus" aria-hidden="true"></i></button></div></header>
           <section class="plugin-connection" aria-labelledby="pluginsSetupTitle">
-            <div><h2 id="pluginsSetupTitle">Set up plugins before your first use</h2><p id="pluginsSetupHint">Add the COS ERP DB Plugins connector in ChatGPT once so it can use your installed plugins.</p><span id="pluginsConnectionStatus" role="status">Setup required · connect your plugins</span></div>
+            <div><h2 id="pluginsSetupTitle">Set up plugins before your first use</h2><p id="pluginsSetupHint">Add COS ERP DB Plugins to ChatGPT once, so ChatGPT can use your installed plugins.</p><span id="pluginsConnectionStatus" role="status">Setup required · connect your plugins</span></div>
             <button class="btn btn-solid" id="pluginsSetupLink" type="button">Set up plugins</button>
           </section>
           <div class="plugin-refresh-guide"><p>After installing, updating or changing enabled plugins, refresh <strong id="pluginsRefreshName" translate="no">COS ERP DB Plugins</strong> in ChatGPT to make its tools available.</p><button class="btn" id="pluginsOpenChatGPT" type="button">Open ChatGPT plugins</button></div>
@@ -341,7 +365,7 @@
             <div class="usage-sections">
               <section class="settings-section usage-section usage-messages" aria-labelledby="usageMessagesTitle">
                 <header class="settings-section-head">
-                  <div><h2 id="usageMessagesTitle">Messages and limits</h2><p>Verified native sends alongside model, shared and feature limits reported by ChatGPT.</p></div>
+                  <div><h2 id="usageMessagesTitle">Messages and limits</h2><p>Messages the app saw you send, per model, and the limits ChatGPT and Codex report.</p></div>
                   <button class="btn" id="refreshUsage" type="button"><i class="ico ph ph-arrow-clockwise" aria-hidden="true"></i>Refresh</button>
                 </header>
                 <div class="settings-surface usage-message-surface">
@@ -404,6 +428,7 @@
                     <div class="desktop-access" id="desktopAccess" hidden>
                       <strong id="desktopAccessTitle">Desktop access needs attention</strong>
                       <p id="desktopAccessDetail"></p>
+                      <button class="btn btn-solid" id="repairDesktopAccess" type="button" hidden>Repair permissions</button>
                       <button class="btn btn-solid" id="requestDesktopAccessibility" type="button">Request Accessibility</button>
                       <button
                         class="btn"
@@ -916,6 +941,7 @@
                 <span aria-hidden="true">/</span>
                 <span id="chatProjectName"></span>
               </span>
+              <button id="chatBranchOrigin" class="chat-branch-origin" type="button" hidden></button>
               <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
               <span class="title">
                 COS-ERP-DB
@@ -984,8 +1010,8 @@
                 the rest of the once-only work already lives.
               -->
               <div class="view settings-page-content automation-content" data-view="settings" hidden>
-                <header class="settings-page-head automation-page-head"><div><h1>Agents &amp; automation</h1><p>Fine-tune your workspace and the way your agents work.</p></div></header>
-                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Continuation sources</h2><p>Choose where continuations come from and what their handoffs include.</p></div></header>
+                <header class="settings-page-head automation-page-head"><div><h1>Agents &amp; automation</h1><p>How chats keep working on their own, which models they use, and how sub-agents run.</p></div></header>
+                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Unfinished answers, Goal and Loop</h2><p>How chats continue on their own, and what a handoff carries.</p></div></header>
                 <div class="settings-surface pane">
                   <label class="setting">
                     <span class="setting-text">
@@ -995,11 +1021,12 @@
                     <input id="autoContinue" type="checkbox" />
                   </label>
                   <details class="setting-timing"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Recovery timing details</summary><p>Recover unfinished answers, including in Goal and Loop. Reload after 2 minutes without progress (Pro: 10). If still generating, wait 1 more minute (Pro: 5), then stop and send. A final answer selects Goal or Loop instead of Continue. Undelivered steps get at most three page reloads (after 2, 5, and 10 minutes); recovery then stops visibly while the original pending work remains saved.</p></details>
-                  <div class="setting"><span class="setting-text"><b id="rotateTurnMinutesTitle">Start a fresh turn after</b><em>Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Not used with Pro models, Goal, Loop or sub-agents.</em></span><select id="rotateTurnMinutes" aria-labelledby="rotateTurnMinutesTitle"><option value="0">Off</option><option value="20">20 minutes</option><option value="30">30 minutes</option><option value="45">45 minutes</option><option value="60">60 minutes</option></select></div>
-                  <div class="setting"><span class="setting-text"><b id="goalBackendTitle">Goal response source</b><em>API is the most reliable. Offline uses completion markers and 200 prepared messages.</em></span><select id="goalBackend" aria-labelledby="goalBackendTitle"><option value="chatgpt">Separate ChatGPT chat</option><option value="api">API key · Most reliable</option><option value="templates">Offline · No API cost</option></select></div>
-                  <div class="setting"><span class="setting-text"><b id="loopBackendTitle">Loop response source</b><em>Loop keeps going until you switch it off.</em></span><select id="loopBackend" aria-labelledby="loopBackendTitle"><option value="api">API key · Most reliable</option><option value="chatgpt">Separate ChatGPT chat</option></select></div>
+                  <div class="setting"><span class="setting-text"><b id="rotateTurnMinutesTitle">Start a fresh turn after</b><em>Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.</em></span><select id="rotateTurnMinutes" aria-labelledby="rotateTurnMinutesTitle"><option value="0">Off</option><option value="20">20 minutes</option><option value="30">30 minutes</option><option value="45">45 minutes</option><option value="60">60 minutes</option></select></div>
+                  <div class="setting"><span class="setting-text"><b id="goalBackendTitle">Goal response source</b><em>Where Goal's next message comes from: a separate ChatGPT chat in your account, your API key (most reliable), or Offline (prepared messages, no API cost).</em></span><select id="goalBackend" aria-labelledby="goalBackendTitle"><option value="chatgpt">Separate ChatGPT chat</option><option value="api">API key · Most reliable</option><option value="templates">Offline · No API cost</option></select></div>
+                  <div class="setting"><span class="setting-text"><b id="loopBackendTitle">Loop response source</b><em>Where Loop's next message comes from: your API key (most reliable) or a separate ChatGPT chat in your account. Loop keeps going until you turn it off.</em></span><select id="loopBackend" aria-labelledby="loopBackendTitle"><option value="api">API key · Most reliable</option><option value="chatgpt">Separate ChatGPT chat</option></select></div>
                   <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan model</b><em>Model for ChatGPT-generated messages and plans.</em></span><select id="helperModel" aria-label="Goal, Loop and Plan model"></select></div>
                   <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan reasoning</b><em>Used with the ChatGPT model above; independent from API reasoning.</em></span><select id="helperReasoning" aria-label="Goal, Loop and Plan reasoning"></select></div>
+                  <label class="setting"><span class="setting-text"><b>Plan generation</b><em>Create staged tasks. ChatGPT uses the Goal, Loop and Plan model above; API uses the model and reasoning in API provider settings.</em></span><select id="planBackend"><option value="chatgpt">ChatGPT</option><option value="api">API provider</option></select></label>
                   <label class="setting"><span class="setting-text"><b>Include tool details in handoffs</b><em>Compact &amp; Resume briefs keep tool calls and their results. Goal and Loop always read only your messages and the assistant's updates and answers.</em></span><input id="goalIncludeToolCalls" type="checkbox" /></label>
                   </div>
                 <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">ChatGPT models</h2><p>Choose the default model and reasoning for new chats and sub-agents, from what your account offers.</p></div></header>
@@ -1007,32 +1034,15 @@
                   <div class="setting"><span class="setting-text"><b>Available ChatGPT models</b><em id="chatModelStatus">Read model choices from your account.</em></span><button class="btn" id="refreshChatModels" type="button">Refresh</button></div>
                   <div class="setting"><span class="setting-text"><b id="defaultChatModelTitle">Default new-chat model</b><em>Used when you start a new chat. A chat you continue keeps its own model.</em></span><select id="defaultChatModel" aria-labelledby="defaultChatModelTitle"><option value="">Automatic</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="defaultChatReasoningTitle">Default new-chat reasoning</b><em>Used with the ordinary chat model above; workers and helpers keep their own defaults.</em></span><select id="defaultChatReasoning" aria-labelledby="defaultChatReasoningTitle"><option value="">Automatic</option></select></div>
-                  <div class="setting"><span class="setting-text"><b id="workerModelTitle">Default sub-agent model</b><em>Confirmed in ChatGPT before a worker starts.</em></span><select id="workerModel" aria-labelledby="workerModelTitle"><option value="" disabled>No observed choices</option></select></div>
-                  <div class="setting"><span class="setting-text"><b id="workerReasoningTitle">Default sub-agent reasoning</b><em>Selected independently from the model.</em></span><select id="workerReasoning" aria-labelledby="workerReasoningTitle"><option value="" disabled>No observed choices</option></select></div>
+                  <div class="setting"><span class="setting-text"><b id="workerModelTitle">Default sub-agent model</b><em>Used when a sub-agent starts. The app checks it in ChatGPT first.</em></span><select id="workerModel" aria-labelledby="workerModelTitle"><option value="" disabled>No observed choices</option></select></div>
+                  <div class="setting"><span class="setting-text"><b id="workerReasoningTitle">Default sub-agent reasoning</b><em>Used with the sub-agent model above.</em></span><select id="workerReasoning" aria-labelledby="workerReasoningTitle"><option value="" disabled>No observed choices</option></select></div>
                   </div>
                 <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Skills</h2><p>Choose whether imported Skills can be matched to ordinary messages.</p></div></header>
                 <div class="settings-surface pane">
                   <label class="setting"><span class="setting-text"><b>Auto-select Skills</b><em>Match one imported Skill by its exact name in the message, not by topic. Explicit Skill choices always win.</em></span><input id="autoSelectSkills" type="checkbox" /></label>
                 </div>
-                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Workers & recovery</h2><p>Set worker limits and which chats can resume after interruptions.</p></div></header>
+                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Chat access</h2><p>Which chats may use this computer's tools.</p></div></header>
                 <div class="settings-surface pane">
-                  <div class="setting">
-                    <span class="setting-text">
-                      <b id="maWorkersTitle">Sub-agent workers</b>
-                      <em>Needs the browser extension to be connected. This sets the most worker chats one run may open.</em>
-                    </span>
-                    <input id="maWorkers" aria-labelledby="maWorkersTitle" class="num" type="number" min="1" max="8" step="1" />
-                    <span class="unit">max</span>
-                  </div>
-
-                  <div class="setting">
-                    <span class="setting-text">
-                      <b id="globalMaWorkersTitle">Workers across all chats</b>
-                      <em>The most workers that may run at once over all your chats together. 0 means no extra limit; each chat still keeps the limit above.</em>
-                    </span>
-                    <input id="globalMaWorkers" aria-labelledby="globalMaWorkersTitle" class="num" type="number" min="0" max="64" step="1" />
-                  </div>
-
                   <label class="setting">
                     <span class="setting-text">
                       <b>Allow unattributed calls</b>
@@ -1044,10 +1054,28 @@
                   <label class="setting">
                     <span class="setting-text">
                       <b>Trust only selected chats</b>
-                      <em>Only chats you trust can use this computer's tools. Existing chats start untrusted; hover a chat in the sidebar and choose Trust (✓). Workers and resumed chats follow the chat they came from. Calls the app can't link to a chat are refused.</em>
+                      <em>Only chats you trust can use this computer's tools. Existing chats start untrusted: open a chat's ⋯ menu in the sidebar and choose Trust chat. Workers and resumed chats follow the chat they came from. Calls the app can't link to a chat are refused.</em>
                     </span>
                     <input id="strictChatAllowlist" type="checkbox" />
                   </label>
+                </div>
+                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Workers & recovery</h2><p>Set worker limits and which chats can resume after interruptions.</p></div></header>
+                <div class="settings-surface pane">
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b id="maWorkersTitle">Sub-agent workers</b>
+                      <em>The most sub-agent chats one chat may run at once. Needs the browser extension to be connected.</em>
+                    </span>
+                    <input id="maWorkers" aria-labelledby="maWorkersTitle" class="num" type="number" min="1" max="8" step="1" />
+                  </div>
+
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b id="globalMaWorkersTitle">Workers across all chats</b>
+                      <em>The most workers that may run at once over all your chats together. 0 means no extra limit; each chat still keeps the limit above.</em>
+                    </span>
+                    <input id="globalMaWorkers" aria-labelledby="globalMaWorkersTitle" class="num" type="number" min="0" max="64" step="1" />
+                  </div>
 
                   <label class="setting">
                     <span class="setting-text">
@@ -1076,7 +1104,7 @@
                   <label class="setting">
                     <span class="setting-text">
                       <b>End background processes of workers asleep for more than 30 minutes</b>
-                      <em>The worker chat and history stay reusable. Off by default; each cleanup is recorded in that worker's transcript.</em>
+                      <em>The worker chat and its history stay reusable. Each cleanup is noted in that worker's transcript.</em>
                     </span>
                     <input id="endSleepingWorkerProcesses" type="checkbox" />
                   </label>
@@ -1108,10 +1136,9 @@
                     </div>
                   </div>
                 </section>
-                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Keep the turn open</h2><p>Control plan generation and what happens near the end of a turn.</p></div></header>
+                <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Keep the turn open</h2><p>What happens near the end of a long turn.</p></div></header>
                 <div class="settings-surface pane">
-                  <label class="setting"><span class="setting-text"><b>Plan generation</b><em>Create staged tasks. ChatGPT uses the Goal, Loop and Plan model above; API uses the model and reasoning in API provider settings.</em></span><select id="planBackend"><option value="chatgpt">ChatGPT</option><option value="api">API provider</option></select></label>
-                  <label class="setting"><span class="setting-text"><b>Session finish</b><em>Holds the turn open near its end so the next step arrives in the same turn. Goal and Loop use it with GPT-6 Pro (Astra), Loop also with older Pro models; other models only when your message asks. Turning it on changes the Core plugin's tools, so ChatGPT needs a plugin refresh (automatic after 20 seconds with Automatic plugin refresh).</em></span><input id="finishTool" type="checkbox" /></label>
+                  <label class="setting"><span class="setting-text"><b>Session finish</b><em>Holds the turn open near its end so the next step arrives in the same turn. Goal and Loop use it with GPT-6 Pro, Loop also with older Pro models; other models only when your message asks. Turning it on changes the Core plugin's tools, so ChatGPT needs a plugin refresh (automatic after 20 seconds with Automatic plugin refresh).</em></span><input id="finishTool" type="checkbox" /></label>
                   <div class="setting"><span class="setting-text"><b id="finishLeadMinutesTitle">Requested notice</b><em>How long before its end the model should hold the turn. A request to the model, not a guaranteed countdown.</em></span><select id="finishLeadMinutes" aria-labelledby="finishLeadMinutesTitle"><option value="3">3 minutes</option><option value="5">5 minutes</option></select></div>
                   <p class="muted">When the model ends the turn this way with Goal or Loop on in this chat, the next step is written from that prompt and response source. Otherwise you get a notification.</p>
                   </div>
@@ -1122,13 +1149,13 @@
                   <div class="setting"><span class="setting-text"><b>Browser extension</b><em>Disconnect the browser extension from this app.</em></span><button class="btn" id="bridgeUnpair" type="button">Disconnect browser</button></div>
                   <label class="setting"><span class="setting-text"><b>Browser bridge port</b><em id="browserBridgePortHint">Auto uses the first available port. A fixed port must be available.</em></span><select id="browserBridgePort"><option value="auto">Auto</option><option value="8865">8865</option><option value="8866">8866</option><option value="8867">8867</option><option value="8868">8868</option><option value="8869">8869</option></select></label>
                   <label class="setting"><span class="setting-text"><b>Background chats</b><em>Keep app-created ChatGPT tabs in the background.</em></span><input id="backgroundChats" type="checkbox" /></label>
-                  <label class="setting"><span class="setting-text"><b>Background tabs open in</b><em>The group stays collapsed in the window you used last. Chrome saves open tab groups automatically; the app's group closes with its last chat, so it is not kept. If you close that window while app chats are open, Chrome may keep the group in its saved groups, where you can delete it. Browsers without tab groups use a window.</em></span><select id="backgroundPlacement"><option value="window">Their own minimized window</option><option value="group">A tab group in your browser window</option></select></label>
+                  <label class="setting"><span class="setting-text"><b>Background tabs open in</b><em>A minimized window keeps app tabs out of your way. A tab group stays collapsed in the window you used last; if you close that window while app chats are open, Chrome may keep the group in its saved groups, where you can delete it. Browsers without tab groups use a window.</em></span><select id="backgroundPlacement"><option value="window">Their own minimized window</option><option value="group">A tab group in your browser window</option></select></label>
                   <label class="setting"><span class="setting-text"><b>Automatic plugin refresh</b><em>Let the browser extension refresh changed plugin tools in ChatGPT, so a permission change reaches it without a manual refresh.</em></span><input id="autoRefreshPlugins" type="checkbox" /></label>
                   <div id="pluginRefreshRecovery" class="setting" hidden>
                     <span class="setting-text"><b id="pluginRefreshRecoveryError" role="alert">Could not read plugin-refresh state</b><em>Reset backs up the unreadable state and lets automatic plugin refresh start again. Refreshing can affect existing ChatGPT chats.</em></span>
                     <button id="pluginRefreshReset" class="btn" type="button">Reset plugin refresh</button>
                   </div>
-                  <label class="setting"><span class="setting-text"><b>Browser only</b><em>Do not open tabs for automatic plugin refresh or chat recovery. Explicit new chats, workers and Reload models still work.</em></span><input id="browserOnly" type="checkbox" /></label>
+                  <label class="setting"><span class="setting-text"><b>Open tabs only when asked</b><em>No tabs open for automatic plugin refresh or chat recovery. New chats, sub-agents and Reload models still open tabs.</em></span><input id="browserOnly" type="checkbox" /></label>
                   <p class="muted">Idle app-created tabs close after five minutes, finished ones after two. Sleeping worker tabs can close earlier when the worker limit is exceeded. Active turns and unsent drafts stay open.</p>
                   <label class="setting"><span class="setting-text"><b>Overwrite ChatGPT tool rows</b><em>Show recorded local activity in the ChatGPT page.</em></span><input id="browserOverwrite" type="checkbox" disabled /></label>
                   <label class="setting"><span class="setting-text"><b>Show durations in ChatGPT</b><em>Uses the same preference as the extension popup.</em></span><input id="browserDurations" type="checkbox" disabled /></label>
@@ -1319,7 +1346,7 @@
 
               </div>
             </div>
-            <div class="composer-dock" id="composerDock"><div class="composer-dock-body"><div class="background-exec-status" id="backgroundExecStatus" role="status" hidden><i class="ico ph ph-terminal-window" aria-hidden="true"></i><span class="queue-label"></span><span class="background-exec-time"></span><svg class="disclosure-chevron background-exec-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false" hidden><path d="M6 3.5 10.5 8 6 12.5"></path></svg><button class="background-exec-stop" type="button"><i class="ico ph ph-power" aria-hidden="true"></i><span></span></button></div><div class="sr-only" id="backgroundExecLiveStatus" role="status" aria-live="polite" hidden></div><div class="background-exec-list" id="backgroundExecList" role="list" hidden></div><section class="agent-plan" id="agentPlan" aria-label="Agent task plan" hidden></section><div id="recoveryStatus" role="status" hidden></div><div id="taskPlanPreview" aria-label="Plan stages" hidden></div><div id="finishQueue" aria-label="Queued tasks" hidden></div><div id="activeGoalRow" hidden></div></div></div>
+            <div class="composer-dock" id="composerDock"><div class="composer-dock-body"><div class="background-exec-status" id="backgroundExecStatus" role="status" hidden><i class="ico ph ph-terminal-window" aria-hidden="true"></i><span class="queue-label"></span><span class="background-exec-time"></span><svg class="disclosure-chevron background-exec-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false" hidden><path d="M6 3.5 10.5 8 6 12.5"></path></svg><button class="background-exec-stop" type="button"><i class="ico ph ph-power" aria-hidden="true"></i><span></span></button></div><div class="sr-only" id="backgroundExecLiveStatus" role="status" aria-live="polite" hidden></div><div class="background-exec-list" id="backgroundExecList" role="list" hidden></div><section class="agent-plan" id="agentPlan" aria-label="Agent task plan" hidden></section><div id="branchDraft" class="branch-draft" role="status" hidden></div><div id="editDraft" class="edit-draft" role="status" hidden></div><div id="recoveryStatus" role="status" hidden></div><div id="taskPlanPreview" aria-label="Plan stages" hidden></div><div id="finishQueue" aria-label="Queued tasks" hidden></div><div id="activeGoalRow" hidden></div></div></div>
             <form class="composer" id="composer">
               <div id="skillPicker" class="skill-autocomplete" aria-label="Skills" hidden></div>
               <div id="composerSelectedSkills" class="composer-selected-skills" aria-label="Selected skills" hidden></div>
@@ -1408,6 +1435,7 @@
               </div>
               <p id="composerStatus" role="status" aria-live="polite"></p>
               <p class="composer-dictation-status" id="dictationStatus" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+              <span class="sr-only" id="recallAnnounce" role="status" aria-live="polite" aria-atomic="true"></span>
             </form>
             <p class="foot" id="chatFoot" hidden></p>
           </section>
@@ -1484,6 +1512,16 @@
     </div>
 
     <!-- Chat search (⌘K / Ctrl+K, or the magnifier beside the app name): recent chats, then matches. -->
+    <dialog class="plugin-dialog ssh-project-dialog" id="sshProjectDialog" aria-labelledby="sshProjectTitle">
+      <div class="plugin-dialog-head"><h2 id="sshProjectTitle">Add a folder on a server</h2><button class="btn" id="sshProjectClose" type="button">Close</button></div>
+      <form id="sshProjectForm" class="plugin-dialog-body">
+        <p>Chat On Steroids connects with your own SSH setup: your ~/.ssh/config, agent, keys and known hosts. Signing in works with a key only, and nothing is installed on the server.</p>
+        <label class="plugin-field" for="sshProjectAddress"><span>SSH address</span><input id="sshProjectAddress" required autocomplete="off" spellcheck="false" placeholder="me@server, me@server:2222 or a Host from ~/.ssh/config" /></label>
+        <label class="plugin-field" for="sshProjectFolder"><span>Folder on the server</span><input id="sshProjectFolder" required autocomplete="off" spellcheck="false" placeholder="/srv/app or ~/app" /></label>
+        <p id="sshProjectError" class="plugin-error" role="alert" hidden></p>
+        <div class="pet-delete-actions"><button class="btn" id="sshProjectCancel" type="button">Cancel</button><button class="btn btn-solid" id="sshProjectSubmit" type="submit">Test and add</button></div>
+      </form>
+    </dialog>
     <dialog class="search-dialog" id="searchDialog" aria-label="Search chats">
       <div class="search-dialog-field">
         <i class="ico ph ph-magnifying-glass" aria-hidden="true"></i>

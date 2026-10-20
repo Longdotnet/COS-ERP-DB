@@ -3981,6 +3981,25 @@ describe('through the MCP endpoint', () => {
     expect(exact).toContain('WORKER_RETIRED');
   });
 
+  it('tells an unproven call to retry while a newly started worker has not reported in, instead of blaming the connection', async () => {
+    // VM, 2026-10-20: a new worker's page reported 138 s after its first command. Both commands were
+    // refused "restore the companion connection and retry"; the model tried once more and gave up,
+    // and both calls were proven to be that worker's a minute later.
+    // Another main chat's sleeping workers: the dormant history that fences unproven calls.
+    startSwarm(1, { conversationId: 'c-earlier-prime' });
+    const worker = startWorker('worker-1', 'c-earlier-worker');
+    finishAgent(worker.caller, 'parked history');
+    expect(releaseQuiescentRun()).toBe(true);
+    // This main chat starts a worker; its chat has not reported in yet.
+    spawn({ workers: [{ task: 'new task' }], caller: prime });
+    const refused = await callTool('read', { paths: ['/anything'] });
+    expect(refused).toContain('CALLER_IDENTITY_REQUIRED');
+    expect(refused).toMatch(/sub-agent.*just started/i);
+    expect(refused).toMatch(/call .* again in about 30 seconds/i);
+    expect(refused).not.toContain('restore the companion connection');
+    expect(refused).toContain('No local tool was run');
+  });
+
   it('explains scheduled-run permission with dormant history and never adopts that history', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
@@ -4633,6 +4652,26 @@ describe('through the MCP endpoint', () => {
       message.text.includes('[worker-2 reported]')
     );
     expect(last?.text).toContain('3 of 3 worker slots are free');
+  });
+
+  it('tells the prime which workers wait for the user to answer a tool approval', async () => {
+    // VM, 2026-10-17: both workers stopped at ChatGPT's own "allow this app?" card for their
+    // report. The status table still said "active", so the prime decided the runtime was the
+    // bottleneck instead of telling the person a click was needed.
+    const { noteApprovalCard, resetApprovalWaits } = await import('../src/main/approval-wait.js');
+    resetApprovalWaits();
+    startSwarm(2);
+    bindConversation('worker-1', 'c-worker-1');
+    bindConversation('worker-2', 'c-worker-2');
+    const deps = { log: () => undefined, record: async () => null, notify: () => undefined } as never;
+    await noteApprovalCard('c-worker-1', true, null, deps);
+    const status = await asChat(PRIME_CHAT, 'status');
+    expect(status).toMatch(/worker-1 {2}worker {2}\S+.*needs the user to answer a tool approval in its chat/);
+    expect(status).not.toMatch(/worker-2 .*tool approval/);
+    expect(status).toContain('worker-1 waits for the user to allow or deny a tool call in its own chat');
+    await noteApprovalCard('c-worker-1', false, null, deps);
+    expect(await asChat(PRIME_CHAT, 'status')).not.toContain('tool approval');
+    resetApprovalWaits();
   });
 
   it('tells the prime a worker is gone for good only once its own chat is full', async () => {

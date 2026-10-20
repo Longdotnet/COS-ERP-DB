@@ -26,6 +26,11 @@ export const APPROVAL_FRESH_MS = 75_000;
 export const APPROVAL_NOTICE_GRACE_MS = 30_000;
 /** How long an answer waits for the card's page to take it; a visible card's page polls every 2 s. */
 export const APPROVAL_ANSWER_MS = 30_000;
+/**
+ * ChatGPT sometimes redraws the card: gone for a poll, then back with the same words (VM,
+ * 2026-10-20: 1.2 s). Back within this long, it is the same request, not an answer and a new one.
+ */
+export const APPROVAL_GONE_MS = 4_000;
 
 /** What the page reports about the card it shows. */
 export interface ApprovalCardFacts { id: string; lines: string[]; allow: boolean }
@@ -37,6 +42,13 @@ export interface ApprovalWaitDeps {
   record(sessionId: string, progressId: string, text: string, anchor?: { seq: number; time: number }): Promise<{ seq: number; time: number } | null>;
   notify(sessionId: string): void;
   log(message: string): void;
+  /** A chat started or stopped waiting, so the session list's `approval` changed. */
+  changed?(): void;
+  /**
+   * The session's latest approval row if it still says waiting: one an earlier app run wrote and
+   * never rewrote. A new wait takes it over instead of adding a row after every restart.
+   */
+  previous?(sessionId: string): Promise<{ progressId: string; anchor: { seq: number; time: number } } | null>;
 }
 
 interface Wait {
@@ -48,14 +60,28 @@ interface Wait {
   row: Promise<{ seq: number; time: number } | null> | null;
   card: ApprovalCardFacts | null;
   answer: ApprovalAnswer | null;
+  /** Fires when no poll has refreshed the wait for `APPROVAL_FRESH_MS`: nothing else would say so. */
+  stale: NodeJS.Timeout | null;
 }
 
 const waits = new Map<string, Wait>();
+/** The episode a page last reported answered, kept for `APPROVAL_GONE_MS` in case the card was only redrawn. */
+const answered = new Map<string, { wait: Wait; at: number; anchor: { seq: number; time: number } | null }>();
+
+function sameWords(a: ApprovalCardFacts | null, b: ApprovalCardFacts | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.lines.length === b.lines.length && a.lines.every((line, index) => line === b.lines[index]);
+}
 
 /** Whether this chat's page said, recently enough to still be true, that the card is waiting. */
 export function approvalCardWaiting(conversationId: string, now = Date.now()): boolean {
   const wait = waits.get(conversationId);
   return !!wait && now - wait.seenAt < APPROVAL_FRESH_MS;
+}
+
+/** Every chat `approvalCardWaiting` holds true for; the session list carries it as `approval`. */
+export function approvalWaitingChats(now = Date.now()): string[] {
+  return [...waits.keys()].filter(conversationId => approvalCardWaiting(conversationId, now));
 }
 
 /**
@@ -73,20 +99,56 @@ export async function noteApprovalCard(
   let wait = waits.get(conversationId);
   if (wait && (!waiting || now - wait.seenAt >= APPROVAL_FRESH_MS)) {
     waits.delete(conversationId);
+    if (wait.stale) clearTimeout(wait.stale);
     deps.log(`bridge: ${conversationId} no longer shows ChatGPT's tool approval card`);
+    try { deps.changed?.(); } catch { /* The list is reread on the next push. */ }
     // Only an answer seen on the page itself rewrites the row; a page that stopped reporting
     // says nothing about the card.
     const anchor = waiting ? null : await wait.row;
     if (anchor && wait.sessionId) await deps.record(wait.sessionId, wait.progressId, APPROVAL_ANSWERED_TEXT, anchor).catch(() => null);
+    if (!waiting) {
+      for (const [id, entry] of answered) if (now - entry.at >= APPROVAL_GONE_MS) answered.delete(id);
+      answered.set(conversationId, { wait, at: now, anchor });
+    }
     wait = undefined;
   }
   if (!waiting) return;
+  const before = answered.get(conversationId);
+  answered.delete(conversationId);
+  if (!wait && before && now - before.at < APPROVAL_GONE_MS && sameWords(before.wait.card, card) && !waits.has(conversationId)) {
+    // Only redrawn: the same episode goes on, its row says waiting again and no second notice comes.
+    wait = before.wait;
+    wait.seenAt = now;
+    waits.set(conversationId, wait);
+    deps.log(`bridge: ${conversationId} shows the same tool approval card again; it was redrawn, not answered`);
+    try { deps.changed?.(); } catch { /* The list is reread on the next push. */ }
+    if (before.anchor && wait.sessionId) await deps.record(wait.sessionId, wait.progressId, APPROVAL_WAITING_TEXT, before.anchor).catch(() => null);
+  }
   if (!wait) {
-    wait = { since: now, seenAt: now, noticed: false, progressId: `${APPROVAL_PROGRESS_PREFIX}${conversationId}:${now}`, sessionId: null, row: null, card: null, answer: null };
+    wait = { since: now, seenAt: now, noticed: false, progressId: `${APPROVAL_PROGRESS_PREFIX}${conversationId}:${now}`, sessionId: null, row: null, card: null, answer: null, stale: null };
     waits.set(conversationId, wait);
     deps.log(`bridge: ${conversationId} waits for the user to answer ChatGPT's tool approval card`);
+    try { deps.changed?.(); } catch { /* The list is reread on the next push. */ }
   }
   wait.seenAt = now;
+  if (deps.changed) {
+    // A page that stops reporting ends the wait with no poll left to say so.
+    const current = wait;
+    if (current.stale) clearTimeout(current.stale);
+    const arm = (delay: number): void => {
+      current.stale = setTimeout(() => {
+        current.stale = null;
+        if (waits.get(conversationId) !== current) return;
+        // A timer may fire a moment early. Pushed then, the list would still say waiting, and
+        // nothing would push again: wait out what is left of the freshness window first.
+        const left = current.seenAt + APPROVAL_FRESH_MS - Date.now();
+        if (left > 0) { arm(left); return; }
+        try { deps.changed?.(); } catch { /* as above */ }
+      }, delay);
+      current.stale.unref?.();
+    };
+    arm(APPROVAL_FRESH_MS);
+  }
   if (card) {
     // Another card replaces this one: an answer filed for the old card must never reach it.
     if (wait.card && wait.card.id !== card.id) wait.answer = null;
@@ -94,7 +156,18 @@ export async function noteApprovalCard(
   }
   if (sessionId && !wait.sessionId) {
     wait.sessionId = sessionId;
-    wait.row = deps.record(sessionId, wait.progressId, APPROVAL_WAITING_TEXT).catch(() => null);
+    const current = wait;
+    const own = `${APPROVAL_PROGRESS_PREFIX}${conversationId}:`;
+    current.row = (async () => {
+      // Only this chat's row: after Compact & Resume the session's earlier rows belong to the chat it left.
+      const earlier = deps.previous ? await deps.previous(sessionId).catch(() => null) : null;
+      if (earlier?.progressId.startsWith(own)) {
+        current.progressId = earlier.progressId;
+        return earlier.anchor;
+      }
+      return deps.record(sessionId, current.progressId, APPROVAL_WAITING_TEXT).catch(() => null);
+    })();
+    await current.row;
   }
   if (wait.sessionId && !wait.noticed && now - wait.since >= APPROVAL_NOTICE_GRACE_MS) {
     wait.noticed = true;
@@ -169,5 +242,7 @@ function expire(wait: Wait, now: number): void {
 }
 
 export function resetApprovalWaits(): void {
+  for (const wait of waits.values()) if (wait.stale) clearTimeout(wait.stale);
   waits.clear();
+  answered.clear();
 }
