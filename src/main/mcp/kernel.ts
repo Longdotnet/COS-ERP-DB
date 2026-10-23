@@ -1,4 +1,5 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
+import { STRICT_REFUSAL_PROGRESS_PREFIX, UNPROVEN_WORKER_NOTICE, UNTRUSTED_NOTICE, UNTRUSTED_WORKER_NOTICE } from '../../shared/trust-notices.js';
 import { noteConnectorUse } from '../connector-proof.js';
 import { beginPluginToolCall } from '../plugin-refresh.js';
 import { pluginManager } from '../plugins/manager.js';
@@ -114,6 +115,7 @@ import {
 import { requestCorrelation } from '../session/correlation.js';
 import { summarizeRunningCall } from '../session/summarize.js';
 import { anyChatBlocked, BLOCKED_CHAT_REFUSAL, isChatBlocked } from '../session/blocked-chats.js';
+import { ROTATION_FENCE_REFUSAL, rotationFenced } from '../rotation-fence.js';
 import { STRICT_CHAT_REFUSAL, conversationAccessRefusal, strictChatAllowlistEnabled } from '../session/conversation-access.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
@@ -138,12 +140,6 @@ import type { ToolOutcome } from '../../shared/session.js';
 /** The page's exact proof of a request id, by which a running call counts for its chat. */
 const requestOwner = (requestId: string): string | null => requestCorrelation(requestId)?.conversationId ?? null;
 
-const UNTRUSTED_NOTICE =
-  'A tool call from an untrusted chat was refused. In the chat list, hover this chat in the sidebar and choose Trust (✓) to allow it.';
-const UNTRUSTED_WORKER_NOTICE =
-  'A tool call from a worker whose owning prime is not currently allowed was refused. In the chat list, hover the owning prime row in the sidebar and choose Trust (✓) if it is untrusted, or Release there if it is blocked.';
-const UNPROVEN_WORKER_NOTICE =
-  'A tool call from an app-created worker was refused because no unique owning prime is currently proven. Return to the owning prime in the chat list; once its row is known, hover it in the sidebar and choose Trust (✓), or Release there if it is blocked, then retry after the worker is attached or recovered there.';
 const WORKER_CONNECTION_PROFILE_REFUSAL =
   'WORKER_CONNECTION_PROFILE_MISMATCH: this worker belongs to a different Chat On Steroids Setup profile. ' +
   'No local tool was run. Return to the owning prime and switch back to the connection that created this worker family; ' +
@@ -198,7 +194,7 @@ async function recordUntrustedRefusalNotice(context: CallContext): Promise<void>
   // A progress id is a presentation identity: reusing it would make foldProgress() collapse a
   // later refusal episode into the old row. The in-memory exact-pair map does deduplication;
   // the durable row therefore gets a fresh identity for each episode.
-  const recorded = await recordProgress(caller.sessionId, `strict-chat-refusal:${randomUUID()}`, message);
+  const recorded = await recordProgress(caller.sessionId, `${STRICT_REFUSAL_PROGRESS_PREFIX}${randomUUID()}`, message);
   if (!recorded) {
     untrustedNoticeEpisodes.delete(key);
     return;
@@ -826,7 +822,9 @@ async function dispatchTracked(
   const conversationPolicyRefusal = (strictChatAllowlistEnabled()
     ? await conversationAccessRefusal(context.caller.conversationId)
     : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
-    workerConnectionProfileRefusal(context.caller);
+    workerConnectionProfileRefusal(context.caller) ??
+    // A turn being stopped to continue in a fresh one: nothing runs until the stop shows.
+    (rotationFenced(context.caller.conversationId) ? ROTATION_FENCE_REFUSAL : null);
   let silentFinishAuthorized = false;
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
@@ -1389,7 +1387,13 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
   const { workspace, missing } = await liveWorkspace();
   // Codex treats an explicitly empty workdir exactly like an omitted one.
   const provided = virtualPath !== undefined && virtualPath !== '';
-  if (!provided && !workspace && swarmRunning()) {
+  // Only a chat that is part of a sub-agent run must name its folder: there the first approved one
+  // may be another agent's. Any other chat falls back as usual, even while another chat has a run
+  // (2026-10-21: with one run anywhere, every new chat outside a project had its first command
+  // refused). A call without a known chat stays as strict as before.
+  const conversationId = currentCall()?.caller.conversationId ?? null;
+  const inRun = conversationId ? currentRunId(conversationId) !== null : swarmRunning();
+  if (!provided && !workspace && inRun) {
     throw new SandboxError(
       missing
         ? `WORKSPACE_REQUIRED: the folder this chat was working in (${missing}) no longer exists. Supply an explicit approved workdir before running a command.`
@@ -1602,7 +1606,7 @@ function workerStarting(): boolean {
   return pendingWorkerSpawns().length > 0;
 }
 const WORKER_STARTING_REFUSAL =
-  'CALLER_IDENTITY_REQUIRED: this chat is not proven yet. A sub-agent chat that has just started reports in late on a busy computer, and until it does the app cannot tell which chat made this call. No local tool was run. Call this tool again in about 30 seconds with the same arguments; repeat a few times if needed.';
+  'CALLER_IDENTITY_REQUIRED: this chat is not proven yet. A sub-agent chat that has just started reports in late on a busy computer, and until it does the app cannot tell which chat made this call. No local tool was run. Call this tool again in about 30 seconds with this same app and the same arguments; repeat a few times if needed.';
 
 /** Brief exact-proof preference before allowed Desktop calls fall back to request-scoped state. */
 export const UNATTRIBUTED_DESKTOP_EVIDENCE_MS = evidenceWindow(250);

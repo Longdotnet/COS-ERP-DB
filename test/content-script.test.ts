@@ -1926,6 +1926,39 @@ describe('desktop input delivery and helper ownership', () => {
     expect(live.hook.desktopInputBusyForTest()).toBe(false);
   });
 
+  /**
+   * 2.1.45 release round: a message for a chat whose tab was closed opens a fresh tab. ChatGPT moves
+   * that tab to its project route and draws the editor again while the app answers the page's
+   * authorization request. Send then refused the redrawn editor and nothing was clicked, but the
+   * page told the app nothing: the authorized message was held as "may already have been sent"
+   * and never sent at all. The fresh tab also drew the chat's earlier questions only after the
+   * Send began, so "a new user row" alone cannot mean this Send went out (same round, rebuilt build).
+   */
+  it.each([['authorized', true, false], ['refused', false, false], ['authorized, history drawn late', true, true]] as const)(
+    'reports an authorized Send it never clicked and takes its own text back (%s)', async (_, granted, history) => {
+      live = await harness(`https://chatgpt.com/c/${chatA}`, {
+        desktop_input: async message => {
+          if (message.authorize) {
+            const editor = live!.document.querySelector('#prompt-textarea')!;
+            editor.replaceWith(editor.cloneNode(true));
+            if (history) userTurn(live!.document, 'earlier-question', 'An earlier question in this chat', { sent: false });
+            await new Promise(resolve => live!.window.setTimeout(resolve, 0));
+            return { ok: true, data: { ok: granted } };
+          }
+          if (message.ack || message.fail) return { ok: true, data: { ok: true } };
+          return { ok: true, data: { input: claimed() } };
+        }
+      });
+      const sends = watchSend(live.document);
+      expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+      expect(sends()).toBe(0);
+      expect(live.sent.filter(message => message.type === 'desktop_input' && message.fail)).toEqual(granted ? [
+        expect.objectContaining({ id: inputId, owner: 'input-owner', error: 'Native Send was withdrawn before its click.' })
+      ] : []);
+      if (granted) expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe('');
+      expect(live.hook.desktopInputBusyForTest()).toBe(false);
+    });
+
   it('ends a receipt wait the page cannot recognise without a second Send, and frees the input slot', async () => {
     const typed = 'Inspect the exact requested task';
     let claims = 0;
@@ -15428,7 +15461,7 @@ describe('the Compact & resume control', () => {
     const label = live.document.querySelector('.clf-blocked') as HTMLElement;
     expect(label.hidden).toBe(false);
     expect(label.textContent).toBe('Chat blocked');
-    expect(label.getAttribute('data-clf-tip')).toMatch(/hover this chat in the sessions list and press its block symbol/);
+    expect(label.getAttribute('data-clf-tip')).toMatch(/open this chat’s ⋯ menu in the app’s sidebar and choose “Release chat”/);
 
     // Released in the app: the next poll takes the word away.
     blocked = '';
@@ -24202,8 +24235,14 @@ describe('archiving a retired worker chat', () => {
         body: JSON.stringify({ is_archived: true }) }
     ]);
 
+    // Restoring it before its worker is woken (#1701) is the same request, the other way round.
+    calls.length = 0;
+    expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: chat, archive: false })).toEqual({ outcome: 'unarchived' });
+    expect(calls[1]).toMatchObject({ url: `https://chatgpt.com/backend-api/conversation/${chat}`, method: 'PATCH', body: JSON.stringify({ is_archived: false }) });
+
     patchStatus = 429;
     expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: chat })).toEqual({ outcome: 'failed' });
+    expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: chat, archive: false })).toEqual({ outcome: 'failed' });
     calls.length = 0;
     expect(await live.runtimeMessage({ type: 'clf-archive-chat', conversationId: '../conversations' })).toEqual({ outcome: 'failed' });
     expect(calls).toEqual([]);
