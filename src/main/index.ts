@@ -7,7 +7,7 @@ import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js
  */
 
 import path from 'node:path';
-import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, powerMonitor, powerSaveBlocker, screen, session } from 'electron';
+import { app, Notification, BrowserWindow, ipcMain, Menu, Tray, nativeImage, nativeTheme, net, powerMonitor, powerSaveBlocker, screen, session } from 'electron';
 import { createKeepAwake, installKeepAwake } from './keep-awake.js';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { initConnectorProofPath, loadConnectorProof, notePluginInstalled } from './connector-proof.js';
@@ -32,7 +32,10 @@ import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, onLog, sna
 import { noteRuntimeEvent, tallyLogEntry } from './diagnostics-facts.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { workspaceTerminalsExited } from './workspace-terminal.js';
-import { initSecretsPath, keychainReadPending } from './secrets.js';
+import { getSecret, initSecretsPath, keychainReadPending } from './secrets.js';
+import { installPhonePush, pushToPhone } from './phone-push.js';
+import { createSoundReadiness, installSoundCues, soundCue, soundQuietHours } from './sound-cues.js';
+import { DEFAULT_PHONE_PUSH } from '../shared/phone-push.js';
 import { mainText, mainTextTranslations, onMainTextsChange, restoreMainTextTranslations } from './main-texts.js';
 import { isMainText } from '../shared/main-texts.js';
 import { executableFingerprint, initKeychainNotice } from './keychain-notice.js';
@@ -40,6 +43,8 @@ import { pluginManager } from './plugins/manager.js';
 import { sessionActivityExpiresAt, setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
 import { setStuckNotifier } from './stuck-notice.js';
 import { flushSessions, getSession, initSessionStore, listSessions, readRecentEvents, setRecordingStorageLimit } from './session/store.js';
+import { runDueSchedules, type RunnerDeps } from './scheduled-runs.js';
+import { enqueueInput, listInputs } from './session/input.js';
 import { createTurnNotifier } from './turn-notifications.js';
 import { DEFAULT_RECORDING_STORAGE_GIB } from '../shared/session.js';
 import { initSkillsPath } from './skills.js';
@@ -76,11 +81,14 @@ import {
   type SwarmSnapshot
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { performance } from 'node:perf_hooks';
+import { createStartupTiming, installStartupTiming, markStartup, STARTUP_STATE } from './startup-timing.js';
 import { loadConnectorIdentity } from './connector-identity.js';
 import { initControlApiPath, shutdownControlApi, startControlApi } from './control-api.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
 import { restoreTrustedChats } from './session/trusted-chats.js';
+import { restoreRouteHold } from './tunnel/route-settle.js';
 import { stopComputerHelper } from './computer/index.js';
 import {
   GOAL_OBJECTIVES_STATE,
@@ -126,8 +134,8 @@ import { browserWindowIconPath } from './window-icon.js';
 import { approvedChatGptImageRequest, RENDERER_CONTENT_SECURITY_POLICY } from './renderer-csp.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 import { configureCosErpDbIdentity, COS_ERP_DB_AUTO_UPDATE } from '../cos-erp-db/app-identity.js';
-import { showConnectionLossNotice } from './connection-loss-notice.js';
 import { closeCosErpDbResources, initCosErpDbSubsystems, stopCosErpDbBackgroundWork } from '../cos-erp-db/integration/lifecycle.js';
+import { connectionLossLine, showConnectionLossNotice } from './connection-loss-notice.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -228,7 +236,7 @@ function createWindow(): void {
 
   // A renderer that fails to load leaves a blank window with no other clue, so
   // record it where the diagnostics panel can show it.
-  window.webContents.on('did-finish-load', () => logInfo('window loaded'));
+  window.webContents.on('did-finish-load', () => { logInfo('window loaded'); markStartup('window'); });
   window.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown' || input.key !== 'F11' || input.isAutoRepeat) return;
     event.preventDefault();
@@ -283,6 +291,13 @@ function createWindow(): void {
 
 /** When a Session-finish or stuck notice last went out per chat, so a turn-done notice does not repeat it. */
 const chatNoticeAt = new Map<string, number>();
+/** A chat that waits for the person, for the phone: its own rules decide whether it goes out. */
+const phoneNeedsYou = (sessionId: string): void => {
+  soundCue('needs-you', sessionId);
+  void getSession(sessionId).catch(() => null).then(summary => pushToPhone({ kind: 'needs-you', sessionId,
+    chatTitle: summary?.title || 'Chat On Steroids', conversationId: summary?.conversationId ?? null }));
+};
+
 function showWindow(): void {
   // Defense in depth for every current or future native activation source. The explicit gate
   // below additionally protects the long pre-window startup interval, while this invariant makes
@@ -298,6 +313,7 @@ function showWindow(): void {
 }
 
 setFinishNotifier((title, body, sessionId, turnId) => {
+  phoneNeedsYou(sessionId);
   if (window?.isFocused() || !Notification.isSupported()) return false;
   chatNoticeAt.set(sessionId, Date.now());
   const write = (): void => {
@@ -320,6 +336,7 @@ setFinishNotifier((title, body, sessionId, turnId) => {
   return true;
 });
 setStuckNotifier((title, body, sessionId, opens = 'app') => {
+  phoneNeedsYou(sessionId);
   // A person looking at the app already has the timeline note this accompanies; interrupting
   // them with the same sentence is noise, exactly as the finish notice treats a focused window.
   if (window?.isFocused() || !Notification.isSupported()) return false;
@@ -339,14 +356,17 @@ setStuckNotifier((title, body, sessionId, opens = 'app') => {
   notice.show();
   return true;
 });
-setConnectionLossNotifier(surface => showConnectionLossNotice(surface, {
-  isQuitting: () => quitting,
-  isFocused: () => window?.isFocused() ?? false,
-  isSupported: () => Notification.isSupported(),
-  text: mainText,
-  create: options => new Notification(options),
-  showWindow
-}));
+setConnectionLossNotifier(surface => {
+  if (!quitting) { soundCue('failed'); void pushToPhone({ kind: 'failed', detail: connectionLossLine(surface, mainText) }); }
+  return showConnectionLossNotice(surface, {
+    isQuitting: () => quitting,
+    isFocused: () => window?.isFocused() ?? false,
+    isSupported: () => Notification.isSupported(),
+    text: mainText,
+    create: options => new Notification(options),
+    showWindow
+  });
+});
 
 setBrowserWorkArea(() => screen.getPrimaryDisplay().workArea);
 
@@ -420,6 +440,11 @@ void app.whenReady().then(async () => {
   // This guard is intentionally before even app.getPath/init* calls. A secondary instance, or a
   // primary that was told to quit before ready, must never touch the primary's shared userData.
   if (!shouldBeginAppBootstrap(hasSingleInstanceLock, quitting)) return;
+  // Startup timing (ms since the process started); saved and compared once the store is open.
+  const startupTiming = createStartupTiming({ clock: () => performance.now(), now: Date.now, version: app.getVersion(), log: logInfo,
+    save: runs => writeDurableSoon(STARTUP_STATE, runs) });
+  installStartupTiming(startupTiming);
+  markStartup('ready');
   powerMonitor.on('suspend', suspendConnectionLossNotices);
   powerMonitor.on('resume', resumeConnectionLossNotices);
   // Counted for the diagnostics report: kinds of warnings, ended page and helper processes, sleep.
@@ -449,6 +474,7 @@ void app.whenReady().then(async () => {
   try { await initSkillsPath(userData); }
   catch (error) { logWarn(`Skills library unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   initDurableStore(userData);
+  startupTiming.restore(await readDurable<unknown>(STARTUP_STATE));
   savedWindowBounds = await readDurable<unknown>(WINDOW_BOUNDS_STATE);
   restoreMainTextTranslations(await readDurable<unknown>(MAIN_TEXTS_STATE));
   await loadConnectorIdentity();
@@ -461,6 +487,7 @@ void app.whenReady().then(async () => {
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
+  markStartup('config');
   setRecordingStorageLimit(getConfig().sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB);
   await loadConnectorProof();
   await loadWorkerArchive();
@@ -486,6 +513,36 @@ void app.whenReady().then(async () => {
   onSessionChange(() => void keepAwake.refresh());
   setInterval(() => void keepAwake.refresh(), 60_000).unref();
   void keepAwake.refresh();
+  // #1802: the window plays the sound; a closed window (only the tray left) plays none, and nor
+  // does a page that is not listening yet (loading, reloading, crashed).
+  const soundReadiness = createSoundReadiness();
+  ipcMain.on('sound:ready', event => { if (window && !window.isDestroyed() && event.sender === window.webContents) soundReadiness.mark(event.sender); });
+  installSoundCues({
+    enabled: () => getConfig().ui.sounds === true,
+    focused: () => window?.isFocused() === true,
+    quietHours: () => soundQuietHours(getConfig().ui),
+    now: () => Date.now(),
+    play: kind => {
+      if (!window || window.isDestroyed() || !soundReadiness.ready(window.webContents)) return false;
+      window.webContents.send('sound:cue', kind);
+      return true;
+    },
+    log: logInfo
+  });
+  // Phone notifications (ntfy): the app's network stack (system proxy) and the system's own idle
+  // state, where three minutes without input, or a locked screen, count as away.
+  installPhonePush({
+    settings: () => ({ ...DEFAULT_PHONE_PUSH, ...getConfig().ui.phonePush }),
+    // A failed read is reported, not treated as no token (phone-push.ts refuses to send).
+    token: () => getSecret('ntfyToken'),
+    now: () => Date.now(),
+    idleState: () => powerMonitor.getSystemIdleState(180),
+    post: async (url, body, headers) => {
+      const reply = await net.fetch(url, { method: 'POST', body, headers, signal: AbortSignal.timeout(10_000) });
+      return { ok: reply.ok, status: reply.status };
+    },
+    log: logInfo
+  });
   // Codex's turn-completion notifications: a finished answer in a background window.
   const turnNotifier = createTurnNotifier({
     getSession,
@@ -497,6 +554,11 @@ void app.whenReady().then(async () => {
     focused: () => window?.isFocused() === true,
     automated: conversationId => goalSwitchEnabledFor(conversationId),
     recentlyNotified: id => Date.now() - (chatNoticeAt.get(id) ?? 0) < 120_000,
+    turnStartedAt: async id => {
+      const [start] = await readRecentEvents(id, 1, { kinds: ['turn_start'] });
+      return start?.time ?? null;
+    },
+    phone: event => { soundCue('finished', event.sessionId); void pushToPhone({ kind: 'finished', ...event }); },
     show: (title, body, sessionId) => {
       const notice = new Notification({ title, body });
       notice.on('click', () => {
@@ -511,6 +573,19 @@ void app.whenReady().then(async () => {
   });
   turnNotifier.seed(await listSessions().catch(() => []));
   onSessionChange(change => void turnNotifier.handle(change.sessionIds ?? []));
+  // #1826: scheduled runs. Checked every 30 s and right after the computer wakes; a run missed
+  // while it slept or the app was closed goes out once, labelled late.
+  const scheduleDeps: RunnerDeps = {
+    // A lookup that fails is not a deleted chat: the runner keeps the schedule and asks again.
+    session: async id => { const summary = await getSession(id); return summary ? { id: summary.id, conversationId: summary.conversationId ?? null, activeTurnId: summary.activeTurnId ?? null } : null; },
+    enqueue: input => enqueueInput(input),
+    pending: async () => new Set((await listInputs()).filter(row => ['queued', 'browser', 'tool'].includes(row.state)).map(row => row.id)),
+    log: logInfo
+  };
+  const checkSchedules = () => void runDueSchedules(Date.now(), scheduleDeps).catch(error => logWarn(`scheduled runs: the check failed (${error instanceof Error ? error.message : String(error)})`));
+  setInterval(checkSchedules, 30_000).unref();
+  powerMonitor.on('resume', checkSchedules);
+  checkSchedules();
   // The app's own requests follow the system proxy too, not only the tunnel (#1255).
   configureAppProxy(url => session.defaultSession.resolveProxy(url), () => [
     ...(getConfig().goal.provider.kind === 'custom' ? [getConfig().goal.provider.baseUrl] : []),
@@ -547,6 +622,8 @@ void app.whenReady().then(async () => {
   // endpoints can accept work, just as blocked-chat policy is restored above.
   await restoreTrustedChats();
   if (windowActivation.isDisabled()) return;
+  // This computer's learned hold after a new tunnel-client (#1788), before any tunnel starts.
+  await restoreRouteHold();
   setAgentConversationLookup(agentConversation);
   // The prime's chat is the user's own, so no extension report can name it. It is bound
   // when the recorder manages to place the prime's first call. See recordToolCall.
@@ -672,6 +749,8 @@ void app.whenReady().then(async () => {
       app.quit();
     }
   );
+  // Chats are restored here; the window, once enabled, can ask for its state before the pet overlay is ready.
+  markStartup('restored');
   windowActivation.enable();
   if (!isBackgroundLaunch(process.argv)) windowActivation.request();
   // The desktop pet overlay is independent of the main window once started; it stays hidden

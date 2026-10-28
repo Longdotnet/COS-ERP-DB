@@ -1149,6 +1149,98 @@ describe('accepted helper tab cleanup', () => {
   }
 });
 
+describe('a linked Project ChatGPT no longer has (#1759)', () => {
+  const inputId = 'ffffffff-1111-4222-8333-444444444444';
+  const project = 'g-p-11111111222233334444555555555555';
+  it.each([
+    ['the opened tab on that Project', 1, `https://chatgpt.com/g/${project}-work/project?cos-input=${inputId}`, project, true],
+    ['another tab', 2, `https://chatgpt.com/g/${project}/project`, project, false],
+    ['a tab that moved away', 1, 'https://chatgpt.com/', project, false],
+    ['another Project', 1, `https://chatgpt.com/g/${project}/project`, 'g-p-99999999888877776666555555555555', false],
+    ['a tab already leaving the Project', 1, `https://chatgpt.com/g/${project}/project`, project, false, 'https://chatgpt.com/']
+  ] as const)('is reported only by %s', async (_name, tabId, url, reportedProject, posted, pendingUrl?: string) => {
+    const calls: any[] = [];
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token', inputOpenings: { [inputId]: { tab: 1, stage: 'ready', project } } }),
+      session: new FakeStorageArea(),
+      tabsGet: async () => ({ id: tabId, url, ...(pendingUrl ? { pendingUrl } : {}) }),
+      fetch: async (input, init: any = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/project-create') calls.push(JSON.parse(init.body));
+        return response(200, { ok: true });
+      }
+    });
+    await worker.registerTab(tabId);
+    await worker.send({ type: 'project_unavailable', id: inputId, project: reportedProject }, tabId);
+    expect(calls).toEqual(posted ? [{ action: 'gone', inputId, chatgptId: project }] : []);
+  });
+
+  it('is not reported by a tab that closed while asking', async () => {
+    const calls: any[] = [];
+    let closed = false;
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token', inputOpenings: { [inputId]: { tab: 1, stage: 'ready', project } } }),
+      session: new FakeStorageArea(),
+      tabsGet: async () => { if (closed) throw new Error('No tab with id: 1.'); return { id: 1, url: `https://chatgpt.com/g/${project}/project` }; },
+      fetch: async (input, init: any = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/project-create') calls.push(JSON.parse(init.body));
+        return response(200, { ok: true });
+      }
+    });
+    await worker.registerTab(1);
+    closed = true;
+    const reply = await worker.send({ type: 'project_unavailable', id: inputId, project }, 1);
+    expect(reply).toEqual({ ok: false });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('a page\'s release reason', () => {
+  it.each(['send-not-ready', 'turn-progressed by app-tool_call', 'turn-progressed by page-text'])('reaches the app whole: %s', async (detail) => {
+    const posted: any[] = [];
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      tabsGet: async () => ({ id: 1, url: 'https://chatgpt.com/c/6adb3318-5500-83eb-afe8-d70d1bd49d1f' }),
+      fetch: async (input, init: any = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/input/fail') posted.push(JSON.parse(init.body));
+        return response(200, { ok: true });
+      }
+    });
+    await worker.registerTab(1);
+    await worker.send({ type: 'desktop_input', id: 'ffffffff-1111-4222-8333-444444444444', owner: '1:document-1-0:0',
+      fail: true, error: 'After-turn pickup was withdrawn before Send.', detail });
+    expect(posted.at(-1)?.detail).toBe(detail);
+  });
+
+  it('drops a reason that is not one of the page\'s own short codes', async () => {
+    const posted: any[] = [];
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+      tabsGet: async () => ({ id: 1, url: 'https://chatgpt.com/c/6adb3318-5500-83eb-afe8-d70d1bd49d1f' }),
+      fetch: async (input, init: any = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/input/fail') posted.push(JSON.parse(init.body));
+        return response(200, { ok: true });
+      }
+    });
+    await worker.registerTab(1);
+    for (const [index, detail] of ['Some sentence. With dots', 'x'.repeat(81), 'UPPER-case'].entries()) {
+      await worker.send({ type: 'desktop_input', id: 'ffffffff-1111-4222-8333-444444444444', owner: '1:document-1-0:0',
+        fail: true, error: 'After-turn pickup was withdrawn before Send.', detail });
+      // The report itself still travels; only its reason is left out.
+      expect(posted).toHaveLength(index + 1);
+      expect(posted.at(-1)).toMatchObject({ error: 'After-turn pickup was withdrawn before Send.' });
+      expect(posted.at(-1)?.detail).toBeUndefined();
+    }
+  });
+});
+
 describe('browser identity', () => {
   it('sends one stable random browser id with every app request', async () => {
     const seen: string[] = [];
@@ -3885,6 +3977,39 @@ describe('extension revival delivery', () => {
     expect(custody).toEqual({ ok: true, deferred: true });
     expect(local.data.deferredRevivals).toMatchObject([revival]);
     expect((local.data.deferredRevivals as Array<{ id: string }>).some((entry) => entry.id === oldId)).toBe(false);
+  });
+});
+
+describe('the ChatGPT Projects a page lists (#1756)', () => {
+  it('passes only valid Projects from a registered page to the app', async () => {
+    const posted: Array<Record<string, unknown>> = [];
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const pathname = new URL(input).pathname;
+        if (pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (pathname !== '/chatgpt-projects') return response(404, {});
+        posted.push(JSON.parse(String(init.body)));
+        return response(200, { ok: true, changed: true });
+      },
+      tabsGet: async (id) => ({ id, url: 'https://chatgpt.com/' })
+    });
+    await worker.registerTab(61);
+    const listed = `g-p-${'a'.repeat(32)}`;
+    expect(await worker.send({ type: 'project_catalog', projects: [{ id: listed, name: 'Kunden' }, { id: 'g-p-bad', name: 'x' }, { id: `g-p-${'b'.repeat(32)}` }], workspace: 'team-account-0001' }, 61))
+      .toEqual({ ok: true });
+    expect(posted).toEqual([{ projects: [{ id: listed, name: 'Kunden' }], workspace: 'team-account-0001' }]);
+    // No workspace, or something that is not one, goes on as none.
+    expect(await worker.send({ type: 'project_catalog', projects: [{ id: listed, name: 'Kunden' }], workspace: { x: 1 } }, 61)).toEqual({ ok: true });
+    expect(posted[1]).toEqual({ projects: [{ id: listed, name: 'Kunden' }], workspace: null });
+    posted.pop();
+    expect(await worker.send({ type: 'project_catalog', projects: [{ id: 'g-p-bad', name: 'x' }] }, 61)).toEqual({ ok: false });
+    expect(await worker.send({ type: 'project_catalog', projects: 'nope' }, 61)).toEqual({ ok: false });
+    expect(posted).toHaveLength(1);
+    // An empty sidebar still names the workspace in use (CodeRabbit on #1757).
+    expect(await worker.send({ type: 'project_catalog', projects: [], workspace: 'team-account-0002' }, 61)).toEqual({ ok: true });
+    expect(posted[1]).toEqual({ projects: [], workspace: 'team-account-0002' });
   });
 });
 

@@ -134,6 +134,27 @@ app.whenReady().then(async () => {
     for(let i=0;i<100 && await js(`document.querySelectorAll('.row-menu').length!==2`);i++) await new Promise(r=>setTimeout(r,10));
     const fits=await js(`[...document.querySelectorAll('.row-menu')].map(m=>{const r=m.getBoundingClientRect();return r.left>=0&&r.top>=0&&r.right<=innerWidth&&r.bottom<=innerHeight})`);
     assert.deepEqual(fits,[true,true],'The menu and its Color submenu fit in the window');
+    // Every language's label fits: each item shows its translation in turn in the real menu, which
+    // may grow to its maximum width before a label is cut ("Geheimnisse vor ChatGPT verbergen" was).
+    const catalogs=Object.fromEntries(fs.readdirSync(path.join(root,'src/renderer/locales')).filter(f=>f.endsWith('.json'))
+      .map(f=>[f.slice(0,-5),JSON.parse(fs.readFileSync(path.join(root,'src/renderer/locales',f),'utf8'))]));
+    const cut=await js(`(${(catalogs=>{
+      const out=[];
+      for (const label of document.querySelector('.row-menu').querySelectorAll('.row-menu-label')) {
+        const shown=label.textContent;
+        // The page may already be in another language: find the English key of what it shows.
+        const english=Object.values(catalogs).flatMap(catalog=>Object.entries(catalog)).find(([,text])=>text===shown)?.[0] ?? shown;
+        for (const [language,catalog] of [['en',{[english]:english}],...Object.entries(catalogs)]) {
+          const text=catalog[english];
+          if (!text) continue;
+          label.textContent=text;
+          if (label.scrollWidth>label.clientWidth+1) out.push(`${language}: ${text}`);
+        }
+        label.textContent=shown;
+      }
+      return out;
+    }).toString()})(${JSON.stringify(catalogs)})`);
+    assert.deepEqual(cut,[],'A project menu label is cut in another language');
     assert.equal(await js(`document.activeElement.dataset.rowAction`),'color-none','The submenu opens on the current color');
     await screenshot('project-menu-color.png');
     press('Down');
@@ -222,7 +243,9 @@ app.whenReady().then(async () => {
       await js(`document.getElementById('setupProfile').scrollIntoView({block:'center'})`);
       await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
       await js(`document.getElementById('setupProfile').click()`);
-      await js('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
+      // A slow runner applies the menu's flip a frame or two after it opens (CI, 2026-10-26: measured
+      // below the viewport two frames in). Wait until its place holds still for two frames, at most ~30.
+      await js(`new Promise(r=>{const m=document.getElementById('setupProfileMenu');let last='',same=0,n=0;const tick=()=>{const b=m.getBoundingClientRect();const now=[b.top,b.left,b.bottom,b.right].join();same=now===last?same+1:0;last=now;if(same>=2||++n>=30)r();else requestAnimationFrame(tick);};requestAnimationFrame(tick);})`);
       const profileBounds = await js(`(() => {const r=document.getElementById('setupProfileMenu').getBoundingClientRect();return {width:r.width,left:r.left,right:r.right,top:r.top,bottom:r.bottom,viewport:[innerWidth,innerHeight],open:document.getElementById('setupProfileMenu').matches(':popover-open')}})()`);
       assert.ok(profileBounds.width>0 && profileBounds.right<=profileBounds.viewport[0] && profileBounds.left>=0 && profileBounds.top>=0 && profileBounds.bottom<=profileBounds.viewport[1],JSON.stringify({width,zoom,profileBounds}));
       assert.equal(await js(`document.querySelector('[data-remove-profile-id]').disabled`),true);

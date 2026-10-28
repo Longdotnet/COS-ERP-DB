@@ -1,7 +1,7 @@
 import { REASONING_EFFORTS } from '../src/shared/session.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_GOAL_MODEL,
   defaultConfig,
@@ -145,6 +145,36 @@ describe('settings migration', () => {
       expect((await loadConfig()).ui.appearance).toEqual({ ...appearance, sidebarLayout: 'projects' });
     }
   });
+  it('loads line spacing and the announcement switch saved before they existed, or damaged, as normal spacing and off', async () => {
+    const { defaultAppearance } = await import('../src/shared/appearance.js');
+    const config = defaultConfig();
+    const appearance = { ...defaultAppearance(), lineSpacing: 140, font: 'legible' as const }; appearance.dark.sidebar = '#e53aa0';
+    await saveConfig({ ...config, ui: { ...config.ui, appearance, announceTurns: true } });
+    expect((await loadConfig()).ui).toMatchObject({ appearance: { lineSpacing: 140, font: 'legible' }, announceTurns: true });
+    const { lineSpacing: _, ...old } = appearance;
+    for (const [saved, announceTurns] of [[old, undefined], [{ ...old, lineSpacing: 145 }, 'yes']] as const) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, readOnly: true,
+        ui: { ...config.ui, appearance: saved, announceTurns } }), 'utf8');
+      const loaded = await loadConfig();
+      // Each falls back on its own; the colors, the font and the rest of Settings are kept.
+      expect(loaded.ui.appearance).toEqual({ ...appearance, lineSpacing: 100 });
+      expect(loaded.ui.announceTurns).toBeUndefined();
+      expect(loaded.readOnly).toBe(true);
+    }
+  });
+  it('loads the sounds switch saved before it existed, or damaged, as off, and keeps everything else', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, ui: { ...config.ui, sounds: true } });
+    expect((await loadConfig()).ui.sounds).toBe(true);
+    const { sounds: _, ...older } = config.ui;
+    for (const ui of [older, { ...older, sounds: 'yes' }, { ...older, sounds: 1 }, { ...older, sounds: null }]) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, readOnly: true, ui: { ...ui, theme: 'light' } }), 'utf8');
+      const loaded = await loadConfig();
+      expect(loaded.ui.sounds).toBe(false);
+      expect(loaded.ui.theme).toBe('light');
+      expect(loaded.readOnly).toBe(true);
+    }
+  });
   it('drops removed file-saving settings without changing other saved choices', async () => {
     const config = defaultConfig();
     config.readOnly = true;
@@ -200,6 +230,24 @@ describe('settings migration', () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, startAtLogin: true, autoConnect: false } });
     expect((await loadConfig()).ui).toMatchObject({ startAtLogin: true, autoConnect: false });
   });
+  it('turns phone notifications off, rather than pointing them at ntfy.sh, when the saved server is damaged', async () => {
+    const phone = { enabled: true, server: 'https://push.example.org', topic: 'cos-fixturetopic234567', needsYou: true, failures: true,
+      finishedAfterMinutes: 5, onlyWhenAway: true, quietHours: null, includeDetails: true };
+    for (const server of ['x'.repeat(3000), 42, null]) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, phonePush: { ...phone, server } } }), 'utf8');
+      // Chat details must never go to a server nobody chose: off, and no server at all.
+      expect((await loadConfig()).ui.phonePush, String(server).slice(0, 8)).toMatchObject({ enabled: false, server: '', topic: phone.topic, includeDetails: true });
+    }
+    // Said in the log, once, and never with the damaged value.
+    const { getLog } = await import('../src/main/logger.js');
+    const lines = getLog().filter(entry => entry.message.startsWith('phone notifications: the saved server setting was damaged'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.message).not.toContain('xxxx');
+    // A missing server is the default, as before.
+    const { server: _server, ...withoutServer } = phone;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, phonePush: withoutServer } }), 'utf8');
+    expect((await loadConfig()).ui.phonePush).toMatchObject({ enabled: true, server: 'https://ntfy.sh' });
+  });
   it('rotates long turns after 30 minutes for fresh, legacy and malformed settings, keeping saved choices', async () => {
     expect(defaultConfig().ui.rotateTurnMinutes).toBe(30);
     const legacy = defaultConfig(); delete legacy.ui.rotateTurnMinutes;
@@ -227,6 +275,25 @@ describe('settings migration', () => {
     expect((await loadConfig()).ui.localAppUsage).toBe(true);
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, localAppUsage: false } });
     expect((await loadConfig()).ui.localAppUsage).toBe(false);
+  });
+  it('keeps Code checkpoints off for fresh, legacy and malformed configs while preserving explicit opt-in', async () => {
+    expect(defaultConfig().projects).toEqual({ codeCheckpoints: false });
+    const load = async (projects: unknown) => {
+      const stored = { ...defaultConfig(), readOnly: false } as Record<string, unknown>;
+      if (projects === undefined) delete stored.projects; else stored.projects = projects;
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(stored), 'utf8');
+      return loadConfig();
+    };
+    expect((await load(undefined)).projects).toEqual({ codeCheckpoints: false });
+    expect((await load({})).projects).toEqual({ codeCheckpoints: false });
+    expect((await load({ codeCheckpoints: true })).projects).toEqual({ codeCheckpoints: true });
+    // A bad value repairs to off without sending the rest of the file through (read-only) recovery.
+    const loaded = await load({ codeCheckpoints: 'yes' });
+    expect(loaded.projects).toEqual({ codeCheckpoints: false });
+    expect(loaded.readOnly).toBe(false);
+    expect((await load('on')).projects).toEqual({ codeCheckpoints: false });
+    await saveConfig({ ...defaultConfig(), projects: { codeCheckpoints: true } });
+    expect((await loadConfig()).projects.codeCheckpoints).toBe(true);
   });
   it('keeps the local control API off for fresh, legacy and malformed configs while preserving explicit opt-in', async () => {
     expect(defaultConfig().controlApi).toEqual({ enabled: false, allowActions: false });
@@ -349,6 +416,8 @@ describe('settings migration', () => {
     expect(loaded.goal.provider).toEqual({ kind: 'openrouter', baseUrl: '' });
     expect(loaded.ui.autoConnect).toBe(true);
     expect(loaded.ui.privacyScreenshots).toBe(false);
+    // #1797: a config from before the secrets shield has it on.
+    expect(loaded.ui.secretsShield).toBe(true);
     // The one tunnel id a pre-split config had is Core's, because Core is the connector
     // the app cannot work without. Desktop is a second, optional tunnel that starts empty
     // rather than inheriting Core's id — publishing Core twice would be worse than not
@@ -1209,3 +1278,25 @@ describe('a settings file the app cannot read as is', () => {
     expect(await fs.readFile(path.join(dir, saved[0]!), 'utf8')).toBe(content);
   });
 });
+
+// #1856 (CodeRabbit): a damaged saved chat style falls back to the built-in text and says so once, never its content.
+it('logs a damaged saved chat style without its text, and nothing for an absent one', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const { MAX_CHAT_STYLE_CHARS } = await import('../src/shared/chat-style.js');
+  // On disk, as a damaged file has it: saveConfig would already drop the value before writing.
+  await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(),
+    ui: { ...defaultConfig().ui, chatPersonality: 'secret-ish ' + 'x'.repeat(MAX_CHAT_STYLE_CHARS) } }), 'utf8');
+  warn.mockClear();
+  const loaded = await loadConfig();
+  expect(loaded.ui.chatPersonality).toBeUndefined();
+  const lines = warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('chatPersonality'));
+  expect(lines).toEqual(['config: the saved ui.chatPersonality was damaged (too long); new chats use the built-in text']);
+  expect(lines.join()).not.toContain('secret-ish');
+  warn.mockClear();
+  await saveConfig(defaultConfig());
+  await loadConfig();
+  expect(warn.mock.calls.filter(call => String(call[0]).includes('chatPersonality'))).toEqual([]);
+  warn.mockRestore();
+});
+

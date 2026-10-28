@@ -351,6 +351,103 @@ it('searches a comparison branch without checking out and keeps the chosen diff 
   expect(window.api.getProjectGitSnapshot).toHaveBeenLastCalledWith(projectB.id, undefined);
 });
 
+it('compares against a code checkpoint and asks main to restore one file or all of them with that revision', async () => {
+  const id = 'c'.repeat(32), ref = `checkpoint:${id}`;
+  // Local time: the label shows the day where the app runs, so a UTC fixture would move a day west of UTC−9.
+  const checkpoints = [{ ref, createdAt: new Date(2026, 9, 13, 9, 30).getTime(), reason: 'turn' as const, available: true }];
+  let changes: ProjectGitSnapshot['changes'] = [
+    { status: 'M', path: 'README.md', additions: 1, deletions: 1, binary: false },
+    { status: 'A', path: 'src/new.ts', additions: 3, deletions: 0, binary: false }
+  ];
+  (window.api.getProjectGitSnapshot as any).mockImplementation((_id: string, selected?: string) => ok({
+    ...cleanGit(), currentBranch: 'feature', branches: [{ ref: 'refs/heads/feature', label: 'feature' }], checkpoints,
+    ...(selected ? { comparison: { ref: selected, label: '', baseOid: 'a'.repeat(40), headOid: 'b'.repeat(40), checkpoint: true },
+      revision: `checkpoint-${changes.length}`, changes } : {})
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation(() => ok({
+    projectId: projectA.id, status: 'M', path: 'README.md', additions: 1, deletions: 1,
+    binary: false, tooLarge: false, baseText: 'before', currentText: 'after'
+  }));
+  const restore = vi.fn(async (_project: string, _id: string, paths: string[] | null) => {
+    changes = paths ? changes.filter(change => !paths.includes(change.path)) : [];
+    return { ok: true, data: { confirmed: true, restored: paths ?? ['README.md', 'src/new.ts'], skipped: [], undoRef: `checkpoint:${'d'.repeat(32)}` } };
+  });
+  Object.assign(window.api, { restoreCheckpoint: restore });
+  const panel = createFilePanel({ host, reviewOnly: true });
+  panel.update(projectA); await panel.show(); await tick();
+  expect(host.querySelector('.file-checkpoint-bar')).toBeNull();
+
+  host.querySelector<HTMLButtonElement>('.file-branch-trigger')!.click();
+  expect(document.querySelector('.file-branch-hint')?.textContent).toBe('Checkpoints');
+  const option = [...document.querySelectorAll<HTMLButtonElement>('.file-branch-option')].at(-1)!;
+  expect(option.textContent).toMatch(/^Before turn · /);
+  option.click(); await tick();
+  expect(window.api.getProjectGitSnapshot).toHaveBeenLastCalledWith(projectA.id, ref);
+  expect(host.querySelector('.file-branch-trigger')?.textContent).toMatch(/Before turn · /);
+  expect(host.querySelector<HTMLElement>('.file-branch-stats')?.title).toBe('Changes since this checkpoint, local work included');
+  // A language change rewrites the label and its date format with the rest of the panel.
+  try {
+    setLanguage('de');
+    expect(host.querySelector('.file-branch-trigger')?.textContent).toMatch(/^Vor dem Durchlauf · 13\.10\.26, /);
+  } finally { setLanguage('en'); }
+  expect(host.querySelector('.file-branch-trigger')?.textContent).toMatch(/^Before turn · 10\/13\/26, /);
+
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="README.md"]')!.click(); await tick(); await tick();
+  expect(window.api.getProjectGitDiff).toHaveBeenLastCalledWith(projectA.id, 'README.md', ref, 'checkpoint-2');
+  // Restore goes back in time, so it does not wear the Refresh arrow it sits next to.
+  const restoreFile = [...host.querySelectorAll<HTMLButtonElement>('.file-preview-actions button')].find(button => button.textContent === 'Restore file')!;
+  const iconOf = (button: Element | null) => button?.querySelector('.ico')?.className;
+  expect(iconOf(restoreFile)).toContain('ph-arrow-counter-clockwise');
+  expect(iconOf(host.querySelector('.file-checkpoint-bar button'))).toContain('ph-arrow-counter-clockwise');
+  expect(iconOf(restoreFile)).not.toBe(iconOf(host.querySelector('[aria-label="Refresh changes"]')));
+  restoreFile.focus(); restoreFile.click();
+  await tick(); await tick();
+  expect(restore).toHaveBeenLastCalledWith(projectA.id, id, ['README.md'], 'checkpoint-2');
+  // The refresh after a restore removes the button that had the keyboard: it continues at Refresh.
+  const refreshChanges = host.querySelector<HTMLButtonElement>('[aria-label="Refresh changes"]');
+  expect(document.activeElement).toBe(refreshChanges);
+  expect(document.querySelector('.toast')?.textContent).toBe('Restored 1 of 1 files');
+  expect(host.querySelector('.file-change-row[data-path="README.md"]')).toBeNull();
+
+  const restoreAll = host.querySelector<HTMLButtonElement>('.file-checkpoint-bar button')!;
+  restoreAll.focus(); restoreAll.click(); await tick(); await tick();
+  expect(restore).toHaveBeenLastCalledWith(projectA.id, id, null, 'checkpoint-1');
+  expect(document.activeElement).toBe(host.querySelector('[aria-label="Refresh changes"]'));
+  expect(host.textContent).toContain('No changes since this checkpoint');
+});
+
+// CodeRabbit on #1443: a restore that finishes after the pane was hidden, or after an A→B→A project switch,
+// moves no focus and starts no refresh of its own.
+it('leaves focus alone when the pane was hidden or the project switched away and back while a restore ran', async () => {
+  const id = 'e'.repeat(32), ref = `checkpoint:${id}`;
+  const checkpoints = [{ ref, createdAt: new Date(2026, 9, 13, 9, 30).getTime(), reason: 'turn' as const, available: true }];
+  const changes: ProjectGitSnapshot['changes'] = [{ status: 'M', path: 'README.md', additions: 1, deletions: 1, binary: false }];
+  (window.api.getProjectGitSnapshot as any).mockImplementation((_id: string, selected?: string) => ok({
+    ...cleanGit(), currentBranch: 'feature', branches: [{ ref: 'refs/heads/feature', label: 'feature' }], checkpoints,
+    ...(selected ? { comparison: { ref: selected, label: '', baseOid: 'a'.repeat(40), headOid: 'b'.repeat(40), checkpoint: true },
+      revision: 'checkpoint-1', changes } : {})
+  }));
+  for (const interrupt of ['switch', 'hide'] as const) {
+    let finish!: () => void;
+    const restore = vi.fn(() => new Promise(resolve => { finish = () => resolve({ ok: true, data: { confirmed: true, restored: ['README.md'], skipped: [], undoRef: null } }); }));
+    Object.assign(window.api, { restoreCheckpoint: restore });
+    const panel = createFilePanel({ host, reviewOnly: true });
+    panel.update(projectA); await panel.show(); await tick();
+    host.querySelector<HTMLButtonElement>('.file-branch-trigger')!.click();
+    [...document.querySelectorAll<HTMLButtonElement>('.file-branch-option')].at(-1)!.click(); await tick();
+    const restoreAll = host.querySelector<HTMLButtonElement>('.file-checkpoint-bar button')!;
+    restoreAll.focus(); restoreAll.click(); await tick();
+    expect(restore, interrupt).toHaveBeenCalledTimes(1);
+    if (interrupt === 'switch') { panel.update(projectB); panel.update(projectA); } else panel.hide();
+    (document.activeElement as HTMLElement | null)?.blur();
+    const snapshots = (window.api.getProjectGitSnapshot as any).mock.calls.length;
+    finish(); await tick(); await tick();
+    expect(document.activeElement, interrupt).toBe(document.body);
+    if (interrupt === 'hide') expect((window.api.getProjectGitSnapshot as any).mock.calls.length, interrupt).toBe(snapshots);
+    panel.hide(); host.replaceChildren();
+  }
+});
+
 it('gives focus back to the branch trigger when a branch is chosen with the keyboard', async () => {
   const branches = [{ ref: 'refs/heads/main', label: 'main' }];
   (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({ ...cleanGit(), currentBranch: 'feature', branches }));
@@ -383,6 +480,85 @@ it('lets Review leave a comparison whose branch disappeared', async () => {
   await tick();
   expect(window.api.getProjectGitSnapshot).toHaveBeenLastCalledWith(projectA.id, undefined);
   expect(host.textContent).toContain('Working tree is clean');
+});
+
+it('shows a conflicted file as ours, base and theirs, and asks chat to resolve it without sending', async () => {
+  // Review showed a conflict only as HEAD against the marker-filled file (2.1.41).
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({
+    ...cleanGit(), revision: 'merging',
+    changes: [{ status: 'C', path: 'src/both.ts', additions: null, deletions: null, binary: false }]
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation(() => ok({
+    projectId: projectA.id, status: 'C', path: 'src/both.ts', additions: null, deletions: null,
+    binary: false, tooLarge: false, baseText: 'ours', currentText: '<<<<<<< HEAD',
+    conflict: { base: null, ours: 'export const side = "main";', theirs: 'export const side = "feature";' }
+  } satisfies ProjectGitDiff));
+  const asked: string[] = [];
+  const panel = createFilePanel({ host, reviewOnly: true, onAskChat: request => asked.push(request) });
+  panel.update(projectA); await panel.show(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="src/both.ts"]')!.click(); await tick(); await tick();
+
+  const panes = [...host.querySelectorAll<HTMLElement>('.file-conflict-pane')];
+  expect(panes.map(pane => pane.querySelector('.file-conflict-pane-label')?.textContent)).toEqual(['Ours (HEAD)', 'Common base', 'Theirs (incoming)']);
+  expect(panes.map(pane => pane.querySelector<HTMLTextAreaElement>('.test-code-input')?.value ?? pane.textContent))
+    .toEqual(['export const side = "main";', 'Common baseNot in this version', 'export const side = "feature";']);
+  expect(host.querySelector('.test-diff-viewer')).toBeNull();
+
+  const toggleView = host.querySelector<HTMLButtonElement>('.file-conflict-toggle')!;
+  expect(toggleView.getAttribute('aria-pressed')).toBe('true');
+  toggleView.focus(); toggleView.click(); await tick();
+  expect(host.querySelector('.file-conflict-pane')).toBeNull();
+  expect(host.querySelector('.test-diff-viewer')?.textContent).toContain('<<<<<<< HEAD');
+  // The header is rebuilt; a keyboard user stays on the toggle.
+  expect(document.activeElement).toBe(host.querySelector('.file-conflict-toggle'));
+  expect(document.activeElement?.getAttribute('aria-pressed')).toBe('false');
+  host.querySelector<HTMLButtonElement>('.file-conflict-toggle')!.click(); await tick();
+  expect(host.querySelectorAll('.file-conflict-pane')).toHaveLength(3);
+
+  [...host.querySelectorAll<HTMLButtonElement>('.file-preview-actions button')].find(button => button.title === 'Ask chat to resolve')!.click();
+  expect(asked).toHaveLength(1);
+  expect(asked[0]).toContain('src/both.ts');
+  expect(asked[0]).toContain('git show :1:./src/both.ts, :2:./src/both.ts and :3:./src/both.ts');
+});
+
+it('shows a binary note, or conflict panes over a too large file, instead of staying on Loading diff', async () => {
+  // The loading view recorded the revision, so a binary or too large result returned before rendering.
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({
+    ...cleanGit(), revision: 'dirty', changes: [
+      { status: 'M', path: 'a.bin', additions: null, deletions: null, binary: true },
+      { status: 'C', path: 'big.txt', additions: null, deletions: null, binary: false }
+    ]
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation((_id: string, file: string) => ok(file === 'a.bin' ? {
+    projectId: projectA.id, status: 'M', path: 'a.bin', additions: null, deletions: null,
+    binary: true, tooLarge: false, baseText: null, currentText: null, note: 'Binary diff · preview unavailable'
+  } : {
+    projectId: projectA.id, status: 'C', path: 'big.txt', additions: null, deletions: null, binary: false, tooLarge: true,
+    baseText: null, currentText: null, note: 'This diff is too large to display.', conflict: { base: 'base', ours: 'ours', theirs: 'theirs' }
+  } satisfies ProjectGitDiff));
+  const panel = createFilePanel({ host, reviewOnly: true });
+  panel.update(projectA); await panel.show(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="a.bin"]')!.click(); await tick(); await tick();
+  expect(host.querySelector('.file-preview')?.textContent).toContain('Binary diff · preview unavailable');
+  host.querySelector<HTMLButtonElement>('.file-preview-actions button[title="Close preview"]')!.click(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="big.txt"]')!.click(); await tick(); await tick();
+  expect(host.querySelectorAll('.file-conflict-pane')).toHaveLength(3);
+  expect(host.querySelector('.file-preview')?.textContent).not.toContain('Loading diff');
+});
+
+it('offers neither conflict action on an ordinary diff', async () => {
+  (window.api.getProjectGitSnapshot as any).mockImplementation(() => ok({
+    ...cleanGit(), revision: 'dirty', changes: [{ status: 'M', path: 'README.md', additions: 1, deletions: 1, binary: false }]
+  }));
+  (window.api.getProjectGitDiff as any).mockImplementation(() => ok({
+    projectId: projectA.id, status: 'M', path: 'README.md', additions: 1, deletions: 1,
+    binary: false, tooLarge: false, baseText: 'before', currentText: 'after'
+  } satisfies ProjectGitDiff));
+  const panel = createFilePanel({ host, reviewOnly: true, onAskChat: () => undefined });
+  panel.update(projectA); await panel.show(); await tick();
+  host.querySelector<HTMLButtonElement>('.file-change-row[data-path="README.md"]')!.click(); await tick(); await tick();
+  expect(host.querySelector('.test-diff-viewer')).not.toBeNull();
+  expect([...host.querySelectorAll<HTMLButtonElement>('.file-preview-actions button')].map(button => button.title)).toEqual(['Close preview']);
 });
 
 it('marks every ancestor folder, including paths of deleted and renamed files, then clears them from Git truth', async () => {

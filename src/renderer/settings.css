@@ -22,6 +22,14 @@
 .appearance-color input[type='color']::-webkit-color-swatch { border: 1px solid var(--edge); border-radius: 50%; }
 .appearance-color input[type='text'] { width: 8ch; min-width: 0; padding: 0; border: 0; border-radius: 0; background: transparent; color: var(--ink); font-family: var(--mono); font-size: calc(12px * var(--text-scale, 1)); }
 .appearance-color input[aria-invalid='true'] { outline: 1px solid var(--red); }
+.appearance-swatches { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.appearance-swatch { width: 24px; height: 24px; padding: 0; border: 1px solid var(--edge); border-radius: 50%; background: var(--swatch); cursor: pointer; }
+.appearance-swatch:hover { box-shadow: 0 0 0 2px var(--hover); }
+.appearance-swatch[aria-checked='true'] { box-shadow: 0 0 0 2px var(--page), 0 0 0 4px var(--swatch); }
+.appearance-swatch:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.appearance-panel .setting :is(input, select):disabled { cursor: not-allowed; opacity: .5; }
+/* Every row high contrast sets aside reads as set aside, not only the checkbox ones. */
+.appearance-panel .setting:has(.appearance-color input:disabled, .appearance-range input:disabled) .setting-text { opacity: .6; }
 .appearance-range { display: flex; align-items: center; gap: 14px; max-width: 100%; }
 .appearance-range input { width: 130px; min-width: 60px; accent-color: var(--accent-fill); }
 .appearance-range output { min-width: 5ch; text-align: right; font-variant-numeric: tabular-nums; font-size: calc(12px * var(--text-scale, 1)); }
@@ -50,7 +58,7 @@
 :root[data-theme="dark"] .layout-preview .for-light, :root:not([data-theme="dark"]) .layout-preview .for-dark { display: none; }
 @media (max-width: 640px) { .layout-choice { grid-template-columns: minmax(0, 1fr); } }
 .appearance-preview-sidebar .is-selected { width: 100%; height: 24px; margin: 0 -4px; border: 1px solid var(--accent-edge); background: var(--accent-wash); opacity: 1; }
-.appearance-preview-chat { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 22px; font-size: calc(13px * var(--text-scale, 1)); }
+.appearance-preview-chat { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 22px; font-size: calc(13px * var(--text-scale, 1)); line-height: calc(1.5 * var(--line-spacing, 1)); }
 .appearance-preview-composer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding: 9px 12px; border-radius: 12px; background: var(--card); color: var(--faint); }
 .appearance-preview-composer b { display: grid; place-items: center; flex: 0 0 26px; height: 26px; border-radius: 50%; background: var(--accent-fill); color: var(--on-accent); }
 @media (max-width: 1100px) {

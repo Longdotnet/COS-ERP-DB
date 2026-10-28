@@ -21,8 +21,10 @@ export interface RowMenuItem {
   /** A longer explanation, as the item's tooltip. */
   title?: () => string;
   danger?: boolean;
-  /** A choice among several (menuitemradio): whether it is the current one. */
+  /** A choice among several (menuitemradio): whether it is the current one. With `toggle`, an on/off switch's state. */
   checked?: boolean;
+  /** An on/off switch (menuitemcheckbox) rather than a choice among several. */
+  toggle?: boolean;
   /** A color dot before the label (`data-color`); an empty string draws the empty dot. */
   swatch?: string;
   disabled?: boolean;
@@ -34,6 +36,8 @@ export interface RowMenuItem {
   hint?: () => string;
   /** Runs after the menu has closed, or with it still open when `keepOpen`. */
   run?: () => void;
+  /** Like `run`, and told whether the keys chose the item (Enter or Space) rather than a pointer. */
+  runWith?: (viaKeyboard: boolean) => void;
   /** The menu stays open (zoom steps: one click after another, the value updating in place). */
   keepOpen?: boolean;
   /** Starts a group: a separator line above this item. */
@@ -189,7 +193,7 @@ function itemButton(item: RowMenuItem, menu: HTMLElement, depth: number): HTMLBu
   for (const [key, value] of Object.entries(item.data ?? {})) button.dataset[key] = value;
   button.tabIndex = -1;
   button.disabled = item.disabled === true;
-  button.setAttribute('role', item.checked === undefined ? 'menuitem' : 'menuitemradio');
+  button.setAttribute('role', item.checked === undefined ? 'menuitem' : item.toggle ? 'menuitemcheckbox' : 'menuitemradio');
   if (item.checked !== undefined) button.setAttribute('aria-checked', String(item.checked));
   if (item.swatch !== undefined) {
     const dot = el('span', 'row-menu-swatch');
@@ -226,7 +230,8 @@ function itemButton(item: RowMenuItem, menu: HTMLElement, depth: number): HTMLBu
       // Focus goes back to the row's button first: an action that moves it (renaming, a new
       // chat's field) still does, and one that repaints the sidebar finds it there to keep.
       closeRowMenu(true);
-      item.run?.();
+      // A keyboard activation is a click with no pointer, so its detail is 0.
+      if (item.runWith) item.runWith(event.detail === 0); else item.run?.();
     });
     // Moving onto a plain item closes a deeper submenu, as in any menu.
     button.addEventListener('pointerenter', () => {

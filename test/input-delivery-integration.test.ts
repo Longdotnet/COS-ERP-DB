@@ -36,7 +36,7 @@ const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
 const { createSession, getSession, rebindSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { registerIpc } = await import('../src/main/ipc.js');
-const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
+const { bridgePort, startBridge, stopBridge, stopRecoverySweepTimerForTests } = await import('../src/main/bridge.js');
 const input = await import('../src/main/session/input.js');
 const goal = await import('../src/main/goal.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -56,6 +56,10 @@ beforeAll(async () => {
   await saveConfig(defaultConfig());
   registerIpc(() => ({ isDestroyed: () => false, webContents: { send: pushed } }) as never, () => undefined);
   await startBridge();
+  // These tests move a mocked Date.now by minutes and call the sweep themselves. The bridge's own
+  // 30-second timer would read such a jump as the computer waking and push every deadline 90 s
+  // (a flake under load: a silence repair was missing at the step that expects it).
+  stopRecoverySweepTimerForTests();
   const paired = await post('/pair', {});
   expect(paired.status).toBe(200);
   bearer = paired.body.token;
@@ -224,6 +228,11 @@ it('says why a page withdrew a Continue and ends it after three minutes of withd
     expect((await post('/input/fail', { id: row.id, owner: 'a-document', conversationId, error: withdrawn, detail: 'send-not-ready' })).body.ok).toBe(true);
     expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')).at(-1)?.message)
       .toContain('(send-not-ready)');
+    // The page's most telling reasons name what moved the turn; they keep their words (#1787).
+    expect(await input.claimBrowserInput(row.id, 'a-document', conversationId, true)).not.toBeNull();
+    expect((await post('/input/fail', { id: row.id, owner: 'a-document', conversationId, error: withdrawn, detail: 'turn-progressed by app-tool_call' })).body.ok).toBe(true);
+    expect(getLog().filter(entry => entry.message.includes('could not send this recovery message')).at(-1)?.message)
+      .toContain('(turn-progressed by app-tool_call)');
     const firstRelease = now;
     expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued',
       recovery: { withdrawnSince: firstRelease } });
@@ -279,6 +288,115 @@ it("files an automatic Continue in the person's own words when they set a Contin
     expect(row.text.startsWith('Bitte weitermachen: finish the open steps. ')).toBe(true);
     // The notice to check existing work stays after the person's words.
     expect(row.text.slice('Bitte weitermachen: finish the open steps. '.length)).toMatch(/check|inspect|verify|look for/i);
+  } finally { clock.mockRestore(); }
+});
+
+it('asks the send check before handing out an automatic Continue, holds it on a refusal and asks again 30 s later', async () => {
+  // #1794: the local program is asked before every send the app makes by itself, never for a typed one.
+  const http = await import('node:http');
+  const asked: Array<Record<string, any>> = [];
+  let allow = false;
+  const server = http.createServer((req, res) => {
+    let raw = ''; req.on('data', chunk => { raw += chunk; });
+    req.on('end', () => {
+      asked.push(JSON.parse(raw));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(allow ? { allow: true } : { allow: false, reason: 'quiet hours' }));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false },
+      ui: { ...defaultConfig().ui, sendCheckUrl: `http://127.0.0.1:${port}/check` } });
+    const { conversationId, session, row } = await silentTurnContinue('Send check holds a Continue', ms => now += ms);
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+    expect(asked).toEqual([{ version: 1, kind: 'continue', id: row.id, chat: { session: session.id, project: null, worker: null }, text: row.text, attempt: 1 }]);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued',
+      sendCheck: { attempt: 1, reason: 'quiet hours', answered: true, nextAt: now + 30_000 } });
+    // Held: not offered to a page, and not taken for a page that failed to pick it up (no reload).
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+    expect((await input.pendingQueuedPickups()).some(item => item.inputId === row.id)).toBe(false);
+    // A page that still knows its id and claims it again inside the 30 s is not a second ask (CodeRabbit).
+    now += 5_000;
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+    expect(asked).toHaveLength(1);
+    now -= 5_000;
+    // 30 s later it is offered again, and the program is asked again with the next attempt.
+    now += 30_001; allow = true;
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(true);
+    const claimed = (await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input;
+    expect(claimed).toMatchObject({ id: row.id });
+    expect(asked.at(-1)).toMatchObject({ kind: 'continue', attempt: 2 });
+    // A message the person typed is never asked about.
+    const before = asked.length;
+    const typed = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'typed by the person' });
+    await post('/input/claim', { id: typed.id, owner: 'a-document', conversationId, requiresAuthorization: true });
+    expect(asked).toHaveLength(before);
+  } finally {
+    clock.mockRestore();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+it('lets a message the person types go while an automatic send before it is held by the send check (CodeRabbit)', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    // Nothing listens there: no answer holds the automatic Continue.
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false },
+      ui: { ...defaultConfig().ui, sendCheckUrl: 'http://127.0.0.1:9/check' } });
+    const { conversationId, session, row } = await silentTurnContinue('Held Continue, typed message', ms => now += ms);
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+    const typed = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'typed by the person' });
+    now += 1;
+    expect((await post('/input/claim', { id: typed.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input)
+      .toMatchObject({ id: typed.id });
+  } finally { clock.mockRestore(); }
+});
+
+it('asks the send check before a scheduled run goes, and holds it on a refusal (#1826 with #1794)', async () => {
+  // A scheduled run is sent by the app at a set time, not by the person at that moment.
+  const http = await import('node:http');
+  const asked: Array<Record<string, any>> = [];
+  const server = http.createServer((req, res) => {
+    let raw = ''; req.on('data', chunk => { raw += chunk; });
+    req.on('end', () => {
+      asked.push(JSON.parse(raw));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ allow: false, reason: 'quiet hours' }));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  try {
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false },
+      ui: { ...defaultConfig().ui, sendCheckUrl: `http://127.0.0.1:${port}/check` } });
+    const conversationId = randomUUID();
+    const session = await createSession({ title: 'Scheduled run held', conversationId });
+    const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Check the issues',
+      scheduled: { scheduleId: randomUUID(), dueAt: Date.now(), late: false } });
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+    expect(asked).toEqual([{ version: 1, kind: 'scheduled', id: row.id, chat: { session: session.id, project: null, worker: null }, text: 'Check the issues', attempt: 1 }]);
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ state: 'queued', sendCheck: { attempt: 1, reason: 'quiet hours' } });
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+it('releases a held automatic send at once when the send check address is cleared', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    // Nothing listens there: no answer holds the send.
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false },
+      ui: { ...defaultConfig().ui, sendCheckUrl: 'http://127.0.0.1:9/check' } });
+    const { conversationId, row } = await silentTurnContinue('Send check cleared', ms => now += ms);
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input).toBeNull();
+    expect((await input.listInputs()).find(item => item.id === row.id)).toMatchObject({ sendCheck: { attempt: 1, answered: false, reason: '' } });
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(false);
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    expect((await input.pendingBrowserInputs()).some(item => item.id === row.id)).toBe(true);
+    expect((await post('/input/claim', { id: row.id, owner: 'a-document', conversationId, requiresAuthorization: true })).body.input).toMatchObject({ id: row.id });
   } finally { clock.mockRestore(); }
 });
 
@@ -549,6 +667,26 @@ it('holds a message for an existing chat until a new tunnel-client has taken ove
     expect(released.body.inputs.map((row: { id: string }) => row.id)).toContain(existing.id);
     expect((await post('/input/claim', { id: existing.id, owner: 'chat-page', conversationId, requiresAuthorization: true })).body.input)
       .toMatchObject({ id: existing.id });
+  } finally { clock.mockRestore(); resetRouteSettleForTests(); }
+});
+
+it('learns a longer hold when the first message for an existing chat after a restart still took the old route (#1788)', async () => {
+  const { noteTunnelClientConnected, resetRouteSettleForTests, routeHoldMs, noteRouteRequestSighted, noteRouteRequestArrived } =
+    await import('../src/main/tunnel/route-settle.js');
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID();
+    const session = await createSession({ title: 'First message after a tunnel restart', conversationId });
+    const existing = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
+    noteTunnelClientConnected();
+    now += routeHoldMs();
+    expect((await post('/input/claim', { id: existing.id, owner: 'chat-page', conversationId, requiresAuthorization: true })).body.input)
+      .toMatchObject({ id: existing.id });
+    now += 2_000;
+    noteRouteRequestSighted('request-after-restart', conversationId);
+    now += 124_000;
+    noteRouteRequestArrived('request-after-restart');
+    expect(routeHoldMs(), 'the claim of an existing chat started the measurement').toBeGreaterThan(35_000);
   } finally { clock.mockRestore(); resetRouteSettleForTests(); }
 });
 

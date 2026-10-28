@@ -33,6 +33,11 @@ const PORTS = [8865, 8866, 8867, 8868, 8869, 18865, 18866, 18867, 18868, 18869, 
 const EXPECTED_APP = 'cos-erp-db';
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * A page's reason for releasing an input before Send: one of its own short codes, some naming what
+ * moved the turn ("turn-progressed by app-tool_call"). Free text never travels (#820, #1787).
+ */
+const RELEASE_DETAIL = /^[a-z][a-z0-9 _-]{0,79}$/;
 /** A journal receipt follows durable session writes, which can outlast an ordinary read. */
 const EVENTS_REQUEST_TIMEOUT_MS = 60_000;
 /**
@@ -4012,6 +4017,18 @@ const HANDLERS = {
     if (['current', 'manual', 'complete', 'fail'].includes(message.action) && result.ok && result.data?.ok) void maintain();
     return result;
   },
+  /** The Projects a ChatGPT page's sidebar lists (#1756), for linking a project to one of them. */
+  async project_catalog(message, _sender, source) {
+    if (!ownsDocument(source) || !Array.isArray(message.projects) || message.projects.length > 400) return { ok: false };
+    const projects = message.projects
+      .filter((project) => project && typeof project.id === 'string' && /^g-p-[0-9a-f]{32}$/.test(project.id) && typeof project.name === 'string')
+      .map((project) => ({ id: project.id, name: project.name.slice(0, 200) }));
+    // Rows that were all invalid say nothing; an empty sidebar still names the workspace in use.
+    if (message.projects.length && !projects.length) return { ok: false };
+    const workspace = typeof message.workspace === 'string' && message.workspace.length <= 200 ? message.workspace : null;
+    const result = await call('/chatgpt-projects', { method: 'POST', body: JSON.stringify({ projects, workspace }) });
+    return { ok: result.ok === true };
+  },
   async model_catalog(message, _sender, source) {
     if (!ownsDocument(source) || typeof message.nonce !== 'string' || !/^[a-f0-9-]{36}$/i.test(message.nonce)) return { ok: false };
     const tab = await chrome.tabs.get(source.tab);
@@ -4055,6 +4072,23 @@ const HANDLERS = {
     return call('/core-plugin', { method: 'POST', body: JSON.stringify({ appId: message.appId }) });
   },
   // A page read ChatGPT's own `conversation_deleted` answer for this chat (usage.js).
+  // A new chat's tab for a linked Project found that Project gone (#1759): ChatGPT now keeps such a
+  // page on "loading" instead of sending it home, which the outbox loop above reports. Only the tab
+  // opened for that message, still on that Project's page, may say so.
+  async project_unavailable(message, _sender, source) {
+    const id = String(message.id || '');
+    const project = String(message.project || '');
+    if (!ownsDocument(source) || !/^[a-f0-9-]{36}$/i.test(id) || !/^g-p-[0-9a-f]{32}$/.test(project)) return { ok: false };
+    const opening = inputOpenings[id];
+    if (opening?.tab !== source.tab || opening.project !== project) return { ok: false };
+    const tab = await chrome.tabs.get(source.tab).catch(() => null);
+    // The document may have been replaced while asking, or the tab may already be leaving.
+    if (!tab || !ownsDocument(source) || tab.pendingUrl) return { ok: false };
+    let home = null;
+    try { home = /^\/g\/(g-p-[0-9a-f]{32})(?:-[^/]+)?\/project\/?$/i.exec(new URL(tab.url).pathname)?.[1]?.toLowerCase() ?? null; } catch {}
+    if (home !== project) return { ok: false };
+    return call('/project-create', { method: 'POST', body: JSON.stringify({ action: 'gone', inputId: id, chatgptId: project }) });
+  },
   async conversation_deleted(message, _sender, source) {
     const conversationId = String(message.conversationId || '').toLowerCase();
     if (!ownsDocument(source) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(conversationId)) return { ok: false };
@@ -4097,7 +4131,7 @@ const HANDLERS = {
     }
     if (message.recoveryAction && message.owner !== owner) return { ok: false };
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && /^[a-z-]{1,40}$/.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined, project: typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && RELEASE_DETAIL.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined, project: typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : undefined })
     });
     if (typeof message.response === 'string' && message.lifetime === 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Acceptance retires this exact helper immediately. Fresh page proof still
@@ -4986,11 +5020,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'stop_ack',
     'desktop_input',
     'model_catalog',
+    'project_catalog',
     'plugin_refresh',
     'project_create',
     'core_plugin',
     'load_failure',
     'conversation_deleted',
+    'project_unavailable',
     'usage_observation',
     'events',
     'bind',

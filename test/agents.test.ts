@@ -3860,6 +3860,23 @@ describe('through the MCP endpoint', () => {
     expect(JSON.stringify(agentsSchema)).not.toMatch(/join/i);
   });
 
+  // #1841: Codex sends every tool call as a new request. Its spawn promised results "at the end of
+  // later tool results", and a later status call answered "use agents action=spawn", so it
+  // waited for results that never came and started runs no later call could reach.
+  it('tells a caller without a chat, at spawn and at status, that later requests cannot reach the run', async () => {
+    await setEnabled(true, 3, true);
+    try {
+      const spawned = await agentsWithRequestId('wfr_codex_spawn', 'spawn', { workers: [{ task: 'read the file' }] });
+      expect(spawned).toMatch(/only later tool calls of this same request can reach the run/);
+      expect(spawned).not.toMatch(/arrive at the end of later tool results/);
+      const status = await agentsWithRequestId('wfr_codex_status', 'status');
+      expect(status).toMatch(/AGENTS_NO_CHAT/);
+      expect(status).not.toMatch(/Use agents action=spawn/);
+    } finally {
+      await setEnabled(true);
+    }
+  });
+
   it('returns empty status to an unrelated chat without exposing the other run', async () => {
     startSwarm(1);
     const text = await asChat('c-stranger', 'status');
@@ -4882,6 +4899,55 @@ describe('through the MCP endpoint', () => {
 
     expect(text).toMatch(/either to\+text or messages/i);
     expect(pendingCount('worker-1')).toBe(0);
+  });
+
+  it('asks the send check before a message reaches a worker, and queues nothing when it is held (#1794)', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, sendCheckUrl: 'http://127.0.0.1:8123/check' } });
+    const asked: Array<Record<string, unknown>> = [];
+    let allow = false;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      asked.push(JSON.parse(String(init.body)));
+      return Response.json(allow ? { allow: true } : { allow: false, reason: 'review first' });
+    }));
+    try {
+      spawn({ caller: prime, workers: [{ task: 'Checked worker' }] });
+      const held = await asChat(PRIME_CHAT, 'message', { to: 'worker-1', text: 'Also update the docs' });
+      expect(held).toContain("The person's send check held this message to worker-1: review first. Nothing was queued.");
+      expect(pendingCount('worker-1')).toBe(0);
+      expect(asked).toEqual([expect.objectContaining({ kind: 'worker-message', text: 'Also update the docs', attempt: 1,
+        chat: expect.objectContaining({ worker: 'worker-1' }) })]);
+      allow = true;
+      expect(await asChat(PRIME_CHAT, 'message', { to: 'worker-1', text: 'Also update the docs' })).toContain('Queued for worker-1');
+      expect(pendingCount('worker-1')).toBe(1);
+      // A worker's report to its prime is not a send the app makes to a worker.
+      const before = asked.length;
+      await asChat(PRIME_CHAT, 'status');
+      expect(asked).toHaveLength(before);
+    } finally {
+      vi.unstubAllGlobals();
+      await saveConfig(previous);
+    }
+  });
+
+  it('names no session to the send check when the prime chat is current on two sessions (CodeRabbit)', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, sendCheckUrl: 'http://127.0.0.1:8123/check' } });
+    const asked: Array<Record<string, any>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      asked.push(JSON.parse(String(init.body)));
+      return Response.json({ allow: false, reason: 'review first' });
+    }));
+    try {
+      await createSession({ conversationId: PRIME_CHAT });
+      await createSession({ conversationId: PRIME_CHAT });
+      spawn({ caller: prime, workers: [{ task: 'Checked worker' }] });
+      await asChat(PRIME_CHAT, 'message', { to: 'worker-1', text: 'Also update the docs' });
+      expect(asked).toEqual([expect.objectContaining({ kind: 'worker-message', chat: expect.objectContaining({ session: null, project: null }) })]);
+    } finally {
+      vi.unstubAllGlobals();
+      await saveConfig(previous);
+    }
   });
 
   it('lets existing primes exchange messages by explicit run address without exposing foreign workers', async () => {

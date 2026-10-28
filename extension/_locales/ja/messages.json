@@ -917,6 +917,9 @@
   "popup_pipeline_waiting_first_message": {
     "message": "最初のメッセージを待っています。"
   },
+  "popup_pipeline_not_a_chat": {
+    "message": "この ChatGPT ページはチャットではないため、アプリが追跡するものはありません。チャットを開くか開始してください。"
+  },
   "popup_pipeline_waiting_latest_request_id": {
     "message": "チャットを記録しました。最新ターンのリクエスト ID を待っています。"
   },
@@ -985,6 +988,9 @@
   },
   "popup_status_new_chat": {
     "message": "新しいチャット"
+  },
+  "popup_status_not_a_chat": {
+    "message": "チャットではありません"
   },
   "popup_status_none_open": {
     "message": "開いていません"
@@ -1189,5 +1195,17 @@
   },
   "content_edit_unavailable": {
     "message": "ChatGPT がそのメッセージの編集を提供しませんでした。ChatGPT でチャットを開いてから、もう一度お試しください。"
+  },
+  "content_auto_compaction_waiting_app": {
+    "message": "自動圧縮: アプリの応答を待っています"
+  },
+  "content_goal_loop_waiting_app": {
+    "message": "ゴールとループ: アプリの応答を待っています"
+  },
+  "content_settings_waiting_app": {
+    "message": "アプリの応答を待っています"
+  },
+  "content_task_waiting_app": {
+    "message": "Chat On Steroids の応答を待っています。"
   }
 }

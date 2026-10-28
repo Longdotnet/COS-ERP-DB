@@ -1,3 +1,4 @@
+import type { PhonePushSettings } from './phone-push.js';
 import type { ReasoningEffort, RecordingStorageLimitGiB } from './session.js';
 import type { PluginRefreshStatus } from './plugin-refresh.js';
 import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_INPUT_METHODS } from './windows-computer.js';
@@ -73,6 +74,9 @@ export type Capabilities = Record<Capability, boolean>;
 
 /** Host family reported to the renderer. */
 export type PlatformFamily = 'windows' | 'macos' | 'linux' | 'other';
+
+/** Commit only; commit, then ask to push; or commit, push and open a pull request. */
+export type CommitFlow = 'commit' | 'ask-push' | 'pr';
 
 export interface PlatformInfo {
   family: PlatformFamily;
@@ -172,10 +176,17 @@ export interface UiPrefs {
   developerMode?: boolean;
   /** Rotating joke words instead of "Working" in a chat's status line. Off by default. */
   playfulStatus?: boolean;
+  /** Screen readers hear "Reply finished" when a turn completes in the open chat. Off by default. */
+  announceTurns?: boolean;
   /** A random fun-fact aside at the end of each automatic Continue, marked for the model to ignore. Off by default. */
   playfulContinue?: boolean;
   /** The person's own words in place of the built-in automatic Continue phrase (silence recovery only). Unset means the built-in phrases. */
   customContinue?: string;
+  /** #1856: Personality and Writing style for new chats; absent = the built-in text, '' = left out. */
+  chatPersonality?: string;
+  chatWritingStyle?: string;
+  /** #1794: local program asked before each automatic send (Goal/Loop step, Continue, recovery, fresh turn, worker); empty = off. */
+  sendCheckUrl?: string;
   /** Keep the chat at its end while it grows, here and on ChatGPT, until the reader scrolls up. On unless false. */
   followOutput?: boolean;
   /** Add the COS ERP DB Core mention to the user's own prompts sent from the app. On unless false. */
@@ -186,6 +197,8 @@ export interface UiPrefs {
   language?: import('./ui-language.js').UiLanguage;
   /** The version this install last started as; What's New shows once per real update (#1172). */
   lastSeenVersion?: string;
+  /** #1833: the first-run tour was taken, skipped or declined. Main-owned (ui:tourDone); Settings only replays it. */
+  tourDone?: boolean;
   /**
    * The extension's own preferences as it last reported them stored. The app keeps them so a
    * reinstalled extension, which starts with empty storage under a new id, gets them back.
@@ -198,6 +211,8 @@ export interface UiPrefs {
   startAtLogin?: boolean;
   /** A notification when a chat finishes a turn while the window is in the background. Missing means on. */
   turnNotifications?: boolean;
+  /** #1802: a short sound when a chat needs you, something failed or a chat finished in the background. Missing means off. */
+  sounds?: boolean;
   /**
    * #1402: after this many minutes of one turn, the next tool result starts a fresh turn with an
    * automatic continue (0 = off). Missing means 30.
@@ -221,6 +236,12 @@ export interface UiPrefs {
   keepScreenAwake?: boolean;
   /** Default screenshots to the active window instead of the whole primary monitor. */
   privacyScreenshots: boolean;
+  /** Phone notifications through ntfy; missing means off. */
+  phonePush?: PhonePushSettings;
+  /** Mask API keys, tokens, private keys and secret settings in what tools return to ChatGPT. Missing means on. */
+  secretsShield?: boolean;
+  /** How far Commit in Review goes; missing means commit, then ask to push. */
+  commitFlow?: CommitFlow;
   /** Browser for app-originated launches; connected source tabs retain placement ownership. */
   chatBrowser?: ChatBrowser;
   /** Where a minimized built-in browser window goes (default: the taskbar or Dock). */
@@ -439,6 +460,16 @@ export interface ControlApiSettings {
   allowActions: boolean;
 }
 
+/** How chats treat their Local Project's files. */
+export interface ProjectsSettings {
+  /**
+   * Take a Git tree checkpoint before each turn's first patch (`src/main/checkpoints`). Off by
+   * default. Turning it off stops new checkpoints only: existing ones stay listed in Review and
+   * Restore keeps working.
+   */
+  codeCheckpoints: boolean;
+}
+
 export interface Config {
   /**
    * Names this computer's connectors in ChatGPT, for one ChatGPT account used on several
@@ -460,6 +491,7 @@ export interface Config {
   goal: GoalSettings;
   mcp: McpSettings;
   controlApi: ControlApiSettings;
+  projects: ProjectsSettings;
 }
 
 export type ConnectionState =
@@ -866,6 +898,8 @@ export interface AppState {
   hasGoalKey: boolean;
   /** True when a custom-provider key is stored. Only meaningful beside a custom endpoint, which may also run keyless. */
   hasCustomProviderKey: boolean;
+  /** An ntfy access token is saved (never the token itself). */
+  hasPhonePushToken?: boolean;
   /** Resolved path of the tunnel binary we would run, or null if we cannot find one. */
   resolvedBinary: string | null;
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */
@@ -972,4 +1006,19 @@ export function capabilityTools(capability: Capability, platform?: PlatformFamil
     case 'clipboardWrite': return ['write_clipboard'];
     default: return [];
   }
+}
+
+/** A settings backup the person chose to import, as the page sees it: a summary, never its keys. */
+export interface SettingsBackupChoice {
+  /** Names this choice for the import that follows; one use. */
+  token: string;
+  file: string;
+  appVersion: string | null;
+  exportedAt: string | null;
+  /** Dotted paths of the settings that would change here, e.g. `ui.theme`. */
+  changed: string[];
+  /** Of those, the ones that give ChatGPT more access (`widerAccess`): a permission on, read-only off… */
+  wider: string[];
+  /** Saved keys the backup carries, locked with its passphrase. */
+  keyCount: number;
 }

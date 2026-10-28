@@ -983,6 +983,9 @@
   "popup_pipeline_waiting_first_message": {
     "message": "À espera da primeira mensagem."
   },
+  "popup_pipeline_not_a_chat": {
+    "message": "Esta página do ChatGPT não é um chat, por isso a app não tem nada para acompanhar aqui. Abra ou inicie um chat."
+  },
   "popup_pipeline_waiting_latest_request_id": {
     "message": "Chat gravado. À espera de um ID de pedido do turno mais recente."
   },
@@ -1051,6 +1054,9 @@
   },
   "popup_status_new_chat": {
     "message": "novo chat"
+  },
+  "popup_status_not_a_chat": {
+    "message": "não é um chat"
   },
   "popup_status_none_open": {
     "message": "nenhum aberto"
@@ -1291,5 +1297,17 @@
   },
   "content_edit_unavailable": {
     "message": "O ChatGPT não ofereceu Editar para essa mensagem. Abra o chat no ChatGPT e tente novamente."
+  },
+  "content_auto_compaction_waiting_app": {
+    "message": "Compactação automática: a aguardar a app"
+  },
+  "content_goal_loop_waiting_app": {
+    "message": "Goal e Loop: a aguardar a app"
+  },
+  "content_settings_waiting_app": {
+    "message": "a aguardar a app"
+  },
+  "content_task_waiting_app": {
+    "message": "A aguardar a resposta do Chat On Steroids."
   }
 }
