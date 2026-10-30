@@ -251,7 +251,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Code checkpoints | `src/main/checkpoints/`: per-turn Git tree snapshots taken before a turn's first patch, their ledger, and confirmed per-file restore. `project-git.ts` projects the comparison. |
 | Projects/cwd | `src/main/projects.ts`, `workspace.ts`, `src/shared/projects.ts`: explicit local folder catalog, session binding, inherited/learned workspaces. |
 | Project Files UI | `src/main/project-files.ts`, `project-file-watcher.ts`, `src/shared/project-files.ts`, `src/renderer/{file-panel,file-code-editor,file-pdf-viewer,work-panel-resize}.ts`: bounded project views, revision-checked saves and renderer-owned drafts. |
-| Durable history | `src/main/session/{store,recorder,correlation,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. |
+| Durable history | `src/main/session/{store,recorder,correlation,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. A tool call's `summary` (title, detail, metric) is recorded in English from a fixed set of phrases; `src/renderer/tool-titles.ts` translates them where they are shown (tool cards, the live activity line, sub-agent activity and cards), saved chats included, and leaves anything else (paths, commands, errors) as recorded. A new phrase in `summarize.ts` needs its row there and its catalog entries (`test/tool-titles.test.ts` runs every phrase through it). |
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
 | Finish/planning | `src/main/session/finish.ts`, `task-request.ts`, `goal.ts`, `src/shared/{finish,task-progress}.ts`: held turn, decision/plan invocation and cancellation. |
 | Continuation | `src/main/session/{continuation,resume-gate,handoff,handoff-prompt}.ts`: A→B transaction, send ambiguity and exact brief. |
@@ -289,7 +289,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Direct browser tool calls | `browser-control.ts` process epoch/pending claims; extension `storage.session.cosBrowserControl` | One claim per command; browser incarnation plus local-session tab lease. MV3 retains custody/receipt, never replays input. App restart invalidates outstanding claims. |
 | Workers and inboxes | `agents.ts` / swarm snapshot and retired-worker fences | Stage → critical durable snapshot → publish/open/report. |
 | Compaction | `continuation.ts` / continuation WAL + session metadata | Disk ownership decides restart outcome; transport phase alone does not. |
-| Goal control | `goal.ts` / `goal-objectives`, `goal-switches`, `goal-replies` | Objective, mode and reply debt are separate concepts; draft memory is disposable. See §21 for remaining atomicity gaps. |
+| Goal control | `goal.ts` / `goal-objectives`, `goal-switches`, `goal-replies`, `goal-outcomes` | Objective, mode and reply debt are separate concepts; draft memory is disposable. `goal-outcomes` keeps only a chat's "goal is met" decision for the window across a restart; a newer draft, a switch change or a new objective clears it, and it never drives anything. See §21 for remaining atomicity gaps. |
 | Stop/block/finish | Stop command; `blocked-chats.ts` durable set; finish facts in recorded progress/session projection | Each names exact chat/turn; no false terminal event. |
 | Browser repair | `bridge.ts` process-memory episodes | Re-earn from live evidence; never restore an old reload token as action authority. |
 | Catalog/usage | Saved successful `chat-models`; derived `usage-cache`; live usage snapshot | Catalog is observation, not a send receipt; estimates are not provider billing. |
@@ -1126,14 +1126,15 @@ are never retried on their own: only the project's "Retry ChatGPT Project" menu 
 and for `uncertain` it warns that a second Project may result.
 
 The browser does it (`inspectProjectCreates` in background.js): one request at a time in one
-foreground helper tab `https://chatgpt.com/?cos-project-create=<request>` (the dialog needs a
+foreground helper tab `https://chatgpt.com/projects?cos-project-create=<request>` (the dialog needs a
 laid-out page; the person just added the project, so it also runs under `browserOnly`). The page
 (`createChatgptProject`) claims first, opens a collapsed sidebar once, clicks ChatGPT's own control
-(`button[data-app-action-sidebar-project-create]`, labelled in the account's language), types the
+(`data-chatgpt-project-conversation-drop-target` on the Projects index, with the earlier sidebar
+`data-app-action-sidebar-project-create` still supported), types the
 folder name into `input#chatgpt-project-name`, arms, submits, and takes the id only from the
 Project page ChatGPT opens by itself, and only one the sidebar did not list before the click. The
-helper is closed once its request is no longer pending and it proves it holds nothing; a closed
-helper is reopened at most every 2 minutes.
+helper is closed once its request is no longer pending and it proves it holds no chat, draft,
+work or open native Create project dialog. A closed helper is reopened at most every 2 minutes.
 
 A new chat of a linked project (`pendingBrowserInputs` adds `project`) opens on
 `/g/<id>/project?cos-input=…#cos-input=…`, never by borrowing a tab (ChatGPT's New chat is the
@@ -2463,6 +2464,14 @@ each with its source and age; `src/main/usage-tool.ts` writes that text. Its ans
 **Intent:** make native ChatGPT observable and controllable for an exact authorized operation,
 while leaving ChatGPT's messages, model execution and account permissions with the provider.
 
+A claimed message whose model or reasoning the native picker could not confirm fails as `desktop_input`
+`fail` with `error` in the page's language (`content_delivery_model_unconfirmed`) and `detail:
+'model-unconfirmed'`; `/input/fail` reads the code, not the words, to ask for the model list again
+(`requestChatModels(false)`). A ChatGPT limit shown instead, or a deleted chat, carries no code;
+that includes a limit dialog `CLF_DOM.errors()` read and acknowledged while the picker ran
+(`CLF_DOM.accessNoticeSince(choosingStartedAt)`), in both the ordinary and the edit path.
+`failBrowserInput` logs every failure it records once, after the record, with the page's reason and code.
+
 Setup's first step installs and version-checks the companion in the person's Chrome, Edge, Brave or Firefox,
 then offers two equally weighted places for ChatGPT to run: the built-in CoS browser (opt-in, never
 preselected) or that browser, preserving the saved setting, and waits for ChatGPT to be signed in
@@ -2998,6 +3007,17 @@ own close entry never reached (a changed ChatGPT browser, an app restart); an ap
 `inputOpeningIds` closes nothing this way. A worker or handoff start page (`clf` marker) closes the
 same way once `commandIds` no longer lists its command, as a worker that failed before its first
 message left one behind; the page check then compares the `clf` marker.
+`/status` also sends `inputSendingIds`: the messages a browser is sending right now (`input.ts`
+`inBrowserDelivery`: state `browser`, or a Goal helper's `decision`; never `tool`, which an MCP caller holds). Only these, or an id whose tab this browser is still opening
+or preparing (`inputOpenings` stage `opening`/`preparing`; a `ready` tab only kept for it does not
+count), hold the extension's self-update as `sending`; a message that only waits in the queue does
+not (a blocked chat kept one for hours on 2026-10-28). An app that sends no `inputSendingIds` keeps
+the old rule: any id in `inputOpeningIds` holds it. `/extension/update` re-checks at the last moment
+and answers `{ ready: false, hold: 'sending' }` while any message is in browser delivery or any claim
+is still deciding (past the reload check, e.g. waiting for the send check); once it answers
+ready, `/input/claim` from that browser (`x-extension-browser`) hands out nothing for 20 s (checked
+again right before the claim takes its message), and the
+extension's `deliverDesktopInputs` starts nothing while its reload is pending.
 Managed idle/retired/duplicate pruning records a successful removal against the exact tab,
 document, navigation epoch and conversation in the existing session-storage snapshot. Its
 lifecycle event carries a non-manual departure through the close outbox; it does not create
@@ -3521,6 +3541,11 @@ without renewing on retries. Browser election is saved before opening; lost rece
 and user closure do not grant another opening for that command. A reopened page adopts the
 pending Stop only after matching its original native question, and rechecks that identity before
 clicking Stop. Newer questions never inherit the old Stop's authority.
+A turn the page still holds after the app stopped counting it as work (its activity ended; e.g.
+ChatGPT stopped loading the chat's history, so the answer never appeared) is `heldTurnId` in the
+session controls: the composer offers Stop for it without showing Working, and `stopSessionTurn`
+accepts it. The page, finding neither ChatGPT's Stop, an approval card nor any answer of that turn,
+ends it as `stopped` with the detail `content_turn_stop_unseen`; later exact work reopens it as usual.
 Block persists the exact conversation's local-tool refusal across all MCP surfaces; only a
 user release/deletion removes it. It does not remotely terminate ChatGPT or erase history.
 Neither action may spill into another local session merely because labels or timing match.
@@ -4272,10 +4297,64 @@ and do not trigger source reloads while awaiting intervention. Normal and restor
 resumes share one projection: move objective/switch, retire A's debt, and let B earn its own.
 Current persistence/publication exceptions are in §21.
 
+### Goal step reviewer (#1832)
+
+Off by default (`goal.reviewerModel`: `''` off, `'same'` the Goal chat's own model, or a model id
+the account offers; an unoffered id falls back to the chat's model with one log line). Settings →
+Agents & automation → Goal says the cost (a second model pass per reviewed step) and the coverage:
+only edits made with the edit tools are reviewed, not files changed by commands, and never in Loop.
+Chosen while Sub-agents are off, the row offers **Turn on Sub-agents** (Home's own switch, only on
+the person's press).
+
+When `acceptGoalReplyNow` records a **pending** Goal reply in `goal` mode, `goal-reviewer.ts`
+`startStepReview` (never awaited) reads the step's own edits (`session/turn-changes.ts`, the
+"Changed files" records) and, when there are any, writes the brief (`goal-review.ts`): the Goal,
+the step's instruction, every changed file with its state, counts and number of edits, then the net
+unified diffs (`text-diff.ts`) in first-changed order, whole, as many as fit `REVIEW_BRIEF_CHARS`;
+the rest are named for the reviewer to read through Core. The reviewer is a worker in the Goal
+chat's **own family** (so the Sub-agents dock and the chat's inbox show it like any worker), marked
+`reviewer` in the broker: label "Reviewer", a brief budget of `REVIEW_TEXT_CHARS` (app-written,
+never the agents tool's 4,000-character task), never an isolated Git worktree (it must see the
+uncommitted step), one per chat, reused (a sleeping one is woken with the next brief through
+`stageMessages(..., { review: true })`), replaced when it cannot be woken or the chosen model
+changed. No free worker slot: retried every 15 s up to `REVIEW_MAX_MS`, then not reviewed.
+
+It reviews, it doesn't author: in a reviewer's own chat the kernel refuses every tool not marked
+read-only before it runs (`reviewerRefusal`, Core, Desktop and plugin tools alike), except
+`exec_command`/`write_stdin` (diffs and tests) and the `agents` actions `status` and `finish`; spawning
+or messaging a worker is refused, so no other chat can write for it. Commands are not read-only: a test
+run can write files, so nothing calls the reviewer read-only, and its brief asks it not to change files. A working reviewer holds its
+chat's next Goal step through `waitingForSubAgents`, whatever `waitForSubAgents` says, for at most
+`REVIEW_MAX_MS` from when it was asked; `goalWaitFor` names it `reviewer` with that deadline (the
+app's Goal row and the page's composer status both say "Waiting for the reviewer").
+
+The draft (`goal.ts run()`) starts when the step ends, before the review is in, so it **waits**
+for it (`awaitStepReview`, polling `reviewForDraft` every second): while the review still looks for
+a worker slot or runs, up to `REVIEW_MAX_MS` from when it was asked, and no longer once the draft is
+replaced. Meanwhile the Goal row shows the `reviewer` wait ("Continues without the review in m:ss"),
+not "Preparing a continuation". (VM 141, 2026-10-26: without the wait the helper decided 8 s before
+the reviewer answered.) Workers finish under RESULT / CHANGES / VALIDATION / BLOCKERS, so the review
+is that RESULT (`reviewAnswer`; the brief says so), else the whole answer. It goes after the helper's
+message as `Reviewer: …` (and the helper is told it is there); "No problems found" adds nothing, an
+overdue review adds "Reviewer did not answer in time.", and a reviewer that stopped without
+answering (failed, cleared) ends the wait at once with "Reviewer could not review this step." An
+answer starting `BLOCKING:` pauses Goal (switch off, a timeline note with the finding, the
+stopped-chat notice) instead of typing anything; ordinary findings never raise a notice. When the
+helper ends the Goal with findings still unsent, they become a note in the chat. Switching the chat's Goal off or to Loop
+cancels a review in progress (as the person's own Clear on the worker's row); its chat stays.
+Tests: `goal-review.test.ts`, `text-diff.test.ts`, `goal-reviewer.test.ts`, `goal-review-flow.test.ts`,
+`kernel-reviewer-readonly.test.ts`, the reviewer cases in `agents.test.ts`, `mcp-worktree-spawn.test.ts`,
+`bridge.test.ts`, `renderer-chat-models.test.ts`, `renderer-state.test.ts`, `renderer-timeline.test.ts`
+and `content-script.test.ts`.
+
 ## 18. Desktop workspace, plugins, connection and native control
 
 Dark is the default theme. Theme selection belongs in Appearance settings; the main header
-has no light/dark shortcut. Files and worker-panel controls attach to the header independently
+has no light/dark shortcut. `ui.theme` is `light`, `dark` or `system` (#1914, "Same as system"):
+`nativeTheme.themeSource` takes the same value, `src/main/theme.ts` resolves the shown theme for
+Electron-drawn parts (window background, Windows title bar, pets, built-in browser, update window)
+and repaints them on `nativeTheme` `updated`; the renderer resolves it through
+`prefers-color-scheme` and repaints on its change. Palette edits apply to the theme shown now. Files and worker-panel controls attach to the header independently
 of appearance controls.
 
 ### Renderer and IPC
@@ -5168,6 +5247,22 @@ surface with a proven app but a different id is foreign. Rows carry `own`; conte
 Turns carry `sightings` for every connector's result rows, emitted once per request id as
 `app_sightings`. The Core @-mention, plugin refresh (`ownSnapshot`, native installed-link IDs) and the
 Plugins catalog limit use proven ids first.
+Request-id traces (#1752, diagnostics only): usage.js also walks every frame of a chat's response
+stream (HTTP and socket) for id-named fields holding a request-id-shaped value that is neither the
+chat's id nor an origin it already published, and posts `cos-request-trace` with each id's field
+path (`<delta p>:<key path>`, never content; 16 per frame, 64 per response). content.js forwards them
+once per id as `request_trace` (`traces: [{ requestId, path }]`), only for the chat the tab shows.
+The bridge never stores them as transcript content; `session/request-trace.ts` keeps 256 and adds
+"the stream of <chat> named it at <path>" to the "no page evidence" warning, or logs one line when
+the trace arrives after a call ran out of time. Attribution never uses them. Since the first report with traces found nothing,
+the page also traces whole request-id-shaped tokens inside arrays and longer strings (path `…text`, no content;
+an array keeps its path only under an id-named key such as `request_ids`),
+event streams from any other same-origin `/backend-api/` route (prefix `<route with ids as *>>`, other characters
+as `_`; at most two readers, 4 MB and 64 traces each, cancelled on page hide and dispose, chat from the frame or the page's `/c/<id>` route), and every socket message
+(prefix `socket>`, 256 ids per socket, then again). The app logs once per chat and run that the page's tracing
+works; with these limits a missing trace makes "the page never saw it" likely, not certain. Traces are expendable: content.js takes
+none while its page queue holds 300 or more entries, and drops queued traces first, without a gap marker, when it
+must evict. A response keeps tracing after its 16 published origins until its own 64.
 
 **Installed discovery.** `/settings/plugins-settings` accepts visible native buttons
 and same-origin links to exact `plugin_asdk_app_*` management routes inside the page's `main`.
@@ -5488,6 +5583,13 @@ The snapshot's optional `environment` (`CompanionEnvironment`) feeds the diagnos
 the browser's name and version, ChatGPT tabs counted by state, and `clf-page-checks` booleans plus
 the page language from the most recently used awake ChatGPT tab, read at most once a minute.
 `sanitiseCompanionDiagnostics` keeps names, versions, counts and booleans and drops everything else.
+Its `errorPageReloads` (`{ count, lastAt }`, the extension's counter since its worker started) reports
+chat tabs reloaded off Chrome's error page: a chat tab that loaded while offline, where injection fails
+with "showing error page". The extension reloads such a tab only while `navigator.onLine`, backing off
+1, 2, 4 … 15 minutes per tab (state in `chrome.storage.session` key `errorPageReloads`, 64 tabs, so a
+restarted worker keeps the backoff and the count; a tab whose recorder answers or takes injection is
+forgotten), and publishes a snapshot after each reload, one more if a report was already under way.
+The bridge logs one line per new `lastAt` per browser (`x-extension-browser`) and stores nothing else.
 
 `tunnel/*` owns pinned-client discovery, child lifetime, health metrics and confirmed outages;
 development discovery uses Electron's app root for `resources/tunnel`, independent of source
@@ -5525,6 +5627,26 @@ shown in Settings and as the chat notice `#desktopAccessNotice` with Repair perm
 (preload `repairDesktopAccess` → IPC `desktop:repairPermissions`): `tccutil reset` of this app's
 own missing entries (`MACOS_BUNDLE_ID`, electron-builder's `appId`), a screen-source request for
 Screen Recording and Electron's Accessibility prompt, so macOS asks again for the running build.
+
+**Ask before the mouse and keyboard (#1804).** `ui.desktopAsk` (`off` default, `active`, `always`;
+macOS and Windows only, Settings row `#desktopAsk` under the control permission) gates every step
+that takes the real pointer or keyboard: the Windows input methods (`windowsStep`) and the macOS
+`computer` tool's pointer/keyboard actions (`macosStep`; waits and clipboard steps never ask).
+Browser tools never ask. The rule is `shared/desktop-ask.ts`: the person's input counts only after
+the app's own last step ended plus the idle clock's 1 s resolution; under 30 s is "active"; a
+locked screen is away; missing idle information asks; Go ahead grants that chat (session, else
+conversation, else transport key; none means no grant) 2 minutes, ended early by the person's next
+input. `main/desktop-ask.ts` asks one question at a time in arrival order and re-checks a step that
+waited. `main/desktop-ask-window.ts` shows the non-activating top-right panel (preload
+`desktop-ask` → `desktop-ask:answer`, sender-checked); no answer in 60 s, closing or a crashed
+page is a refusal. The panel never takes the focus, so while it waits the main window shows the
+same question as the `#desktopAskNotice` notice (`renderer/desktop-ask-notice.ts`; push
+`desktopAsk:pending` with `DesktopAskPending | null`, read `desktopAsk:pending`, answer
+`desktopAsk:answer` `{ id, choice }`, true only while that id waits): a keyboard or screen-reader
+user switches to the app and answers there, and either answer ends both. A damaged saved
+`ui.desktopAsk` loads as `always` with one log line; a missing one is `off`, and the settings merge
+treats missing and `off` as the same value. A refusal is the tool error `DECLINED_BY_USER: …` and
+nothing runs; nothing retries by itself. One `desktop ask:` log line per decision, never the step's text.
 
 `computer/index.ts` owns native actions, capture frames/accessibility refs, batching and
 postconditions. Registrars own live capability checks. Windows `windows-api.ts` implements the

@@ -50,7 +50,8 @@ import { DEFAULT_RECORDING_STORAGE_GIB } from '../shared/session.js';
 import { initSkillsPath } from './skills.js';
 import { initUvRuntime } from './plugins/uv-runtime.js';
 import { initPetLibrary } from './pet-library.js';
-import { shutdownPetOverlay, startPetOverlay } from './pet-overlay.js';
+import { refreshPetOverlayAppearance, shutdownPetOverlay, startPetOverlay } from './pet-overlay.js';
+import { shownTheme, watchSystemTheme } from './theme.js';
 import { usageOverview } from './session/usage.js';
 import {
   flushRecorder,
@@ -92,15 +93,18 @@ import { restoreRouteHold } from './tunnel/route-settle.js';
 import { stopComputerHelper } from './computer/index.js';
 import {
   GOAL_OBJECTIVES_STATE,
+  GOAL_OUTCOMES_STATE,
   GOAL_REPLIES_STATE,
   GOAL_SWITCHES_STATE,
   GOAL_HELPER_SIZE_STATE,
   restoreGoalHelperSize,
   goalSwitchEnabledFor,
   restoreGoalObjectives,
+  restoreGoalOutcomes,
   restoreGoalReplies,
   restoreGoalSwitches,
   type GoalObjectivesSnapshot,
+  type GoalOutcomesSnapshot,
   type GoalRepliesSnapshot,
   type GoalSwitchesSnapshot
 } from './goal.js';
@@ -186,14 +190,14 @@ function createWindow(): void {
     autoHideMenuBar: true,
     ...(process.platform === 'win32' ? {
       titleBarStyle: 'hidden' as const,
-      titleBarOverlay: titleBarOverlayForTheme(getConfig().ui.theme, getConfig().ui.appearance)
+      titleBarOverlay: titleBarOverlayForTheme(shownTheme(getConfig().ui.theme), getConfig().ui.appearance)
     } : {}),
     // macOS: the app's own top bar is the title bar, with the traffic lights inside it, instead
     // of a native title row above a second row that only held the sidebar and View buttons.
     // The overlay publishes the traffic-light area as env(titlebar-area-x) to the page.
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden' as const, titleBarOverlay: true } : {}),
     // Painted before the renderer loads, so a dark window never flashes white.
-    backgroundColor: windowBackgroundForTheme(getConfig().ui.theme, getConfig().ui.appearance),
+    backgroundColor: windowBackgroundForTheme(shownTheme(getConfig().ui.theme), getConfig().ui.appearance),
     title: cosErpDbIdentity.displayName,
     webPreferences: {
       zoomFactor: UI_BASE_ZOOM,
@@ -600,12 +604,17 @@ void app.whenReady().then(async () => {
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
   // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.
   nativeTheme.themeSource = getConfig().ui.theme;
+  // System (#1914): the window follows the operating system when it switches.
+  watchSystemTheme(() => getConfig().ui, () => window, refreshPetOverlayAppearance);
   const savedGoalObjectives = await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalObjectives(savedGoalObjectives);
   const savedGoalSwitches = await readDurable<GoalSwitchesSnapshot>(GOAL_SWITCHES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalSwitches(savedGoalSwitches);
+  const savedGoalOutcomes = await readDurable<GoalOutcomesSnapshot>(GOAL_OUTCOMES_STATE);
+  if (windowActivation.isDisabled()) return;
+  restoreGoalOutcomes(savedGoalOutcomes);
   const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalReplies(savedGoalReplies);

@@ -175,6 +175,18 @@ describe('settings migration', () => {
       expect(loaded.readOnly).toBe(true);
     }
   });
+  // #1914: Same as system is saved as 'system'; Light and Dark from older versions load as they were,
+  // and a damaged theme loads as the default (Dark) without touching the other saved choices.
+  it('loads the System theme, older Light and Dark as saved, and a damaged theme as Dark', async () => {
+    const config = defaultConfig();
+    for (const [saved, loadedAs] of [['system', 'system'], ['light', 'light'], ['dark', 'dark'], ['sepia', 'dark'], [7, 'dark'], [null, 'dark']] as const) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, readOnly: true, ui: { ...config.ui, theme: saved, sounds: true } }), 'utf8');
+      const loaded = await loadConfig();
+      expect(loaded.ui.theme).toBe(loadedAs);
+      expect(loaded.ui.sounds).toBe(true);
+      expect(loaded.readOnly).toBe(true);
+    }
+  });
   it('drops removed file-saving settings without changing other saved choices', async () => {
     const config = defaultConfig();
     config.readOnly = true;
@@ -928,6 +940,19 @@ describe('the goal loop settings', () => {
     expect(config.goal.objectivePrompt).toContain('Read it together with the original task');
   });
 
+  it('keeps the Goal step reviewer off by default, and loads a saved or damaged choice safely (#1832)', async () => {
+    expect(defaultConfig().goal.reviewerModel).toBe('');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: 'same' } });
+    expect((await loadConfig()).goal.reviewerModel).toBe('same');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: '  gpt-6-thinking ' } });
+    expect((await loadConfig()).goal.reviewerModel).toBe('gpt-6-thinking');
+    // A value no version wrote (too long, not text) turns the reviewer off rather than failing the file.
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: 'x'.repeat(200) } });
+    const loaded = await loadConfig();
+    expect(loaded.goal.reviewerModel).toBe('');
+    expect(loaded.goal.helperModel).toBe(defaultConfig().goal.helperModel);
+  });
+
   it('moves the exact superseded helper models to GPT-6 and keeps any other choice', async () => {
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, helperModel: 'gpt-5.6-sol', helperReasoning: 'medium' } });
     // GPT-5.6 Sol is no longer in ChatGPT's catalog; the untouched shipped value adopts the current default.
@@ -963,6 +988,7 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-6',
       helperReasoning: 'high',
+      reviewerModel: '',
       enabled: true,
       mode: 'loop',
       provider: { kind: 'openrouter', baseUrl: '' },
@@ -1110,6 +1136,7 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-6',
       helperReasoning: 'high',
+      reviewerModel: '',
       enabled: false,
       mode: 'goal',
       provider: { kind: 'openrouter', baseUrl: '' },
@@ -1277,6 +1304,27 @@ describe('a settings file the app cannot read as is', () => {
     expect(saved).toHaveLength(1);
     expect(await fs.readFile(path.join(dir, saved[0]!), 'utf8')).toBe(content);
   });
+});
+
+// CodeRabbit on #1864: a damaged ask-before-mouse-and-keyboard choice keeps asking (always) and says so;
+// a missing one is the default, off; a saved one loads as it was.
+it('loads a damaged desktop ask choice as always, a missing one as off, and says so once', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const lines = () => warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('desktopAsk'));
+  for (const [saved, loadedAs] of [['active', 'active'], ['off', 'off'], ['always', 'always'], [undefined, undefined]] as const) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopAsk: saved } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopAsk).toBe(loadedAs);
+    expect(lines()).toEqual([]);
+  }
+  for (const damaged of ['sometimes', 3, null, { off: true }]) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopAsk: damaged } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopAsk).toBe('always');
+    expect(lines()).toEqual(['config: the saved ui.desktopAsk was damaged; the app asks before every desktop step until it is chosen again']);
+  }
+  warn.mockRestore();
 });
 
 // #1856 (CodeRabbit): a damaged saved chat style falls back to the built-in text and says so once, never its content.
