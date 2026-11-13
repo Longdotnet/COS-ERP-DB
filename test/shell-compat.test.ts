@@ -3,7 +3,7 @@
  * No cache-derived message history, invented receipts or alternate presentation. */
 import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { connectorName } from '../src/shared/connector-names.js';
 
 const domSource = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
@@ -188,6 +188,88 @@ it('reads the real shell composer, messages and tools through existing contracts
   expect(f.api.presentationTurns().map((t: any) => t.role)).toEqual(['user', 'assistant']);
 });
 
+/** #2157: a bound on tool observations or work rows limits what is reported, never the public text. */
+describe('a very long turn still reports its public messages (#2157)', () => {
+  const own = (id: string) => ({ type: 'mcp-tool-call', callId: id, completed: true, invocation: { server: CORE_APP, tool: 'link_x/read' }, result: null });
+  const exec = (id: string) => ({ type: 'dynamic-tool-call', callId: id, tool: 'exec', completed: true });
+  const interim = (index: number) => ({ type: 'assistant-message', messageId: `66666666-6666-4666-8666-${String(index).padStart(12, '0')}`, content: `Update ${index}`, phase: 'commentary', completed: true });
+  const complete = (f: ReturnType<typeof fixture>, work: any[]) => {
+    (f.entry.turn as any).status = 'complete';
+    f.entry.turn.items = [f.entry.turn.items[0], { type: 'chatgpt-reasoning-group', items: work },
+      { type: 'assistant-message', messageId: ANSWER, content: 'Answer', phase: 'final_answer', completed: true }];
+    ids(f);
+  };
+  // The page lists every message of the turn, in order.
+  const ids = (f: ReturnType<typeof fixture>) => {
+    const all: string[] = [];
+    const visit = (items: any[]) => { for (const item of items) { if (item.messageId) all.push(item.messageId); if (item.callId) all.push(item.callId); if (item.items) visit(item.items); } };
+    visit(f.entry.turn.items);
+    (f.entry.turn as any).messageIds = all;
+  };
+  const read = async (work: any[]) => {
+    const f = fixture(); complete(f, work);
+    const { turns } = await f.ask();
+    expect(turns).toHaveLength(1);
+    return turns[0];
+  };
+
+  it.each([199, 200, 201, 297])('keeps the final answer of a turn with %i connector calls', async count => {
+    const turn = await read(Array.from({ length: count }, (_, index) => own(`call-${index}`)));
+    expect(turn.messages.map((m: any) => m.rawMessageId)).toEqual([USER, ANSWER]);
+    expect(turn.endMessageId).toBe(ANSWER);
+    expect(turn.calls.length).toBe(Math.min(count, 200));
+  });
+
+  it('keeps the final answer of a turn with more than 200 exec calls', async () => {
+    const turn = await read(Array.from({ length: 297 }, (_, index) => exec(`exec-${index}`)));
+    expect(turn.messages.map((m: any) => m.rawMessageId)).toEqual([USER, ANSWER]);
+    expect(turn.endMessageId).toBe(ANSWER);
+  });
+
+  it('keeps the final answer when the turn holds more work rows than the row limit', async () => {
+    const turn = await read(Array.from({ length: 19 }, (_, index) => own(`call-${index}`)).concat(Array.from({ length: 380 }, (_, index) => interim(index)) as any[]));
+    expect(turn.messages.map((m: any) => m.rawMessageId).at(-1)).toBe(ANSWER);
+    expect(turn.endMessageId).toBe(ANSWER);
+    expect(turn.calls.length).toBe(19);
+  });
+
+  it('keeps the final answer when the work rows are far past the row limit', async () => {
+    const turn = await read(Array.from({ length: 1500 }, (_, index) => interim(index)));
+    expect(turn.messages.map((m: any) => m.rawMessageId).at(-1)).toBe(ANSWER);
+    expect(turn.endMessageId).toBe(ANSWER);
+  });
+
+  it('keeps the text of an interim update that follows an empty copy of the same message', async () => {
+    const f = fixture(); complete(f, [{ ...interim(1), content: '' }, { ...interim(1), content: 'The real text' }]);
+    const turn = (await f.ask()).turns[0];
+    expect(turn.messages.map((m: any) => m.rawText)).toContain('The real text');
+  });
+
+  it('still refuses a repeated call identity that sits past the row limit', async () => {
+    const f = fixture(); complete(f, [...Array.from({ length: 450 }, (_, index) => own(`call-${index}`)), own('call-0')]);
+    expect((await f.ask()).turns).toEqual([]);
+  });
+
+  it('keeps the whole text of the final answer however long the interim updates are', async () => {
+    const f = fixture(); complete(f, Array.from({ length: 6 }, (_, index) => ({ ...interim(index), content: 'x'.repeat(300_000) })));
+    (f.entry.turn.items[2] as any).content = 'The complete answer. '.repeat(499) + 'The end.';
+    ids(f);
+    const turn = (await f.ask()).turns[0];
+    expect(turn.messages.at(-1).rawText).toBe('The complete answer. '.repeat(499) + 'The end.');
+    expect(turn.endMessageId).toBe(ANSWER);
+  });
+
+  it('keeps the final answer when top-level items outnumber the row limit', async () => {
+    const f = fixture(); (f.entry.turn as any).status = 'complete';
+    f.entry.turn.items = [f.entry.turn.items[0], ...Array.from({ length: 450 }, (_, index) => interim(index)),
+      { type: 'assistant-message', messageId: ANSWER, content: 'Answer', phase: 'final_answer', completed: true }];
+    ids(f);
+    const turn = (await f.ask()).turns[0];
+    expect(turn.messages.map((m: any) => m.rawMessageId).at(-1)).toBe(ANSWER);
+    expect(turn.endMessageId).toBe(ANSWER);
+  });
+});
+
 it.each(['in_progress', 'cancelled', 'complete', 'unknown', undefined])('does not invent a tool receipt from turn status %s', async status => {
   const f = fixture(); (f.entry.turn as any).status = status;
   const turn = (await f.ask()).turns[0];
@@ -306,7 +388,7 @@ it('decodes the entities a DIL fallback writes for | and & in plain text, once',
   };
   expect(await read('a&#124;b \\<c> &amp;d \\\\e \\*f\\*\n`a|b <c> &d \\e *f*`\nEND'))
     .toBe('a|b <c> &d \\e *f*\n`a|b <c> &d \\e *f*`\nEND');
-  expect(await read('KIWI &#124; /home/maxim/cos-ssh-live')).toBe('KIWI | /home/maxim/cos-ssh-live');
+  expect(await read('KIWI &#124; /home/you/cos-ssh-live')).toBe('KIWI | /home/you/cos-ssh-live');
   // A literal entity the model wrote has its & encoded, so one pass gives back the literal text.
   expect(await read('Write &amp;#124; or &amp;amp; or &amp;lt;b&amp;gt; &#x7C; &#X7c;')).toBe('Write &#124; or &amp; or &lt;b&gt; | |');
   // Code and formulas keep their own text.
@@ -392,6 +474,181 @@ it('stamps blob pixels only for the exact mounted image item and retires replace
   await f.ask();
   expect(node.hasAttribute('data-clf-fiber-image')).toBe(false);
   expect(node.hasAttribute('data-clf-fiber-image-source')).toBe(false);
+});
+
+// #2005 (2026-11-02, live VM 2026-11-03): an ImageGen gallery mounts one large preview plus a thumbnail
+// strip, `div[role=group] > button[aria-pressed] > img`. The gallery's shell item is only its first image,
+// so only that one was ever recorded; the others said "Image preview unavailable".
+function gallery(f: ReturnType<typeof fixture>, selected = 2) {
+  const files = ['file_aaaaaaaaaaaaaaa1', 'file_aaaaaaaaaaaaaaa2', 'file_aaaaaaaaaaaaaaa3', 'file_aaaaaaaaaaaaaaa4'];
+  const images = files.map((file, index) => ({ type: 'generated-image', id: `${ANSWER}:image-asset:${index}`, chatGptMessageId: ANSWER,
+    src: `sediment://${file}`, status: 'completed', isPreview: false, width: 1254, height: 1254 }));
+  f.entry.turn.status = 'complete'; f.entry.turn.messageIds = [USER, ANSWER];
+  f.entry.turn.items = [f.entry.turn.items[0], ...images];
+  f.doc.querySelector('[data-content-search-unit-key$=":assistant"]')!.remove();
+  const wrapper = f.doc.createElement('div');
+  const preview = f.doc.createElement('div'); preview.className = 'group/generated-image-preview';
+  const big = f.doc.createElement('img'); big.src = 'blob:https://chatgpt.com/large'; preview.append(big);
+  const strip = f.doc.createElement('div'); strip.setAttribute('role', 'group');
+  wrapper.append(preview, strip);
+  f.doc.querySelector('[data-turn-key]')!.append(wrapper);
+  // The page's own copies of the typed images: equal values, other objects.
+  const shown = images.map(image => ({ ...image }));
+  const owner = f.chain({ item: images[0] }, f.row);
+  (big as any).__reactFiber$fixture = f.chain({ image: shown[selected], imageId: shown[selected]!.id, isComplete: true, isPreview: false }, owner);
+  const thumbs = shown.map((image, index) => {
+    const button = f.doc.createElement('button'); button.setAttribute('aria-pressed', String(index === selected));
+    const thumb = f.doc.createElement('img'); thumb.src = `blob:https://chatgpt.com/thumb-${index}`; button.append(thumb); strip.append(button);
+    (thumb as any).__reactFiber$fixture = f.chain({ image }, f.chain({ images: shown, selectedImageId: shown[selected]!.id }, owner));
+    return thumb;
+  });
+  return { images, shown, big, thumbs, files };
+}
+const stampedFile = (node: Element, files: string[]) => {
+  const stamp = node.getAttribute('data-clf-fiber-image');
+  return stamp ? files.find(file => stamp.endsWith(`:${encodeURIComponent(file)}`)) ?? 'other' : null;
+};
+
+it('records every image of a gallery: the large preview as whichever image it shows, and each thumbnail (#2005)', async () => {
+  const f = fixture(); const { big, thumbs, files } = gallery(f, 2);
+  const turn = (await f.ask()).turns[0];
+  expect(turn.images.map((image: any) => image.assetId)).toEqual(files);
+  expect(stampedFile(big, files)).toBe(files[2]);
+  expect(thumbs.map(thumb => stampedFile(thumb, files))).toEqual(files);
+});
+
+// Observed public page shape: ImageGen outputs can be children of the working
+// group instead of top-level answer items, including before this turn finishes.
+it.each(['running', 'group-complete', 'assistant-final'] as const)(
+  'reads generated images inside the current reasoning group (%s)', async state => {
+    const f = fixture(); const g = gallery(f, 1);
+    f.entry.turn.status = state === 'running' ? 'in_progress' : 'complete';
+    f.entry.turn.items = [f.entry.turn.items[0], {
+      type: 'chatgpt-reasoning-group', completed: state !== 'running', items: [
+        { type: 'reasoning', presentation: 'analysis', content: 'NEVER_COPY_PRIVATE_REASONING' },
+        ...g.images
+      ]
+    }];
+    if (state === 'assistant-final') {
+      f.entry.turn.messageIds.push(OTHER);
+      f.entry.turn.items.push({ type: 'assistant-message', messageId: OTHER,
+        content: 'Both images are ready.', phase: 'final_answer', completed: true });
+    }
+    const turn = (await f.ask()).turns[0];
+    expect(turn.images.map((image: any) => image.assetId)).toEqual(g.files);
+    expect(turn.images.every((image: any) => image.providerStatus === 'finished_successfully')).toBe(true);
+    expect(stampedFile(g.big, g.files)).toBe(g.files[1]);
+    expect(g.thumbs.map(thumb => stampedFile(thumb, g.files))).toEqual(g.files);
+    expect(turn.endMessageId).toBe(state === 'assistant-final' ? OTHER : null);
+    expect(JSON.stringify(turn)).not.toContain('NEVER_COPY_PRIVATE_REASONING');
+  }
+);
+
+it('keeps newer nested image identities after an older top-level image', async () => {
+  const f = fixture(); const g = gallery(f, 2);
+  const newest = '66666666-6666-4666-8666-666666666666';
+  g.images[1]!.chatGptMessageId = OTHER;
+  g.images[2]!.chatGptMessageId = newest;
+  Object.assign(g.shown[1]!, g.images[1]);
+  Object.assign(g.shown[2]!, g.images[2]);
+  f.entry.turn.status = 'in_progress';
+  f.entry.turn.messageIds.push(OTHER, newest);
+  f.entry.turn.items = [f.entry.turn.items[0], g.images[0], {
+    type: 'chatgpt-reasoning-group', items: [g.images[1], g.images[2]]
+  }];
+  const turn = (await f.ask()).turns[0];
+  expect(turn.images.map((image: any) => [image.messageId, image.assetId])).toEqual([
+    [ANSWER, g.files[0]], [OTHER, g.files[1]], [newest, g.files[2]]
+  ]);
+  expect(stampedFile(g.big, g.files)).toBe(g.files[2]);
+  expect(turn.endMessageId).toBeNull();
+});
+
+it.each([
+  ['an id no typed image of this turn has', (g: ReturnType<typeof gallery>) => { g.shown[1]!.id = `${ANSWER}:image-asset:9`; }],
+  ['another message', (g: ReturnType<typeof gallery>) => { g.shown[1]!.chatGptMessageId = OTHER; }],
+  ['another source', (g: ReturnType<typeof gallery>) => { g.shown[1]!.src = 'sediment://file_bbbbbbbbbbbbbbbb'; }],
+  ['an image still being made', (g: ReturnType<typeof gallery>) => { g.images[1]!.status = 'in_progress'; }],
+  ['two typed images with that id', (g: ReturnType<typeof gallery>, f: ReturnType<typeof fixture>) => {
+    f.entry.turn.items.push({ ...g.images[1]!, src: 'sediment://file_cccccccccccccccc' }); }]
+] as const)('leaves a thumbnail unrecorded when its image is %s', async (_case, change) => {
+  const f = fixture(); const g = gallery(f, 0);
+  change(g as any, f);
+  await f.ask();
+  expect(stampedFile(g.thumbs[1]!, g.files)).toBeNull();
+  // The other images of the gallery are unaffected.
+  expect(stampedFile(g.thumbs[2]!, g.files)).toBe(g.files[2]);
+});
+
+it.each(['foreign message', 'invalid asset', 'running image', 'preview'])(
+  'keeps nested image validation and pixel ownership strict (%s)', async scenario => {
+    const f = fixture(); const { image, node } = generatedAnswer(f);
+    f.entry.turn.items = [f.entry.turn.items[0], { type: 'chatgpt-reasoning-group', items: [image] }];
+    if (scenario === 'foreign message') image.chatGptMessageId = OTHER;
+    if (scenario === 'invalid asset') image.src = 'https://example.com/not-an-owned-asset';
+    if (scenario === 'running image') image.status = 'in_progress';
+    if (scenario === 'preview') image.isPreview = true;
+    const turn = (await f.ask()).turns[0];
+    expect(turn.endMessageId).toBeNull();
+    if (scenario === 'foreign message' || scenario === 'invalid asset') expect(turn.images).toEqual([]);
+    else expect(turn.images).toEqual([expect.objectContaining({ providerStatus: 'in_progress' })]);
+    expect(node.hasAttribute('data-clf-fiber-image')).toBe(false);
+  }
+);
+
+it('does not take a large preview that ChatGPT marks incomplete or a preview', async () => {
+  for (const flags of [{ isComplete: false, isPreview: false }, { isComplete: true, isPreview: true }]) {
+    const f = fixture(); const g = gallery(f, 1);
+    const props = (g.big as any).__reactFiber$fixture.memoizedProps;
+    Object.assign(props, flags);
+    await f.ask();
+    expect(stampedFile(g.big, g.files)).toBeNull();
+  }
+});
+
+// #2005 part B: history found later was recorded at the moment it was read ("new 12:55 timestamps").
+// ChatGPT's own turn says when its work started and ended (live, a 16-turn chat from 2026-10-28: each
+// question's recorded time equals its turn's workStartedAtMs to the minute; sentAtMs was null).
+it('gives a question its turn\'s start and a finished answer its end, as ChatGPT records them', async () => {
+  const f = fixture();
+  const started = Date.parse('2026-09-18T08:30:00Z'), finished = Date.parse('2026-09-18T08:34:00Z');
+  Object.assign(f.entry.turn, { workStartedAtMs: started, workCompletedAtMs: finished });
+  const times = async () => Object.fromEntries((await f.ask()).turns[0].messages.map((m: any) => [m.role, m.createTime ?? null]));
+  // While the answer is running it has no time of its own yet.
+  expect(await times()).toEqual({ user: started, assistant: null });
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  expect(await times()).toEqual({ user: started, assistant: finished });
+  // ChatGPT's own send time, once it keeps one, wins over the turn's start.
+  f.entry.turn.items[0].sentAtMs = started - 2_000;
+  expect((await times()).user).toBe(started - 2_000);
+  // No usable time: nothing is invented.
+  Object.assign(f.entry.turn, { workStartedAtMs: null, workCompletedAtMs: 'soon' });
+  f.entry.turn.items[0].sentAtMs = null;
+  expect(await times()).toEqual({ user: null, assistant: null });
+});
+
+// CodeRabbit on #2064: the turn's start belongs to its opening question, its end to its last answer,
+// and a value that cannot be a ChatGPT time is no time.
+it('gives the turn\'s start only to its opening question, its end only to its last answer, and takes only plausible times', async () => {
+  const f = fixture();
+  const started = Date.parse('2026-09-18T08:30:00Z'), finished = Date.parse('2026-09-18T08:34:00Z');
+  Object.assign(f.entry.turn, { workStartedAtMs: started, workCompletedAtMs: finished, status: 'complete' });
+  f.entry.turn.items[2].completed = true;
+  // A retry left an earlier finished answer, and a follow-up was sent into the running answer.
+  f.entry.turn.items.push(
+    { type: 'user-message', messageId: OTHER, message: 'One more thing' },
+    { type: 'assistant-message', messageId: 'answer-after-retry', content: 'Retried', phase: 'final_answer', completed: true });
+  f.entry.turn.messageIds.push(OTHER, 'answer-after-retry');
+  const times = async () => Object.fromEntries((await f.ask()).turns[0].messages.map((m: any) => [m.messageId, m.createTime ?? null]));
+  expect(await times()).toEqual({ [USER]: started, [ANSWER]: null, [OTHER]: null, 'answer-after-retry': finished });
+  // A follow-up's own send time is still its time.
+  f.entry.turn.items[3].sentAtMs = started + 60_000;
+  expect((await times())[OTHER]).toBe(started + 60_000);
+  for (const odd of [1, 9.9e13, Date.now() + 7 * 86_400_000]) {
+    Object.assign(f.entry.turn, { workStartedAtMs: odd, workCompletedAtMs: odd });
+    f.entry.turn.items[3].sentAtMs = odd;
+    expect(await times()).toEqual({ [USER]: null, [ANSWER]: null, [OTHER]: null, 'answer-after-retry': null });
+  }
 });
 
 it('rejects an image borrowing the authored user message identity', async () => {
@@ -881,6 +1138,10 @@ it('finds the stop control by its square when the label is translated', () => {
     '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>';
   expect(f.api.generating(), 'a translated stop button was not recognised').toBe(true);
   expect(f.api.stopButton()?.getAttribute('aria-label')).toBe('Durdur');
+  form.querySelector('button[type="submit"]')!.remove();
+  expect(f.api.composerText()).toBe('');
+  expect(f.api.generating()).toBe(true);
+  expect(f.api.sendButton(), 'an empty composer with only localized Stop offered Send').toBeNull();
 });
 
 /**
@@ -1000,16 +1261,75 @@ it('finds the send control by its slot when the label is translated', () => {
     '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button>');
   expect(f.api.sendButton()?.getAttribute('aria-label'), 'a translated send button was not recognised').toBe('Gönder');
 
-  // The stop square in that same slot is never a send target.
-  form.querySelector('button[aria-label="Gönder"]')!.outerHTML =
+  // While generating (#1231), a translated send control alongside stop is still recognised.
+  form.insertAdjacentHTML('beforeend',
     `<button type="button" class="${slot}" aria-label="Durdur">` +
-    '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>';
+    '<svg class="icon-primary-action" viewBox="0 0 20 20"><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C15.5 14.9404 14.9404 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>');
+  expect(f.api.generating()).toBe(true);
+  expect(f.api.sendButton()?.getAttribute('aria-label'), 'a translated send button was hidden while generating').toBe('Gönder');
+
+  // The stop square in that same slot is never a send target.
+  form.querySelector('button[aria-label="Gönder"]')!.remove();
   expect(f.api.sendButton(), 'the stop square was read as send').toBeNull();
 
   // And an English label still wins outright, without consulting the slot at all.
   form.querySelector('button[aria-label="Durdur"]')!.outerHTML =
     '<button type="button" aria-label="Send prompt">send</button>';
   expect(f.api.sendButton()?.getAttribute('aria-label')).toBe('Send prompt');
+});
+
+it('excludes voice controls from structural Send with text while generating', () => {
+  const f = fixture(), edit = editing(f);
+  const form = f.doc.querySelector('form[data-chatgpt-composer]')!;
+  const slot = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full bg-composer-primary p-0.5';
+  f.doc.querySelector('button[type="submit"]')!.remove();
+  expect(f.api.insertPrompt('Continue', true)).toBe(true);
+  expect(edit.box.innerText).toContain('Continue');
+
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot}" aria-label="Sprachchat starten" data-state="closed">` +
+    '<svg><path d="M8.22266 2.45825C8"></path><path d="M12.4443 4.62524C1"></path>' +
+    '<path d="M4 6.95825C4.48325"></path><path d="M16.667 7.45825C17"></path></svg></button>' +
+    `<button type="button" class="${slot}" aria-label="Durdur">` +
+    '<svg><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C14.9404 14.9404 14.25 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>');
+  expect(f.api.generating()).toBe(true);
+  expect(f.api.sendButton(), 'voice must not be mistaken for Send').toBeNull();
+
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot}" aria-label="Gönder"><svg><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button>`);
+  expect(f.api.sendButton()?.getAttribute('aria-label')).toBe('Gönder');
+});
+
+it('ignores hidden structural Send controls with text while generating', () => {
+  const f = fixture(), edit = editing(f);
+  const form = f.doc.querySelector('form[data-chatgpt-composer]')!;
+  const slot = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full bg-composer-primary p-0.5';
+  f.doc.querySelector('button[type="submit"]')!.remove();
+  expect(f.api.insertPrompt('Continue', true)).toBe(true);
+  expect(edit.box.innerText).toContain('Continue');
+
+  form.insertAdjacentHTML('beforeend',
+    `<div hidden><button type="button" class="${slot}" aria-label="Gönder"><svg><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button></div>` +
+    `<button type="button" class="${slot}" aria-label="Durdur"><svg><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C14.9404 14.9404 14.25 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>` +
+    `<button type="button" class="${slot}" aria-label="Envoyer"><svg><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button>`);
+  expect(f.api.generating()).toBe(true);
+  expect(f.api.sendButton()?.getAttribute('aria-label'), 'a hidden control made Send ambiguous').toBe('Envoyer');
+});
+
+it('rejects multiple visible structural Send candidates with text while generating', () => {
+  const f = fixture(), edit = editing(f);
+  const form = f.doc.querySelector('form[data-chatgpt-composer]')!;
+  const slot = 'cursor-interaction size-token-button-composer flex items-center justify-center rounded-full bg-composer-primary p-0.5';
+  f.doc.querySelector('button[type="submit"]')!.remove();
+  expect(f.api.insertPrompt('Continue', true)).toBe(true);
+  expect(edit.box.innerText).toContain('Continue');
+
+  form.insertAdjacentHTML('beforeend',
+    `<button type="button" class="${slot}" aria-label="Gönder"><svg><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button>` +
+    `<button type="button" class="${slot}" aria-label="Envoyer"><svg><path d="M8.5 16.5v-9l-3.25 3.25"></path></svg></button>` +
+    `<button type="button" class="${slot}" aria-label="Durdur"><svg><path d="M4.5 5.75C4.5 5.05964 5.05964 4.5 5.75 4.5H14.25C14.9404 4.5 15.5 5.05964 15.5 5.75V14.25C14.9404 14.9404 14.25 15.5 14.25 15.5H5.75C5.05964 15.5 4.5 14.9404 4.5 14.25V5.75Z"></path></svg></button>`);
+  expect(f.api.generating()).toBe(true);
+  expect(f.api.sendButton(), 'two visible structural candidates must remain ambiguous').toBeNull();
 });
 
 it('preserves prepared multiline text through the shell editor serializer', () => {
@@ -1803,6 +2123,15 @@ it('places a message sent into a running turn after the message it followed, not
   const questions = (await f.ask()).turns.flatMap((turn: any) => turn.messages.filter((m: any) => m.role === 'user')
     .map((m: any) => [m.rawMessageId, m.parentId, m.parentExact]));
   expect(questions).toEqual([[USER, 'root', false], [second.userId, ANSWER, true], [steered, interim, true]]);
+  // When ChatGPT had already opened its consolidated final_answer item before the steered user-message,
+  // final_answer stays the closing parent of the next turn while the steered message still follows interim.
+  second.entry.turn.items = [question!,
+    { type: 'assistant-message', messageId: interim, content: 'Running step two', phase: 'commentary', completed: true } as any,
+    answer!,
+    { type: 'user-message', messageId: steered, serverMessageId: steered, message: 'Continue the task from where you are.' } as any];
+  const afterFinal = (await f.ask()).turns.flatMap((turn: any) => turn.messages.filter((m: any) => m.role === 'user')
+    .map((m: any) => [m.rawMessageId, m.parentId, m.parentExact]));
+  expect(afterFinal).toEqual([[USER, 'root', false], [second.userId, ANSWER, true], [steered, interim, true]]);
 });
 
 it('places each question in ChatGPT\'s message tree, with the versions control as proof of an edit', async () => {

@@ -104,6 +104,8 @@ it('translates every delivery error a queued message can show', () => {
     'Fresh-turn continue declined: no Send while ChatGPT works.',
     'User authorized a new helper',
     'session-input',
+    // The durable store of each chat's latest automatic send (#2074), never shown.
+    'own-sent-receipts',
     '\\n--- New instructions from the user ---\\n'
   ]);
   const source = readFileSync('src/main/session/input.ts', 'utf8');
@@ -151,6 +153,22 @@ it('translates every error the Files panel, projects, pets, skills and settings 
   for (const locale of LOCALES) {
     const catalog = JSON.parse(readFileSync(`src/renderer/locales/${locale}.json`, 'utf8')) as Record<string, string>;
     expect([...messages].filter(message => !Object.hasOwn(catalog, message)), locale).toEqual([]);
+  }
+});
+
+it('translates every backend error the global Scheduled page can show', () => {
+  const messages = [
+    'The session exists but its metadata could not be read.',
+    'Could not read scheduled-runs state',
+    'The saved manual run id belongs to a different scheduled message.',
+    'The schedule operation failed. Check the local app logs for details.'
+  ];
+  expect(readFileSync('src/main/session/store.ts', 'utf8')).toContain(messages[0]);
+  expect(readFileSync('src/main/durable.ts', 'utf8')).toContain('`Could not read ${name} state`');
+  expect(readFileSync('src/main/scheduled-runs.ts', 'utf8')).toContain(messages[2]);
+  for (const locale of LOCALES) {
+    const catalog = JSON.parse(readFileSync(`src/renderer/locales/${locale}.json`, 'utf8')) as Record<string, string>;
+    expect(messages.filter(message => !Object.hasOwn(catalog, message)), locale).toEqual([]);
   }
 });
 

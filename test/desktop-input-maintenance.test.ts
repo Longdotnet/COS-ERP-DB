@@ -253,12 +253,12 @@ it('carries the direct-turn offer only to the elected existing conversation', as
 });
 
 type Tab = { id: number; url?: string; pendingUrl?: string; windowId?: number; active?: boolean; pinned?: boolean };
-async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; project?: string; branch?: { conversationId: string; messageId: string } }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}, rendered?: Set<number>) {
+async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; project?: string; branch?: { conversationId: string; messageId: string } }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}, rendered?: Set<number>, hooks: { revoke?: () => Promise<void> } = {}) {
   const tabs: Tab[] = [];
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
   const localSaved: Record<string, unknown> = { port: testBridgePort, token: 'test-pairing', ...priorLocal };
-  const local = { get: async () => ({ ...localSaved }), set: vi.fn(async (value: object) => { Object.assign(localSaved, value); }), remove: async () => {} };
+  const local = { get: async () => ({ ...localSaved }), set: vi.fn(async (value: object) => { Object.assign(localSaved, value); }), remove: async (keys: string | string[]) => { for (const key of [keys].flat()) delete localSaved[key]; } };
   const saved: Record<string, unknown> = { ...priorSession };
   // A key listed in `__unreadable` fails to read, as session storage can.
   const session = { get: async (key?: string) => { if (typeof key === 'string' && (saved.__unreadable as string[] | undefined)?.includes(key)) throw new Error('storage unavailable'); return { ...saved }; }, set: async (value: object) => { Object.assign(saved, value); }, remove: async (key: string) => { delete saved[key]; } };
@@ -273,6 +273,7 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
   const remove = vi.fn(async (_id: number) => {});
   const query = vi.fn(async () => [...tabs]);
   const reload = vi.fn(async (_id: number) => {});
+  const runtimeReload = vi.fn();
   const sendMessage = vi.fn(async (_id: number, _message: any): Promise<{ ok: boolean; ready?: boolean }> => ({ ok: true, ready: true }));
   const debuggerApi = {
     onEvent: event, onDetach: event,
@@ -310,22 +311,22 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
       ...(rendered ? { debugger: debuggerApi } : {}),
       storage: { local, session },
       windows,
-      runtime: { getManifest: () => ({ version: '2.0.5' }), onMessage: event, onInstalled: event, onStartup: event },
+      runtime: { getManifest: () => ({ version: '2.0.5' }), reload: runtimeReload, onMessage: event, onInstalled: event, onStartup: event },
       tabs: { query, get: async (id: number) => tabs.find(tab => tab.id === id), remove, reload, create, update, sendMessage, onCreated: event, onUpdated: tabUpdated, onRemoved: event },
       alarms: { onAlarm: event, create: () => {}, clear: async () => true },
       scripting
     },
-    createBrowserControl: () => ({ pump: async () => {} }),
+    createBrowserControl: () => ({ pump: async () => {}, revoke: async () => hooks.revoke?.() }),
     fetch, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, TextEncoder, console
   });
   vm.runInContext(activeTabsSource, context);
-  vm.runInContext(`${source}\nglobalThis.testMaintenance = { load, maintain, releaseTab, serializeTab, noteTabConversation, createChatTab, authorizeDocument, ackDesktopInput, drainCommandAcks, inspectRequestedModels, desktopInput: HANDLERS.desktop_input, catalog: HANDLERS.model_catalog, events: HANDLERS.events, bind: HANDLERS.bind, closed: HANDLERS.closed, loadFailure: HANDLERS.load_failure, correlate: HANDLERS.correlate, applyRequestedBrowserPreferences };`, context);
+  vm.runInContext(`${source}\nglobalThis.testMaintenance = { load, maintain, releaseTab, serializeTab, noteTabConversation, createChatTab, authorizeDocument, ackDesktopInput, drainCommandAcks, inspectRequestedModels, reloadForExtensionUpdate, setWorkerStamp: (value) => { workerStampValue = value; }, desktopInput: HANDLERS.desktop_input, catalog: HANDLERS.model_catalog, events: HANDLERS.events, bind: HANDLERS.bind, closed: HANDLERS.closed, loadFailure: HANDLERS.load_failure, correlate: HANDLERS.correlate, unpair: HANDLERS.unpair, pair: HANDLERS.pair, applyRequestedBrowserPreferences };`, context);
   const api = context.testMaintenance as { releaseTab(...args: any[]): Promise<any>; serializeTab(tab: number, operation: () => Promise<any>): Promise<any>; noteTabConversation(source: any, conversationId: string): Promise<any>; applyRequestedBrowserPreferences(request: object): Promise<void>; authorizeDocument(sender: unknown, message: unknown): Promise<any>; catalog(message: unknown, sender: unknown, source: unknown): Promise<any>; load(): Promise<void>; maintain(): Promise<void>; createChatTab(url: string, background: boolean): Promise<Tab> };
   await api.load();
   Object.assign(api, { query });
   const updated = (id: number, change: object) => tabUpdated.addListener.mock.calls[0]![0](id, change, tabs.find(tab => tab.id === id));
   vm.runInContext('Object.assign(testMaintenance, { offerStopTurns, noteTabConversation, ackCommand })', context);
-  return { ...api, scripting, updated, update, advance, navigator: browserNavigator, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
+  return { ...api, scripting, updated, update, advance, navigator: browserNavigator, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, unpair: (context.testMaintenance as any).unpair as () => Promise<any>, pair: (context.testMaintenance as any).pair as () => Promise<any>, reloadForExtensionUpdate: (context.testMaintenance as any).reloadForExtensionUpdate as (...args: any[]) => Promise<void>, setWorkerStamp: (context.testMaintenance as any).setWorkerStamp as (value: string) => void, query, create, sendMessage, tabs, fetch, windows, remove, reload, runtimeReload, local, localSaved, saved };
 }
 
 // 2.1.47 round: a chat tab that loaded offline in the app's background window stayed on Chrome's
@@ -356,8 +357,11 @@ describe('a chat tab left on Chrome\'s error page', () => {
     await vi.waitFor(() => expect(h.fetch.mock.calls.some(([url, init]: any) => new URL(url).pathname === '/diagnostics' &&
       JSON.parse(init.body).errorPageReloads?.count === 1)).toBe(true), { timeout: 5_000 });
   });
-  const reported = (h: Awaited<ReturnType<typeof errorPage>>) => h.fetch.mock.calls
-    .filter(([url]: any) => new URL(url).pathname === '/diagnostics').map(([, init]: any) => JSON.parse(init.body).errorPageReloads?.skipped).filter(Boolean);
+  // Each skip once, by when it happened: a report sent again (a change while one was in flight) carries
+  // the same skip, and the app logs it once by that time (#1940 made the snapshot's read bounded).
+  const reported = (h: Awaited<ReturnType<typeof errorPage>>) => [...new Map(h.fetch.mock.calls
+    .filter(([url]: any) => new URL(url).pathname === '/diagnostics').map(([, init]: any) => JSON.parse(init.body).errorPageReloads?.skipped).filter(Boolean)
+    .map((skip: any) => [`${skip.reason}:${skip.at}`, skip])).values()];
   // CodeRabbit on #1911: a skipped reload says why in the app's log, once per reason.
   const pings = (h: Awaited<ReturnType<typeof errorPage>>) => h.sendMessage.mock.calls.filter(([, message]: any) => message.type === 'clf-recorder-ping').length;
   // The next recorder check, a minute later on the worker's clock.
@@ -522,6 +526,43 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect(h.create.mock.calls.some(([options]) => String(options.url).includes(firstId))).toBe(false);
   });
 
+  it('preserves the project helper owner while its catalog is unavailable and still delivers unrelated input', async () => {
+    const owner = { id: firstId, tab: 7, openedAt: Date.now() };
+    const h = await worker([{ id: secondId, conversationId: null }], undefined, {}, { projectCreateOwner: owner });
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/projects?cos-project-create=${firstId}` });
+    const original = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      const reply = await original(url, init);
+      if (new URL(url).pathname !== '/status') return reply;
+      return { ...reply, json: async () => ({ ...(await reply.json() as object), projectCreateRequests: null }) };
+    });
+    await h.maintain();
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: expect.stringContaining(`cos-input=${secondId}`) }));
+    expect(h.saved.projectCreateOwner).toEqual(owner);
+    expect(h.remove).not.toHaveBeenCalledWith(7);
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-project-create-state')).toBe(false);
+  });
+
+  it('clears the project helper owner when the catalog returns a valid empty list', async () => {
+    const owner = { id: firstId, tab: 7, openedAt: Date.now() };
+    const h = await worker([], undefined, {}, { projectCreateOwner: owner });
+    h.tabs.push({ id: owner.tab, url: `https://chatgpt.com/projects?cos-project-create=${owner.id}` });
+    h.sendMessage.mockImplementation(async (_tabId, message) => ({
+      ok: true, ready: true, safe: message.type === 'clf-project-create-state',
+    }));
+    const original = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      const reply = await original(url, init);
+      if (new URL(url).pathname !== '/status') return reply;
+      return { ...reply, json: async () => ({ ...(await reply.json() as object), projectCreateRequests: [] }) };
+    });
+    await h.maintain();
+    // Project inspection runs separately from the awaited desktop-input pass.
+    await vi.waitFor(() => expect(h.saved).not.toHaveProperty('projectCreateOwner'), { timeout: 5_000 });
+    expect(h.sendMessage).toHaveBeenCalledWith(owner.tab, { type: 'clf-project-create-state', id: owner.id });
+    expect(h.remove).toHaveBeenCalledWith(owner.tab);
+  });
+
   it.each(['complete', 'loading'] as const)('reports a linked Project ChatGPT no longer opens when its tab ends on the home page (%s)', async status => {
     const project = `g-p-${'e'.repeat(32)}`;
     const h = await worker([{ id: firstId, conversationId: null, project }], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready', project } } });
@@ -644,7 +685,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
   it.each(['owned-home', 'foreign-chat', 'replacement-document', 'extra-navigation'])('keeps a reused conversation rendering only through its authorized transition (%s)', async transition => {
     const rendered = new Set<number>();
     const h = await worker([{ id: firstId, conversationId: null }], undefined, {}, {}, rendered);
-    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
     h.tabs.push(tab);
     const sender = { tab, documentId: 'reused-document', frameId: 0, url: tab.url };
     await h.authorizeDocument(sender, { navigationEpoch: 1 });
@@ -689,7 +730,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     // #1086: a new chat took an idle app-owned chat's tab. The page then reported that chat as
     // closed, the app read it as the user closing it on purpose, and paused its recovery for good.
     const h = await worker([{ id: firstId, conversationId: null }]);
-    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
     h.tabs.push(tab);
     const sender = { tab, documentId: 'reused-document', frameId: 0, url: tab.url };
     const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
@@ -717,6 +758,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
       // The record is spent: a later departure of the same chat is the user's again.
       tab.url = `https://chatgpt.com/c/${secondId}`;
       const back = await h.authorizeDocument({ ...sender, url: tab.url, documentId: 'reused-document' }, { navigationEpoch: 3 });
+      tab.pendingUrl = 'https://chatgpt.com/';
       await h.closed({ conversationId: secondId }, { ...sender, url: tab.url }, back);
       expect(closes().at(-1)).toEqual({ conversationId: secondId, manual: true });
     }
@@ -726,12 +768,15 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     // #1086: Retry on ChatGPT's load-failure surface (pressed by the page's own recovery or by the
     // user) took the tab to the home page, and the app paused the chat's recovery as if closed.
     const h = await worker([]);
-    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
     h.tabs.push(tab);
     const sender = { tab, documentId: 'failed-document', frameId: 0, url: tab.url };
     const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
     await h.noteTabConversation(source, secondId);
     if (reported) expect(await h.loadFailure({ conversationId: secondId }, sender, source)).toEqual({ ok: true });
+    // The page reported departure while Chrome is navigating to home; its
+    // committed tab.url still names the now-left conversation.
+    tab.pendingUrl = 'https://chatgpt.com/';
     await h.closed({ conversationId: secondId }, sender, source);
     const closes = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')
       .map(([, init]) => JSON.parse(String(init!.body)));
@@ -892,6 +937,125 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     const restarted = await worker([input], undefined, h.localSaved);
     await restarted.maintain();
     expect(restarted.create).not.toHaveBeenCalled();
+  });
+  it.each(['ready', 'preparing'])('reports a missing %s opening tab without replacing it, including after restart', async stage => {
+    const input = { id: firstId, conversationId: null };
+    const local = { inputOpenings: { [firstId]: { tab: 7, stage, conversationId: null } } };
+    const h = await worker([input], undefined, local);
+    await h.maintain();
+    const reports = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/opening-unavailable');
+    expect(reports).toHaveLength(1);
+    expect(JSON.parse(String(reports[0]![1]?.body))).toEqual({ id: firstId, tab: 7, stage });
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+    expect(h.localSaved.inputOpenings).toEqual(local.inputOpenings);
+    const restarted = await worker([input], undefined, h.localSaved);
+    await restarted.maintain();
+    expect(restarted.create).not.toHaveBeenCalled();
+    expect(restarted.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toBe(true);
+  });
+  // #1950 follow-up: the app proved nothing reached the lost tab and grants a fresh one.
+  it('opens a fresh tab for a lost new chat only when the app answers reopen', async () => {
+    const input = { id: firstId, conversationId: null };
+    const h = await worker([input], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready', conversationId: null } } });
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, reopen: true }) }) : fetch(url, init));
+    await h.maintain();
+    await vi.waitFor(() => expect((h.localSaved.inputOpenings as Record<string, unknown> | undefined)?.[firstId]).toBeUndefined(), { timeout: 10_000, interval: 20 });
+    expect(h.create).not.toHaveBeenCalled();
+    await h.maintain();
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect((h.localSaved.inputOpenings as Record<string, unknown> | undefined)?.[firstId]).toMatchObject({ stage: expect.any(String) });
+  });
+
+  // CodeRabbit on #1980: an election saved under the old key must not come back after a restart.
+  it('forgets a lost opening saved under the old key too, so a restart does not report it again', async () => {
+    const input = { id: firstId, conversationId: null };
+    const h = await worker([input], undefined, { desktopInputTabs: { [firstId]: { tab: 7, stage: 'ready', conversationId: null } } });
+    expect(h.localSaved.desktopInputTabs).toBeUndefined();
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, reopen: true }) }) : fetch(url, init));
+    await h.maintain();
+    await vi.waitFor(() => expect((h.localSaved.inputOpenings as Record<string, unknown> | undefined)?.[firstId]).toBeUndefined(), { timeout: 10_000, interval: 20 });
+    const restarted = await worker([input], undefined, h.localSaved);
+    await restarted.maintain();
+    expect(restarted.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toBe(false);
+    expect(restarted.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not hold later input opening or the next maintenance pass behind a slow missing-tab report', async () => {
+    const inputs = [{ id: firstId, conversationId: null }, { id: secondId, conversationId: null }];
+    const h = await worker(inputs, undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready' } } });
+    const fetch = h.fetch.getMockImplementation()!;
+    let finish!: (response: any) => void;
+    const pending = new Promise<any>(resolve => { finish = resolve; });
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? pending : fetch(url, init));
+    try {
+      await h.maintain();
+      await vi.waitFor(() => expect(h.fetch.mock.calls.filter(([url]) =>
+        new URL(url).pathname === '/input/opening-unavailable')).toHaveLength(1));
+      // A slow bridge does not delay creation of an unrelated new chat.
+      expect(h.create).toHaveBeenCalledTimes(1);
+      await h.maintain();
+      expect(h.create).toHaveBeenCalledTimes(1);
+      expect(h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toHaveLength(1);
+      expect(h.localSaved.inputOpenings).toMatchObject({ [firstId]: { tab: 7, stage: 'ready' } });
+    } finally { finish({ ok: true, status: 200, json: async () => ({ ok: true }) }); }
+  });
+  it('bounds concurrent missing-tab reports and retries a failed report on a later pass', async () => {
+    const ids = [firstId, secondId, 'cccccccc-dddd-4eee-8fff-111111111111',
+      'dddddddd-eeee-4fff-8aaa-222222222222', 'eeeeeeee-ffff-4111-8bbb-333333333333'];
+    const inputs = ids.map(id => ({ id, conversationId: null }));
+    const openings = Object.fromEntries(ids.map((id, i) => [id, { tab: i + 7, stage: 'ready' }]));
+    const h = await worker(inputs, undefined, { inputOpenings: openings });
+    const fetch = h.fetch.getMockImplementation()!;
+    const finishes: Array<(response: any) => void> = [];
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? new Promise(resolve => { finishes.push(resolve); }) : fetch(url, init));
+    const reportCalls = () => h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/opening-unavailable');
+    const succeed = { ok: true, status: 200, json: async () => ({ ok: true }) };
+    try {
+      await h.maintain();
+      await vi.waitFor(() => expect(reportCalls()).toHaveLength(3));
+      expect(h.create).not.toHaveBeenCalled();
+      await h.maintain();
+      expect(reportCalls()).toHaveLength(3); // Same IDs are not reported twice in flight.
+      finishes[0]!({ ok: false, status: 503, json: async () => ({ error: 'temporarily_unavailable' }) });
+      await vi.waitFor(() => expect(finishes).toHaveLength(3));
+      await h.maintain();
+      await vi.waitFor(() => expect(reportCalls()).toHaveLength(4));
+      // The rejected first ID retries on the next normal pass; neither it nor
+      // the other queued work is held by the two outstanding bridge requests.
+      const body = JSON.parse(String(reportCalls()[3]![1]?.body));
+      expect(body.id).toBe(firstId);
+      expect(h.create).not.toHaveBeenCalled();
+    } finally { for (const finish of finishes) finish(succeed); }
+  });
+  it.each(['existing-unmarked', 'alternate-marker', 'unreadable-scan', 'ambiguous-create', 'unknown-stage', 'missing-tab-value'])('retains opening custody without a missing-tab report for %s', async scenario => {
+    const input = { id: firstId, conversationId: null };
+    const h = await worker([input], undefined, { inputOpenings: { [firstId]: {
+      tab: ['ambiguous-create', 'missing-tab-value'].includes(scenario) ? null : 7,
+      stage: scenario === 'ambiguous-create' ? 'opening' : scenario === 'unknown-stage' ? 'unknown' : 'ready'
+    } } });
+    if (scenario === 'existing-unmarked') h.tabs.push({ id: 7, url: 'https://example.com/' });
+    if (scenario === 'alternate-marker') h.tabs.push({ id: 8, url: `https://chatgpt.com/?cos-input=${firstId}` });
+    if (scenario === 'unreadable-scan') {
+      const query = h.query.getMockImplementation()!;
+      let allTabScans = 0;
+      h.query.mockImplementation(async (...args: any[]) => {
+        // The first all-tab scan belongs to ordinary window layout; refuse the
+        // later absence check without failing unrelated maintenance first.
+        if (args[0] && Object.keys(args[0]).length === 0 && ++allTabScans === 2) throw new Error('tab scan unavailable');
+        return query();
+      });
+    }
+    await h.maintain();
+    expect(h.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toBe(false);
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
   });
   it('spends input opening authority before creation and permits a new explicit operation', async () => {
     const inputs = [{ id: firstId, conversationId: null }];
@@ -2006,4 +2170,411 @@ it('releases departed-chat ownership so input claims and model discovery cannot 
   expect(h.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/models')).toBe(true);
   expect(h.localSaved.inputOpenings).toMatchObject({ [firstId]: { tab: 7, stage: 'ready' } });
   expect(h.create).not.toHaveBeenCalled();
+});
+
+it.each(['declined', 'unreachable'] as const)('retries a %s desktop input offer before the 30-second alarm', async mode => {
+  vi.useFakeTimers();
+  try {
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let attempts = 0;
+    h.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type !== 'clf-desktop-input') return { ok: true, ready: true };
+      attempts += 1;
+      if (attempts === 1) {
+        if (mode === 'unreachable') throw new Error('Receiving end does not exist');
+        return { ok: false };
+      }
+      inputs.length = 0;
+      return { ok: true };
+    });
+
+    await h.maintain();
+    expect(attempts).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 5000 });
+    expect(h.create).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('cancels a pending fast retry before it fires once the input is retired', async () => {
+  vi.useFakeTimers();
+  try {
+    // Positive control: keeping the input active after a declined offer triggers a fast retry at 1500 ms.
+    const activeInputs = [{ id: firstId, conversationId: secondId }];
+    const active = await worker(activeInputs);
+    active.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let activeOffers = 0;
+    active.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type !== 'clf-desktop-input') return { ok: true, ready: true };
+      activeOffers += 1;
+      if (activeOffers >= 2) activeInputs.length = 0;
+      return { ok: activeOffers >= 2 };
+    });
+    await active.maintain();
+    expect(activeOffers).toBe(1);
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(activeOffers).toBe(2), { timeout: 5000 });
+
+    // Retirement scenario: declining schedules a fast retry, then retiring removes it before firing.
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let retiredOffers = 0;
+    h.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') { retiredOffers += 1; return { ok: false }; }
+      return { ok: true, ready: true };
+    });
+
+    await h.maintain();
+    expect(retiredOffers).toBe(1);
+    inputs.length = 0;
+    await h.maintain();
+
+    const statusCallsBeforeAdvance = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const statusCallsAfterAdvance = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length;
+    expect(statusCallsAfterAdvance).toBe(statusCallsBeforeAdvance);
+    expect(retiredOffers).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('cancels a pending fast retry when the elected tab closes mid-backoff', async () => {
+  vi.useFakeTimers();
+  try {
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let offers = 0;
+    h.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') { offers += 1; return { ok: false }; }
+      return { ok: true, ready: true };
+    });
+
+    await h.maintain();
+    expect(offers).toBe(1);
+
+    h.tabs.splice(0, 1);
+    await h.maintain();
+
+    const statusCallsBeforeAdvance = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const statusCallsAfterAdvance = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length;
+    expect(statusCallsAfterAdvance).toBe(statusCallsBeforeAdvance);
+    expect(offers).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it.each(['accepted', 'rejected'] as const)('does not let an obsolete %s offer clear a replacement tab retry', async outcome => {
+  vi.useFakeTimers();
+  try {
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let resolveStale!: (value: { ok: boolean }) => void;
+    let rejectStale!: (reason?: unknown) => void;
+    const staleOffer = new Promise<{ ok: boolean }>((resolve, reject) => {
+      resolveStale = resolve;
+      rejectStale = reject;
+    });
+    let tab8Attempts = 0;
+    h.sendMessage.mockImplementation(async (tabId, message) => {
+      if (message.type !== 'clf-desktop-input') return { ok: true, ready: true };
+      if (tabId === 7) return staleOffer;
+      tab8Attempts += 1;
+      if (tab8Attempts === 1) return { ok: false };
+      inputs.length = 0;
+      return { ok: true };
+    });
+
+    await h.maintain();
+    // Tab 7 closes while its offer is still in flight; tab 8 takes over the election and declines.
+    h.tabs.splice(0, 1, { id: 8, url: `https://chatgpt.com/c/${secondId}` });
+    await h.maintain();
+    expect(tab8Attempts).toBe(1);
+
+    if (outcome === 'accepted') resolveStale({ ok: true });
+    else rejectStale(new Error('stale tab gone'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(tab8Attempts).toBe(2), { timeout: 5000 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('resets fast desktop input retry budget when unpair disconnects and reconnects', async () => {
+  vi.useFakeTimers();
+  try {
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    h.fetch.mockImplementation(async request => {
+      const path = new URL(request).pathname;
+      if (path === '/hello') return { ok: true, status: 200, json: async () => helloReply() };
+      if (path === '/pair') return { ok: true, status: 200, json: async () => ({ ok: true, token: 'reconnected-token' }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, inputs: [...inputs], inputOpeningIds: inputs.map(row => row.id), background: true }) };
+    });
+    let offers = 0;
+    h.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') { offers += 1; return { ok: false }; }
+      return { ok: true, ready: true };
+    });
+
+    await h.maintain();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(offers).toBe(5);
+
+    await h.unpair();
+    await h.pair();
+    await h.maintain();
+    expect(offers).toBe(6);
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(offers).toBe(7), { timeout: 5000 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('clears fast retries scheduled while unpair awaits browserController.revoke()', async () => {
+  vi.useFakeTimers();
+  try {
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    let revokeStarted = false;
+    let releaseRevoke!: () => void;
+    const revokePending = new Promise<void>(resolve => { releaseRevoke = resolve; });
+    const h = await worker(inputs, undefined, {}, {}, new Set(), {
+      revoke: async () => { revokeStarted = true; await revokePending; }
+    });
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    h.fetch.mockImplementation(async request => {
+      const path = new URL(request).pathname;
+      if (path === '/hello') return { ok: true, status: 200, json: async () => helloReply() };
+      if (path === '/pair') return { ok: true, status: 200, json: async () => ({ ok: true, token: 'reconnected-token' }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, inputs: [...inputs], inputOpeningIds: inputs.map(row => row.id), background: true }) };
+    });
+    let offers = 0;
+    let resolveInFlightOffer!: (value: { ok: boolean }) => void;
+    h.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type !== 'clf-desktop-input') return { ok: true, ready: true };
+      offers += 1;
+      if (offers === 5) return new Promise<{ ok: boolean }>(resolve => { resolveInFlightOffer = resolve; });
+      return { ok: false };
+    });
+
+    await h.maintain();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(offers).toBe(5);
+
+    const unpairing = h.unpair();
+    await vi.waitFor(() => expect(revokeStarted).toBe(true), { timeout: 5000 });
+
+    // Offer 5 settles as declined while revoke() is awaiting, attempting to latch exhausted retries.
+    resolveInFlightOffer({ ok: false });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    releaseRevoke();
+    await unpairing;
+
+    await h.pair();
+    await h.maintain();
+    expect(offers).toBe(6);
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(offers).toBe(7), { timeout: 5000 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('clears pending fast retries when latchAppDisconnect or reloadForExtensionUpdate runs mid-backoff', async () => {
+  vi.useFakeTimers();
+  try {
+    // App-initiated disconnect via /status { disconnected: true } clears mid-backoff retry and resets budget on reconnect.
+    const disconnectInputs = [{ id: firstId, conversationId: secondId }];
+    const d = await worker(disconnectInputs);
+    d.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let appDisconnected = false;
+    let disconnectOffers = 0;
+    d.fetch.mockImplementation(async request => {
+      const path = new URL(request).pathname;
+      if (path === '/hello') return { ok: true, status: 200, json: async () => helloReply() };
+      if (path === '/pair') return { ok: true, status: 200, json: async () => ({ ok: true, token: 'reconnected-token' }) };
+      if (appDisconnected) return { ok: false, status: 401, json: async () => ({ error: 'browser_disconnected' }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, inputs: [...disconnectInputs], inputOpeningIds: disconnectInputs.map(row => row.id), background: true }) };
+    });
+    d.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') { disconnectOffers += 1; return { ok: false }; }
+      return { ok: true, ready: true };
+    });
+
+    await d.maintain();
+    expect(disconnectOffers).toBe(1);
+    appDisconnected = true;
+    await d.maintain();
+    const statusAfterDisconnect = d.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(d.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length).toBe(statusAfterDisconnect);
+    appDisconnected = false;
+    await d.pair();
+    await d.maintain();
+    expect(disconnectOffers).toBe(2);
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(disconnectOffers).toBe(3), { timeout: 5000 });
+
+    // Extension auto-reload resumes a retry whose timer expired while /extension/update was pending and held, and clears retries once committed.
+    const reloadInputs = [{ id: firstId, conversationId: secondId }];
+    const r = await worker(reloadInputs);
+    r.setWorkerStamp('aaaaaaaaaaaa');
+    r.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let updateCommit = false;
+    let updateRequested = false;
+    let resolvePendingUpdate: ((value: any) => void) | null = null;
+    r.fetch.mockImplementation(async request => {
+      const path = new URL(request).pathname;
+      if (path === '/hello') return { ok: true, status: 200, json: async () => helloReply() };
+      if (path === '/extension/update') {
+        if (!updateCommit) {
+          updateRequested = true;
+          return {
+            ok: true, status: 200,
+            json: async () => new Promise(resolve => { resolvePendingUpdate = resolve; })
+          };
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true, build: 'bbbbbbbbbbbb', ready: true }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, inputs: [...reloadInputs], inputOpeningIds: reloadInputs.map(row => row.id), background: true }) };
+    });
+    let reloadOffers = 0;
+    r.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') { reloadOffers += 1; return { ok: false }; }
+      if (message.type === 'clf-recorder-ping') return { ok: true, busy: false };
+      return { ok: true, ready: true };
+    });
+
+    await r.maintain();
+    expect(reloadOffers).toBe(1);
+
+    const heldUpdate = r.reloadForExtensionUpdate({ build: 'bbbbbbbbbbbb', busy: false }, new Set(), new Set(), new Set());
+    await vi.waitFor(() => expect(updateRequested && resolvePendingUpdate !== null).toBe(true), { timeout: 5000 });
+    // Advance past the 1000 ms retry timer deadline while /extension/update is still in flight.
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(reloadOffers).toBe(1);
+
+    resolvePendingUpdate!({ ok: true, hold: 'app-busy' });
+    await heldUpdate;
+    expect(r.runtimeReload).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(reloadOffers).toBe(2), { timeout: 5000 });
+
+    updateCommit = true;
+    await r.reloadForExtensionUpdate({ build: 'bbbbbbbbbbbb', busy: false }, new Set(), new Set(), new Set());
+    expect(r.runtimeReload).toHaveBeenCalledTimes(1);
+    const statusBeforeAdvance = r.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(r.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/status').length).toBe(statusBeforeAdvance);
+
+    // Delayed offer reply that declines while /extension/update is pending still retries once the update holds.
+    const delayedInputs = [{ id: firstId, conversationId: secondId }];
+    const p = await worker(delayedInputs);
+    p.setWorkerStamp('aaaaaaaaaaaa');
+    p.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    let pendingUpdateRequested = false;
+    let resolveDelayedUpdate: ((value: any) => void) | null = null;
+    p.fetch.mockImplementation(async request => {
+      const path = new URL(request).pathname;
+      if (path === '/hello') return { ok: true, status: 200, json: async () => helloReply() };
+      if (path === '/extension/update') {
+        pendingUpdateRequested = true;
+        return {
+          ok: true, status: 200,
+          json: async () => new Promise(resolve => { resolveDelayedUpdate = resolve; })
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, inputs: [...delayedInputs], inputOpeningIds: delayedInputs.map(row => row.id), background: true }) };
+    });
+    let delayedOffers = 0;
+    let resolveFirstOffer: ((value: { ok: boolean }) => void) | null = null;
+    p.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') {
+        delayedOffers += 1;
+        if (delayedOffers === 1) return new Promise<{ ok: boolean }>(resolve => { resolveFirstOffer = resolve; });
+        return { ok: false };
+      }
+      if (message.type === 'clf-recorder-ping') return { ok: true, busy: false };
+      return { ok: true, ready: true };
+    });
+
+    await p.maintain();
+    await vi.waitFor(() => expect(resolveFirstOffer !== null).toBe(true), { timeout: 5000 });
+    const delayedHoldUpdate = p.reloadForExtensionUpdate({ build: 'bbbbbbbbbbbb', busy: false }, new Set(), new Set(), new Set());
+    await vi.waitFor(() => expect(pendingUpdateRequested && resolveDelayedUpdate !== null).toBe(true), { timeout: 5000 });
+
+    resolveFirstOffer!({ ok: false });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    resolveDelayedUpdate!({ ok: true, hold: 'app-busy' });
+    await delayedHoldUpdate;
+    expect(p.runtimeReload).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() => expect(delayedOffers).toBe(2), { timeout: 5000 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('bounds fast desktop input offer retries and clears pending retries once retired', async () => {
+  vi.useFakeTimers();
+  const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+  try {
+    const inputs = [{ id: firstId, conversationId: secondId }];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    h.fetch.mockImplementation(async request => ({
+      ok: true, status: 200,
+      json: async () => new URL(request).pathname === '/hello'
+        ? helloReply()
+        : { ok: true, inputs: [...inputs], inputOpeningIds: inputs.map(row => row.id), background: true }
+    }));
+    let offers = 0;
+    h.sendMessage.mockImplementation(async (_id, message) => {
+      if (message.type === 'clf-desktop-input') { offers += 1; return { ok: false }; }
+      return { ok: true, ready: true };
+    });
+
+    await h.maintain();
+    expect(offers).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(offers).toBe(5);
+
+    // Further maintain + decline keeps retry exhaustion logged once rather than repeating per decline.
+    await h.maintain();
+    expect(offers).toBe(6);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(offers).toBe(6);
+    expect(infoSpy.mock.calls.filter(([text]) => typeof text === 'string' && text.includes('fast retries exhausted'))).toHaveLength(1);
+
+    // A fresh maintain clears retry state once the input is retired.
+    inputs.length = 0;
+    await h.maintain();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(offers).toBe(6);
+  } finally {
+    infoSpy.mockRestore();
+    vi.useRealTimers();
+  }
 });

@@ -11,6 +11,7 @@
  * test/content-script.test.ts against the real content script.
  */
 
+import { BROWSER_PICKUP_ATTEMPT_LIMIT } from '../src/shared/recovery.js';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { recordLoopMcpProof } from './goal-mcp-proof.js';
 import * as prompts from '../src/shared/goal.js';
@@ -277,6 +278,94 @@ describe('what leaves this machine', () => {
     await appendEvent(own.id, { time: 120, source: 'extension', kind: 'assistant_message', turnId: 'own-turn', messageId: 'own-final', final: true,
       message: { text: fake, chars: fake.length, truncated: false } });
     expect(goal.templateDecisionText(await goal.conversationMessages(own.id))).toBe(fake);
+  });
+
+  // #2007: ChatGPT can keep writing commentary after its final answer in the same turn. The Offline
+  // marker check reads the final answer, not the last commentary.
+  it('reads the Offline marker from the final answer, not commentary written after it in the same turn (#2007)', async () => {
+    const session = await createSession({ title: 'offline commentary', conversationId: 'offline-commentary' });
+    const say = (time: number, messageId: string, text: string, final: boolean) => appendEvent(session.id, { time, source: 'extension', kind: 'assistant_message',
+      turnId: 'commentary-turn', messageId, final, message: { text, chars: text.length, truncated: false } });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Keep going', chars: 10, truncated: false } });
+    await say(110, 'c-before', 'Verifying the test results next.', false);
+    await say(120, 'c-final', 'Tests pass.\n[[COS_GOAL:CONTINUE]]', true);
+    await say(130, 'c-after-1', 'State consistency recovered.', false);
+    await say(140, 'c-after-2', 'Solver parameters tried; results look plausible.', false);
+    expect(goal.templateDecisionText(await goal.conversationMessages(session.id))).toBe('Tests pass.\n[[COS_GOAL:CONTINUE]]');
+    // A turn with only commentary (no final yet) still reads its last message, as before.
+    const open = await createSession({ title: 'only commentary', conversationId: 'only-commentary' });
+    await appendEvent(open.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Go', chars: 2, truncated: false } });
+    await appendEvent(open.id, { time: 110, source: 'extension', kind: 'assistant_message', turnId: 'open-turn', messageId: 'o-1', final: false,
+      message: { text: 'Working on it.', chars: 14, truncated: false } });
+    expect(goal.templateDecisionText(await goal.conversationMessages(open.id))).toBe('Working on it.');
+    // A final answer from an earlier turn is never borrowed across the user message that opened this one.
+    const later = await createSession({ title: 'earlier final', conversationId: 'earlier-final' });
+    await appendEvent(later.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'One', chars: 3, truncated: false } });
+    await appendEvent(later.id, { time: 110, source: 'extension', kind: 'assistant_message', turnId: 'l-1', messageId: 'l-final', final: true,
+      message: { text: 'Done.\n[[COS_GOAL:COMPLETE]]', chars: 27, truncated: false } });
+    await appendEvent(later.id, { time: 120, source: 'extension', kind: 'user_message', message: { text: 'Two', chars: 3, truncated: false } });
+    await appendEvent(later.id, { time: 130, source: 'extension', kind: 'assistant_message', turnId: 'l-2', messageId: 'l-c', final: false,
+      message: { text: 'Starting step two.', chars: 18, truncated: false } });
+    expect(goal.templateDecisionText(await goal.conversationMessages(later.id))).toBe('Starting step two.');
+    // A Retry reuses the question: the earlier generation's final answer stays recorded before the new
+    // generation's commentary, and is never read for the new one (CodeRabbit on #2014).
+    const retried = await createSession({ title: 'retried', conversationId: 'retried-turn' });
+    await appendEvent(retried.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Go', chars: 2, truncated: false } });
+    await appendEvent(retried.id, { time: 110, source: 'extension', kind: 'assistant_message', turnId: 'gen-1', messageId: 'r-final', final: true,
+      message: { text: 'Done.\n[[COS_GOAL:COMPLETE]]', chars: 27, truncated: false } });
+    await appendEvent(retried.id, { time: 120, source: 'extension', kind: 'assistant_message', turnId: 'gen-2', messageId: 'r-c', final: false,
+      message: { text: 'Trying again.', chars: 13, truncated: false } });
+    expect(goal.templateDecisionText(await goal.conversationMessages(retried.id))).toBe('Trying again.');
+    // Much commentary after the final answer: the context cut keeps the final answer (CodeRabbit on #2014).
+    const long = await createSession({ title: 'long commentary', conversationId: 'long-commentary' });
+    await appendEvent(long.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Go', chars: 2, truncated: false } });
+    await appendEvent(long.id, { time: 101, source: 'extension', kind: 'assistant_message', turnId: 'long-turn', messageId: 'long-final', final: true,
+      message: { text: 'All done.\n[[COS_GOAL:CONTINUE]]', chars: 31, truncated: false } });
+    for (let n = 0; n < 130; n++) await appendEvent(long.id, { time: 102 + n, source: 'extension', kind: 'assistant_message', turnId: 'long-turn',
+      messageId: `long-c-${n}`, final: false, message: { text: `Note ${n}.`, chars: 8, truncated: false } });
+    const longMessages = await goal.conversationMessages(long.id);
+    expect(longMessages.length).toBeLessThanOrEqual(120);
+    expect(goal.templateDecisionText(longMessages)).toBe('All done.\n[[COS_GOAL:CONTINUE]]');
+  });
+
+  // CodeRabbit on #2014: the final answer must not take a user correction's place in the helper's context.
+  it('keeps user corrections in the context and still reads the Offline marker when the final answer does not fit', async () => {
+    const session = await createSession({ title: 'corrections first', conversationId: 'corrections-first' });
+    const user = (time: number, text: string) => appendEvent(session.id, { time, source: 'extension', kind: 'user_message', message: { text, chars: text.length, truncated: false } });
+    await user(100, 'O'.repeat(48_000));
+    await user(110, 'A'.repeat(48_000));
+    await user(120, 'B'.repeat(10_000));
+    const final = `${'F'.repeat(11_900)}\n[[COS_GOAL:CONTINUE]]`;
+    await appendEvent(session.id, { time: 130, source: 'extension', kind: 'assistant_message', turnId: 'cf-turn', messageId: 'cf-final', final: true,
+      message: { text: final, chars: final.length, truncated: false } });
+    await appendEvent(session.id, { time: 140, source: 'extension', kind: 'assistant_message', turnId: 'cf-turn', messageId: 'cf-after', final: false,
+      message: { text: 'C'.repeat(12_000), chars: 12_000, truncated: false } });
+    const messages = await goal.conversationMessages(session.id);
+    expect(messages.filter(message => message.role === 'user').map(message => message.content[0])).toEqual(['O', 'A', 'B']);
+    expect(goal.templateDecisionText(messages)).toBe(final);
+  });
+
+  // CodeRabbit on #2014: a reload can record the same commentary again without its turn. The store keeps a
+  // stable message's first turn, so the marker is still read from the final answer.
+  it('keeps the turn of a message re-recorded without it, by its exact message id', async () => {
+    const { upsertMessageEvent } = await import('../src/main/session/store.js');
+    const session = await createSession({ title: 'reloaded commentary', conversationId: 'reloaded-commentary' });
+    const say = (time: number, messageId: string, text: string, final: boolean, turnId?: string) => upsertMessageEvent(session.id, { time, source: 'extension',
+      kind: 'assistant_message', ...(turnId ? { turnId } : {}), messageId, final, message: { text, chars: text.length, truncated: false } });
+    await appendEvent(session.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Keep going', chars: 10, truncated: false } });
+    await say(110, 'r-final', 'Tests pass.\n[[COS_GOAL:CONTINUE]]', true, 'reload-turn');
+    await say(120, 'r-after', 'Checking the logs.', false, 'reload-turn');
+    await say(130, 'r-after', 'Checking the logs once more.', false);
+    expect(goal.templateDecisionText(await goal.conversationMessages(session.id))).toBe('Tests pass.\n[[COS_GOAL:CONTINUE]]');
+    // A different message recorded without a turn has no identity tying it to the earlier answer: it is
+    // read as its own, as before, rather than borrowing that answer's marker by position.
+    const loose = await createSession({ title: 'loose commentary', conversationId: 'loose-commentary' });
+    await appendEvent(loose.id, { time: 100, source: 'extension', kind: 'user_message', message: { text: 'Go', chars: 2, truncated: false } });
+    await appendEvent(loose.id, { time: 110, source: 'extension', kind: 'assistant_message', turnId: 'loose-turn', messageId: 'l-final', final: true,
+      message: { text: 'Done.\n[[COS_GOAL:COMPLETE]]', chars: 27, truncated: false } });
+    await appendEvent(loose.id, { time: 120, source: 'extension', kind: 'assistant_message', messageId: 'l-other', final: false,
+      message: { text: 'Something else.', chars: 15, truncated: false } });
+    expect(goal.templateDecisionText(await goal.conversationMessages(loose.id))).toBe('Something else.');
   });
 
   // 2.1.43, live on Windows: a Goal step split by two fresh turns ran its five commands as 2 + 2 + 1.
@@ -2094,7 +2183,7 @@ describe('a chat driven towards a specific goal', () => {
     expect(goal.goalPendingReplyFor('invalid-provisional')).toBeNull();
   });
 
-  it('persists the three-reload Goal pickup stop and refuses a fourth attempt after restore', async () => {
+  it('persists the Goal pickup stop after three reloads and keeps retrying slowly, across a restore, up to the bound', async () => {
     const conversationId = 'goal-pickup-bound';
     const session = await createSession({ title: 'Bounded Goal pickup', conversationId });
     const acceptedAt = Date.now();
@@ -2105,14 +2194,36 @@ describe('a chat driven towards a specific goal', () => {
       .toEqual({ attempts: 1, nextAt: acceptedAt + 420_000 });
     expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 420_000, acceptedAt + 1_020_000))
       .toEqual({ attempts: 2, nextAt: acceptedAt + 1_020_000 });
-    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_020_000, acceptedAt + 1_920_000))
-      .toEqual({ attempts: 3, stoppedAt: acceptedAt + 1_020_000 });
+    // The third reload shows the chat as stopped, and the first slow retry is already due 15 minutes later.
+    const slow = acceptedAt + 1_020_000 + 15 * 60_000;
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_020_000, slow))
+      .toEqual({ attempts: 3, nextAt: slow, stoppedAt: acceptedAt + 1_020_000 });
 
     const saved = goal.snapshotGoalReplies();
     goal.resetGoalStateForTests();
     goal.restoreGoalReplies(saved);
-    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ pickupAttempts: 3, pickupStoppedAt: acceptedAt + 1_020_000 });
-    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_920_000)).toBeNull();
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ pickupAttempts: 3, pickupNextAt: slow, pickupStoppedAt: acceptedAt + 1_020_000 });
+    // The slow retry after the restore keeps the first stop time.
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', slow, slow + 30 * 60_000))
+      .toEqual({ attempts: 4, nextAt: slow + 30 * 60_000, stoppedAt: acceptedAt + 1_020_000 });
+    // Never more than the hard bound.
+    for (let attempt = 5; attempt <= BROWSER_PICKUP_ATTEMPT_LIMIT; attempt++)
+      expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', slow + attempt, slow + attempt + 1)).toMatchObject({ attempts: attempt });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', slow + 100)).toBeNull();
+  });
+
+  // CodeRabbit on #1979: the sweep and the person's click can both find the same retry due.
+  it('reserves a Goal pickup retry only for the attempt count the caller saw', async () => {
+    const conversationId = 'goal-pickup-race';
+    const session = await createSession({ title: 'Goal pickup race', conversationId });
+    const at = Date.now();
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'goal-reply-race',
+      turnId: 'goal-turn-race', eventSeq: 7, blocked: false });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-race', at, at + 1, 0)).toMatchObject({ attempts: 1 });
+    // The second pass read zero too: it reserves nothing, and the count stays at one.
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-race', at, at + 1, 0)).toBeNull();
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ pickupAttempts: 1 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-race', at, at + 1, 1)).toMatchObject({ attempts: 2 });
   });
 
   it('upgrades a decided provisional turn to the stable reply without reopening it', async () => {
@@ -2484,6 +2595,23 @@ describe('a chat driven towards a specific goal', () => {
     expect(await goal.setGoalSwitchNow('c-switch-loud', 'loop', true)).toEqual({ enabled: true, mode: 'loop' });
   });
 
+  // #1882: a Loop that read Normal after a move could not be traced to who turned it off.
+  it('logs each change of one chat\'s switch once, with where it came from', async () => {
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
+    const lines = () => info.mock.calls.map(([line]) => String(line)).filter(line => line.startsWith('goal: c-switch-said '));
+    await goal.setGoalSwitchNow('c-switch-said', 'loop', true, undefined, 'the app');
+    await goal.setGoalSwitchNow('c-switch-said', 'loop', true, undefined, 'the ChatGPT page');
+    await goal.setGoalSwitchNow('c-switch-said', 'loop', false, undefined, 'a Stop sent by the control API');
+    await goal.setGoalSwitchNow('c-switch-said', 'goal', true);
+    expect(lines()).toEqual([
+      'goal: c-switch-said switched to loop by the app',
+      'goal: c-switch-said switched to Normal by a Stop sent by the control API',
+      'goal: c-switch-said switched to goal'
+    ]);
+    info.mockRestore();
+  });
+
   it('carries one chat\'s switch across a snapshot, a restore and a resume', async () => {
     await goal.setGoalSwitchNow('c-switch-parent', 'loop', true);
     const saved = goal.snapshotGoalSwitches();
@@ -2495,13 +2623,25 @@ describe('a chat driven towards a specific goal', () => {
 
     // Compact & Resume replaces the conversation and the loop goes on running in its
     // replacement; leaving the override behind would hand chat B back to the app-wide setting.
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
     expect(goal.moveGoalSwitch('c-switch-parent', 'c-switch-child')).toBe(true);
+    // #1882: said, so a page that later shows another mode can be compared.
+    expect(info).toHaveBeenCalledWith("goal: c-switch-parent's own loop switch moved to c-switch-child (Compact & Resume)");
+    info.mockRestore();
     expect(goal.goalSwitchFor('c-switch-parent').own).toBe(false);
     expect(goal.goalSwitchFor('c-switch-child')).toEqual({ enabled: true, mode: 'loop', own: true, afterTurn: false });
 
     // The app's own switch going off is the master stop and reaches every override there is.
+    const cleared = vi.spyOn(logger, 'logInfo');
     goal.clearAllGoalSwitches();
     expect(goal.goalSwitchFor('c-switch-child').own).toBe(false);
+    expect(cleared.mock.calls.map(([line]) => String(line)).filter(line => line.includes('went back to the app-wide setting')))
+      .toEqual([expect.stringMatching(/^goal: the app's own switch was turned off; [1-9]\d* chat\(s\) went back to the app-wide setting$/)]);
+    // Nothing left to clear: nothing is said.
+    goal.clearAllGoalSwitches();
+    expect(cleared.mock.calls.filter(([line]) => String(line).includes('went back to the app-wide setting'))).toHaveLength(1);
+    cleared.mockRestore();
   });
 
   /**
@@ -3360,5 +3500,20 @@ describe('the original request reaches the helper verbatim', () => {
     expect(original?.content).toMatch(/\d+ characters omitted/);
     expect(original!.content.length).toBeLessThan(20_300);
     expect(box.system.some(content => content.includes('[… cut …]'))).toBe(false);
+  });
+});
+
+// 2026-11-01, the maintainer's Mac: a Loop drafted by a ChatGPT helper on GPT-6 at extra-high reasoning timed
+// out at three minutes five times in a row over a long transcript. A helper that thinks longer gets longer.
+describe('how long a Goal or Loop draft may take', () => {
+  it('follows the ChatGPT helper reasoning and keeps three minutes for API backends', async () => {
+    const config = getConfig();
+    try {
+      for (const [effort, minutes] of [['low', 3], ['medium', 3], ['high', 5], ['xhigh', 12], ['max', 12], ['pro', 20]] as const) {
+        await saveConfig({ ...config, goal: { ...config.goal, helperReasoning: effort } });
+        expect(goal.goalRequestTimeoutMs('chatgpt'), effort).toBe(minutes * 60_000);
+        expect(goal.goalRequestTimeoutMs('api'), effort).toBe(3 * 60_000);
+      }
+    } finally { await saveConfig(config); }
   });
 });

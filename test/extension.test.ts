@@ -40,8 +40,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(14);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 14;');
+    expect(BRIDGE_PROTOCOL).toBe(15);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 15;');
   });
 
   /**
@@ -529,6 +529,8 @@ function loadWorker(options: {
   >;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
   windowsGet?: (windowId: number) => Promise<{ focused?: boolean }>;
+  /** A Chrome debugger API: the worker then keeps background tabs rendering with the real active-tabs.js. */
+  debuggerApi?: Record<string, unknown>;
   /** Chrome's tab-group API with these groups; omitted, the browser has none. */
   tabGroups?: Array<{ id: number; windowId: number; title?: string; collapsed?: boolean }>;
 }): WorkerHarness {
@@ -665,7 +667,11 @@ function loadWorker(options: {
   const fetch = options.fetch ?? (async () => response(503, {}));
   // This legacy VM harness exercises non-debugger hosts. The real MV3 entry fixture
   // separately loads the unchanged module graph and verifies browser registration.
-  vm.runInNewContext(backgroundSource.replace(/^import .*$/gm, ''), {
+  if (options.debuggerApi) (chrome as Record<string, unknown>).debugger = options.debuggerApi;
+  const activeTabsSource = options.debuggerApi ? readFileSync('extension/active-tabs.js', 'utf8').replace('export function', 'function') : '';
+  vm.runInNewContext(activeTabsSource + backgroundSource.replace(/^import .*$/gm, ''), {
+    // The browser-control module is imported in the real worker; with a debugger it is asked for one.
+    ...(options.debuggerApi ? { createBrowserControl: () => ({ pump: async () => undefined, event: async () => undefined }) } : {}),
     chrome,
     fetch,
     AbortController,
@@ -1568,6 +1574,55 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     }
   );
 
+  // 2026-11-01, the maintainer's Mac: a Loop chat's repairs were handed out ten times and never claimed, twice,
+  // and the app stopped recovering it. Each status pass waited for the rendering leases (a debugger command to
+  // every background chat tab, without a time limit) before it looked at its repairs. A lease that never answers
+  // or fails to release must not keep recovery waiting.
+  it.each(['hangs', 'cannot release'] as const)('performs a handed repair when keeping tabs rendering %s', async mode => {
+    let armed = false;
+    let handed = false;
+    const trace: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/repairs/claim') { trace.push('claim'); return response(200, { allowed: true }); }
+      if (url.pathname === '/status') {
+        if (url.searchParams.has('repaired')) trace.push('repaired');
+        // Released once the repair is due: a lease whose release keeps failing rejected every later pass.
+        const leased = mode === 'hangs' || !armed ? [CHAT] : [];
+        if (!armed || handed) return response(200, { nonDiscardableConversations: leased, repairs: [] });
+        handed = true;
+        return response(200, { nonDiscardableConversations: leased,
+          repairs: [{ conversationId: CHAT, token: 'stuck-lease', reason: 'assistant-error', requiresClaim: true }] });
+      }
+      return response(200, {});
+    });
+    const debuggerApi = {
+      attach: vi.fn(async () => undefined),
+      detach: vi.fn(async () => { throw new Error('detach failed'); }),
+      getTargets: vi.fn(async () => [{ tabId: 21, attached: true }]),
+      sendCommand: vi.fn(() => mode === 'hangs' ? new Promise(() => undefined) : Promise.resolve({})),
+      onDetach: { addListener: () => undefined },
+      onEvent: { addListener: () => undefined }
+    };
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch, debuggerApi,
+      tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+      tabsSendMessage: async (_id, message) => message.type === 'clf-repair-check'
+        ? { safe: true, revision: 1, turnId: 'source', questionId: 'question' }
+        : message.type === 'clf-page-status' ? { ok: true, conversationId: CHAT } : { ok: true },
+      tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }] });
+    await worker.registerTab(21);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+    await worker.fireAlarm();
+    armed = true;
+    // Alarms keep coming, as Chrome's do; a pass still running takes none. Each lease change waits at most
+    // three seconds, so the repair follows instead of never.
+    const alarms = setInterval(() => void worker.fireAlarm(), 1000);
+    try { await vi.waitFor(() => expect(trace).toContain('repaired'), { timeout: 25_000 }); } finally { clearInterval(alarms); }
+    expect(trace).toContain('claim');
+    expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+  }, 40_000);
+
   it.each([
     { page: 'still loading', status: 'loading', answers: false, reload: false },
     { page: 'answering', status: 'complete', answers: true, reload: false },
@@ -1625,6 +1680,40 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     await worker.fireAlarm();
     expect(reports).toEqual(['held-attempt:sending']);
     expect(worker.tabsReload).not.toHaveBeenCalled();
+  });
+
+  // #2074: the page is told which texts the app sent by itself, and a cleared leftover is reported.
+  it("hands the page the app's own sent texts for its check, and tells the app it cleared one", async () => {
+    let handed = false;
+    const cleared: string[] = [];
+    const checks: Array<Record<string, unknown>> = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/repairs/claim') return response(200, { allowed: false });
+      if (url.pathname === '/status') {
+        if (url.searchParams.has('repairCleared')) cleared.push(url.searchParams.get('repairCleared')!);
+        if (handed) return response(200, { repairs: [] });
+        handed = true;
+        return response(200, { repairs: [{ conversationId: CHAT, token: 'own-leftover', reason: 'silence', requiresClaim: true,
+          ownSent: [{ text: 'Continue with the task', messageId: 'm-continue' }, { text: 'no id' }] }] });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+      tabsSendMessage: async (_id, message) => {
+        if (message.type !== 'clf-repair-check') return { ok: true };
+        checks.push(message);
+        return { safe: true, cleared: 'own-sent' };
+      },
+      tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }] });
+    await worker.registerTab(21);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+    await worker.fireAlarm();
+    expect(checks[0]).toMatchObject({ conversationId: CHAT, ownSent: [{ text: 'Continue with the task', messageId: 'm-continue' }] });
+    expect((checks[0]!.ownSent as unknown[]).length).toBe(1);
+    expect(cleared).toEqual(['own-leftover']);
   });
 
   /**
@@ -2183,6 +2272,33 @@ describe('active agent tab discard protection', () => {
     }
   });
 
+  // CodeRabbit on #2027: taking a chat is not showing it. A show that fails is reported, so the app can
+  // show it again instead of counting it as done.
+  it('reports a chat it could not show', async () => {
+    const TARGET = 'dddddddd-eeee-4fff-8aaa-444444444444';
+    const failed: string[] = [];
+    let handed = false;
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch: vi.fn(async (input: string, init?: Record<string, unknown>) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/reveal/failed') { failed.push(JSON.parse(String(init?.body)).conversationId); return response(200, { ok: true }); }
+        if (url.pathname === '/status') {
+          const reveals = handed ? [] : [TARGET];
+          handed = true;
+          return response(200, { ok: true, repairs: [], reveals });
+        }
+        return response(404, {});
+      }),
+      tabsQuery: async () => [{ id: 5, windowId: 7, url: `https://chatgpt.com/c/${TARGET}`, status: 'complete' }]
+    });
+    worker.windowsUpdate.mockRejectedValue(new Error('No window with id: 7.'));
+    await worker.fireAlarm();
+    await vi.waitFor(() => expect(failed).toEqual([TARGET]), { timeout: 5_000 });
+  });
+
   it.each([
     ['adopts its mirrored window after an extension reload', true],
     ['refuses a mirrored window that also holds a non-ChatGPT tab', false]
@@ -2451,7 +2567,8 @@ describe('active agent tab discard protection', () => {
 
   it.each([
     ['selects its tab in the Background chats window', 'dddddddd-eeee-4fff-8aaa-777777777777', 12],
-    ['leaves a chat whose only tab is in the user\'s window alone', 'dddddddd-eeee-4fff-8aaa-888888888888', null]
+    ['leaves a chat whose only tab is in the user\'s window alone', 'dddddddd-eeee-4fff-8aaa-888888888888', null],
+    ['discards the follow for a closed chat tab without recreating it', 'dddddddd-eeee-4fff-8aaa-999999999999', null]
   ])('follows the chat selected in the app: %s (#1249)', async (_name, target, selected) => {
     const BACKGROUND = 9;
     let handed = false;
@@ -2556,6 +2673,107 @@ describe('active agent tab discard protection', () => {
     expect(await worker.send({ type: 'command_step', id: 'cmd-steps', client: 'doc-1', step: 'model', text: 'never forwarded' }, 41))
       .toEqual({ ok: true });
     expect(steps).toEqual([{ id: 'cmd-steps', client: 'doc-1', step: 'model' }]);
+    const modelSelection = { phase: 'select-effort', outcome: 'pending' };
+    expect(await worker.send({ type: 'command_step', id: 'cmd-steps', client: 'doc-1', step: 'model-diagnostic', modelSelection, text: 'never forwarded' }, 41))
+      .toEqual({ ok: true });
+    await vi.waitFor(() => expect(steps.at(-1)).toEqual({ id: 'cmd-steps', client: 'doc-1', step: 'model-diagnostic', modelSelection }));
+    await worker.send({ type: 'command_step', id: 'cmd-steps', client: 'doc-1', step: 'model-diagnostic', modelSelection: { pageText: 'x'.repeat(8193) } }, 41);
+    await vi.waitFor(() => expect(steps.at(-1)).toEqual({ id: 'cmd-steps', client: 'doc-1', step: 'model-diagnostic' }));
+  });
+
+  it('coalesces model diagnostics without delaying a resume permit or command ACK', async () => {
+    const reports: any[] = [], critical: string[] = [], work: Promise<unknown>[] = [];
+    let release = () => {};
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(),
+      tabsGet: async () => ({ id: 41, url: 'https://chatgpt.com/' }),
+      fetch: async (input, init = {}) => {
+        const route = new URL(input).pathname, body = JSON.parse(String(init.body || '{}'));
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/commands/step' && body.step === 'model-diagnostic') {
+          reports.push(body.modelSelection);
+          if (reports.length === 1) return new Promise(resolve => { release = () => resolve(response(200, { ok: true })); });
+        }
+        if (route === '/compact' || route === '/commands/ack') critical.push(route);
+        return response(200, { ok: true, allowed: true });
+      } });
+    await worker.registerTab(41);
+    const report = (attempt: number, outcome: string, phase = 'select-effort') => worker.send({
+      type: 'command_step', id: 'cmd-steps', client: 'doc-1', step: 'model-diagnostic', modelSelection: { attempt, outcome, phase }
+    }, 41);
+    try {
+      work.push(report(1, 'pending'));
+      await vi.waitFor(() => expect(reports).toHaveLength(1));
+      for (let i = 0; i < 30; i++) work.push(report(1, 'pending'));
+      work.push(report(1, 'failed', 'close'), report(1, 'pending'), report(2, 'pending'),
+        report(2, 'confirmed', 'close'), report(2, 'pending'), report(1, 'failed', 'close'));
+      work.push(worker.send({ type: 'compact', token: '0123456789abcdef0123456789abcdef',
+        commandId: 'cmd-steps', client: 'doc-1', destinationAttempt: true }, 41));
+      work.push(worker.send({ type: 'ack', id: 'cmd-steps', client: 'doc-1', status: 'failed' }, 41));
+      await vi.waitFor(() => expect(critical).toEqual(['/compact', '/commands/ack']));
+      expect(reports).toHaveLength(1);
+      release();
+      await Promise.all(work);
+      await vi.waitFor(() => expect(reports).toHaveLength(2));
+      expect(reports[1]).toEqual({ attempt: 2, outcome: 'confirmed', phase: 'close' });
+    } finally { release(); await Promise.allSettled(work); }
+  });
+
+  it.each(['navigation', 'disconnect'])('discards queued model diagnostics after %s', async change => {
+    const reports: unknown[] = [];
+    let release = () => {};
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (route === '/commands/step') {
+          reports.push(JSON.parse(String(init.body || '{}')));
+          if (reports.length === 1) return new Promise(resolve => { release = () => resolve(response(200, { ok: true })); });
+        }
+        return response(200, { ok: true });
+      } });
+    await worker.registerTab(41);
+    const message = { type: 'command_step', id: 'cmd-steps', client: 'doc-1', step: 'model-diagnostic',
+      modelSelection: { attempt: 1, outcome: 'pending' } };
+    const first = worker.send(message, 41);
+    let queued: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(reports).toHaveLength(1));
+      queued = worker.send({ ...message, modelSelection: { attempt: 1, outcome: 'failed' } }, 41);
+      expect(await queued).toEqual({ ok: true });
+      if (change === 'navigation') {
+        await worker.registerTab(41, 'replacement-document');
+        expect(await worker.send(message, 41, 'document-41-0')).toMatchObject({ ok: false, error: 'stale_document' });
+      } else await worker.sendPopup({ type: 'unpair' });
+      release();
+      await first;
+      // A following critical request settles after the already-released diagnostic continuation.
+      await worker.send({ type: 'command_step', id: 'cmd-other', client: 'doc-2', step: 'model' }, 42);
+      expect(reports.filter((entry: any) => entry.id === 'cmd-steps')).toHaveLength(1);
+    } finally { release(); await Promise.allSettled([first, ...(queued ? [queued] : [])]); }
+  });
+
+  it('rechecks a model diagnostic document after asynchronous bridge discovery', async () => {
+    const reports: unknown[] = [];
+    let release: (() => void) | undefined;
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return new Promise(resolve => {
+          release = () => resolve(response(200, { app: 'chat-on-steroids', paired: true }));
+        });
+        if (route === '/commands/step') reports.push(JSON.parse(String(init.body || '{}')));
+        return response(200, { ok: true });
+      } });
+    await worker.registerTab(41);
+    try {
+      expect(await worker.send({ type: 'command_step', id: 'cmd-stale', client: 'doc-1', step: 'model-diagnostic',
+        modelSelection: { attempt: 1, outcome: 'pending' } }, 41)).toEqual({ ok: true });
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      await worker.registerTab(41, 'replacement-document');
+      release!();
+      await worker.send({ type: 'command_step', id: 'cmd-current', client: 'doc-2', step: 'model' }, 42);
+      expect(reports).toEqual([{ id: 'cmd-current', client: 'doc-2', step: 'model' }]);
+    } finally { release?.(); }
   });
 
   it('protects a newly created input tab until its conversation binds', async () => {
@@ -2589,19 +2807,27 @@ describe('active agent tab discard protection', () => {
 });
 
 describe('app-owned retained tab pool', () => {
+  // Use the exact original queue when running the fail-first test against
+  // unpatched main; include the optional guard only when the patch is present.
+  const closeQueueCode = () => {
+    const guarded = backgroundSource.indexOf('async function verifiedConversationGone(');
+    return backgroundSource.slice(guarded < 0 ? backgroundSource.indexOf('async function enqueueClose(') : guarded,
+      backgroundSource.indexOf('\n/**\n * Removes one tab'));
+  };
   it('keeps a later manual close queued when an older automatic close response arrives', async () => {
     const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000071';
     let release!: () => void;
     const first = new Promise<void>(resolve => { release = resolve; });
     const bodies: Array<{ manual: boolean }> = [];
-    const code = backgroundSource.slice(backgroundSource.indexOf('async function enqueueClose('),
-      backgroundSource.indexOf('\n/**\n * Removes one tab'));
+    const code = closeQueueCode();
     const outbox = vm.runInNewContext(`${code}\n({enqueueClose, drainCloses})`, {
       cleanConversationId: (id: string) => id, recoveryMonitoring: false,
-      closeOutbox: [], closing: false, token: 'paired',
+      closeOutbox: [], closeOutboxDecision: null, closing: false, token: 'paired',
       load: async () => undefined, persistLive: async () => undefined,
       scheduleRetry: () => undefined, clearRetryIfIdle: () => undefined,
       conversationStillOpen: () => false,
+      chrome: { tabs: { query: async () => [] } }, CHATGPT_TAB_URLS: ['*://chatgpt.com/*'],
+      conversationFromUrl: () => null,
       call: async (_route: string, init: { body: string }) => {
         bodies.push(JSON.parse(init.body));
         if (bodies.length === 1) await first;
@@ -2616,6 +2842,102 @@ describe('app-owned retained tab pool', () => {
     expect(await draining).toMatchObject({ pending: 1 });
     expect(await outbox.drainCloses()).toMatchObject({ pending: 0 });
     expect(bodies).toEqual([{ conversationId, manual: false }, { conversationId, manual: true }]);
+  });
+
+  it('does not report a deliberate close when Chrome still has the chat after the worker cache loses its binding', async () => {
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000072';
+    const closed = vi.fn(async () => ({ ok: true }));
+    const info = vi.fn();
+    const report = vi.fn();
+    let tabOpen = true;
+    const code = closeQueueCode();
+    const api = vm.runInNewContext(`${code}\n({enqueueClose, drainCloses, queued: () => closeOutbox})`, {
+      closeOutbox: [], closeOutboxDecision: null, closing: false, token: 'paired', recoveryMonitoring: false,
+      cleanConversationId: (id: string) => id, load: async () => undefined,
+      persistLive: async () => undefined, scheduleRetry: () => undefined,
+      clearRetryIfIdle: () => undefined, conversationStillOpen: () => false,
+      CHATGPT_TAB_URLS: ['https://chatgpt.com/*'],
+      chrome: { tabs: { query: async () => tabOpen ? [{ id: 2, url: `https://chatgpt.com/c/${chat}` }] : [] } },
+      conversationFromUrl: (url: string) => new URL(url).pathname.split('/c/')[1], call: closed,
+      console: { info }, publishCompanionDiagnostics: report
+    });
+    await api.enqueueClose(chat);
+    expect(await api.drainCloses()).toMatchObject({ pending: 1 });
+    expect(api.queued()).toHaveLength(1);
+    expect(closed).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledWith('close outbox: deferred close; chrome_tab_open');
+    expect(report).toHaveBeenCalledTimes(1);
+    // A streaming answer can drain the close outbox after every event batch.
+    // Rechecking an unchanged open tab must not spam diagnostics or the app log.
+    expect(await api.drainCloses()).toMatchObject({ pending: 1 });
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(report).toHaveBeenCalledTimes(1);
+    // A late true departure must still be reported: the close was deferred,
+    // not dropped just because the tab was visible before navigation.
+    tabOpen = false;
+    expect(await api.drainCloses()).toMatchObject({ pending: 0 });
+    expect(closed).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the close queued if Chrome cannot provide the tab list', async () => {
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000073';
+    const closed = vi.fn(async () => ({ ok: true }));
+    const info = vi.fn();
+    const code = closeQueueCode();
+    const api = vm.runInNewContext(`${code}\n({enqueueClose, drainCloses, queued: () => closeOutbox})`, {
+      closeOutbox: [], closeOutboxDecision: null, closing: false, token: 'paired', recoveryMonitoring: false,
+      cleanConversationId: (id: string) => id, load: async () => undefined,
+      persistLive: async () => undefined, scheduleRetry: () => undefined,
+      clearRetryIfIdle: () => undefined, conversationStillOpen: () => false,
+      CHATGPT_TAB_URLS: ['https://chatgpt.com/*'],
+      chrome: { tabs: { query: async () => { throw new Error('Chrome restarting'); } } },
+      conversationFromUrl: () => null, call: closed, console: { info }
+    });
+    await api.enqueueClose(chat);
+    expect(await api.drainCloses()).toMatchObject({ pending: 1 });
+    expect(api.queued()).toHaveLength(1);
+    expect(closed).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledWith('close outbox: deferred close; chrome_inventory_unavailable');
+  });
+
+  it('reports one diagnostic per changed reason for the same pending close', async () => {
+    const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000074';
+    const info = vi.fn(), report = vi.fn(), close = vi.fn(async () => ({ ok: true }));
+    let browser = 'open';
+    const api = vm.runInNewContext(`${closeQueueCode()}\n({enqueueClose, drainCloses})`, {
+      closeOutbox: [], closeOutboxDecision: null, closing: false, token: 'paired', recoveryMonitoring: false,
+      cleanConversationId: (id: string) => id, load: async () => undefined,
+      persistLive: async () => undefined, scheduleRetry: () => undefined,
+      clearRetryIfIdle: () => undefined, conversationStillOpen: () => false,
+      CHATGPT_TAB_URLS: ['https://chatgpt.com/*'],
+      chrome: { tabs: { query: async () => {
+        if (browser === 'error') throw Error('Chrome restarting');
+        return browser === 'open' ? [{ url: `https://chatgpt.com/c/${chat}` }] : [];
+      } } },
+      conversationFromUrl: (url: string) => new URL(url).pathname.split('/c/')[1],
+      call: close, console: { info }, publishCompanionDiagnostics: report
+    });
+    await api.enqueueClose(chat);
+    await api.drainCloses();
+    await api.drainCloses();
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledTimes(1);
+
+    browser = 'error';
+    await api.drainCloses();
+    await api.drainCloses();
+    expect(report).toHaveBeenCalledTimes(2);
+    expect(info).toHaveBeenNthCalledWith(2, 'close outbox: deferred close; chrome_inventory_unavailable');
+
+    browser = 'open';
+    await api.drainCloses();
+    await api.drainCloses();
+    expect(report).toHaveBeenCalledTimes(3);
+    expect(info).toHaveBeenNthCalledWith(3, 'close outbox: deferred close; chrome_tab_open');
+
+    browser = 'gone';
+    expect(await api.drainCloses()).toMatchObject({ pending: 0 });
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   const id = (n: number) => `aaaaaaaa-bbbb-4ccc-8ddd-${String(n).padStart(12, '0')}`;
@@ -2821,14 +3143,15 @@ describe('worker settings authority', () => {
     const sourceError = 'The browser could not insert the handoff request (native_edit_rejected).';
     await worker.send({ type: 'compact', conversationId: CHAT, token, sourceLost: true, sourceError }, 44);
     const deferredError = 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.';
-    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDeferred: true, sourceError: deferredError }, 44);
+    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDeferred: true, sourceError: deferredError, sourceErrorCode: 'results-unconfirmed' }, 44);
     await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDispatch: true }, 44);
     await worker.send({ type: 'compact', conversationId: CHAT, token, destinationDispatch: true }, 44);
 
     expect(posted).toEqual([
       expect.objectContaining({ conversationId: CHAT, ticket: true, automatic: true }),
       expect.objectContaining({ conversationId: CHAT, token, sourceLost: true, sourceError }),
-      expect.objectContaining({ conversationId: CHAT, token, sourceDeferred: true, sourceError: deferredError }),
+      // Why it stopped, as a code the app counts (2026-11-03), not only the translated sentence.
+      expect.objectContaining({ conversationId: CHAT, token, sourceDeferred: true, sourceError: deferredError, sourceErrorCode: 'results-unconfirmed' }),
       expect.objectContaining({ conversationId: CHAT, token, sourceDispatch: true }),
       expect.objectContaining({ conversationId: CHAT, token, destinationDispatch: true })
     ]);
@@ -3454,10 +3777,14 @@ describe('extension command delivery', () => {
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
       [{ target: { tabId: 41 }, files: ['i18n.js'] }],
       [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
+      // The app's colors before content.js, as the manifest loads them (CodeRabbit on #2038).
+      [{ target: { tabId: 41 }, files: ['app-palette.js'] }],
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['usage.js', 'fiber.js'] }],
       [{ target: { tabId: 41 }, files: ['content.js'] }],
       [{ target: { tabId: 42 }, files: ['i18n.js'] }],
       [{ target: { tabId: 42 }, files: ['chatgpt-dom.js'] }],
+      // The app's colors before content.js, as the manifest loads them (CodeRabbit on #2038).
+      [{ target: { tabId: 42 }, files: ['app-palette.js'] }],
       [{ target: { tabId: 42 }, world: 'MAIN', files: ['usage.js', 'fiber.js'] }],
       [{ target: { tabId: 42 }, files: ['content.js'] }]
     ]);
@@ -3559,6 +3886,7 @@ describe('extension command delivery', () => {
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
       [{ target, files: ['i18n.js'] }],
       [{ target, files: ['chatgpt-dom.js'] }],
+      [{ target, files: ['app-palette.js'] }],
       [{ target, world: 'MAIN', files: ['usage.js', 'fiber.js'] }],
       [{ target, files: ['content.js'] }]
     ]);
@@ -3638,7 +3966,7 @@ describe('extension command delivery', () => {
     const fetch = vi.fn(async (input: string) => {
       const url = new URL(input);
       paths.push(url.pathname);
-      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', bridge: 14, paired: true });
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, paired: true });
       if (url.pathname === '/pair') return response(200, { token: 'fresh-start-token' });
       return response(200, {});
     });
@@ -3652,7 +3980,7 @@ describe('extension command delivery', () => {
     const session = new FakeStorageArea();
     const fetch = vi.fn(async (input: string) => {
       const url = new URL(input);
-      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', bridge: 14, paired: false });
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, paired: false });
       if (url.pathname === '/pair') return response(200, { token: 'unwanted-token' });
       return response(200, {});
     });
@@ -5116,6 +5444,8 @@ describe('extension observation journal', () => {
       local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session,
       tabsGet: async () => ({ id: 12, status: 'loading',
         url: `https://chatgpt.com/c/${conversationId}`, pendingUrl: 'https://example.com/away' }),
+      tabsQuery: async () => [{ id: 12, status: 'loading',
+        url: `https://chatgpt.com/c/${conversationId}`, pendingUrl: 'https://example.com/away' }],
       fetch: async (input, init = {}) => {
         const path = new URL(input).pathname;
         if (path === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
@@ -5125,7 +5455,8 @@ describe('extension observation journal', () => {
     });
     await worker.send({ type: 'bind', conversationId }, 12);
     await worker.startTabNavigation(12);
-    expect(closed).toEqual([conversationId]);
+    // The actual Chrome tab inventory is read asynchronously before /closed.
+    await vi.waitFor(() => expect(closed).toEqual([conversationId]));
     expect(session.data.tabConversations).toEqual({});
   });
 
@@ -6000,6 +6331,9 @@ describe('the goal opening, which waits on a model', () => {
     expect(workerMs).toBeGreaterThan(appMs);
     // And it is the goal opening that spends it. Nothing else here waits on a model.
     expect(backgroundSource).toContain("await call('/goal/open', {\n      method: 'POST',\n      timeoutMs: MODEL_REQUEST_TIMEOUT_MS,");
+    // A ChatGPT helper may take longer than that (#2033); the page's opening message stays capped.
+    const bridgeSource = await fs.readFile(path.join(process.cwd(), 'src', 'main', 'bridge.ts'), 'utf8');
+    expect(bridgeSource).toContain('await draftOpeningMessage(text, opening, undefined, undefined, REQUEST_TIMEOUT_MS)');
   });
 });
 
@@ -6381,4 +6715,12 @@ describe('a ChatGPT page that moves to a new address', () => {
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(routeNotices(worker)).toEqual([]);
   });
+});
+
+// CodeRabbit on #2027: every lease change the worker waits for goes through the bounded, non-failing
+// `renderingLeases`, so another tab's stuck lease can neither hold nor fail an unrelated caller.
+it('waits for rendering leases only through renderingLeases', () => {
+  const source = readFileSync('extension/background.js', 'utf8');
+  const raw = source.split('\n').filter(line => /await\s+activeTabs/.test(line) && !line.includes('renderingLeases'));
+  expect(raw).toEqual([]);
 });

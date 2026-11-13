@@ -1,12 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
+import { modelSelectionDiagnostic } from '../src/shared/model-selection-diagnostic.js';
 
 const domSource = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
 const fiberSource = readFileSync(new URL('../extension/fiber.js', import.meta.url), 'utf8');
 const contentSource = readFileSync(new URL('../extension/content.js', import.meta.url), 'utf8');
 let page: JSDOM;
-afterEach(() => { page?.window.close(); });
+afterEach(() => { page?.window.close(); vi.useRealTimers(); });
 it('reveals the native New Chat control through the compact sidebar before reuse', async () => {
   page = new JSDOM('<button data-testid="open-sidebar-button" aria-expanded="false" aria-controls="stage-popover-sidebar">Menu</button>', { url: 'https://chatgpt.com/c/existing', runScripts: 'outside-only' });
   Object.defineProperty(page.window.HTMLElement.prototype, 'getClientRects', { value: () => [{}] });
@@ -177,9 +178,44 @@ it.each([['xhigh', 11], ['medium', 10]] as const)('selects the nearest offered e
   expect(await f.api.selectModelSettings('future-model', effort), `${effort} refused instead of rounded`).toBe(true);
   expect(f.state.currentBucket).toBe(bucket);
 });
+// CodeRabbit on #1972: an effort-only request (a wake keeps the chat's model) never moves to another
+// model that happens to offer that effort; it rounds within the current model.
+it('keeps an effort-only request on the current model', async () => {
+  const f = fixture('', 0);
+  expect(await f.api.selectModelSettings(null, 'ultra')).toBe(true);
+  expect(f.state.selectedVersionEntry.id).toBe('latest');
+  expect(f.state.currentSelection.modelSlug).toBe('gpt-5-6-thinking');
+});
 it('still refuses a model the account does not offer, whatever the effort', async () => {
   const f = fixture('', 0);
   expect(await f.api.selectModelSettings('no-such-model', 'high')).toBe(false);
+});
+// #2085: "could not be confirmed" for every worker said nothing about which step failed or what the picker
+// offered. The reason names both, and a success clears it.
+it('says why a selection was not confirmed, with what the picker offers, and clears it on success', async () => {
+  const f = fixture('', 0);
+  expect(await f.api.selectModelSettings('no-such-model', 'high')).toBe(false);
+  const why = f.api.modelSelectionFailure();
+  expect(why).toContain('model no-such-model with high is not offered');
+  // CodeRabbit on #2137: models of every version read are listed, not only the open one's.
+  expect(why).toMatch(/the picker offers .*future-model:/);
+  expect(why).toMatch(/the picker offers .*gpt-5-6-thinking:/);
+  expect(why.length).toBeLessThan(260);
+  expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'high')).toBe(true);
+  expect(f.api.modelSelectionFailure()).toBe('');
+});
+// atsu6 on #2085: with the picker already open on the requested pair and unable to close, the early return
+// gave no reason.
+it('reports the close failure when the open picker already has the requested pair', async () => {
+  const f = fixture('', null);
+  page.window.document.querySelector('button')!.dispatchEvent(new page.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'high')).toBe(false);
+  expect(f.api.modelSelectionFailure()).toContain('the picker did not close');
+});
+it('says the picker retained its focus trap when the selection cannot close it', async () => {
+  const f = fixture('', null);
+  expect(await f.api.selectModelSettings('future-model', 'ultra')).toBe(false);
+  expect(f.api.modelSelectionFailure()).toBe('the picker did not close');
 });
 
 /*
@@ -651,4 +687,250 @@ it('confirms a picker of exactly 48 versions or lanes and refuses one of 49 (#19
       expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'high'), `${count} ${part}`).toBe(readable);
     }
   }
+});
+
+// #2085: diagnostic callbacks observe the real selector, including early returns and cleanup.
+it('reports the failed selection phase and exact restoration without leaking provider props', async () => {
+  const f = fixture(), reports: unknown[] = [];
+  expect(await f.api.selectModelSettings('missing-model', 'high', () => true, (value: unknown) => reports.push(value))).toBe(false);
+  expect(reports.length).toBeGreaterThan(0);
+  const trace = modelSelectionDiagnostic.parse(reports.at(-1));
+  expect(trace).toMatchObject({ outcome: 'failed', failedPhase: 'resolve',
+    requested: { model: 'missing-model', effort: 'high' },
+    before: { model: 'gpt-5-6-thinking', effort: 'high' },
+    after: { model: 'gpt-5-6-thinking', effort: 'high' }, restore: 'confirmed', closed: true });
+  expect(JSON.stringify(reports)).not.toMatch(/must-never-cross|privateSecret|conversation|modelsData|Denkaufwand/);
+  expect(trace.offered.length).toBeLessThanOrEqual(16);
+});
+it('reports the close failure on the already-selected open-picker early return', async () => {
+  vi.useFakeTimers();
+  const f = fixture('', null), reports: unknown[] = [];
+  page.window.document.querySelector('button')!.dispatchEvent(new page.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  const result = f.api.selectModelSettings('gpt-5-6-thinking', 'high', () => true, (value: unknown) => reports.push(value));
+  await vi.runAllTimersAsync();
+  expect(await result).toBe(false);
+  expect(f.api.modelSelectionFailure()).toBe('the picker did not close');
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({ outcome: 'failed', failedPhase: 'close', closed: false,
+    selected: { model: 'gpt-5-6-thinking', effort: 'high' }, restore: 'not-needed' });
+});
+it('retains the failing version separately from subsequent restore and close phases', async () => {
+  vi.useFakeTimers();
+  const f = fixture(), reports: unknown[] = []; f.freeze();
+  const result = f.api.selectModelSettings('future-model', 'ultra', () => true, (value: unknown) => reports.push(value));
+  await vi.runAllTimersAsync(); expect(await result).toBe(false);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({ failedPhase: 'enumerate-version',
+    failedVersion: 'future', phase: 'close', restore: 'failed', closed: true });
+});
+it('distinguishes a slider failure from failed restoration and preserves the last observed pair', async () => {
+  vi.useFakeTimers();
+  const f = fixture(), reports: unknown[] = [];
+  page.window.document.addEventListener('keydown', event => { if (event.key === 'ArrowRight') event.stopImmediatePropagation(); }, true);
+  const result = f.api.selectModelSettings('future-model', 'ultra', () => true, (value: unknown) => reports.push(value));
+  await vi.runAllTimersAsync(); expect(await result).toBe(false);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({ failedPhase: 'select-effort', failedVersion: 'future',
+    restore: 'failed', closed: true, after: { model: 'gpt-5-6-thinking', effort: 'medium' } });
+});
+it('reports effort substitution on success and keeps the ordinary boolean contract', async () => {
+  const f = fixture(), reports: unknown[] = [];
+  expect(await f.api.selectModelSettings('future-model', 'medium', () => true, (value: unknown) => reports.push(value))).toBe(true);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({ outcome: 'confirmed', failedPhase: null,
+    requested: { model: 'future-model', effort: 'medium' }, resolved: { model: 'future-model', effort: 'low' } });
+  expect(f.api.modelSelectionFailure()).toBe('');
+  expect(await f.api.selectModelSettings('future-model', 'low', () => true, () => { throw new Error('receiver unavailable'); })).toBe(true);
+});
+it.each([true, false])('keeps the last observed pair after an unreadable closing read (selected=%s)', async selected => {
+  const f = fixture(), reports: unknown[] = [];
+  page.window.document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') f.props.modelsData.versions = [];
+  });
+  expect(await f.api.selectModelSettings(selected ? 'future-model' : 'missing-model', 'ultra', () => true,
+    (value: unknown) => reports.push(value))).toBe(selected);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({
+    before: { model: 'gpt-5-6-thinking', effort: 'high' }, closed: true,
+    after: selected ? { model: 'future-model', effort: 'ultra' } : { model: 'gpt-5-6-thinking', effort: 'high' },
+    observedVersion: selected ? 'future' : 'latest'
+  });
+});
+it('records a close-time selection change without changing the existing selection policy', async () => {
+  const f = fixture(), reports: unknown[] = [];
+  page.window.document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { f.state.currentBucket = 10; f.state.currentSelection = f.selections[1]![0]!; }
+  });
+  expect(await f.api.selectModelSettings('future-model', 'ultra', () => true, (value: unknown) => reports.push(value))).toBe(true);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({ outcome: 'confirmed',
+    selected: { model: 'future-model', effort: 'ultra' }, after: { model: 'future-model', effort: 'low' } });
+});
+
+it('accepts a legacy localized display selector in the diagnostic without changing selection', async () => {
+  const f = fixture(), reports: unknown[] = [];
+  expect(await f.api.selectModelSettings('Neues Modell', 'ultra', () => true, (value: unknown) => reports.push(value))).toBe(true);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1)).requested).toEqual({ model: 'Neues Modell', effort: 'ultra' });
+});
+
+it.each([false, true])('distinguishes a menu that never opened from unreadable state after opening (%s)', async unreadable => {
+  vi.useFakeTimers();
+  const f = fixture(), reports: unknown[] = [];
+  if (unreadable) page.window.document.querySelector('button')!.addEventListener('keydown', event => {
+    if (event.key === 'Enter') f.props.modelsData.versions = [];
+  });
+  else page.window.document.addEventListener('keydown', event => {
+    if (event.key === 'Enter') event.stopImmediatePropagation();
+  }, true);
+  const result = f.api.selectModelSettings('future-model', 'ultra', () => true, (value: unknown) => reports.push(value));
+  await vi.runAllTimersAsync(); expect(await result).toBe(false);
+  expect(modelSelectionDiagnostic.parse(reports.at(-1))).toMatchObject({ outcome: 'failed', failure: 'unreadable',
+    failedPhase: unreadable ? 'read' : 'open', closed: true });
+});
+
+function attachMockPickerPanel(doc: Document, f: ReturnType<typeof fixture>, fiberOwner: Element) {
+  const render = () => {
+    let panel = doc.querySelector('[data-testid="composer-intelligence-picker-content"]') as HTMLElement | null;
+    if (!panel) {
+      panel = doc.createElement('div');
+      panel.dataset.testid = 'composer-intelligence-picker-content';
+      doc.body.append(panel);
+    }
+    (panel as any).__reactFiber$test = (fiberOwner as any).__reactFiber$test;
+    panel.innerHTML = '<div role="menuitem" aria-expanded="false">Modell auswählen</div><div role="menuitem" aria-keyshortcuts="ArrowLeft ArrowRight" aria-label="Leistung"></div>';
+    panel.querySelector('[aria-expanded]')!.addEventListener('click', () => {
+      panel!.innerHTML = '';
+      for (const version of f.versions) {
+        const row = doc.createElement('div');
+        row.setAttribute('role', 'menuitemradio');
+        const name = doc.createElement('div');
+        name.textContent = version.displayTextForIntelligence;
+        row.append(name);
+        row.addEventListener('keydown', event => {
+          if (event.key !== 'Enter') return;
+          f.state.selectedVersionEntry = version;
+          f.state.bucketSelections = f.selections[f.versions.indexOf(version)]!;
+          f.state.currentBucket = f.state.bucketSelections[0]!.bucket;
+          f.state.currentSelection = f.state.bucketSelections[0]!;
+          render();
+        });
+        panel!.append(row);
+      }
+    });
+  };
+  return render;
+}
+
+it('falls back to clicking the trigger when synthetic Enter does not open the picker', async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const doc = page.window.document;
+  const trigger = doc.querySelector('button')!;
+  const clone = trigger.cloneNode(true) as HTMLButtonElement;
+  (clone as any).__reactFiber$test = (trigger as any).__reactFiber$test;
+  trigger.replaceWith(clone);
+  const renderPanel = attachMockPickerPanel(doc, f, clone);
+  clone.addEventListener('click', () => { renderPanel(); });
+  // Block Enter on the replacement trigger so only click() can open it.
+  clone.addEventListener('keydown', event => { if (event.key === 'Enter') event.stopImmediatePropagation(); }, true);
+
+  const result = f.api.selectModelSettings('future-model', 'low');
+  await vi.runAllTimersAsync();
+  expect(await result).toBe(true);
+  expect(doc.querySelector('[data-testid="composer-intelligence-picker-content"]')).toBeNull();
+});
+
+it('re-acquires a remounted model trigger when the first trigger fails to open the picker', async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const doc = page.window.document;
+  const trigger = doc.querySelector('button')!;
+  const fresh = doc.createElement('button');
+  fresh.type = 'button';
+  fresh.setAttribute('aria-haspopup', 'menu');
+  fresh.textContent = 'Denkaufwand';
+  (fresh as any).__reactFiber$test = (trigger as any).__reactFiber$test;
+  let remounted = false;
+  doc.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && event.target === trigger && !remounted) {
+      remounted = true;
+      event.stopImmediatePropagation();
+      trigger.replaceWith(fresh);
+    }
+  }, true);
+  const renderPanel = attachMockPickerPanel(doc, f, fresh);
+  fresh.addEventListener('keydown', event => { if (event.key === 'Enter') renderPanel(); });
+
+  const result = f.api.selectModelSettings('future-model', 'low');
+  await vi.runAllTimersAsync();
+  expect(await result).toBe(true);
+});
+
+it('reads picker state once fiber metadata hydrates without an extra DOM mutation', async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const savedVersions = f.props.modelsData.versions;
+  f.props.modelsData.versions = [];
+  page.window.setTimeout(() => { f.props.modelsData.versions = savedVersions; }, 300);
+
+  const result = f.api.selectModelSettings('future-model', 'ultra');
+  await vi.runAllTimersAsync();
+  expect(await result).toBe(true);
+});
+
+it('skips the fallback click when cancelled during the remounted trigger wait', async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const doc = page.window.document;
+  const trigger = doc.querySelector('button')!;
+  const fresh = doc.createElement('button');
+  fresh.type = 'button';
+  fresh.setAttribute('aria-haspopup', 'menu');
+  fresh.textContent = 'Denkaufwand';
+  (fresh as any).__reactFiber$test = (trigger as any).__reactFiber$test;
+  let active = true;
+  let remounted = false;
+  doc.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && event.target === trigger && !remounted) {
+      remounted = true;
+      event.stopImmediatePropagation();
+      trigger.replaceWith(fresh);
+    }
+  }, true);
+  const freshEnter = vi.fn(() => { active = false; });
+  const freshClick = vi.fn();
+  fresh.addEventListener('keydown', event => { if (event.key === 'Enter') freshEnter(); });
+  fresh.addEventListener('click', freshClick);
+
+  const result = f.api.selectModelSettings('future-model', 'low', () => active);
+  await vi.runAllTimersAsync();
+  expect(await result).toBe(false);
+  expect(freshEnter).toHaveBeenCalledTimes(1);
+  expect(freshClick).not.toHaveBeenCalled();
+});
+
+it('skips duplicate Enter and click when the picker opens before retrying a re-acquired trigger', async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const doc = page.window.document;
+  const trigger = doc.querySelector('button')!;
+  const renderPanel = attachMockPickerPanel(doc, f, trigger);
+  const retryEnter = vi.fn();
+  const retryClick = vi.fn();
+  let blockedFirst = false;
+  doc.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' || event.target !== trigger) return;
+    if (!blockedFirst) {
+      blockedFirst = true;
+      event.stopImmediatePropagation();
+      // Hide trigger during initial wait so readyTrigger pauses until the open picker mounts.
+      trigger.hidden = true;
+      return;
+    }
+    retryEnter();
+  }, true);
+  trigger.addEventListener('click', retryClick);
+
+  const result = f.api.selectModelSettings('future-model', 'low');
+  await vi.advanceTimersByTimeAsync(1550);
+  trigger.hidden = false;
+  renderPanel();
+  await vi.runAllTimersAsync();
+  expect(await result).toBe(true);
+  expect(retryEnter).not.toHaveBeenCalled();
+  expect(retryClick).not.toHaveBeenCalled();
 });

@@ -231,10 +231,12 @@ export interface ToolCallRecord {
   attribution: CallAttribution;
   /** Normalized inbound HTTP x-request-id, retained for forensic correlation. */
   requestId: string | null;
-  /** Conversation proven by that request id, or null when ownership was unresolved. */
+  /** Recorded conversation; generation placement is provisional and never caller proof. */
   conversationId: string | null;
-  /** Deterministic placement outcome for current, unresolved, or deliberately retired callers. */
-  attributionMethod: 'request_id' | 'unattributed' | 'superseded';
+  /** Exact, provisional, unresolved or deliberately retired recording placement. */
+  attributionMethod: 'request_id' | 'unattributed' | 'superseded' | 'generation';
+  /** Native request that anchored a verified host conversation-metadata correlation. */
+  providerSessionAnchor?: string;
   /** Exact arguments as JSON. Cut inline past the cap, with the whole text in an asset. */
   args: StoredText;
   result: StoredText;
@@ -381,6 +383,8 @@ export type SessionEvent =
       inputId?: string;
       /** #1826: the message was a run of the chat's schedule, due then, and sent late when `late`. */
       scheduled?: { dueAt: number; late: boolean };
+      /** Sent by the person from elsewhere: a reply to a Telegram notification (Haz on #1990). */
+      via?: 'telegram';
       /** Tool handout remains unconfirmed until a later exact invocation proves receipt. */
       inputDelivery?: 'offered' | 'confirmed';
       /** Original app-authored text, excluding transport-only control instructions. */
@@ -393,6 +397,8 @@ export type SessionEvent =
       parentId?: string;
       /** Edit & resubmit (#365): the question this one is a later version of, in ChatGPT's own edit. */
       replaces?: string;
+      /** The app acknowledged this exact edit; read-time inference cannot revoke its replacement link. */
+      replacesConfirmed?: true;
       /** A Goal or Loop follow-up its page typed: the app's message, not the person's (#1655). */
       automatic?: true;
       attachments?: import('./input.js').InputAttachment[];
@@ -438,6 +444,8 @@ export type SessionEvent =
       finalContentSeq?: number;
       /** Local acceptance time of final content; provider time can predate its last tools. */
       finalObservedAt?: number;
+      /** Store-observed streaming-to-final boundary; first-seen finals have no proven settlement order. */
+      settledAtSeq?: number;
       /** First sequence assigned to this logical message; later revisions keep this anchor. */
       origin?: number;
       /** Store-owned text/state revision, including interim progress before the final. */
@@ -482,7 +490,9 @@ export type SessionEvent =
    * event written before this model existed, or by a page whose commentary had no readable
    * identity, is still a plain standalone caption.
    */
-  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number; reason?: 'helper_stop_unverified'; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
+  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number;
+      /** Set by foldProgress: when its newest update came; `time` stays when it began. */
+      updatedAt?: number; reason?: 'helper_stop_unverified'; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
   /**
    * Visible ChatGPT-native tool activity that never passed through this MCP server.
    *
@@ -672,6 +682,13 @@ export interface SessionSummary {
   selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
   /** Explicit local project; durable across frontend conversation replacement. */
   projectId?: string;
+  /**
+   * The person moved this chat to its project, or out of one (#1919). The app then never binds it
+   * to a project by itself again, as it does for a chat started in a linked ChatGPT Project.
+   */
+  projectChosen?: true;
+  /** Moved into its project since the person's last message: the next one names the folder once. */
+  projectNotePending?: true;
   id: string;
   title: string;
   /**
@@ -702,6 +719,10 @@ export interface SessionSummary {
   events: number;
   userMessages: number;
   toolCalls: number;
+  /** Calls provisionally placed by the only observed running turn; never caller proof. */
+  provisionalToolCalls?: number;
+  /** Provider-proven calls whose provenance can be upgraded by native request evidence. */
+  providerSessionToolCalls?: number;
   /** Start time of the newest exact attributed tool call, independent of later page noise. */
   lastToolCallAt: number | null;
   /**
@@ -1268,7 +1289,7 @@ export function foldProgress(events: readonly SessionEvent[]): SessionEvent[] {
     }
     const held = out[at];
     if (held && held.kind === 'progress' && event.kind === 'progress') {
-      out[at] = { ...held, message: event.message };
+      out[at] = { ...held, message: event.message, updatedAt: event.time };
     } else if (held && held.kind === 'page_tool' && event.kind === 'page_tool') {
       out[at] = { ...held, label: event.label };
     } else if (held && held.kind === 'tool_call' && event.kind === 'tool_call') {
@@ -1356,3 +1377,6 @@ export const UNATTRIBUTED_SESSION_TITLE = 'Unattributed activity';
 export function isUnattributedSession(summary: { conversationId: string | null; title: string; origin?: SessionOrigin | null }): boolean {
   return summary.conversationId === null && !summary.origin && summary.title === UNATTRIBUTED_SESSION_TITLE;
 }
+
+/** How long a Compact & Resume may wait for ChatGPT's summary before the last saved one is offered (2026-11-01). */
+export const STUCK_SUMMARY_MS = 15 * 60_000;

@@ -13,6 +13,7 @@ import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connec
 import { displayLocalServer } from './local-url.js';
 import { paintPluginRefreshReminder } from './plugin-refresh-reminder.js';
 import { initRecordingStorageSetting, paintRecordingStorageNotice, paintRecordingStorageUsage } from './image-storage.js';
+import { paintAutomaticPause } from './automatic-pause.js';
 import { paintCredentialsNotice } from './credentials-notice.js';
 import { paintPluginRefreshOffer } from './plugin-refresh-offer.js';
 import { initUpdateReadiness, paintUpdateReadiness } from './update-readiness.js';
@@ -32,6 +33,7 @@ import { initDesktopAskNotice } from './desktop-ask-notice.js';
 import { initPet } from './pet.js';
 import { initPets } from './pets.js';
 import { initSkillsLibrary } from './skills-library.js';
+import { initScheduled } from './scheduled.js';
 import { initWhatsNew } from './whats-new.js';
 import { initTour } from './tour.js';
 import { playSoundCue } from './sound-cues.js';
@@ -70,8 +72,8 @@ import {
   WRITE_CAPABILITIES
 } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
-import { $, ago, disclosureChevron, el, elapsedDurationText, icon, run, shortAgo, toast } from './dom.js';
-import { chatApply, chatSettingsPatch, chatVisible, focusChatComposer, initChat, openChatSearch, openChatView, openFeedback } from './chat.js';
+import { $, ago, disclosureChevron, el, elapsedDurationText, icon, paintWhenShown, run, shortAgo, toast } from './dom.js';
+import { chatApply, chatSettingsPatch, chatVisible, focusChatComposer, initChat, openChatSearch, openChatView, openFeedback, openScheduledChat } from './chat.js';
 import { publishStopNoticeTexts } from './stop-notices.js';
 import { publishMainTexts } from './main-texts.js';
 import { paintSharedTunnel } from './tunnel-warning.js';
@@ -83,6 +85,16 @@ declare global {
 }
 
 const api = window.api;
+const scheduled = initScheduled({
+  list: () => api.listSchedules(),
+  pause: (sessionId, paused) => api.pauseSchedule(sessionId, paused),
+  runNow: sessionId => api.runScheduleNow(sessionId),
+  delete: sessionId => api.deleteSchedule(sessionId),
+  openChat: sessionId => { showTab('chat'); void openScheduledChat(sessionId); }
+});
+api.onSessionChanged(() => {
+  if (document.querySelector('.panel[data-panel="scheduled"]')?.classList.contains('is-active')) void scheduled.refresh();
+});
 // First: main announces a Keychain read before it starts and may not get through again until it ends.
 initKeychainNotice(api);
 initDesktopAskNotice(api);
@@ -266,7 +278,7 @@ function showTab(name: string): void {
   if (name !== 'chat') stopTour();
   if (name === 'skills') openSkillsLibrary();
   placePermissions(name);
-  const library = name === 'plugins' || name === 'skills' || name === 'pets';
+  const library = name === 'plugins' || name === 'skills' || name === 'pets' || name === 'scheduled';
   const settings = name !== 'chat' && !library;
   // Opening Settings asks whether "Up to date" is still true (the check itself waits ten minutes).
   if (settings && document.querySelector<HTMLElement>('.app')!.dataset.screen !== 'settings') void api.refreshUpdate();
@@ -276,6 +288,7 @@ function showTab(name: string): void {
   $('workspaceSettings').hidden = false;
   $('workspaceSettings').classList.toggle('is-sel', settings);
   if (name === 'usage') void refreshUsage();
+  if (name === 'scheduled') void scheduled.refresh();
   if (name === 'settings') void paintRecordingStorageUsage();
   $('tabs').hidden = !settings;
   $('settingsFindBox').hidden = !settings;
@@ -393,6 +406,7 @@ $('newChat').addEventListener('click', () => showTab('chat'));
 $('sidebarPlugins').addEventListener('click', () => showTab('plugins'));
 $('sidebarPets').addEventListener('click', () => showTab('pets'));
 $('sidebarSkills').addEventListener('click', () => showTab('skills'));
+$('sidebarScheduled').addEventListener('click', () => showTab('scheduled'));
 api.onPetOverlayOpenOwner(screen => showTab(screen));
 $('addProject').addEventListener('click', () => showTab('chat'));
 let zoomFactor = 1;
@@ -583,6 +597,104 @@ function desktopAskRow(): HTMLElement {
   return row;
 }
 
+/**
+ * Desktop control for a call the app can't tie to a chat (2026-10-30): off unless chosen, because
+ * with one ChatGPT account on several computers such a call can come from another computer's chat.
+ */
+function desktopUnattributedRow(): HTMLElement {
+  const row = el('label', 'tool desktop-unattributed-row');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.id = 'desktopUnattributed';
+  input.addEventListener('change', () => void save());
+  const body = el('span');
+  body.append(el('strong', '', () => t('Allow desktop control from calls without a known chat')),
+    el('em', '', () => t("Normally the screen, mouse and keyboard are used only for a chat the app can name. With one ChatGPT account on several computers, a call it can't name may come from another computer's chat.")));
+  row.append(input, body);
+  return row;
+}
+
+function linuxDesktopRow(): HTMLElement {
+  const row = el('label', 'tool linux-desktop-row');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.id = 'linuxDesktopEnabled';
+  input.addEventListener('change', () => void save());
+  const body = el('span');
+  body.append(el('strong', '', () => t('Allow native Linux Desktop access')),
+    el('em', '', () => t('Off by default. GNOME display screenshots require Screen permission and OS consent. Semantic accessibility actions require Control permission, a proven chat, and explicit approval when configured. No physical-input fallback.')));
+  row.append(input, body);
+  return row;
+}
+
+let linuxScreenshotConsentBusy = false;
+/** Only translate known, fixed main-process errors; never display arbitrary backend text. */
+function linuxScreenshotConsentErrorText(error: unknown): string {
+  switch (error) {
+    case 'Activate the Chat On Steroids window before requesting screenshot permission.':
+    case 'The Chat On Steroids window lost focus; no screenshot was requested.':
+      return t('Activate the Chat On Steroids window, then try again.');
+    case 'Enable native Linux Desktop and Screen access first.':
+    case 'Screen access was disabled before the screenshot request.':
+    case 'Native Linux Desktop or Screen access was disabled during the screenshot request.':
+      return t('Enable native Linux Desktop access and Screen permission, then try again.');
+    case 'Screenshot permission can be requested only from the Chat On Steroids main window.':
+      return t('Screenshot permission can be requested only from the Chat On Steroids main window.');
+    case 'A screenshot permission request is already running.':
+      return t('A screenshot permission request is already running.');
+    default:
+      return t('GNOME screenshot permission could not be confirmed.');
+  }
+}
+function linuxScreenshotConsentRow(): HTMLElement {
+  const row = el('div', 'tool is-static linux-consent-row');
+  const body = el('span');
+  body.append(
+    el('strong', '', () => t('Test GNOME screenshot permission')),
+    el('em', '', () => t('Click while the Chat On Steroids window is active. If GNOME asks, choose Allow. The screenshot is discarded.'))
+  );
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.id = 'linuxScreenshotConsent';
+  ui(button, 'textContent', () => t('Request screenshot permission'));
+  button.disabled = true;
+  const status = el('em', 'linux-consent-result');
+  status.id = 'linuxScreenshotConsentResult';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  button.addEventListener('click', async () => {
+    if (linuxScreenshotConsentBusy || button.disabled) return;
+    const hadFocus = document.activeElement === button;
+    linuxScreenshotConsentBusy = true;
+    button.disabled = true;
+    status.textContent = t('Waiting for GNOME screenshot permission…');
+    try {
+      const reply = await api.linuxScreenshotConsent();
+      status.textContent = reply.ok
+        ? t('Screenshot permission confirmed. No image was saved.')
+        : t('Screenshot permission request failed: {0}', [
+          linuxScreenshotConsentErrorText(reply.error)
+        ]);
+    } catch {
+      status.textContent = t('Screenshot permission request failed: {0}', [
+        t('GNOME screenshot permission could not be confirmed.')
+      ]);
+    } finally {
+      linuxScreenshotConsentBusy = false;
+      const config = state?.config;
+      button.disabled = !config || config.ui.linuxDesktopEnabled !== true || config.capabilities.screen !== true;
+      // A disabled button can drop keyboard focus. Restore it only when the
+      // person originally focused this button and has not moved elsewhere.
+      const active = document.activeElement;
+      if (hadFocus && !button.disabled && (!active || active === button ||
+          active === document.body || active === document.documentElement)) button.focus();
+    }
+  });
+  body.append(button, status);
+  row.append(body);
+  return row;
+}
+
 function buildGroups(): void {
   const permissionGroups = GROUPS.map((group) => {
     const box = document.createElement('input');
@@ -609,7 +721,8 @@ function buildGroups(): void {
       body.append(el('strong', '', () => t(CAPABILITY_LABELS[cap])), el('em', '', () => t(CAPABILITY_DETAILS[cap])));
       label.append(input, body);
       tools.append(label);
-      if (cap === 'control') tools.append(desktopAskRow());
+      if (cap === 'control') tools.append(desktopAskRow(), desktopUnattributedRow());
+      if (cap === 'screen') tools.append(linuxDesktopRow(), linuxScreenshotConsentRow());
     }
     tools.append(toolNames([]));
     if (group.id === 'run') tools.append(buildCommandAllowlist());
@@ -814,6 +927,8 @@ function save(over: { readOnly?: boolean; theme?: ThemeChoice; appearance?: Appe
       chatBrowser: $<HTMLSelectElement>('chatBrowser').value as ChatBrowser,
       cosBrowserMinimize: $<HTMLSelectElement>('cosBrowserMinimize').value === 'tray' ? 'tray' : 'taskbar',
       desktopAsk: ($<HTMLSelectElement>('desktopAsk').value || 'off') as NonNullable<Config['ui']['desktopAsk']>,
+      desktopUnattributed: $<HTMLInputElement>('desktopUnattributed').checked,
+      linuxDesktopEnabled: $<HTMLInputElement>('linuxDesktopEnabled').checked,
       finishTool: $<HTMLInputElement>('finishTool').checked,
       finishHoldOnStop: $<HTMLInputElement>('finishHoldOnStop').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
@@ -846,6 +961,7 @@ function save(over: { readOnly?: boolean; theme?: ThemeChoice; appearance?: Appe
       chatWritingStyle: chatStyleDraft('chatWritingStyle', DEFAULT_CHAT_WRITING_STYLE),
       sendCheckUrl: sendCheckDraft(previous),
       followOutput: $<HTMLInputElement>('followOutput').checked,
+      showMessageTimes: $<HTMLInputElement>('showMessageTimes').checked,
       mentionCore: $<HTMLInputElement>('mentionCore').checked,
       mentionPlugins: $<HTMLInputElement>('mentionPlugins').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
@@ -924,6 +1040,23 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     }
     if (state && (!requestedSettings || requestedSettings.controlApi?.enabled === patch.controlApi?.enabled)) {
       $<HTMLInputElement>('controlApiEnabled').checked = state.config.controlApi?.enabled === true;
+    }
+    // And for replies from Telegram, which let the phone message a chat: a box shown off while the saved
+    // value is still on would misstate it (CodeRabbit on #1990).
+    if (state && (!requestedSettings || requestedSettings.ui.phonePush?.telegramSteer === patch.ui.phonePush?.telegramSteer)) {
+      $<HTMLInputElement>('telegramSteer').checked = state.config.ui.phonePush?.telegramSteer === true;
+    }
+    // And for desktop control without a known chat (CodeRabbit on #1938): a box shown off while the
+    // saved value is still on would misstate what the desktop tools allow.
+    if (state && (!requestedSettings || requestedSettings.ui.desktopUnattributed === patch.ui.desktopUnattributed)) {
+      $<HTMLInputElement>('desktopUnattributed').checked = state.config.ui.desktopUnattributed === true;
+    }
+    if (state && (!requestedSettings || requestedSettings.ui.linuxDesktopEnabled === patch.ui.linuxDesktopEnabled)) {
+      $<HTMLInputElement>('linuxDesktopEnabled').checked = state.config.ui.linuxDesktopEnabled === true;
+    }
+    // And message times: a switch left on after a failed save would show what the setting hides.
+    if (state && (!requestedSettings || requestedSettings.ui.showMessageTimes === patch.ui.showMessageTimes)) {
+      $<HTMLInputElement>('showMessageTimes').checked = state.config.ui.showMessageTimes === true;
     }
     if (state && (!requestedSettings || requestedSettings.projects?.codeCheckpoints === patch.projects?.codeCheckpoints)) {
       $<HTMLInputElement>('codeCheckpoints').checked = state.config.projects?.codeCheckpoints === true;
@@ -1700,6 +1833,7 @@ function apply(next: AppState): void {
   paintPluginRefreshRecovery(next);
   paintPluginRefreshReminder(next.connectorSchemas ?? {}, next.confirmedConnectorSchemas ?? {});
   paintRecordingStorageNotice(next.recordingStorageFull === true);
+  paintAutomaticPause(next.bridge.automaticPauseUntil ?? null);
   // A new size changes the "used of" line at once, not only when Settings opens again.
   if (previousState && previousState.config.sessions.storageLimitGiB !== next.config.sessions.storageLimitGiB) void paintRecordingStorageUsage();
   paintCredentialsNotice(next, api, apply);
@@ -1707,7 +1841,7 @@ function apply(next: AppState): void {
 
   // ---- health numbers and facts
   paintClock();
-  $('facts').replaceChildren(...facts(next));
+  paintWhenShown($('facts'), () => $('facts').replaceChildren(...facts(next)));
 
   // ---- permissions
   $('readOnlyBtn').classList.toggle('is-on', config.readOnly);
@@ -1772,8 +1906,16 @@ function apply(next: AppState): void {
   applyValue($<HTMLSelectElement>('chatBrowser'), config.ui.chatBrowser ?? 'chrome', previousState?.config.ui.chatBrowser ?? 'chrome');
   applyValue($<HTMLSelectElement>('cosBrowserMinimize'), config.ui.cosBrowserMinimize ?? 'taskbar', previousState?.config.ui.cosBrowserMinimize ?? 'taskbar');
   applyValue($<HTMLSelectElement>('desktopAsk'), config.ui.desktopAsk ?? 'off', previousState?.config.ui.desktopAsk ?? 'off');
-  // The system says when it was last used only on macOS and Windows; elsewhere nothing would ask.
-  ($('desktopAsk').closest('.desktop-ask-row') as HTMLElement).hidden = !['macos', 'windows'].includes(next.platform?.family ?? 'macos');
+  applyChecked($<HTMLInputElement>('desktopUnattributed'), config.ui.desktopUnattributed === true, previousState?.config.ui.desktopUnattributed === true);
+  applyChecked($<HTMLInputElement>('linuxDesktopEnabled'), config.ui.linuxDesktopEnabled === true, previousState?.config.ui.linuxDesktopEnabled === true);
+  // The optional native approval row is available on Linux too; the gate
+  // stays disabled by default and conservatively asks when idle proof is absent.
+  ($('desktopAsk').closest('.desktop-ask-row') as HTMLElement).hidden = !['macos', 'windows', 'linux'].includes(next.platform?.family ?? 'macos');
+  ($('desktopUnattributed').closest('.desktop-unattributed-row') as HTMLElement).hidden = !['macos', 'windows', 'linux'].includes(next.platform?.family ?? 'macos');
+  ($('linuxDesktopEnabled').closest('.linux-desktop-row') as HTMLElement).hidden = next.platform?.family !== 'linux';
+  ($('linuxScreenshotConsent').closest('.linux-consent-row') as HTMLElement).hidden = next.platform?.family !== 'linux';
+  $<HTMLButtonElement>('linuxScreenshotConsent').disabled = linuxScreenshotConsentBusy ||
+    next.platform?.family !== 'linux' || config.ui.linuxDesktopEnabled !== true || config.capabilities.screen !== true;
   // Only the built-in browser has a window of the app's own to minimize.
   $('cosBrowserMinimizeRow').hidden = (config.ui.chatBrowser ?? 'chrome') !== 'cos';
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
@@ -1792,7 +1934,7 @@ function apply(next: AppState): void {
     rotate.add(option);
   }
   applyValue(rotate, rotateMinutes, previousState ? String(previousState.config.ui.rotateTurnMinutes ?? 30) : undefined);
-  applyChecked($<HTMLInputElement>('rotateStopFallback'), config.ui.rotateStopFallback === true, previousState?.config.ui.rotateStopFallback);
+  applyChecked($<HTMLInputElement>('rotateStopFallback'), config.ui.rotateStopFallback !== false, previousState?.config.ui.rotateStopFallback);
   $<HTMLInputElement>('rotateStopFallback').disabled = (config.ui.rotateTurnMinutes ?? 30) === 0;
   applyChecked($<HTMLInputElement>('backgroundChats'), config.ui.backgroundChats === true, previousState?.config.ui.backgroundChats);
   applyValue($<HTMLSelectElement>('backgroundPlacement'), config.ui.backgroundPlacement ?? 'window', previousState?.config.ui.backgroundPlacement ?? 'window');
@@ -1839,6 +1981,9 @@ function apply(next: AppState): void {
     applyValue(sendCheckField, config.ui.sendCheckUrl ?? '', previousState ? previousState.config.ui.sendCheckUrl ?? '' : undefined);
   sendCheckValid();
   applyChecked($<HTMLInputElement>('followOutput'), config.ui.followOutput !== false, previousState?.config.ui.followOutput);
+  applyChecked($<HTMLInputElement>('showMessageTimes'), config.ui.showMessageTimes === true, previousState?.config.ui.showMessageTimes === true);
+  // Every chat row carries its time; the stylesheet shows it above each message only while this is on.
+  document.documentElement.classList.toggle('show-message-times', config.ui.showMessageTimes === true);
   applyChecked($<HTMLInputElement>('mentionCore'), config.ui.mentionCore !== false, previousState?.config.ui.mentionCore);
   applyChecked($<HTMLInputElement>('mentionPlugins'), config.ui.mentionPlugins === true, previousState?.config.ui.mentionPlugins);
   applyChecked($<HTMLInputElement>('controlApiEnabled'), config.controlApi?.enabled === true, previousState?.config.controlApi?.enabled);
@@ -1903,7 +2048,7 @@ function apply(next: AppState): void {
   // The add button is the call to action until a folder is shared, then it quiets to done.
   $('wizAddFolder').dataset.tone = config.roots.length > 0 ? 'ok' : 'off';
   // One folder per line: they are paths, and a row of them wraps mid-name.
-  $('wizFolders').replaceChildren(...(config.roots.length === 0
+  paintWhenShown($('wizFolders'), () => $('wizFolders').replaceChildren(...(config.roots.length === 0
     ? [(() => {
       // Empty is an invitation, not a hole: the whole area chooses a folder, like the button.
       const row = el('li', 'is-empty');
@@ -1914,7 +2059,7 @@ function apply(next: AppState): void {
       row.append(pick);
       return row;
     })()]
-    : config.roots.map((root) => { const row = el('li'); row.append(icon('i-folder'), el('span', '', `/${root.name}`)); return row; })));
+    : config.roots.map((root) => { const row = el('li'); row.append(icon('i-folder'), el('span', '', `/${root.name}`)); return row; }))));
   const secureStorageAvailable = next.secureStorage?.available ?? true;
   const apiKey = $<HTMLInputElement>('apiKey');
   ui(apiKey, 'placeholder', () => next.hasApiKey ? t("•••••••• stored") : 'sk-…');
@@ -1986,7 +2131,7 @@ function apply(next: AppState): void {
           : t("ChatGPT ran a tool {0} — the whole chain works.", [ago(ranAt)]));
 
   const cards = $('connectorCards');
-  cards.replaceChildren(...connectorCards(next));
+  paintWhenShown(cards, () => cards.replaceChildren(...connectorCards(next)));
 
   // Step marks: everything before the first unfinished step counts as done.
   const order = ['browser', 'folder', 'access', 'tunnel', 'key', 'connect', 'chatgpt'];
@@ -2336,7 +2481,7 @@ function paintReady(shown: string[], done: Set<string>, cosBrowser: boolean, all
   $('readyStart').hidden = !allSet;
   step('ready').classList.toggle('is-all-set', allSet);
   const list = $('readyChecks');
-  const rows = shown.map(name => {
+  paintWhenShown(list, () => list.replaceChildren(...shown.map(name => {
     const check = READY_CHECKS[name]!;
     const passed = done.has(name);
     const narrowed = name === 'access' && limited;
@@ -2355,8 +2500,7 @@ function paintReady(shown: string[], done: Set<string>, cosBrowser: boolean, all
       row.append(go);
     }
     return row;
-  });
-  list.replaceChildren(...rows);
+  })));
 }
 
 /** A connector's newest evidence that ChatGPT uses it: this run's, else what earlier runs proved. */
@@ -2970,6 +3114,7 @@ for (const id of [
   'playfulContinue',
   'announceTurns',
   'followOutput',
+  'showMessageTimes',
   'followUp',
   'enterSends',
   'turnNotifications',
@@ -2990,6 +3135,7 @@ for (const id of [
   'phonePushAway',
   'phonePushQuiet',
   'phonePushDetails',
+  'telegramSteer',
   'secretsShield',
   'tunnelKind',
   'tunnelId',
@@ -3008,6 +3154,17 @@ $('soundCues').addEventListener('change', event => {
 });
 api.onSoundCue?.(playSoundCue);
 
+/**
+ * A plain web link outside the chat (the Usage price links, Send feedback's guide link): the window
+ * denies new windows, so without this it did nothing (design audit 2026-11-01). Chat links route
+ * themselves and mark the click handled; the main process validates the address again.
+ */
+function openPlainWebLink(event: MouseEvent): void {
+  const anchor = (event.target as Element | null)?.closest?.<HTMLAnchorElement>('a[href]');
+  if (!anchor || event.defaultPrevented || !/^https?:\/\//i.test(anchor.href)) return;
+  event.preventDefault();
+  void run(api.openLink(anchor.href, { external: true }));
+}
 document.addEventListener('click', (event) => {
   const target = event.target as HTMLElement;
   if (!target.closest('.connection-anchor') && !$('connectionPopover').contains(target) && !$('connectionPopover').hidden) setConnectionPopover(false);
@@ -3015,7 +3172,11 @@ document.addEventListener('click', (event) => {
   if (external?.dataset.linkExternal) void run(api.openLink(external.dataset.linkExternal, { external: true }));
   const link = target.closest<HTMLElement>('[data-link]');
   if (link?.dataset.link) void run(api.openLink(link.dataset.link));
+  openPlainWebLink(event);
 });
+// A middle-click on the same links (auxclick), so it opens in the browser instead of being denied
+// (CodeRabbit on #2011). Chat links handle their own middle-click and mark it handled.
+document.addEventListener('auxclick', event => { if (event.button === 1) openPlainWebLink(event); });
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape' || $('connectionPopover').hidden) return;
   setConnectionPopover(false);

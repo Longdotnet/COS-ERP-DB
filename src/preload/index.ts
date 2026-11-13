@@ -13,14 +13,14 @@ import type { InputAttachment } from '../shared/input.js';
 import type { UsageOverview } from '../shared/usage.js';
 import type { ProviderUsage } from '../shared/provider-usage.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
-import type { ChatgptProjectChoice, LocalProject, ProjectColor } from '../shared/projects.js';
+import type { ChatgptProjectChoice, LocalProject, ProjectColor, RelatedFolderView } from '../shared/projects.js';
 import type { ProjectDirectoryListing, ProjectFileMutationResult, ProjectFilePreview, ProjectFileSaveResult, ProjectFilesChanged } from '../shared/project-files.js';
 import type { CheckpointRestoreResult, ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot } from '../shared/project-git.js';
 import type { PetLibraryState, PetOverlayControlState, PetRuntimeAsset } from '../shared/pets.js';
 import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, SkillsDraftScope } from '../shared/skills.js';
 import type { RunningToolActivity, SessionChange, SessionSearchReply, SessionSearchLocation, SessionBookmark, ToolEditReview } from '../shared/session.js';
 import type { TurnTrace } from '../shared/turn-trace.js';
-import type { RunningExecProcess } from '../shared/background-exec.js';
+import type { AgentOutputEvent, RunningExecProcess } from '../shared/background-exec.js';
 import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
 import { createDatabaseApi } from './database-api.js';
 /**
@@ -37,7 +37,7 @@ import type { AppState, Capabilities, CommitFlow, CompanionDiagnostics, Config, 
 import type { SoundCue } from '../shared/sound-cues.js';
 import type { CommitState } from '../shared/project-git.js';
 import type { ScheduledRun } from '../main/scheduled-runs.js';
-import type { ScheduleRepeat } from '../shared/schedule.js';
+import type { ScheduledRunListItem, ScheduleRepeat } from '../shared/schedule.js';
 import type {
   Handoff,
   ImageStorageClearMode,
@@ -134,6 +134,14 @@ const api = {
   terminalResize: (id: string, cols: number, rows: number) => call<void>('workspaceTerminal:request', { action: 'resize', id, cols, rows }),
   terminalAck: (id: string, count: number) => call<void>('workspaceTerminal:request', { action: 'ack', id, count }),
   terminalClose: (id: string) => call<void>('workspaceTerminal:request', { action: 'close', id }),
+  agentOutputOpen: (id: string, sessionId: string, processId: number, incarnation: number) =>
+    ipcRenderer.invoke('agentOutput:request', { action: 'open', id, sessionId, processId, incarnation }) as Promise<{ ok: true; data: true } | { ok: false; error: string }>,
+  agentOutputClose: (id: string) => ipcRenderer.invoke('agentOutput:request', { action: 'close', id }) as Promise<{ ok: true; data: true } | { ok: false; error: string }>,
+  onAgentOutput: (listener: (event: AgentOutputEvent) => void): (() => void) => {
+    const wrapped = (_event: unknown, value: AgentOutputEvent): void => listener(value);
+    ipcRenderer.on('agentOutput:event', wrapped);
+    return () => ipcRenderer.removeListener('agentOutput:event', wrapped);
+  },
   onTerminalEvent: (listener: (event: WorkspaceTerminalEvent) => void): (() => void) => {
     const wrapped = (_event: unknown, value: WorkspaceTerminalEvent): void => listener(value);
     ipcRenderer.on('workspaceTerminal:event', wrapped);
@@ -162,6 +170,8 @@ const api = {
   renameChatGroup: (id: string, name: string) => call<ChatGroupsState>('chatGroups:rename', { id, name }),
   deleteChatGroup: (id: string) => call<ChatGroupsState>('chatGroups:delete', { id }),
   assignChatGroup: (sessionId: string, groupId: string | null) => call<ChatGroupsState>('chatGroups:assign', { sessionId, groupId }),
+  moveChatProject: (sessionId: string, projectId: string | null, groupId?: string | null) =>
+    call<{ from: string | null; fromGroup: string | null; groups: ChatGroupsState; summaries: SessionSummary[] }>('sessions:moveProject', { sessionId, projectId, ...(groupId !== undefined ? { groupId } : {}) }),
   petsList: () => call<PetLibraryState>('pets:list'),
   petsOverlayState: () => call<PetOverlayControlState>('pets:overlayState'),
   petsSetOverlayVisible: (visible: boolean) => call<PetOverlayControlState>('pets:overlayVisible', { visible }),
@@ -178,12 +188,17 @@ const api = {
     // `warnings`: what went wrong after the settings were written, each a sentence of its own.
     call<{ state: AppState; changedCount: number; keyCount: number; warnings?: string[] }>('settings:importApply', { token, includeKeys, ...(passphrase !== undefined ? { passphrase } : {}) }),
   testPhonePush: () => call<void>('phonePush:test', undefined),
+  connectTelegram: (token: string) => call<AppState>('telegram:connect', { token }),
+  disconnectTelegram: () => call<AppState>('telegram:disconnect', undefined),
+  testTelegram: () => call<void>('telegram:test', undefined),
   setPhonePushToken: (token: string) => call<AppState>('phonePush:token', { token }),
   markWhatsNewSeen: () => call<void>('ui:whatsNewSeen'),
   /** #1833: the first-run tour was taken, skipped or declined. */
   markTourDone: () => call<void>('ui:tourDone'),
   /** #1864: the desktop question waiting now, its answer from the app's window, and when it changes. */
   desktopAskPending: () => call<DesktopAskPending | null>('desktopAsk:pending'),
+  /** Explicit one-time GNOME screenshot consent check, never returns the screenshot itself. */
+  linuxScreenshotConsent: () => call<{ pngBytes: number }>('desktop:linuxScreenshotConsent'),
   answerDesktopAsk: (id: string, choice: 'go' | 'not-now') => call<boolean>('desktopAsk:answer', { id, choice }),
   onDesktopAskPending: (listener: (pending: DesktopAskPending | null) => void): (() => void) => {
     const wrapped = (_event: unknown, pending: DesktopAskPending | null): void => listener(pending);
@@ -295,8 +310,8 @@ const api = {
     call<{ url: string; via: 'gh' | 'existing' | 'browser' }>('projectCommit:pullRequest', { projectId, title, body }),
   setCommitFlow: (flow: CommitFlow) => call<boolean>('projectCommit:flow', { flow }),
   saveDiagnosticsReport: () => call<{ saved: false } | { saved: true; name: string }>('diagnostics:saveReport'),
-  openFeedbackIssue: (report: { kind: 'bug'; what: string; steps?: string; frequency?: 'Every time' | 'Sometimes' | 'It happened once' }
-    | { kind: 'idea'; problem: string; proposal: string }) => call<{ trimmed: boolean }>('feedback:openIssue', report),
+  openFeedbackIssue: (report: { kind: 'bug'; what: string; steps?: string; frequency?: 'Every time' | 'Sometimes' | 'It happened once' }) =>
+    call<{ trimmed: boolean }>('feedback:openIssue', report),
   requestDesktopAccessibility: () => call<AppState>('desktop:requestAccessibility'),
   repairDesktopAccess: () => call<AppState>('desktop:repairPermissions'),
   getLog: () => call<LogEntry[]>('log:get'),
@@ -341,11 +356,16 @@ const api = {
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
   setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
   setProjectSecretsShieldOff: (id: string, off: boolean) => call<LocalProject>('projects:secrets-shield', { id, off }),
+  /** #1689: a project's related folders, each available or not. */
+  relatedFolders: (id: string) => call<RelatedFolderView[]>('projects:related', { id }),
+  setRelatedFolders: (id: string, folders: string[]) => call<RelatedFolderView[]>('projects:related-set', { id, folders }),
   /** #1826: a chat's schedule (one per chat), or null. */
   getSchedule: (sessionId: string) => call<ScheduledRun | null>('schedules:get', { sessionId }),
+  listSchedules: () => call<ScheduledRunListItem[]>('schedules:list'),
   saveSchedule: (request: { sessionId: string; text: string; repeat: ScheduleRepeat; until: number | null; catchUp?: boolean }) => call<ScheduledRun>('schedules:save', request),
   pauseSchedule: (sessionId: string, paused: boolean) => call<ScheduledRun | null>('schedules:pause', { sessionId, paused }),
   deleteSchedule: (sessionId: string) => call<boolean>('schedules:delete', { sessionId }),
+  runScheduleNow: (sessionId: string) => call<boolean>('schedules:runNow', { sessionId }),
   listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
   watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
   onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {
@@ -383,7 +403,8 @@ const api = {
   clearImageStorage: (mode: ImageStorageClearMode) => call<ImageStorageClearResult>('sessions:clearImageStorage', { mode }),
     getSession: (id: string, options?: { from?: number; before?: number; after?: number; limit?: number; actions?: boolean }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),
-  stopSessionTurn: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:stopTurn', { id, expectedTurnId }),
+  stopSessionTurn: (id: string, expectedTurnId: string, expectedConversationId?: string | null) =>
+    call<SessionControlsView>('sessions:stopTurn', { id, expectedTurnId, ...(expectedConversationId ? { expectedConversationId } : {}) }),
   releaseSessionFinish: (id: string, expectedTurnId: string) => call<SessionControlsView>('sessions:releaseFinish', { id, expectedTurnId }),
   generateFinishGoal: (id: string, expectedTurnId: string) => call<string>('sessions:generateFinishGoal', { id, expectedTurnId }),
   getChatModels: () => call<ChatModelCatalog>('chatModels:get'),
@@ -401,7 +422,12 @@ const api = {
     return () => ipcRenderer.removeListener('chatModels:changed', wrapped);
   },
   getSessionControls: (id: string) => call<SessionControlsView>('sessions:controls', { id }),
+  resumeAutomaticSends: () => call<boolean>('automation:resumeNow'),
+  answerUserRequest: (id: string, requestId: string, answer: 'done' | 'skipped') =>
+    call<NonNullable<SessionControlsView['userRequests']>>('sessions:answerUserRequest', { id, requestId, answer }),
   cancelRecovery: (id: string) => call<boolean>('sessions:cancelRecovery', { id }),
+  pickupNow: (id: string, shown: { next: 'queue' | 'goal' | 'loop' | 'continue'; stoppedAt: number }) =>
+    call<{ ok: true; did: 'queued' | 'retrying' } | { ok: false; code: 'no-chat' | 'history-limit' | 'nothing-waiting' | 'changed' | 'not-sent' | 'not-started' }>('sessions:pickupNow', { id, ...shown }),
   setSessionAutomation: (id: string, automation: SessionControlsView['automation'], afterTurn?: boolean) => call<SessionControlsView>('sessions:automation', { id, automation, afterTurn }),
   setSessionObjective: (id: string, text: string, mode: 'goal' | 'loop') => call<SessionControlsView>('sessions:objective', { id, text, mode }),
   compactSession: (id: string) => call<SessionControlsView>('sessions:compact', { id }),
@@ -436,7 +462,7 @@ const api = {
   /** The person's answer to that exact card; the page presses it only if the card still stands. */
   answerApproval: (id: string, cardId: string, choice: 'allow' | 'deny') =>
     call<{ ok: true } | { ok: false; error: string }>('sessions:answerApproval', { id, cardId, choice }),
-  followSessionTab: (id: string) => call<boolean>('sessions:followTab', { id }),
+  followSessionTab: (id: string | null) => call<boolean>('sessions:followTab', { id }),
   // Stops a chat this app cannot stop in the page: every tool call it has already been proved
   // to own is refused until it is released. Returns the whole blocked set, so one press
   // repaints without a second read.

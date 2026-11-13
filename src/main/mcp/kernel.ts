@@ -110,6 +110,8 @@ import {
   awaitFreshCallOrigin,
   evidenceWindow,
   freshCallOrigin,
+  captureRecordingContext,
+  recordingContextCurrent,
   recordAgentMessage,
   recordProgress,
   recordToolCall
@@ -237,6 +239,13 @@ export interface ToolContext {
    */
   exposedSessionTools?: boolean;
   exposedAgentTools?: boolean;
+  /**
+   * Whether the steps-for-the-person tools (#1695) stay registered, for the same reason. They
+   * follow Run programs, and also Read-only over it, which switches the command tools off.
+   */
+  exposedUserRequests?: boolean;
+  /** Monotone native Linux tool exposure for one MCP endpoint; execution uses the live opt-in. */
+  exposedLinuxDesktop?: boolean;
 }
 
 export type ToolContent =
@@ -439,6 +448,7 @@ function setCallerConversation(context: CallContext, conversationId: string | nu
   context.caller.conversationId = conversationId;
   const exact = conversationId ? requestCorrelation(context.caller.requestId) : null;
   context.caller.sessionId = exact?.conversationId === conversationId ? exact.sessionId : null;
+  context.caller.providerSessionAnchor = exact?.conversationId === conversationId ? exact.providerSessionAnchor : undefined;
 }
 
 /** SDK fields this layer forwards to tools; request identity still comes from ingress ALS. */
@@ -560,9 +570,19 @@ function withUnattributedNotice(
   conversationId: string | null | undefined,
   result: ToolResult,
   requestId: string | null,
-  allowUnattributed: boolean
+  allowUnattributed: boolean,
+  provisional = false
 ): ToolResult {
   if (conversationId) return result;
+  const requestOwnershipNotice =
+    'This request id owns its workspace, update_plan, terminals and agents/subagents. Use the process and run ids returned to this request; later exact proof attaches that state to its chat. ';
+  if (provisional) return { ...result, content: [...result.content, { type: 'text', text:
+    '\n--- Recording context ---\n' +
+    'Exact caller identity is not available. The recorder may provisionally place this operation in the only observed running chat, ' +
+    'pending exact request evidence. This does not grant access to that chat’s workspace, messages, workers or terminals. ' +
+    'Continue using enabled self-contained tools with their existing permissions. Do not repeat a completed operation to repair attribution. ' +
+    requestOwnershipNotice
+  }] };
   const eta = unattributedRepairEta(Date.now(), requestId);
   const recovery = eta === null ? '' : `The next attribution recovery check is in about ${eta}s. `;
   return {
@@ -577,7 +597,7 @@ function withUnattributedNotice(
             'Unattributed does not switch on Read-only mode or disable tools. Continue using every enabled tool, ' +
             'including apply_patch, exec_command, Desktop and Plugins; their existing permissions still apply. ' +
             (requestId
-              ? 'This request id owns its workspace, update_plan, terminals and agents/subagents. Use the process and run ids returned to this request; later exact proof attaches that state to its chat. '
+              ? requestOwnershipNotice
               : 'This call has no request id, so request-owned plans and worker families cannot be created until a request id or exact chat proof is available. ') +
             'A refusal about a particular process, worker or chat target applies only to that operation, not to file edits or other tools. ' +
             'Report the actual tool result; do not claim mutation or terminal tools are unavailable because of this notice, and never replay successful work. ' +
@@ -667,6 +687,7 @@ export async function dispatch(
   // those gaps describes a machine that has not finished changing. The counter therefore
   // opens with the request and closes with it.
   const context: CallContext = {
+    recordingContext: parent?.recordingContext ?? (inboundProviderRequest() && requestId ? captureRecordingContext(Date.now()) : null),
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
     activity: summarizeRunningCall(name, args, emptyEvidence()),
@@ -764,16 +785,24 @@ async function dispatchTracked(
   // Identity and the finish hold share one ingress deadline; late proof must not
   // add another complete hold interval to an already waiting provider request.
   const finishDeadline = name === 'session_finish' ? sessionFinishDeadline(startedAt) : null;
-  const identityWindow = (requested: number): number => finishDeadline === null
-    ? requested : Math.min(requested, Math.max(0, finishDeadline - Date.now()));
+  // A step for the person (#1695) waits for its chat at most the ordinary identity window in total,
+  // across every later identity check too (CodeRabbit on #2088).
+  const stepDeadline = name === 'ask_user_to_run' || name === 'user_request_status' ? startedAt + IDENTITY_EVIDENCE_MS : null;
+  const deadline = finishDeadline ?? stepDeadline;
+  const identityWindow = (requested: number): number => deadline === null
+    ? requested : Math.min(requested, Math.max(0, deadline - Date.now()));
   // Windows observation/input gets one short grace even under the opt-in. Exact proof can then
   // alias the observation directly to the durable session, while a genuinely headless caller
   // falls back to its request principal instead of waiting the old full identity window.
-  const needsExactIdentity = name === 'session_finish' || desktopContext || (!allowUnattributed && (
+  // A step for the person (#1695) is shown in its own chat and refused without it, so it waits for
+  // the page's proof like session_finish: ChatGPT can hand one before that proof arrives (VM, 2026-11-07).
+  const stepForPerson = name === 'ask_user_to_run' || name === 'user_request_status';
+  const needsExactIdentity = name === 'session_finish' || stepForPerson || desktopContext || (!allowUnattributed && (
     name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())
   ));
   if (!context.caller.conversationId && needsExactIdentity && requestId) {
-    const wait = name === 'session_finish' || (workerStarting() && !desktopContext)
+    // A step for the person keeps the ordinary identity window, also while a worker starts (CodeRabbit on #2088).
+    const wait = name === 'session_finish' || (workerStarting() && !desktopContext && !stepForPerson)
       ? SPAWN_EVIDENCE_MS
       : desktopContext && allowUnattributed
       ? UNATTRIBUTED_DESKTOP_EVIDENCE_MS
@@ -1027,7 +1056,7 @@ async function dispatchTracked(
     handlerRan = true;
     return run();
   };
-  const result = await runInCallContext(context, () =>
+  let result = await runInCallContext(context, () =>
       admissionRefusal
         ? Promise.resolve(fail(admissionRefusal))
         : compacting
@@ -1080,8 +1109,6 @@ async function dispatchTracked(
         : invokeHandler()
   );
   markTiming('handler');
-  // Nested exec children are counted under their own names, like direct calls.
-  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
   if (identityRefusals.has(result)) rememberIdentityRefusal(requestId, name);
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
@@ -1097,7 +1124,22 @@ async function dispatchTracked(
     ? await conversationAccessRefusal(context.caller.conversationId)
     : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
     workerConnectionProfileRefusal(context.caller);
-  const deliveryFenced = Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
+  const currentProviderProof = context.caller.providerSessionAnchor ? requestCorrelation(requestId) : null;
+  const providerIdentityChanged = !!context.caller.providerSessionAnchor &&
+    (!currentProviderProof || currentProviderProof.conversationId !== context.caller.conversationId || currentProviderProof.sessionId !== context.caller.sessionId);
+  if (providerIdentityChanged) {
+    logWarn(`provider session delivery refused for request ${requestId}; caller proof changed while the operation ran`);
+    result = failIdentity('CALLER_IDENTITY_CHANGED: caller proof changed while this operation ran. Its result was withheld. ' +
+      'The operation may already have completed; do not repeat it to repair attribution.');
+    context.outcome = 'tool_internal_error';
+    context.evidence = emptyEvidence();
+    context.caller = { ...context.caller, conversationId: null, sessionId: null, runId: undefined };
+    context.agent = null;
+    rememberIdentityRefusal(requestId, name);
+  }
+  // Nested exec children are counted under their own names, like direct calls.
+  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
+  const deliveryFenced = providerIdentityChanged || Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
     Boolean(deliveryPolicyRefusal) ||
     compactingConversation(context.caller.conversationId) !== null || Boolean(context.caller.conversationId &&
       (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded');
@@ -1153,7 +1195,8 @@ async function dispatchTracked(
     context.caller.conversationId,
     deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish),
     context.caller.requestId,
-    context.allowUnattributed === true
+    context.allowUnattributed === true,
+    recordingContextCurrent(context.recordingContext)
   );
   if (!nested && recoveredWorkerRole && !deliveryFenced) delivered = {
     ...delivered,
@@ -1208,6 +1251,7 @@ async function dispatchTracked(
   // while ChatGPT still sees the call running; the answer waits for it below, bounded.
   const closeHold = !nested && context.caller.conversationId ? openCallHold(context.caller.conversationId) : null;
   const recording = recordToolCall({
+    recordingContext: context.recordingContext,
     nested,
     tool: name,
     args: surface === 'plugins' ? pluginManager.redact(args) : args,
@@ -1223,6 +1267,7 @@ async function dispatchTracked(
     requestId: context.caller.requestId,
     conversationId: context.caller.conversationId,
     sessionId: context.caller.sessionId ?? null,
+    ...(context.caller.providerSessionAnchor ? { providerSessionAnchor: context.caller.providerSessionAnchor } : {}),
     endsActivity: isFinish && !result.isError
   });
   // Exact request-id identity needs no browser wait, so make its durable session append part

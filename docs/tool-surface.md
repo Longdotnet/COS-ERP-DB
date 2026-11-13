@@ -12,22 +12,22 @@ composes that connector's own tools.
 
 | Connector | Purpose | Possible tools |
 | --- | --- | --- |
-| **COS ERP DB Core** | Approved files, verified local knowledge, project-native engineering, SQL Server, patches, terminal, generated images, task plans, workers | `read`, `view_image`, `find`, `knowledge`, `engineering`, `database`, `apply_patch`, `save_image`, `exec_command`, `write_stdin`, `update_plan`, `agents`, `session_finish`, `exec` |
-| **COS ERP DB Desktop** | Browser tabs through the companion (all platforms); screen, windows, mouse/keyboard and clipboard (Windows/macOS) | `browser_tabs`, `browser_snapshot`, `browser_screenshot`, `browser_navigate`, `browser_action`, `browser_evaluate`, `browser_console`, `browser_network`; Windows: `list_windows`, `get_window`, `list_apps`, `get_window_state`, `launch_app`, `click`, `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action`, `activate_window`, `read_clipboard`, `write_clipboard`; macOS: `observe`, `computer`; `exec` |
+| **COS ERP DB Core** | Approved files, verified local knowledge, project-native engineering, SQL Server, patches, terminal, generated images, task plans, workers | `read`, `view_image`, `find`, `knowledge`, `engineering`, `database`, `apply_patch`, `save_image`, `exec_command`, `write_stdin`, `ask_user_to_run`, `user_request_status`, `update_plan`, `agents`, `session_finish`, `usage`, `exec` |
+| **COS ERP DB Desktop** | Browser tabs through the companion (all platforms); screen, windows, mouse/keyboard and clipboard (Windows/macOS); opt-in GNOME Wayland screenshots and semantic accessibility control (Linux) | `browser_tabs`, `browser_snapshot`, `browser_screenshot`, `browser_navigate`, `browser_action`, `browser_evaluate`, `browser_console`, `browser_network`; Windows: `list_windows`, `get_window`, `list_apps`, `get_window_state`, `launch_app`, `click`, `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action`, `activate_window`, `read_clipboard`, `write_clipboard`; macOS: `observe`, `computer`; Linux opt-in: `linux_observe`, `linux_act`; `exec` |
 | **COS ERP DB Plugins** | External MCP tools the user enabled in Settings | Each enabled tool under its own schema, plus `exec` |
 
 Core is the main connector everywhere; Desktop and Plugins are optional.
 
 On a fresh current config, Core permissions are enabled, along with
 session recording and multi-agent mode; read-only mode is off. Windows also enables Desktop permissions; macOS starts them off and the user switches them on. Linux masks
-Desktop permissions off at runtime while preserving stored choices for a config later reopened on
-Windows or macOS. Existing configs keep explicit choices during upgrades; missing legacy permissions are
+native Desktop input permissions off at runtime while preserving stored choices for a config later reopened on
+Windows or macOS. Linux GNOME screenshots require an independent default-off opt-in and explicit Screen permission. Existing configs keep explicit choices during upgrades; missing legacy permissions are
 not silently widened.
 
 With fresh defaults, Core advertises `read`, `view_image`, `find`, `knowledge`, `engineering`, `database`,
-`apply_patch`, `save_image`, `exec_command`, `write_stdin`, `update_plan`, `agents` and `exec`.
-`session_finish` appears while Session finish is on. `find` is the bounded repository-search
-primitive whenever search permission is enabled; `exec_command` is independent and remains the
+`apply_patch`, `save_image`, `exec_command`, `write_stdin`, `ask_user_to_run`, `user_request_status`,
+`update_plan`, `agents`, `usage` and `exec`. `session_finish` appears while Session finish is on.
+`find` is the bounded repository-search primitive whenever search permission is enabled; `exec_command` is independent and remains the
 shell escape hatch. Tool exposure is monotonic within a running connector instance, so a permission
 changed mid-conversation can leave a previously exposed name listed; its handler still enforces
 the current permission.
@@ -170,6 +170,19 @@ Always available (recording is always on). Replaces the exact caller’s display
 not execute queued work. Local history continues recording messages and real tool results for the
 app transcript and continuation. There is no model-facing recording search/read tool.
 
+### `ask_user_to_run` and `user_request_status`
+
+Offered with the command tools (also in Read-only mode over Run programs, since they run nothing).
+`ask_user_to_run` hands one step to the person: the exact command (up to 8 KB, shown in full), the
+folder (an approved folder or inside one; defaults like `exec_command`), a one-line purpose, the
+files it should leave (at most 10) and constraints. The app records it in that chat, shows it as a
+card with Copy, Mark as done and Skip, and returns an id at once. It never runs the command. The
+same open command and folder returns the existing id; a chat holds at most 20 open steps.
+`user_request_status` reports open, done or skipped, and for each expected file whether it exists
+with its size and time; nothing is read. Only the person marks a step done. The description asks
+the model never to use it for an action it declined or that was refused for safety; the app cannot
+enforce that.
+
 Compact & Resume is app/browser orchestration. There is no model-visible `save_handoff` or
 `resume_session` tool.
 
@@ -232,6 +245,40 @@ attaching, including protected ChatGPT tabs. An attached tab also accepts `brows
 dialogs), `browser_evaluate`, `browser_console` and `browser_network`. Input works in the
 background without moving the OS cursor or bringing the browser to the front.
 
+### `browser_network` stream capture
+
+For Chromium network inspection, `browser_network` accepts `requestId` with `stream:true`
+to retain an in-flight `text/event-stream` response. Retention is bounded to 4 MiB per tab
+and 4096 nonempty chunks per request; exceeding either bound marks overflow.
+`browser_network` refuses ChatGPT pages (`chatgpt.com` and `chat.openai.com`) and
+tabs protected by CoS orchestration, including previously attached tabs that navigate
+into those pages. ChatGPT request traffic is excluded from retained listings even
+when encountered from another tab. This covers stream capture and legacy body reads.
+Captured response bytes remain only in extension memory while their attached tab
+and request entry are retained; there is no time-based expiry. Clear, request
+replacement, buffer eviction, debugger detach or tab release disposes the bytes.
+Top-level document navigation also releases retained stream bytes. A subframe
+navigation or same-document URL change does not interrupt the main page's stream.
+Already-open ChatGPT tabs are checked before recording network events, including
+third-party requests with no document URL.
+Capture from an individual child frame/session is discarded when that child
+navigates to another document or detaches. ChatGPT child frames are excluded even
+when the resource URL and document URL are not ChatGPT URLs. Read permission is
+rechecked after asynchronous response-body work before any byte page is returned.
+Child debugger sessions are bound to the top-level document epoch at attach time;
+an old session cannot contribute requests after the top page navigates.
+Child requests are admitted only after that debugger session initializes successfully;
+failed or pending initialization cannot leave retained request metadata or bytes.
+Read captured bytes with `body:true`, optional `bodyOffset` (byte offset) and `bodyBytes`
+(default 65536, maximum 262144). Decode each base64 page to bytes and concatenate before
+UTF-8 decoding; a page can split a character. Inspect `terminal` and `complete` separately:
+aborts, capture errors, invalid bytes and overflow never prove a complete response.
+`nextOffsetBytes:null` means the end of currently retained bytes, not the end of a live
+response. Poll again from `totalBytes` while `terminal:false`.
+Enable capture before the request finishes. Unsupported CDP capture is reported explicitly;
+ordinary finite response reads retain their existing behavior. Clear/release/eviction discard
+retained data. This operation uses the existing tab ownership and screen-read permission.
+
 ### Native desktop tools (Windows and macOS)
 
 Linux does not advertise or execute these schemas. Windows publishes one tool per operation:
@@ -239,6 +286,41 @@ Linux does not advertise or execute these schemas. Windows publishes one tool pe
 `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action` and
 `activate_window` act; `read_clipboard` and `write_clipboard` follow the clipboard permissions.
 macOS publishes `observe` and `computer`, described below.
+
+### `linux_observe` (read-only screenshots and semantic observation, Linux)
+
+The screenshot-only part 2 first published `linux_observe` after a person enabled
+`ui.linuxDesktopEnabled` and granted Screen permission. Part 3 extends the
+read-only input schema to `windows`, `apps`, `displays`, `snapshot` with a
+`window_id`, and `screenshot` with `display: 0` (the only permitted screenshot
+display). Inventory and snapshots return bounded structured data; screenshot
+output is an MCP PNG image plus text metadata labeled `scope: 'display'`.
+GNOME's operating-system portal can ask for consent and can be cancelled; do not retry
+automatically. The separate Settings test requests one portal screenshot but discards it
+without returning pixels to the renderer. Unknown caller identity requires the existing,
+separately chosen `desktopUnattributed` setting; the default is to refuse.
+
+The semantic snapshot mode requires a proven nonbrowser window. Refs are kept
+only for the proven Setup profile, session and
+conversation; an unattributed observation gets ephemeral non-actionable refs.
+
+### `linux_act` (semantic accessibility refs only, Linux)
+
+Requires the native opt-in, live Control permission, Read-only mode off and
+an owned, unexpired `linux_observe` snapshot. Supports only semantic
+`click` and `set_value` on the exact window's snapshot-scoped refs.
+The target process incarnation, ref, owner and grants are rechecked
+after any approval wait; every action consumes its refs. It cannot
+target browser windows or fall back to physical pointer/keyboard input.
+The backend version probe accepts only a `version` command response for Linux
+agent-desktop 1.0.2. Ref tokens (`@s<snapshot>:e<element>`) are capped at
+128 characters by observation collection, the action schema and the native
+subprocess adapter, so oversized backend refs never become actionable.
+An invalid ref or a tree that would be truncated by the 24-depth, 200-children
+or 512-ref bounds causes the whole snapshot to be refused before publication.
+Only a static diagnostic is logged; no backend ref or private UI text leaks.
+Desktop Ask (if configured) grants permission only to the exact proven
+Linux profile/session/conversation, not a shared transport connection.
 
 ### `observe`
 

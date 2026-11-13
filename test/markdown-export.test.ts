@@ -1,8 +1,10 @@
 import { expect, it } from 'vitest';
+import { Lexer } from 'marked';
 import type { SessionEvent } from '../src/shared/session.js';
+import { chronological } from '../src/shared/chronology.js';
 import {
   answerAnchors, answerMarkdown, completedTurnIds, markdownFileName, messageAnswerAnchors, messageAnswerEntries, sessionMarkdown,
-  transcriptEntries, turnAnswerEntries
+  latestAnswer, transcriptEntries, turnAnswerEntries
 } from '../src/shared/markdown-export.js';
 
 const text = (value: string) => ({ text: value, truncated: false, chars: value.length });
@@ -112,6 +114,36 @@ it('offers actions only for turns the page reported as completed, on their last 
   expect(turnAnswerEntries(events, 't1').map(entry => entry.stored.text)).toEqual(['First part', 'Second part']);
 });
 
+it.each(['completed', 'interrupted', 'failed'])('revokes a reopened turn until its next end (%s)', outcome => {
+  seq = 0;
+  const events = [
+    user('earlier', 'Earlier'), answer('earlier', 'a0', 'Earlier answer'), end('earlier'),
+    user('t1', 'Continue'),
+    { seq: ++seq, time: seq, source: 'extension', kind: 'turn_start', turnId: 't1' } as SessionEvent,
+    answer('t1', 'a1', 'First answer'), end('t1'),
+    { seq: ++seq, time: seq, source: 'app', kind: 'turn_start', turnId: 't1' } as SessionEvent
+  ];
+  expect([...completedTurnIds(events)]).toEqual(['earlier']);
+  expect([...answerAnchors(events).keys()]).toEqual(['earlier']);
+  expect(latestAnswer(events)).toEqual({ turnId: 'earlier' });
+  // The store returns display chronology, which can move a repeated start before the old end.
+  expect(completedTurnIds(chronological(events)).has('t1')).toBe(false);
+  expect(answerAnchors(chronological(events)).has('t1')).toBe(false);
+  expect(latestAnswer(chronological(events))).toEqual({ turnId: 'earlier' });
+  events.push(end('t1', outcome));
+  expect(completedTurnIds(events).has('t1')).toBe(outcome === 'completed');
+  expect(answerAnchors(events).has('t1')).toBe(outcome === 'completed');
+  expect(latestAnswer(events)).toEqual({ turnId: outcome === 'completed' ? 't1' : 'earlier' });
+  expect(completedTurnIds([...events].reverse()).has('t1')).toBe(outcome === 'completed');
+});
+
+it('keeps a completed answer available when only its original start is outside the loaded history', () => {
+  seq = 0;
+  const events = [answer('t1', 'a1', 'Historical answer'), end('t1')];
+  expect(completedTurnIds(events).has('t1')).toBe(true);
+  expect(answerAnchors(events).has('t1')).toBe(true);
+});
+
 // Answers recorded outside any turn: the history ChatGPT copied into a branch, an adopted chat's
 // earlier answers, replies to messages typed in the ChatGPT tab. Each final one carries actions too.
 it('offers actions on each final answer recorded without a turn, by its message id', () => {
@@ -150,4 +182,25 @@ it('names files safely from chat titles', () => {
   expect(markdownFileName(`${prefix}🧪 test`)).toBe(`${prefix}.md`);
   expect(markdownFileName(`${'x'.repeat(78)}🧪 test`)).toBe(`${'x'.repeat(78)}🧪.md`);
   expect(markdownFileName(`${prefix}🧪 test`, ' - answer')).toBe(`${prefix} - answer.md`);
+});
+
+it.each(['\n', '\r\n'])('preserves first-line code indentation in answers and assistant transcripts (%j)', newline => {
+  const code = ['    - ```markdown', '    | Item | Qty |', '    |---|---|'].join(newline);
+  const source = `${newline} \t${newline}${code}${newline}${newline}`;
+  expect(answerMarkdown([source])).toBe(`${code}\n`);
+  expect(sessionMarkdown('Code', [{ role: 'assistant', text: source }])).toBe(`# Code\n\n## ChatGPT\n\n${code}\n`);
+  expect(answerMarkdown([' \t\n', '', 'Done.  '])).toBe('Done.\n');
+});
+
+it.each(['- Notes', '1. Notes', 'Notes'])('keeps the next message’s indented code outside %j', previous => {
+  for (const newline of ['\n', '\r\n']) {
+    for (const indent of ['    ', '\t', ' \t']) {
+      const code = `${indent}echo *text*`;
+      const markdown = answerMarkdown([`${previous}${newline}`, ' \t\n', `${newline}${code}${newline}`]);
+      const blocks = Lexer.lex(markdown).filter(token => token.type !== 'space' && token.type !== 'html');
+      expect(blocks.map(token => token.type)).toEqual([previous === 'Notes' ? 'paragraph' : 'list', 'code']);
+      expect(blocks[1]).toMatchObject({ text: 'echo *text*\n' });
+      expect(markdown).toBe(`${previous}\n\n<!-- -->\n\n${code}\n`);
+    }
+  }
 });

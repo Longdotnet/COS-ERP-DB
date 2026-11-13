@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import {
@@ -179,6 +180,20 @@ describe('what an import would open up', () => {
       'multiAgent.allowUnattributedCalls', 'multiAgent.strictChatAllowlist', 'readOnly', 'ui.secretsShield']);
   });
 
+  it('counts desktop control for calls without a known chat as wider access (2026-10-30)', () => {
+    expect(widerAccess(base, after(copy => { (copy.ui as Record<string, unknown>).desktopUnattributed = true; }))).toEqual(['ui.desktopUnattributed']);
+    expect(widerAccess(after(copy => { (copy.ui as Record<string, unknown>).desktopUnattributed = true; }), base)).toEqual([]);
+  });
+
+  // CodeRabbit on #1990: an import that turns on replies from Telegram gives the phone a way to message chats.
+  it('counts replies from Telegram as wider access when an import turns them on, and not when it turns them off', () => {
+    const steer = (on: boolean | undefined) => after(copy => { (copy.ui as Record<string, unknown>).phonePush = { telegramSteer: on }; });
+    expect(widerAccess(steer(false), steer(true))).toEqual(['ui.phonePush.telegramSteer']);
+    expect(widerAccess(base, steer(true))).toEqual(['ui.phonePush.telegramSteer']);
+    expect(widerAccess(steer(true), steer(false))).toEqual([]);
+    expect(widerAccess(steer(true), steer(true))).toEqual([]);
+  });
+
   it('counts the command rules as wider when they are switched off, even with the same rules', () => {
     expect(widerAccess(base, after(copy => { copy.commandAllowlist.enabled = false; }))).toEqual(['commandAllowlist']);
   });
@@ -187,5 +202,16 @@ describe('what an import would open up', () => {
     const { secretsShield: _, ...ui } = base.ui;
     expect(widerAccess(base, { ...base, ui })).toEqual([]);
     expect(widerAccess({ ...base, ui }, after(copy => { copy.ui.secretsShield = false; }))).toEqual(['ui.secretsShield']);
+  });
+  it('translates the native Linux Desktop access warning in every settings catalog', () => {
+    const keys = ['Native Linux Desktop access on',
+      'Off by default. GNOME display screenshots require Screen permission and OS consent. Semantic accessibility actions require Control permission, a proven chat, and explicit approval when configured. No physical-input fallback.'];
+    for (const locale of ['de', 'es', 'fr', 'ja', 'ko', 'pt-BR', 'pt-PT', 'ru', 'tr', 'vi', 'zh-CN', 'zh-TW']) {
+      const catalog = JSON.parse(readFileSync(`src/renderer/locales/${locale}.json`, 'utf8')) as Record<string, string>;
+      for (const key of keys) {
+        expect(catalog[key], locale).toBeTruthy();
+        expect(catalog[key], locale).not.toBe(key);
+      }
+    }
   });
 });

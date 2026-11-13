@@ -30,10 +30,13 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
     // Browser delivery uses its exact native key, so a later page echo updates this row.
     // Tool delivery has no native user row and keeps the stable input id as its key.
     messageId, inputId: entry.id, inputDelivery: offered ? 'offered' as const : 'confirmed' as const, authoredText: authoredTextOf(entry),
+    ...(confirmed && entry.edit && !messageId.startsWith('input:') && messageId !== entry.edit.messageId
+      ? { replaces: entry.edit.messageId, replacesConfirmed: true as const } : {}),
     wireTokenEstimate: estimateTokens(text),
     ...(messageId.startsWith('input:') && entry.toolTurnId ? { turnId: entry.toolTurnId } : {}),
     // The chat keeps saying the message was a scheduled run after the outbox row is gone.
     ...(entry.scheduled ? { scheduled: { dueAt: entry.scheduled.dueAt, late: entry.scheduled.late } } : {}),
+    ...(entry.via === 'telegram' ? { via: 'telegram' as const } : {}),
     ...(entry.attachments?.length && entry.transportIntent !== 'tool' ? { attachments: entry.attachments } : {}),
     // Injection does not change the running model. Only the native send path verifies
     // picker selection before delivery; a later sparse browser echo keeps this evidence.

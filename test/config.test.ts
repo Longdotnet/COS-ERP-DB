@@ -80,6 +80,20 @@ describe('settings migration', () => {
     }]);
   });
 
+  it('defaults missing or damaged Linux Desktop opt-in to off, but retains an explicit true across reload', async () => {
+    const fresh = defaultConfig();
+    expect(fresh.ui.linuxDesktopEnabled).toBe(false);
+    const { linuxDesktopEnabled: _, ...legacyUi } = fresh.ui;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...fresh, ui: legacyUi }), 'utf8');
+    expect((await loadConfig()).ui.linuxDesktopEnabled).toBe(false);
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({
+      ...fresh, ui: { ...fresh.ui, linuxDesktopEnabled: 'yes' }
+    }), 'utf8');
+    expect((await loadConfig()).ui.linuxDesktopEnabled).toBe(false);
+    await saveConfig({ ...fresh, ui: { ...fresh.ui, linuxDesktopEnabled: true } });
+    expect((await loadConfig()).ui.linuxDesktopEnabled).toBe(true);
+  });
+
   it('defaults command policy enforcement off in allow mode and round-trips both modes', async () => {
     expect(defaultConfig().commandAllowlist).toEqual({ enabled: false, mode: 'allow', rules: [] });
     const legacy = defaultConfig() as Partial<ReturnType<typeof defaultConfig>>;
@@ -270,15 +284,26 @@ describe('settings migration', () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, rotateTurnMinutes: 0 } });
     expect((await loadConfig()).ui.rotateTurnMinutes).toBe(0);
   });
-  it('keeps the stop fallback for fresh turns off unless chosen, also for legacy and malformed settings', async () => {
-    expect(defaultConfig().ui.rotateStopFallback).toBe(false);
-    const legacy = defaultConfig(); delete legacy.ui.rotateStopFallback;
+  // User decision 2026-10-31: fresh turns failed in long chats where ChatGPT shows only Stop, so the
+  // stop-and-continue fallback is on by default. Configs from before it are turned on once (a saved
+  // false there was the old default, not a choice); after that a person's off stays off.
+  it('turns the stop fallback for fresh turns on for new and earlier configs once, then keeps a later choice', async () => {
+    expect(defaultConfig().ui).toMatchObject({ rotateStopFallback: true, rotateStopFallbackAdopted: true });
+    const legacy = defaultConfig(); delete legacy.ui.rotateStopFallback; delete legacy.ui.rotateStopFallbackAdopted;
     await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
-    expect((await loadConfig()).ui.rotateStopFallback).toBe(false);
-    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...legacy, ui: { ...legacy.ui, rotateStopFallback: 'yes', startAtLogin: true } }), 'utf8');
-    expect((await loadConfig()).ui).toMatchObject({ rotateStopFallback: false, startAtLogin: true });
-    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, rotateStopFallback: true } });
+    expect((await loadConfig()).ui).toMatchObject({ rotateStopFallback: true, rotateStopFallbackAdopted: true });
+    // 2.1.48 wrote the old default with every save.
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...legacy, ui: { ...legacy.ui, rotateStopFallback: false } }), 'utf8');
     expect((await loadConfig()).ui.rotateStopFallback).toBe(true);
+    // A malformed value reads as the default.
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...legacy, ui: { ...legacy.ui, rotateStopFallback: 'yes', rotateStopFallbackAdopted: true, startAtLogin: true } }), 'utf8');
+    expect((await loadConfig()).ui).toMatchObject({ rotateStopFallback: true, startAtLogin: true });
+    // Switched off after the change: it stays off.
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, rotateStopFallback: false } });
+    expect((await loadConfig()).ui.rotateStopFallback).toBe(false);
+    // A damaged marker reads as adopted: the saved off is kept (CodeRabbit on #1954).
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, rotateStopFallback: false, rotateStopFallbackAdopted: 'yes' } }), 'utf8');
+    expect((await loadConfig()).ui.rotateStopFallback).toBe(false);
   });
   it('reads other apps’ usage for fresh and legacy settings and keeps it off once switched off', async () => {
     expect(defaultConfig().ui.localAppUsage).toBe(true);
@@ -784,6 +809,24 @@ describe('shipped defaults', () => {
       expect(config.multiAgent.archiveWorkerChats).toBe(false);
     }
   );
+
+  it('starts "Chats working at once" off for an older config, keeps a saved limit, and reads a damaged one as off (#1694)', async () => {
+    const saved = JSON.parse(JSON.stringify(defaultConfig())) as Record<string, any>;
+    delete saved.multiAgent.chatsAtOnce;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(saved), 'utf8');
+    expect((await loadConfig()).multiAgent.chatsAtOnce).toBe(0);
+    saved.multiAgent.chatsAtOnce = 3;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(saved), 'utf8');
+    expect((await loadConfig()).multiAgent.chatsAtOnce).toBe(3);
+    for (const damaged of [99, -1, 2.5, 'three']) {
+      saved.multiAgent.chatsAtOnce = damaged;
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(saved), 'utf8');
+      const loaded = await loadConfig();
+      expect(loaded.multiAgent.chatsAtOnce, String(damaged)).toBe(0);
+      // The rest of the settings are kept, not reset to recovery defaults.
+      expect(loaded.multiAgent.maxWorkers).toBe(saved.multiAgent.maxWorkers);
+    }
+  });
 
   it('does not widen omitted permissions or agents exposure in an existing legacy config', async () => {
     const legacy = {
@@ -1323,6 +1366,48 @@ it('loads a damaged desktop ask choice as always, a missing one as off, and says
     warn.mockClear();
     expect((await loadConfig()).ui.desktopAsk).toBe('always');
     expect(lines()).toEqual(['config: the saved ui.desktopAsk was damaged; the app asks before every desktop step until it is chosen again']);
+  }
+  warn.mockRestore();
+});
+
+// 2026-10-30: desktop control for calls without a known chat. A config from before the setting, or a
+// damaged value, loads as off (the safe side), and only the damaged one is logged.
+it('loads desktop control for calls without a known chat as off when missing or damaged, and logs only the damaged one', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const lines = () => warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('desktopUnattributed'));
+  for (const [saved, loadedAs] of [[true, true], [false, false], [undefined, undefined]] as const) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopUnattributed: saved } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopUnattributed).toBe(loadedAs);
+    expect(lines()).toEqual([]);
+  }
+  for (const damaged of ['yes', 1, null, { on: true }]) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopUnattributed: damaged } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopUnattributed).toBeUndefined();
+    expect(lines()).toEqual(['config: the saved ui.desktopUnattributed was damaged; desktop control is used only for chats the app can name until it is chosen again']);
+  }
+  warn.mockRestore();
+});
+
+// 2026-10-30: "Show message times". A config from before the switch loads as off; a damaged value too,
+// said once.
+it('loads Show message times as off when missing or damaged, and logs only the damaged one', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const lines = () => warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('showMessageTimes'));
+  for (const [saved, loadedAs] of [[true, true], [false, false], [undefined, undefined]] as const) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, showMessageTimes: saved } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.showMessageTimes).toBe(loadedAs);
+    expect(lines()).toEqual([]);
+  }
+  for (const damaged of ['yes', 1, null]) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, showMessageTimes: damaged } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.showMessageTimes).toBeUndefined();
+    expect(lines()).toEqual(['config: the saved ui.showMessageTimes was damaged; message times stay hidden until the switch is set again']);
   }
   warn.mockRestore();
 });

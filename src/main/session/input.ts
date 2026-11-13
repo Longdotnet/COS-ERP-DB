@@ -11,7 +11,8 @@ import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, questionHasMcpCall, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage, readEvents } from './store.js';
-import { noteEditReplacement } from './edits.js';
+import { assertSessionNotRemoving } from './removal.js';
+import { noteEditReplacement, noteEditReplacements } from './edits.js';
 import { userPromptText } from '../../shared/user-prompt.js';
 import type { SessionEvent } from '../../shared/session.js';
 import { assignSessionProject, getProject, getSessionProject, localProjectPath, projectWorkspace } from '../projects.js';
@@ -23,13 +24,14 @@ import { noteChatOrigin } from './recorder.js';
 import { seedBranchHistory } from './branch-history.js';
 import { DEFAULT_HELPER_CHAT_MODEL, isAstraModel, isProModel } from '../../shared/chat-models.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
+import { automaticPauseRefusal, automaticSendRefusal } from '../chats-at-once.js';
 import { automaticFinishEnabled, goalDrivingMode, consumeGoalReplyForInputNow } from '../goal.js';
 import { finishInstruction } from '../../shared/finish.js';
 import { CONVERSATION_DELETED } from '../../shared/chat-error.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
-import { BROWSER_PICKUP_MAX_ATTEMPTS, recoveryMessage, recoveryBusyMs, rotationMessage } from '../../shared/recovery.js';
+import { BROWSER_PICKUP_ATTEMPT_LIMIT, BROWSER_PICKUP_MAX_ATTEMPTS, recoveryMessage, recoveryBusyMs, rotationMessage } from '../../shared/recovery.js';
 import { invokedSkills } from '../../shared/skill-invocation.js';
 import { SKILL_ID_PATTERN } from '../../shared/skills.js';
 import { autoSelectManagedSkills } from '../skill-routing.js';
@@ -77,7 +79,9 @@ export const inputArgs = z.object({
    */
   edit: z.object({ messageId: z.string().regex(NATIVE_ID) }).strict().optional(),
   /** Scheduled runs (#1826): this message is a run of the chat's schedule, due at `dueAt`; `late` when it went out after a missed time. */
-  scheduled: z.object({ scheduleId: z.string().uuid(), dueAt: z.number().int().nonnegative(), late: z.boolean() }).strict().optional()
+  scheduled: z.object({ scheduleId: z.string().uuid(), dueAt: z.number().int().nonnegative(), late: z.boolean() }).strict().optional(),
+  /** Sent by the person from somewhere else: a reply to a Telegram notification (Haz on #1990). Main sets it, never the window. */
+  via: z.literal('telegram').optional()
 });
 export type InputArgs = z.infer<typeof inputArgs>;
 const entrySchema = inputArgs.extend({
@@ -98,6 +102,20 @@ const entrySchema = inputArgs.extend({
   /** The active turn at admission; its final may already be waiting in the browser journal. */
   queuedTurn: z.object({ conversationId: z.string().min(1).max(256), turnId: z.string().min(1).max(256) }).optional(),
   /** Shared unfinished-response fallback belongs to this question in every mode. */
+  /** An automatic Continue the app sent on as an ordinary message (`continueAsOrdinaryMessage`). */
+  continuedFrom: z.literal('recovery').optional(),
+  /**
+   * A new chat's tab vanished before anything reached it, and a fresh one was opened this often (max 2).
+   * A damaged count reads as used up: it must never make the outbox unreadable, nor grant more tabs.
+   */
+  openingReopens: z.number().int().min(1).max(2).optional().catch(2),
+  /**
+   * The lost tab the last fresh one was granted for, as `<browser>:<tab>` (tab ids are per browser
+   * session): a repeat report of it gets the same grant.
+   */
+  openingReopenedTab: z.string().min(1).max(220).optional().catch(undefined),
+  /** The question that Continue continues, still checked until it is sent (CodeRabbit on #1960). */
+  continuesQuestionId: z.string().max(200).optional(),
   recovery: z.object({ questionId: z.string(), episode: z.string().max(200).optional(), pro: z.boolean(), busyUntil: z.number(), phase: z.enum(['ready', 'stopping', 'reloading', 'resumed']), reloadOwner: z.string().optional(),
     /** First release of an unbroken run of pages withdrawing this Continue before Send (#820). */
     withdrawnSince: z.number().optional(),
@@ -129,8 +147,12 @@ const entrySchema = inputArgs.extend({
   pickupRetryCount: z.number().int().nonnegative().optional(),
   /** Times a Send the page proved untaken (its exact text still in the composer) was requeued. */
   notTakenRetries: z.number().int().nonnegative().optional(),
+  /** Cumulative eligible browser-pickup time for a scheduled row; held time is excluded. */
+  scheduledPickupMs: z.number().int().min(0).max(60_000).optional(),
+  /** Start of the current continuously eligible scheduled browser-pickup window. */
+  scheduledPickupSince: z.number().int().nonnegative().optional(),
   /** Browser reload budget for this exact queued input; survives app restart. */
-  pickupRecovery: z.object({ attempts: z.number().int().min(0).max(BROWSER_PICKUP_MAX_ATTEMPTS),
+  pickupRecovery: z.object({ attempts: z.number().int().min(0).max(BROWSER_PICKUP_ATTEMPT_LIMIT),
     nextAt: z.number().int().positive().optional(), stoppedAt: z.number().int().positive().optional() }).optional(),
   cancelledByUser: z.literal(true).optional(),
   error: z.string().max(200).optional(),
@@ -149,7 +171,25 @@ const entrySchema = inputArgs.extend({
   completedTurnId: z.string().max(256).optional(),
   queueOrder: z.number().int().nonnegative().optional(),
   /** #1794: the send check held this automatic send; it is asked again from `nextAt`. */
-  sendCheck: z.object({ attempt: z.number().int().positive(), nextAt: z.number(), reason: z.string().max(200), answered: z.boolean() }).optional()
+  sendCheck: z.object({ attempt: z.number().int().positive(), nextAt: z.number(), reason: z.string().max(200), answered: z.boolean() }).optional(),
+  /** Shown, never saved: this automatic send waits for a free slot or ChatGPT's pause (#1694). */
+  slotWait: z.enum(['slots', 'paused']).optional(),
+  /**
+   * "Chats working at once" holds this message back (#1694): `at` is the last time it did (refreshed
+   * while `open`) or when the hold ended. The app never offered it meanwhile, so the one-minute
+   * pickup deadline counts from `at`; saved, so a restart keeps it (CodeRabbit on #2051).
+   */
+  slotHold: z.object({ at: z.number(), open: z.boolean() }).optional(),
+  /**
+   * A page has this message and holds it back until its own turn ends (2026-11-03): ChatGPT still
+   * answering, a turn the page still holds, or a running tool call. The browser did pick it up, so
+   * the one-minute pickup deadline counts from the last such hold, and the queue says why it waits.
+   */
+  pageHold: z.object({ reason: z.enum(['still-answering', 'turn-held', 'tool-running']), at: z.number(),
+    /** The chat whose page holds it; a hold counts only while the message still goes there (CodeRabbit on #2054). */
+    conversationId: z.string().nullable().optional(),
+    /** When the window was last told, so its wording is refreshed before it lapses (CodeRabbit on #2054). */
+    toldAt: z.number().optional() }).optional()
 });
 export type InputEntry = z.infer<typeof entrySchema>;
 
@@ -158,11 +198,38 @@ export type InputEntry = z.infer<typeof entrySchema>;
  * which is never asked about. Finish replies are asked before they are filed, as they can also
  * reach ChatGPT in a tool result.
  */
-export function automaticSendKind(row: Pick<InputEntry, 'recovery' | 'purpose' | 'afterStop' | 'scheduled'>): SendCheckKind | null {
-  if (row.recovery) return 'continue';
+export function automaticSendKind(row: Pick<InputEntry, 'recovery' | 'purpose' | 'afterStop' | 'scheduled' | 'continuedFrom'>): SendCheckKind | null {
+  // An automatic Continue sent as an ordinary message is still the app's own send (CodeRabbit on #1960).
+  if (row.recovery || row.continuedFrom === 'recovery') return 'continue';
   if (row.purpose === 'rotation' || row.afterStop) return 'fresh-turn';
   if (row.scheduled) return 'scheduled';
   return null;
+}
+
+/**
+ * Whether "Chats working at once" (#1694) applies: only the app's own sends wait. A message the
+ * person sent, and a finish step they asked for, never do. The Goal helper's own question belongs
+ * to a Goal step that was already admitted at /goal/draft.
+ */
+function slotGated(row: InputEntry): boolean {
+  return automaticSendKind(row) !== null || (!!row.finishOwner && row.finishOwner.userRequested !== true);
+}
+/** Why each automatic send waits for a slot now, for its row and the offer log; never saved. */
+const slotWaits = new Map<string, string>();
+/** How often a held message's saved `slotHold` is refreshed: well inside the one-minute pickup deadline. */
+const SLOT_HELD_REFRESH_MS = 15_000;
+function noteSlotWait(id: string, reason: string | null): void {
+  const before = slotWaits.get(id);
+  if (reason === null) {
+    if (before !== undefined) { slotWaits.delete(id); logInfo(`input ${id}: a slot is free; the automatic send goes out`); deliveryHooks?.changed(); }
+    return;
+  }
+  if (before === reason) return;
+  slotWaits.set(id, reason);
+  // Once per kind of wait (a slot, or ChatGPT's pause), not per poll or per count.
+  const kind = (text: string) => text.startsWith('ChatGPT asked to slow down') ? 'paused' : 'slots';
+  if (before === undefined || kind(before) !== kind(reason)) logInfo(`input ${id} waits: ${reason}`);
+  deliveryHooks?.changed();
 }
 
 /** Held by the send check until its next ask; clearing the check's address releases it at once. */
@@ -282,6 +349,10 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
 const CLOSE_REPORT_GRACE_MS = 5_000;
 async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   if (entry.error?.startsWith('Local chat setup failed:')) return false;
+  // Scheduled messages are always browser sends after the chat is idle. Refuse any
+  // legacy or malformed row that still carries active-turn/tool custody.
+  if (entry.scheduled && (entry.directTurn || entry.transportIntent === 'tool' ||
+      entry.delivery === 'tool' || entry.attachmentDelivery === 'tool')) return false;
   // Authored Inject-now custody never changes transports. Its exact turn either
   // offers it from an MCP response or expires it visibly below.
   if (entry.delivery === 'tool') return false;
@@ -350,9 +421,11 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
   return serial(async () => {
     const current = ordered(await load());
     if (current.some(row => row.sessionId === sessionId && row.state === 'browser')) return false;
-    const head = current.find(row => row.sessionId === sessionId && queuedFollowup(row) && ['queued', 'tool'].includes(row.state));
+    const head = current.find(row => row.sessionId === sessionId && !row.scheduled && queuedFollowup(row) && ['queued', 'tool'].includes(row.state));
     for (const row of current) {
-      if (row.sessionId !== sessionId || row.dueAt > Date.now()) continue;
+      // A scheduled run is owned exclusively by the browser route, including
+      // when it is still 'auto' and a tool call happens before its page Send.
+      if (row.sessionId !== sessionId || row.scheduled || row.dueAt > Date.now()) continue;
       if (row.attachments?.length && row.attachmentDelivery !== 'tool' && row.delivery !== 'tool') continue;
       if (row.mode === 'after-turn' || (row.mode === 'finish' && !finishBoundary)) continue;
       if (row.mode === 'finish' && row !== head) continue;
@@ -386,11 +459,20 @@ export function deliveryProof(row: Readonly<InputEntry>): DeliveryProof {
   // `sent` says the page or the exact request confirmed it, so a row with that state and no
   // receipt is a gap in the record, not proof that nothing was sent.
   if (row.state === 'sent') return 'unconfirmed';
+  // This exact terminal error is written only after the page positively proved that
+  // ChatGPT did not take the authorized Send (the composer still held the text).
+  // Authorization alone must not turn that durable no-send receipt into ambiguity.
+  if (row.state === 'failed' && row.error === NOT_TAKEN_FAILED) return 'not_sent';
   if (terminal(row)) return neverAuthorized(row) ? 'not_sent' : 'unconfirmed';
   return row.state === 'queued' || (row.state === 'browser' && neverAuthorized(row)) ? 'pending' : 'unconfirmed';
 }
 const preparable = (row: InputEntry): boolean => row.state === 'queued' ||
   (row.state === 'browser' && row.requiresAuthorization === true && row.sendAuthorizedAt === undefined);
+/** A schedule is appended behind authored work and may not jump its delivery custody. */
+function hasPendingUserInput(rows: InputEntry[], sessionId: string, now = Date.now()): boolean {
+  return rows.some(row => row.sessionId === sessionId && !row.scheduled && row.purpose !== 'decision' &&
+    (row.state === 'browser' || row.state === 'tool' || (row.state === 'queued' && row.dueAt <= now)));
+}
 const needsHistory = (row: InputEntry): boolean => row.purpose !== 'decision' && !row.historyRecorded &&
   ((row.state === 'tool' && Number.isFinite(row.offeredAt)) || ((row.state === 'sent' || row.state === 'cancelled') && !!row.messageId));
 const pendingStages = (row: InputEntry): boolean => row.state === 'sent' && !!row.stages?.length && !row.stagesApplied;
@@ -471,10 +553,48 @@ async function migrateLegacyOpeningOwners(current: InputEntry[]): Promise<boolea
 
 async function load(): Promise<InputEntry[]> {
   if (entries) return expireQueued(entries);
-  const raw = await readDurable<unknown>(STATE);
+  // The outbox is authoritative: a transient read or damaged JSON must never look like an empty
+  // queue, or the next enqueue could replace messages we have not been able to inspect. ENOENT
+  // remains the normal first-run case and strict durable reads return null for it.
+  const raw = await readDurable<unknown>(STATE, { strict: true });
   const parsed = z.array(entrySchema).safeParse(raw ?? []);
   if (!parsed.success) throw new Error('The message outbox could not be read safely');
-  entries = parsed.data;
+  let scheduledRoutingChanged = false, scheduledRepaired = 0;
+  const routed = parsed.data.map((row): InputEntry => {
+    // A live eligibility window cannot include time while the app was closed.
+    // Keep only checkpointed eligible milliseconds across restart.
+    if (row.scheduled && row.scheduledPickupSince !== undefined) row = { ...row, scheduledPickupSince: undefined };
+    if (!row.scheduled) return row;
+    const activeTurnRoute = !!row.directTurn || row.transportIntent === 'tool' || row.delivery === 'tool' ||
+      row.attachmentDelivery === 'tool' || row.toolTurnId !== undefined;
+    const legacyAfterTurn = row.mode === 'finish' || row.requestedMode === 'after-turn';
+    if (row.state === 'queued' && row.owner === null && row.offeredAt === undefined && row.sendAuthorizedAt === undefined &&
+        (activeTurnRoute || legacyAfterTurn || (row.mode === 'after-turn' && row.requestedMode !== undefined))) {
+      // A pre-fix queued schedule was never handed to a page or tool, so its exact
+      // outbox id can be retained while moving it to browser-only after-turn custody.
+      // Keep the source turn as a release boundary when the old route recorded one.
+      const turnId = row.directTurn?.id ?? row.toolTurnId ?? row.queuedTurn?.turnId;
+      const conversationId = row.queuedTurn?.conversationId ?? row.conversationId;
+      const { directTurn: _direct, toolTurnId: _toolTurn, delivery: _delivery, attachmentDelivery: _attachmentDelivery,
+        requestedMode: _requestedMode, transportIntent: _transportIntent, ...rest } = row;
+      const repaired: InputEntry = {
+        ...rest,
+        mode: legacyAfterTurn ? (turnId && conversationId ? 'after-turn' : 'auto')
+          : activeTurnRoute && turnId && conversationId ? 'after-turn' : row.mode,
+        ...(activeTurnRoute && turnId && conversationId ? { queuedTurn: { conversationId, turnId } } : {}),
+        transportIntent: 'browser'
+      };
+      if (activeTurnRoute && !(turnId && conversationId)) repaired.mode = 'auto';
+      scheduledRoutingChanged = true; scheduledRepaired++;
+      return repaired;
+    }
+    return row;
+  });
+  if (scheduledRoutingChanged) {
+    await writeDurableNow(STATE, routed, { onPersisted: () => deliveryHooks?.changed() });
+    logInfo(`input: ${scheduledRepaired} scheduled message(s) moved to browser-only custody on load (legacy routing repaired)`);
+  }
+  entries = routed;
   const legacyOpeningRepair = await migrateLegacyOpeningOwners(entries);
   // One failed/deleted project must not prevent unrelated accepted work loading.
   let openingRepair = legacyOpeningRepair;
@@ -503,6 +623,20 @@ async function load(): Promise<InputEntry[]> {
       else if (summary.origin) stamped.add(summary.conversationId);
       seen.add(summary.conversationId);
     }
+  }
+  const confirmedEdits = new Map<string, Array<{ messageId: string; replaced: string }>>();
+  for (const row of entries) {
+    const sessionId = row.sessionId ?? row.deliveredSessionId;
+    if (!row.edit || !row.messageId || !sessionId || !Number.isFinite(row.deliveredAt) ||
+        (row.state !== 'sent' && row.state !== 'cancelled')) continue;
+    const edits = confirmedEdits.get(sessionId) ?? [];
+    edits.push({ messageId: row.messageId, replaced: row.edit.messageId });
+    confirmedEdits.set(sessionId, edits);
+  }
+  for (const [sessionId, edits] of confirmedEdits) {
+    await noteEditReplacements(sessionId, edits, (messageId, error) =>
+      logWarn(`input: could not restore confirmed edit ${messageId} (${String(error)})`))
+      .catch((error: Error) => logWarn(`input: could not read confirmed edits for session ${sessionId} (${error.message})`));
   }
   // Durable decision receipts recover helper provenance even when recording/ACK raced
   // or this version first opens a helper recorded before origins were stamped.
@@ -549,9 +683,48 @@ async function retireRemovedSessionReceipts(current: InputEntry[], pendingOnly =
   await commit(next);
   return next;
 }
+/** When a page last held this message, counted only while the message still goes to that page's chat. */
+async function heldUntil(row: InputEntry): Promise<number> {
+  const hold = row.pageHold;
+  if (!hold) return 0;
+  if (hold.conversationId === undefined) return hold.at;
+  const goesTo = await target(row).catch(() => undefined);
+  return goesTo !== undefined && (goesTo ?? null) === hold.conversationId ? hold.at : 0;
+}
+
+/** Mirrors every main-process gate before counting a scheduled browser pickup second. */
+async function scheduledPickupEligible(row: InputEntry, current: InputEntry[]): Promise<boolean> {
+  if (!row.scheduled || row.state !== 'queued' || row.dueAt > Date.now() || heldBySendCheck(row) || companionOf(current, row)) return false;
+  try {
+    if (row.sessionId && hasPendingUserInput(current, row.sessionId)) return false;
+    if (queuedFollowup(row) && !await completedStageBoundary(row, current)) return false;
+    if (!await browserInputAllowed(row)) return false;
+    const conversationId = await target(row);
+    if (conversationId && !readyForWake(conversationId)) return false;
+    const chatgptProject = !conversationId && row.projectId && row.purpose !== 'decision' && !row.lifetime && !row.branch
+      ? (await getProject(row.projectId))?.chatgpt : undefined;
+    if (chatgptProject && chatgptProject.state !== 'linked') return false;
+    // This is the same last admission gate used by pendingBrowserInputs. A refusal
+    // pauses the pickup clock; an admitted slot belongs to this exact outbox row.
+    if (slotGated(row) && automaticSendRefusal(`input:${row.id}`, conversationId)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
-  const next = await Promise.all(current.map(async (row): Promise<InputEntry> => {
+  // Slot admission is ordered and stateful, so inspect scheduled rows serially in the
+  // same queue order as pendingBrowserInputs before calculating their eligible time.
+  const releasedScheduledClaims: string[] = [];
+  const scheduledEligibility = new Map<string, boolean>();
+  for (const row of ordered(current)) if (row.scheduled && row.state === 'queued')
+    scheduledEligibility.set(row.id, await scheduledPickupEligible(row, current));
+  const next = await Promise.all(current.map(async (storedRow): Promise<InputEntry> => {
+    let row = storedRow;
     if (companionOf(current, row)) return row;
+    if (row.scheduled && row.state !== 'queued' && row.scheduledPickupSince !== undefined)
+      row = { ...row, scheduledPickupSince: undefined };
     if (row.recovery && row.state === 'browser' && row.sendAuthorizedAt !== undefined &&
         row.sessionId && row.conversationId && row.silenceBoundary?.conversationId === row.conversationId &&
         !row.companionInputId) {
@@ -565,6 +738,10 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     }
     if (row.recovery && !terminal(row) && row.sendAuthorizedAt === undefined) {
       const reason = await recoveryInvalidReason(row);
+      if (reason) return { ...row, state: 'cancelled', error: `Automatic Continue cancelled: ${reason}.` };
+    }
+    if (row.continuesQuestionId && !terminal(row) && row.sendAuthorizedAt === undefined) {
+      const reason = await continuedInvalidReason(row);
       if (reason) return { ...row, state: 'cancelled', error: `Automatic Continue cancelled: ${reason}.` };
     }
     if (row.finishOwner && !terminal(row) && !(await finishInputCurrent(row)))
@@ -583,17 +760,39 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
         error: 'Not injected: the selected turn ended before an eligible tool call.' };
     }
     if (row.state === 'tool') return settleToolInputFromFinal(row);
+    if (row.state === 'queued' && row.scheduled) {
+      const now = Date.now();
+      const eligible = scheduledEligibility.get(row.id) === true;
+      const since = row.scheduledPickupSince;
+      const interval = since === undefined ? 0 : Math.max(0, now - since);
+      const eligibleMs = (row.scheduledPickupMs ?? 0) + (eligible ? interval : 0);
+      if (eligible && eligibleMs >= 60_000) return { ...row, state: 'failed', pickupFailedAt: now,
+        scheduledPickupMs: undefined, scheduledPickupSince: undefined,
+        error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
+      if (!eligible) {
+        // A hold may have started between polls. Discard the uncheckpointed interval
+        // rather than count any time that might have belonged to the hold.
+        return since === undefined ? row : { ...row, scheduledPickupSince: undefined };
+      }
+      // Only pendingBrowserInputs starts this clock after it actually advertises the row.
+      if (since === undefined) return row;
+      // Checkpoint eligible time in bounded chunks so restarts retain progress while
+      // a newly observed hold can never make the held interval count toward the minute.
+      if (interval >= 5_000) return { ...row, scheduledPickupMs: eligibleMs, scheduledPickupSince: now };
+    }
     // Only an ordinary browser attempt has an unclaimed startup deadline. Tool
     // intent survives a later terminal observation/restart; legacy bound-chat
     // rows are ambiguous and cannot safely be reclassified from today's activity.
     // A message the app itself holds ("Message queued. Finish Setup to send: …", or after a failed
     // browser start) was never offered to a browser. It stays queued with its reason and Retry;
     // failing it here lost it and blamed the browser instead.
-    if (row.state === 'queued' && row.mode === 'auto' && !row.opening && !row.finishOwner && !row.silenceBoundary &&
+    if (row.state === 'queued' && row.mode === 'auto' && !row.scheduled && !row.opening && !row.finishOwner && !row.silenceBoundary &&
         (row.transportIntent === 'browser' || (!row.transportIntent && !row.sessionId)) &&
         !row.error?.startsWith('Message queued. ') &&
         // Time the person's send check held it is not the browser's: its minute starts when the hold ends (#1794).
-        Date.now() - Math.max(row.createdAt, row.dueAt, row.sendCheck?.nextAt ?? 0) >= 60_000)
+        // Nor is time a page held it until its own turn ended: that page has it (2026-11-03).
+        // Nor time "Chats working at once" held it back: the app never offered it then (#1694, CodeRabbit on #2051).
+        Date.now() - Math.max(row.createdAt, row.dueAt, row.sendCheck?.nextAt ?? 0, await heldUntil(row), row.slotHold?.at ?? 0) >= 60_000)
       return { ...row, state: 'failed', pickupFailedAt: Date.now(), error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
     // Preparation can expire before Send. Once authorized, this exact claim owns
     // the uncertain outcome until receipt or explicit cancellation, regardless of
@@ -604,6 +803,25 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
       // A never-authorized Continue still owes delivery. Retain its ticket and
       // pickup budget, but never replay a possibly consumed Stop after losing a page.
       if (row.recovery) return releaseRecoveryClaim(row);
+      if (row.scheduled) {
+        // A browser claim that never obtained Send permission is provably
+        // unsent. Preserve the same id, but discard any legacy tool/finish route
+        // that made the original browser claim unclaimable on Astra.
+        const activeTurnRoute = !!row.directTurn || row.transportIntent === 'tool' || row.delivery === 'tool' ||
+          row.attachmentDelivery === 'tool' || row.toolTurnId !== undefined;
+        const legacyAfterTurn = row.mode === 'finish' || row.mode === 'after-turn' || row.requestedMode === 'after-turn';
+        const turnId = row.completedTurnId ?? row.directTurn?.id ?? row.toolTurnId ?? row.queuedTurn?.turnId;
+        const boundaryConversation = row.queuedTurn?.conversationId ?? row.conversationId;
+        const { directTurn: _direct, toolTurnId: _toolTurn, delivery: _delivery, attachmentDelivery: _attachmentDelivery,
+          requestedMode: _requestedMode, transportIntent: _transportIntent, ...rest } = row;
+        const afterTurn = legacyAfterTurn || activeTurnRoute;
+        releasedScheduledClaims.push(row.id);
+        return { ...rest, mode: afterTurn ? (turnId && boundaryConversation ? 'after-turn' : 'auto') : row.mode,
+          ...(afterTurn && turnId && boundaryConversation ? { queuedTurn: { conversationId: boundaryConversation, turnId } } : {}),
+          transportIntent: 'browser', state: 'queued', owner: null, offeredAt: undefined,
+          requiresAuthorization: undefined, completedTurnId: undefined,
+          deliveryText: undefined, error: undefined, scheduledPickupMs: undefined, scheduledPickupSince: undefined };
+      }
       // A message the user sent into the running answer that the page could not take (its answer
       // broke and was reloaded, 2026-10-14) was never sent: keep it for after that turn rather than
       // cancelling what the person typed.
@@ -636,7 +854,15 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     if (root && root.state !== next[i]!.state) next[i] = { ...next[i]!, state: root.state, error: root.error };
   }
   if (next.some((row, index) => row !== current[index])) {
-    await commit(next);
+    const notify = next.some((row, index) => {
+      const previous = current[index]!;
+      const { scheduledPickupMs: _nextMs, scheduledPickupSince: _nextSince, ...nextVisible } = row;
+      const { scheduledPickupMs: _previousMs, scheduledPickupSince: _previousSince, ...previousVisible } = previous;
+      return JSON.stringify(nextVisible) !== JSON.stringify(previousVisible);
+    });
+    await commit(next, { notify });
+    // After the write: a failed save leaves the claim where it was, and the log must not say it was released.
+    for (const id of releasedScheduledClaims) logInfo(`input ${id}: scheduled claim released: its browser never authorized Send before the timeout; it queues again`);
     for (const [index, row] of next.entries()) if (row.pickupFailedAt !== undefined && current[index]?.pickupFailedAt === undefined) {
       const gb = (bytes: number) => (bytes / 1024 ** 3).toFixed(1);
       let context = '';
@@ -683,7 +909,8 @@ export function retryUnclaimedInput(id: string): Promise<InputEntry | null> {
     return next;
   });
 }
-async function commit(next: InputEntry[]): Promise<void> {
+type InputCommitOptions = { notify?: boolean };
+async function commit(next: InputEntry[], options: InputCommitOptions = {}): Promise<void> {
   // A temporary planner keeps only ownership metadata across restart, never its task or answer.
   const durableRows = (rows: InputEntry[]) => rows.map(row => row.lifetime === 'temporary-planner'
     ? { ...row, text: '[Temporary planner]', deliveryText: undefined, response: undefined } : row);
@@ -697,7 +924,9 @@ async function commit(next: InputEntry[]): Promise<void> {
   entries = next;
   wakeBrowserWork();
   for (const listener of inputListeners) { try { listener(); } catch { /* observer only */ } }
-  try { deliveryHooks?.changed(); } catch { /* a detached renderer does not undo a durable commit */ }
+  if (options.notify !== false) {
+    try { deliveryHooks?.changed(); } catch { /* a detached renderer does not undo a durable commit */ }
+  }
 }
 /** Reserve the attempt durably before crossing into Goal's control ledger. The failed
  * row is the crash tombstone: an ambiguous settings write is never replayed after a
@@ -745,8 +974,9 @@ function append(current: InputEntry[], entry: InputEntry, stackDirect = false): 
     if (positioned.length) entry = { ...entry, queueOrder: Math.max(...positioned.map(row => row.queueOrder!)) + 1 };
   }
   // Admission is per durable session. Native composer custody stays with each claim.
-  if (!stackDirect && entry.purpose !== 'decision' && !queuedFollowup(entry) && current.some(row => row.sessionId === entry.sessionId && row.purpose !== 'decision' &&
+  if (!stackDirect && !entry.scheduled && entry.purpose !== 'decision' && !queuedFollowup(entry) && current.some(row => row.sessionId === entry.sessionId && row.purpose !== 'decision' &&
       !(!entry.finishOwner && row.finishOwner && row.state === 'tool') &&
+      (!row.scheduled || row.state === 'browser' || row.state === 'tool') &&
       (!queuedFollowup(row) || row.state === 'browser') && ['queued', 'browser', 'tool'].includes(row.state))) {
     throw new Error('One message is already awaiting delivery. Cancel it before sending another.');
   }
@@ -956,15 +1186,34 @@ export function withdrawUnsentRotation(id: string): Promise<'queued' | 'browser'
   });
 }
 
-export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
+export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner'], options: InputCommitOptions = {}): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
+    const localId = input.sessionId ?? input.id;
+    assertSessionNotRemoving(localId, 'enqueue input');
+    const scheduled = input.scheduled !== undefined;
+    if (scheduled) {
+      if (finishOwner) throw new Error('Scheduled messages cannot be attached to a finish turn');
+      // The schedule owns a future browser message. Callers cannot turn it into an
+      // Inject-now/tool send by supplying a different mode or delivery hint.
+      input.mode = 'auto';
+      delete input.delivery;
+      delete input.attachmentDelivery;
+    }
     if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
       throw new Error('Keep the complete plan below 12,000 characters');
     const current = await load();
+    assertSessionNotRemoving(localId, 'enqueue input');
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
-      if (JSON.stringify(inputArgs.parse({ ...prior, sessionId: prior.opening ? prior.requestedSessionId ?? null : prior.sessionId, mode: prior.requestedMode ?? prior.mode })) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
+      const comparablePrior = { ...prior, sessionId: prior.opening ? prior.requestedSessionId ?? null : prior.sessionId,
+        mode: scheduled ? 'auto' as const : prior.requestedMode ?? prior.mode };
+      if (scheduled) {
+        delete comparablePrior.delivery;
+        delete comparablePrior.attachmentDelivery;
+        delete comparablePrior.transportIntent;
+      }
+      if (JSON.stringify(inputArgs.parse(comparablePrior)) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
       if (!terminal(prior)) await materializeOpening(prior);
       return { ...prior };
     }
@@ -972,10 +1221,15 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     // Explicit injection has its own recipient and can never spend a browser completion.
     const activity = requestedSession && input.delivery !== 'tool' && input.attachmentDelivery !== 'tool'
       ? deliveryHooks?.activity?.(requestedSession) : null;
-    const sourceTurn = requestedSession?.activeTurnId ?? (activity?.exact ? activity.turnId : null);
+    // Ordinary inputs can attach to an exact browser-observed turn. Scheduled
+    // delivery has no tool/direct-turn route and requires a recorded boundary.
+    const sourceTurn = requestedSession?.activeTurnId ?? (activity?.exact ? activity.turnId ?? null : null);
     const queuedTurn = requestedSession?.conversationId && sourceTurn
       ? { conversationId: requestedSession.conversationId, turnId: sourceTurn } : undefined;
     let policy = input.sessionId ? await sessionInputPolicy(input.sessionId) : null;
+    // An unrecorded browser-only activity has no durable completion boundary;
+    // leave it browser-only auto and wait for the idle transport fence.
+    if (scheduled) input.mode = requestedSession?.activeTurnId ? 'after-turn' : 'auto';
     const previousOpening = [...current].reverse().find(row => row.opening && row.sessionId === input.sessionId);
     // An explicit reviewed resend may replace a proven pre-send failure in the same
     // local chat. An ambiguous native Send still owns its receipt; never replay it.
@@ -1008,19 +1262,19 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       // Native files belong to the next browser message, never a tool-result injection.
       if (finishOwner) throw new Error('Automatic finish messages cannot attach files');
       if (input.mode === 'finish' || (input.mode === 'auto' && (policy?.canInject || policy?.directTurn))) input.mode = 'after-turn';
-    } else if (input.mode === 'after-turn' && policy?.queueAtFinish) input.mode = 'finish';
+    } else if (!scheduled && input.mode === 'after-turn' && policy?.queueAtFinish) input.mode = 'finish';
     if (input.mode === 'finish' || input.stages?.length) {
       const session = input.sessionId ? await getSession(input.sessionId) : null;
       if ((input.mode === 'finish' && !session?.conversationId) || session?.origin?.kind === 'worker') throw new Error('Queue staged tasks in a normal chat');
     }
     // Unattributed work can fence browser Send without making this chat a tool recipient.
     // Leave that input neutral until the existing serialized claim selects a safe transport.
-    const transportIntent = toolDelivery ? 'tool' as const : input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
+    const transportIntent = scheduled ? 'browser' as const : toolDelivery ? 'tool' as const : input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
       ? policy?.canInject ? 'tool' as const : !policy || policy.browserAllowed || policy.directTurn ? 'browser' as const : undefined : undefined;
-    const directTurn = !toolDelivery && input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
+    const directTurn = !scheduled && !toolDelivery && input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
     const entry: InputEntry = { ...input, ...(queuedTurn ? { queuedTurn } : {}), ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}),
       ...(injectionOwner ? { toolTurnId: injectionOwner.turnId } : {}), ...(transportIntent ? { transportIntent } : {}),
-      ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+      ...(!scheduled && requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
       await projectWorkspace(input.projectId);
       if (input.sessionId) {
@@ -1055,21 +1309,42 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
           ? 'The active chat changed while preparing injection; send again'
           : 'The active chat changed while preparing images; send again');
     }
+    if (scheduled && input.sessionId) {
+      // Recheck after all asynchronous preparation. A turn can begin after the
+      // runner's summary lookup or during enqueue; keep the row browser-only and
+      // let the normal idle/after-turn gates decide when it may be claimed.
+      policy = await sessionInputPolicy(input.sessionId);
+      const latestSession = await getSession(input.sessionId);
+      // Browser activity without a recorded turn has no completion boundary;
+      // its scheduled send remains 'auto' and the idle browser gate waits.
+      const latestTurnId = latestSession?.activeTurnId ?? null;
+      entry.mode = latestTurnId ? 'after-turn' : 'auto';
+      delete entry.requestedMode;
+      if (latestTurnId && latestSession?.conversationId)
+        entry.queuedTurn = { conversationId: latestSession.conversationId, turnId: latestTurnId };
+      else delete entry.queuedTurn;
+      delete entry.directTurn;
+      delete entry.toolTurnId;
+      delete entry.delivery;
+      delete entry.attachmentDelivery;
+      entry.transportIntent = 'browser';
+    }
     // User input supersedes only automatic work that has never been handed out.
     // Offered tool receipts retain their identity until a later request proves receipt.
     const prioritized = !finishOwner ? current.map(row => row.sessionId === entry.sessionId &&
       ((row.finishOwner && row.state === 'queued') || (row.recovery && !terminal(row) && row.sendAuthorizedAt === undefined) ||
         (row.purpose === 'rotation' && !terminal(row) && row.sendAuthorizedAt === undefined))
       ? { ...row, state: 'cancelled' as const, error: 'Replaced by your new instruction before delivery.' } : row) : current;
-    let next = append(prioritized, entry, input.mode === 'auto' && !finishOwner && policy?.canInject === true);
+    let next = append(prioritized, entry, !scheduled && input.mode === 'auto' && !finishOwner && policy?.canInject === true);
     // A finish plan belongs to an existing session now. Publish every editable
     // checkpoint atomically; no composer text or first-send receipt owns its life.
     if (entry.mode === 'finish') next = materializeStages(next, entry);
-    await commit(next);
+    assertSessionNotRemoving(localId, 'enqueue input');
+    await commit(next, options);
     try { await materializeOpening(entry); }
     catch (error) {
       const failed = { ...entry, error: ('Local chat setup failed: ' + (error as Error).message).slice(0, 200) };
-      await commit(next.map(row => row.id === entry.id ? failed : row));
+      await commit(next.map(row => row.id === entry.id ? failed : row), options);
       throw error;
     }
     return { ...next.find(row => row.id === entry.id)! };
@@ -1102,7 +1377,10 @@ export function listInputs(): Promise<InputEntry[]> {
     }
     if (next.length !== current.length || next.some((entry, index) => entry !== current[index])) await commit(next);
     await publishHistory();
-    return ordered(await load()).map((entry) => ({ ...entry }));
+    return ordered(await load()).map((entry) => {
+      const slot = entry.state === 'queued' ? slotWaits.get(entry.id) : undefined;
+      return slot ? { ...entry, slotWait: slot.startsWith('ChatGPT asked to slow down') ? 'paused' as const : 'slots' as const } : { ...entry };
+    });
   });
 }
 export interface PickupRecoveryState { attempts: number; nextAt?: number; stoppedAt?: number }
@@ -1117,15 +1395,14 @@ async function rowsForPickupSource(current: InputEntry[], sessionId: string, sou
 }
 
 function mergedPickupState(rows: InputEntry[], inherited?: PickupRecoveryState): PickupRecoveryState {
-  const attempts = Math.min(BROWSER_PICKUP_MAX_ATTEMPTS,
+  const attempts = Math.min(BROWSER_PICKUP_ATTEMPT_LIMIT,
     Math.max(inherited?.attempts ?? 0, ...rows.map(row => row.pickupRecovery?.attempts ?? 0)));
+  // The next slow retry belongs to the newest reload, before and after the chat shows as stopped.
+  const nextAt = (inherited?.attempts === attempts ? inherited.nextAt : undefined) ??
+    rows.find(row => row.pickupRecovery?.attempts === attempts)?.pickupRecovery?.nextAt;
   const stoppedAt = inherited?.stoppedAt ?? rows.find(row => row.pickupRecovery?.stoppedAt)?.pickupRecovery?.stoppedAt;
-  if (stoppedAt || attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) return {
-    attempts, stoppedAt: stoppedAt ?? rows.find(row => row.pickupRecovery?.stoppedAt)?.pickupRecovery?.stoppedAt ?? Date.now()
-  };
-  const nextAt = inherited?.attempts === attempts ? inherited.nextAt : undefined;
-  return { attempts, ...(nextAt ?? rows.find(row => row.pickupRecovery?.attempts === attempts)?.pickupRecovery?.nextAt
-    ? { nextAt: nextAt ?? rows.find(row => row.pickupRecovery?.attempts === attempts)?.pickupRecovery?.nextAt } : {}) };
+  if (stoppedAt || attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) return { attempts, stoppedAt: stoppedAt ?? Date.now(), ...(nextAt ? { nextAt } : {}) };
+  return { attempts, ...(nextAt ? { nextAt } : {}) };
 }
 
 /** Copies a source-turn budget to every durable input owner, so reorder/replacement cannot reset it. */
@@ -1148,7 +1425,11 @@ function samePickupState(a: PickupRecoveryState | undefined, b: PickupRecoverySt
 }
 
 /** Reserve a source-turn reload against all of its queued owners before browser handout. */
-export function recordQueuedPickupAttemptNow(inputId: string, sourceTurnId: string, at: number, nextAt?: number, inherited?: PickupRecoveryState): Promise<PickupRecoveryState | null> {
+/**
+ * `expected`: the attempts the caller read before deciding a retry is due. Another pass that reserved
+ * meanwhile moved the count past it, and this one then reserves nothing (CodeRabbit on #1979).
+ */
+export function recordQueuedPickupAttemptNow(inputId: string, sourceTurnId: string, at: number, nextAt?: number, inherited?: PickupRecoveryState, expected?: number): Promise<PickupRecoveryState | null> {
   return serial(async () => {
     const current = await load();
     const row = current.find(entry => entry.id === inputId);
@@ -1158,15 +1439,17 @@ export function recordQueuedPickupAttemptNow(inputId: string, sourceTurnId: stri
     if (!session || session.conversationId !== row.conversationId || session.browserRecoveryDismissedAt !== undefined) return null;
     const matches = await rowsForPickupSource(current, row.sessionId, sourceTurnId);
     const prior = mergedPickupState(matches, inherited);
-    if (prior.stoppedAt || prior.attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) {
+    if (expected !== undefined && prior.attempts > expected) return null;
+    // Past the quick burst the chat shows as stopped, and slow retries go on until the hard bound.
+    if (prior.attempts >= BROWSER_PICKUP_ATTEMPT_LIMIT) {
       const next = current.map(entry => matches.includes(entry) && !samePickupState(entry.pickupRecovery, prior)
         ? { ...entry, pickupRecovery: prior } : entry);
       if (next.some((entry, index) => entry !== current[index])) await commit(next);
       return null;
     }
     const attempts = prior.attempts + 1;
-    const pickupRecovery = attempts >= BROWSER_PICKUP_MAX_ATTEMPTS ? { attempts, stoppedAt: at }
-      : { attempts, ...(nextAt !== undefined ? { nextAt } : {}) };
+    const stoppedAt = prior.stoppedAt ?? (attempts >= BROWSER_PICKUP_MAX_ATTEMPTS ? at : undefined);
+    const pickupRecovery = { attempts, ...(nextAt !== undefined ? { nextAt } : {}), ...(stoppedAt ? { stoppedAt } : {}) };
     const next = current.map(entry => matches.includes(entry) ? { ...entry, pickupRecovery } : entry);
     await commit(next);
     return { attempts, ...('nextAt' in pickupRecovery && pickupRecovery.nextAt ? { nextAt: pickupRecovery.nextAt } : {}),
@@ -1215,6 +1498,27 @@ export function cancelInput(id: string): Promise<boolean> {
   });
 }
 
+/** Retire an unbound chat's opening before Remove deletes its local reservation.
+ * Unlike Cancel delivery, Remove detaches any late receipt from that reservation.
+ * Keep the admission tombstone and Send evidence: an authorized Send may have happened. */
+export function retireRemovedOpening(sessionId: string): Promise<string[]> {
+  return serial(async () => {
+    const current = await load();
+    const retired = new Set<string>();
+    const next = current.map((row): InputEntry => {
+      if (!row.opening || row.sessionId !== sessionId || row.deliveredAt !== undefined ||
+          !(row.state === 'queued' || row.state === 'browser' || (row.state === 'cancelled' && row.owner))) return row;
+      retired.add(row.id);
+      return { ...row, state: 'cancelled', cancelledByUser: true, owner: null };
+    });
+    if (retired.size) {
+      await commit(next);
+      logInfo(`session ${sessionId}: retired its pending opening before local deletion`);
+    }
+    return [...retired];
+  });
+}
+
 /** Only explicit withdrawal of a provably unsent opening retires its empty reservation.
  * The cancelled outbox row remains the tombstone; timeout/failure never grants deletion.
  * Runs under the input queue, which also owns initial provider binding and Send authority. */
@@ -1254,7 +1558,7 @@ async function settleToolInputFromFinal(row: InputEntry): Promise<InputEntry> {
 export function reorderQueuedInputs(sessionId: string, ids: string[]): Promise<boolean> {
   return serial(async () => {
     const current = await load();
-    const queue = current.filter(row => row.sessionId === sessionId && queuedFollowup(row) && !row.recovery && row.state === 'queued');
+    const queue = current.filter(row => row.sessionId === sessionId && !row.scheduled && queuedFollowup(row) && !row.recovery && row.state === 'queued');
     // A stale snapshot must not move claimed input or omit newly queued work.
     if (!ids.length || ids.length !== queue.length || new Set(ids).size !== ids.length ||
         queue.some(row => !ids.includes(row.id))) return false;
@@ -1299,7 +1603,7 @@ export function editQueuedInput(id: string, text: string, afterTurn?: boolean): 
 export function sendQueuedInputNow(id: string): Promise<boolean> {
   return serial(async () => {
     const current = await load();
-    const row = current.find(entry => entry.id === id && entry.state === 'queued' && entry.mode === 'after-turn' && queuedFollowup(entry) &&
+    const row = current.find(entry => entry.id === id && !entry.scheduled && entry.state === 'queued' && entry.mode === 'after-turn' && queuedFollowup(entry) &&
       !entry.recovery && !entry.finishOwner && !entry.attachments?.length && !entry.images?.length && !entry.stages?.length && !!entry.sessionId);
     if (!row) return false;
     const policy = await sessionInputPolicy(row.sessionId!);
@@ -1318,7 +1622,39 @@ export function authorizeBrowserInput(id: string, owner: string, conversationId:
     const current = await load();
     const row = current.find(row => row.id === id && row.owner === owner && row.state === 'browser' && row.conversationId === conversationId);
     if (!row || row.sendAuthorizedAt !== undefined || companionOf(current, row)) return false;
-    if (!(await browserInputAllowed(row)) || await target(row) !== conversationId) return false;
+    if (row.scheduled && row.sessionId && hasPendingUserInput(current, row.sessionId)) {
+      // Authored work can arrive after this scheduled row was claimed. The claim
+      // has no Send authority yet, so release the same UUID and let user work go first.
+      await commit(current.map(entry => sameDelivery(row, entry)
+        ? { ...entry, state: 'queued', owner: null, offeredAt: undefined,
+          requiresAuthorization: undefined, completedTurnId: undefined,
+          deliveryText: undefined, error: undefined, scheduledPickupSince: undefined }
+        : entry));
+      logInfo(`input ${row.id}: scheduled claim released before Send: authored work arrived first`);
+      return false;
+    }
+    if (!(await browserInputAllowed(row)) || await target(row) !== conversationId) {
+      if (row.scheduled) {
+        // A new turn may begin after the browser claimed a completed boundary.
+        // No Send was authorized, so release that exact claim rather than leaving
+        // a stale completedTurnId that prevents every subsequent browser pickup.
+        await commit(current.map(entry => sameDelivery(row, entry)
+          ? { ...entry, state: 'queued', owner: null, offeredAt: undefined,
+            requiresAuthorization: undefined, completedTurnId: undefined,
+            deliveryText: undefined, error: undefined,
+            ...(entry.scheduled ? { scheduledPickupSince: undefined } : {}) }
+          : entry));
+        logInfo(`input ${row.id}: scheduled claim released before Send: the chat moved on or the browser may no longer take it`);
+      }
+      return false;
+    }
+    if (await continuedInvalidReason(row)) return false;
+    // Its slot was admitted at the offer; ChatGPT's pause may have started since (CodeRabbit on #2051).
+    // Refused like any other last-moment veto: nothing is sent and the claim's own retry rules apply.
+    if (slotGated(row)) {
+      const paused = automaticPauseRefusal();
+      if (paused) { logInfo(`input ${row.id}: Send not authorized: ${paused}`); return false; }
+    }
     if (row.companionInputId) {
       const companion = current.find(other => other.id === row.companionInputId && other.state === 'browser' && other.owner === owner && other.sessionId === row.sessionId);
       const session = row.sessionId ? await getSession(row.sessionId) : null;
@@ -1358,6 +1694,48 @@ export function setInputAutomation(id: string, automation: NonNullable<InputArgs
       await deliveryHooks.applyAutomation(conversationId, mode, entry.state === 'sent' ? 'after-send' : 'before-send', undefined, delivery);
     }
     return true;
+  });
+}
+/** How often a new chat whose tab vanished before anything reached it gets a fresh tab. */
+export const OPENING_REOPENS = 2;
+
+/** A missing elected tab is not replay authority. End only a never-handed-out opening. */
+export function failUnclaimedBrowserOpening(id: string, currentOwner: () => boolean, tab?: string): Promise<boolean> {
+  return lostBrowserOpening(id, currentOwner, tab).then(outcome => outcome === 'failed');
+}
+
+/**
+ * A new chat whose elected tab vanished before anything reached it (#1950 follow-up, 2026-10-31):
+ * nothing was offered, authorized or delivered, so its message was typed nowhere. It gets a fresh
+ * tab, twice at most, rather than "Not sent" at once; after that it fails as before. Anything that
+ * may have reached a page is never reopened.
+ */
+export function lostBrowserOpening(id: string, currentOwner: () => boolean, tab?: string): Promise<'reopen' | 'failed' | 'kept'> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id);
+    if (!currentOwner() || !row?.opening || row.state !== 'queued' || row.owner !== null || row.offeredAt !== undefined ||
+        row.sendAuthorizedAt !== undefined || row.deliveredAt !== undefined || row.conversationId ||
+        !row.sessionId || row.purpose || row.lifetime || row.branch) return 'kept';
+    const session = await getSession(row.sessionId);
+    if (!currentOwner() || session?.origin?.kind !== 'desktop' || session.conversationId) return 'kept';
+    const reopens = row.openingReopens ?? 0;
+    // The extension asks again for the same lost tab when the answer did not reach it: that is the
+    // grant it already has, not another tab spent (CodeRabbit on #1980).
+    if (tab !== undefined && reopens > 0 && row.openingReopenedTab === tab) {
+      logInfo(`input ${id}: the lost tab ${tab} was reported again; the fresh tab already granted for it stands`);
+      return 'reopen';
+    }
+    if (reopens < OPENING_REOPENS) {
+      await commit(current.map(entry => entry === row ? { ...entry, openingReopens: reopens + 1,
+        ...(tab !== undefined ? { openingReopenedTab: tab } : {}) } : entry));
+      logInfo(`input ${id}: its new chat's tab vanished before anything reached it; opening a fresh one (${reopens + 1} of ${OPENING_REOPENS})`);
+      return 'reopen';
+    }
+    await commit(current.map(entry => entry === row ? { ...entry, state: 'failed',
+      error: 'Not sent: the browser tab for this new chat was closed or lost. Review the message and send again.' } : entry));
+    logWarn(`input ${id}: not sent; its elected opening tab is absent before any browser claim, after ${OPENING_REOPENS} fresh tab(s)`);
+    return 'failed';
   });
 }
 export function noteInputStartupError(id: string, error: string | null): Promise<InputEntry | null> {
@@ -1433,7 +1811,7 @@ const INPUT_WORK_KINDS: import('../../shared/session.js').SessionEvent['kind'][]
 function queuedAfterTurn(row: InputEntry, session: SessionSummary): boolean {
   const astra = session.selectedModel?.conversationId === session.conversationId &&
     isAstraModel(session.selectedModel.model, session.selectedModel.reasoningEffort);
-  return row.sessionId === session.id && (queuedFollowup(row) || (manualInput(row) && row.offeredAt === undefined)) && row.state === 'queued' && row.dueAt <= Date.now() &&
+  return !row.scheduled && row.sessionId === session.id && (queuedFollowup(row) || (manualInput(row) && row.offeredAt === undefined)) && row.state === 'queued' && row.dueAt <= Date.now() &&
     (row.mode !== 'finish' || row.afterTurn === true || !astra);
 }
 export async function hasQueuedAfterTurnInput(sessionId: string): Promise<boolean> {
@@ -1447,7 +1825,8 @@ export function pendingQueuedPickups(): Promise<Array<{ inputId: string; convers
   return serial(async () => {
     const rows = await load();
     const result: Array<{ inputId: string; conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean; pickupAttempts: number; pickupNextAt?: number; pickupStoppedAt?: number }> = [];
-    const pending = ordered(rows).filter(row => row.sessionId && row.purpose !== 'decision' && ['queued', 'browser', 'tool'].includes(row.state));
+    // Scheduled runs are ordinary browser deliveries, never silence/Goal pickups.
+    const pending = ordered(rows).filter(row => row.sessionId && !row.scheduled && row.purpose !== 'decision' && ['queued', 'browser', 'tool'].includes(row.state));
     for (const sessionId of new Set(pending.map(row => row.sessionId))) {
       const candidates = pending.filter(row => row.sessionId === sessionId);
       const row = candidates.find(row => manualInput(row) && row.silenceBoundary) ?? candidates[0]!;
@@ -1498,7 +1877,7 @@ export function inputBeforeGoal(sessionId: string, sourceTurnId?: string): Promi
 /** A native-only queue head needs the held answer to finish before it can send. */
 export function finishNeedsBrowserInput(sessionId: string): Promise<boolean> {
   return serial(async () => {
-    const head = ordered(await load()).find(row => row.sessionId === sessionId && row.purpose !== 'decision' &&
+    const head = ordered(await load()).find(row => row.sessionId === sessionId && !row.scheduled && row.purpose !== 'decision' &&
       ['queued', 'browser', 'tool'].includes(row.state));
     if (!head || head.state !== 'queued' || head.dueAt > Date.now() ||
       !(head.mode === 'after-turn' || (head.attachments?.length && head.attachmentDelivery !== 'tool'))) return false;
@@ -1664,7 +2043,7 @@ export function fileSilenceInput(sessionId: string, conversationId: string, turn
     if (current.some(row => row.sessionId === sessionId &&
       (consumedTurn(row, turnId) || (row.silenceBoundary?.turnId === turnId && row.state === 'browser')))) return true;
     if (current.some(row => row.sessionId === sessionId && (row.state === 'browser' || row.state === 'tool'))) return false;
-    const candidates = ordered(current).filter(row => row.sessionId === sessionId && row.state === 'queued');
+    const candidates = ordered(current).filter(row => row.sessionId === sessionId && !row.scheduled && row.state === 'queued');
     const row = candidates.find(row => manualInput(row) && row.offeredAt === undefined && row.dueAt <= Date.now()) ?? candidates.find(queuedFollowup);
     if (!row || !queuedAfterTurn(row, session)) return false;
     if (row.recovery) return true; // Its frozen source and conditional busy deadline belong to the outbox.
@@ -1715,6 +2094,35 @@ function withoutSilenceClaim(row: InputEntry, preserveBoundary = false): InputEn
     ...(manualInput(row) ? { transportIntent: 'tool' } : {}),
     companionInputId: undefined, offeredAt: undefined, sendAuthorizedAt: undefined, requiresAuthorization: undefined, deliveryText: undefined, error: undefined };
 }
+/**
+ * The person's Stop for an answer that had already ended (#2066): every unsent Continue of the app's
+ * own for this chat goes, counted in the same step that withdraws it, so a send authorized meanwhile is
+ * neither withdrawn nor counted. Silence tickets go as revokeSilenceInputs takes them; a Continue the app
+ * had turned into an ordinary message and the fresh-turn Continue of the named turn are cancelled too
+ * (CodeRabbit on #2066). Returns how many automatic Continues were cancelled.
+ */
+export function withdrawOwnContinuesAfterStop(sessionId: string, turnId: string): Promise<number> {
+  return serial(async () => {
+    const current = await load();
+    let cancelled = 0;
+    const next = current.map(row => {
+      if (row.sessionId !== sessionId || !(row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined))) return row;
+      if (row.silenceBoundary || row.completedTurnId) {
+        const out = withoutSilenceClaim(row);
+        if (out.state === 'cancelled') cancelled++;
+        return out;
+      }
+      if (row.continuedFrom === 'recovery' || (row.purpose === 'rotation' && row.queuedTurn?.turnId === turnId)) {
+        cancelled++;
+        return { ...row, state: 'cancelled' as const, owner: null, error: 'Automatic Continue cancelled: you pressed Stop.' };
+      }
+      return row;
+    });
+    if (next.some((row, index) => row !== current[index])) await commit(next);
+    return cancelled;
+  });
+}
+
 /** New work revokes an unspent ticket. Authorized sends retain custody until their exact receipt/failure. */
 export function revokeSilenceInputs(sessionId: string): Promise<void> {
   return serial(async () => {
@@ -1730,7 +2138,8 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
   if (!entry.sessionId || !queuedFollowup(entry)) return null;
   // Match the displayed order. A finish-only/file/delayed head cannot be silently
   // skipped by a later after-turn row just because that transport is ready first.
-  const first = ordered(current).find(row => row.sessionId === entry.sessionId && queuedFollowup(row) && row.state === 'queued');
+  const first = ordered(current).find(row => row.sessionId === entry.sessionId && !!row.scheduled === !!entry.scheduled &&
+    queuedFollowup(row) && row.state === 'queued');
   if (first?.id !== entry.id || first.dueAt > Date.now() || !await browserInputAllowed(first)) return null;
   const turnId = await eligibleStageEnd(entry);
   if (!turnId) return null;
@@ -1738,7 +2147,7 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
   if (current.some(row => row !== entry && row.sessionId === entry.sessionId && row.state === 'queued' &&
       row.silenceBoundary?.turnId === turnId)) return null;
   if (current.some(row => row.sessionId === entry.sessionId && (consumedTurn(row, turnId) || row.state === 'tool' || row.state === 'browser'))) return null;
-  if (current.some(row => row.sessionId === entry.sessionId && !queuedFollowup(row) && row.purpose !== 'decision' &&
+  if (current.some(row => row.sessionId === entry.sessionId && !row.scheduled && !queuedFollowup(row) && row.purpose !== 'decision' &&
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
@@ -1746,21 +2155,38 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
   return serial(async () => {
     const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; project?: string; branch?: { conversationId: string; messageId: string }; edit?: { messageId: string } }> = [];
     const current = await load();
+    const slotHeld = new Map<string, NonNullable<InputEntry['slotHold']>>();
+    const scheduledPickupStarts = new Map<string, number>();
+    const scheduledPickupPauses = new Set<string>();
     for (const entry of ordered(current)) {
-      if (companionOf(current, entry)) continue;
-      if (!preparable(entry) || entry.dueAt > Date.now() || heldBySendCheck(entry)) continue;
-      if (queuedFollowup(entry) && !(entry.state === 'browser' && entry.completedTurnId) && !(await completedStageBoundary(entry, current))) continue;
-      if (!(await browserInputAllowed(entry))) continue;
+      const pauseScheduledPickup = () => {
+        if (entry.scheduled && entry.scheduledPickupSince !== undefined) scheduledPickupPauses.add(entry.id);
+      };
+      if (companionOf(current, entry)) { pauseScheduledPickup(); continue; }
+      if (!preparable(entry) || entry.dueAt > Date.now() || heldBySendCheck(entry)) { pauseScheduledPickup(); continue; }
+      if (entry.scheduled && entry.sessionId && hasPendingUserInput(current, entry.sessionId)) { pauseScheduledPickup(); continue; }
+      if (queuedFollowup(entry) && !(entry.state === 'browser' && entry.completedTurnId) && !(await completedStageBoundary(entry, current))) { pauseScheduledPickup(); continue; }
+      if (!(await browserInputAllowed(entry))) { pauseScheduledPickup(); continue; }
       try {
         const conversationId = await target(entry);
         // A worker chat this app archived in ChatGPT has no message box until it is restored (#1701).
-        if (conversationId && !readyForWake(conversationId)) continue;
+        if (conversationId && !readyForWake(conversationId)) { pauseScheduledPickup(); continue; }
         // A new chat of a project with a native ChatGPT Project opens in that Project and nowhere
         // else: it waits while the Project is being created or could not be, never the root.
         // A branch is made where its source chat lives in ChatGPT, never on a Project's page.
         const chatgptProject = !conversationId && entry.projectId && entry.purpose !== 'decision' && !entry.lifetime && !entry.branch
           ? (await getProject(entry.projectId))?.chatgpt : undefined;
-        if (chatgptProject && chatgptProject.state !== 'linked') continue;
+        if (chatgptProject && chatgptProject.state !== 'linked') { pauseScheduledPickup(); continue; }
+        // Chats working at once (#1694): the app's own send waits its turn; the line is kept by first wait.
+        // Last, after every other reason not to offer it: a message that cannot go yet anyway must not
+        // hold a slot others could use (CodeRabbit on #2051).
+        if (entry.state === 'queued' && slotGated(entry)) {
+          const refusal = automaticSendRefusal(`input:${entry.id}`, conversationId);
+          noteSlotWait(entry.id, refusal);
+          const now = Date.now(), hold = entry.slotHold;
+          if (refusal ? !hold?.open || now - hold.at >= SLOT_HELD_REFRESH_MS : hold?.open) slotHeld.set(entry.id, { at: now, open: !!refusal });
+          if (refusal) { pauseScheduledPickup(); continue; }
+        }
         const [end] = !entry.silenceBoundary && manualInput(entry) && entry.sessionId
           ? await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];
         const silenceTurnId = entry.silenceBoundary?.turnId ?? (end?.kind === 'turn_end' && end.outcome === 'failed' &&
@@ -1775,11 +2201,146 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ...(chatgptProject?.state === 'linked' ? { project: chatgptProject.id } : {}),
           ...(entry.branch && !conversationId ? { branch: { conversationId: entry.branch.conversationId, messageId: entry.branch.messageId } } : {}),
           ...(entry.edit && conversationId ? { edit: { messageId: entry.edit.messageId } } : {}) });
-      } catch { /* blocked/deleted stays user-visible */ }
+        if (entry.scheduled && entry.state === 'queued' && entry.scheduledPickupSince === undefined)
+          scheduledPickupStarts.set(entry.id, Date.now());
+      } catch { pauseScheduledPickup(); /* blocked/deleted stays user-visible */ }
+    }
+    if (slotHeld.size || scheduledPickupStarts.size || scheduledPickupPauses.size) {
+      const next = current.map(row => {
+        let updated = row;
+        if (scheduledPickupPauses.has(row.id)) updated = { ...updated, scheduledPickupSince: undefined };
+        else if (scheduledPickupStarts.has(row.id) && updated.scheduledPickupSince === undefined)
+          updated = { ...updated, scheduledPickupSince: scheduledPickupStarts.get(row.id)! };
+        if (slotHeld.has(row.id) && row.state === 'queued') updated = { ...updated, slotHold: slotHeld.get(row.id)! };
+        return updated;
+      });
+      // Pickup-clock metadata is durable but not a renderer-visible outbox change.
+      await commit(next, { notify: slotHeld.size > 0 });
     }
     return result;
   });
 }
+/**
+ * Why a queued message is not on the offer list, in the order `pendingBrowserInputs` checks; null
+ * when it is offered. A page cannot claim a message the app itself withholds, so reloading the page
+ * for it changes nothing (2026-10-31: an automatic Continue sat withheld after a silence reload, the
+ * pickup reloaded the chat for it and then gave up, and nothing anywhere said which gate held it).
+ */
+export function queuedInputOfferBlocker(id: string): Promise<string | null> {
+  return serial(async () => {
+    const current = await load();
+    const entry = current.find(row => row.id === id);
+    if (!entry || entry.state !== 'queued') return 'it is no longer queued';
+    if (!preparable(entry)) return 'it cannot be prepared for the browser';
+    if (entry.dueAt > Date.now()) return 'it is not due yet';
+    if (heldBySendCheck(entry)) return `the send check holds it (${entry.sendCheck?.reason ?? 'no answer yet'})`;
+    if (entry.scheduled && entry.sessionId && hasPendingUserInput(current, entry.sessionId)) {
+      const earlier = ordered(current).find(row => row.sessionId === entry.sessionId && !row.scheduled && row.purpose !== 'decision' &&
+        (row.state === 'browser' || row.state === 'tool' || (row.state === 'queued' && row.dueAt <= Date.now())));
+      return earlier ? `an earlier user message (${earlier.id}) goes first` : 'an earlier user message goes first';
+    }
+    if (queuedFollowup(entry) && !await completedStageBoundary(entry, current)) {
+      const first = ordered(current).find(row => row.sessionId === entry.sessionId && !!row.scheduled === !!entry.scheduled &&
+        queuedFollowup(row) && row.state === 'queued');
+      if (first && first.id !== entry.id) return `an earlier queued message of this chat (${first.id}) goes first`;
+      if (!await browserInputAllowed(entry)) return await notAllowedReason(entry);
+      const turnId = await eligibleStageEnd(entry);
+      if (!turnId) {
+        if (entry.recovery) {
+          const invalid = await recoveryInvalidReason(entry);
+          if (invalid) return `its automatic Continue no longer applies: ${invalid}`;
+          if (!['ready', 'resumed'].includes(entry.recovery.phase)) return `its recovery is still ${entry.recovery.phase}`;
+          if ((entry.silenceBoundary?.listenUntil ?? 0) > Date.now()) return 'it still listens for the turn to finish by itself';
+        }
+        return 'the turn it follows has not ended';
+      }
+      if (current.some(row => row !== entry && row.sessionId === entry.sessionId && row.state === 'queued' && row.silenceBoundary?.turnId === turnId))
+        return 'another queued message owns the same turn';
+      const other = current.find(row => row.sessionId === entry.sessionId && (consumedTurn(row, turnId) || row.state === 'tool' || row.state === 'browser'));
+      if (other) return other.state === 'browser' || other.state === 'tool'
+        ? `another message of this chat (${other.id}) is still being sent` : `another message (${other.id}) already continued this turn`;
+      return 'a message to send right away goes first';
+    }
+    if (!await browserInputAllowed(entry)) return await notAllowedReason(entry);
+    try {
+      const conversationId = await target(entry);
+      if (conversationId && !readyForWake(conversationId)) return 'its chat is being restored from ChatGPT\'s archive';
+    } catch { return 'its chat cannot be resolved'; }
+    const slot = slotGated(entry) ? slotWaits.get(entry.id) : undefined;
+    if (slot) return `it waits for a free slot: ${slot}`;
+    return null;
+  });
+}
+
+async function notAllowedReason(entry: InputEntry): Promise<string> {
+  if (entry.error?.startsWith('Local chat setup failed:')) return 'its local chat setup failed';
+  if (entry.delivery === 'tool' || entry.attachmentDelivery === 'tool') return 'it goes out with a tool result, not through the page';
+  const session = entry.sessionId ? await getSession(entry.sessionId) : null;
+  if (session?.browserRecoveryDismissedAt !== undefined) return 'its chat\'s tab was closed';
+  if (entry.silenceBoundary) return 'the turn it continues is no longer the chat\'s open turn';
+  if (!session?.conversationId) return 'its chat has no ChatGPT conversation yet';
+  if (isChatBlocked(session.conversationId)) return 'its chat is blocked';
+  if (session.activeTurnId) return 'its chat\'s turn is still running';
+  if (entry.directTurn) return 'the turn it was typed into has ended';
+  const policy = await sessionInputPolicy(entry.sessionId!);
+  if (policy.stoppedWait) return `its chat was stopped and ${policy.stoppedWait}`;
+  if (!policy.browserAllowed) return 'ChatGPT or a running tool call still shows work in its chat';
+  return 'it waits for a tool result, not for the page';
+}
+
+/**
+ * An automatic Continue no page took becomes an ordinary message, once: the chat must not stop
+ * while it is unfinished (user decision 2026-10-31). On 2026-10-30/31 such a Continue sat unclaimed
+ * after a silence reload, the pickup stopped after its reloads, and a plain "Continue" typed into the
+ * same chat was taken in under a second, twice. Only while the app's own record shows nothing newer:
+ * the chat's latest question is still the one the Continue answers, no turn runs and no tool call is
+ * in flight. Returns the converted row, or null with nothing changed.
+ */
+/**
+ * `lastGate`: the caller's own final check on the chat, run inside this one serialized step right
+ * before the commit (a history limit can arrive during the reads above; CodeRabbit on #1979). It
+ * returns why the conversion must wait, or null.
+ */
+export function continueAsOrdinaryMessage(id: string, why: string, minAgeMs = 0, lastGate?: (conversationId: string) => string | null): Promise<{ row: InputEntry } | { refused: string }> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id);
+    if (!row?.recovery || row.state !== 'queued' || row.sendAuthorizedAt !== undefined || !row.sessionId) return { refused: 'it is no longer a queued automatic Continue' };
+    // Its own age, not a pickup it shares with an older Goal step (CodeRabbit on #1960).
+    const since = row.silenceBoundary?.acceptedAt ?? row.createdAt;
+    if (Date.now() - since < minAgeMs) return { refused: 'it is not old enough yet' };
+    const session = await getSession(row.sessionId);
+    if (!session?.conversationId) return { refused: 'its chat has no ChatGPT conversation' };
+    if (session.activeTurnId) return { refused: 'its turn is still open in the record' };
+    if (isChatBlocked(session.conversationId)) return { refused: 'its chat is blocked' };
+    if (session.browserRecoveryDismissedAt !== undefined) return { refused: 'its chat\'s tab was closed' };
+    if (inFlightToolCalls(session.conversationId) > 0) return { refused: 'a tool call of its chat is still running' };
+    const question = await readLatestUserMessage(row.sessionId);
+    if (question?.messageId !== row.recovery.questionId) return { refused: 'a newer question arrived in its chat' };
+    const gated = lastGate?.(session.conversationId);
+    if (gated) return { refused: gated };
+    const { recovery: _recovery, silenceBoundary: _boundary, pickupRecovery: _pickup, requestedMode: _requested, ...rest } = row;
+    const ordinary: InputEntry = { ...rest, mode: 'auto', dueAt: Date.now(), continuedFrom: 'recovery', continuesQuestionId: row.recovery.questionId };
+    await commit(current.map(entry => entry === row ? ordinary : entry));
+    logInfo(`input ${id}: no page took the automatic Continue (${why}); sending it as an ordinary message — the chat's latest question is still the one it continues and nothing runs`);
+    return { row: ordinary };
+  });
+}
+
+/**
+ * Why an automatic Continue sent on as an ordinary message no longer applies, or null: a newer
+ * question in its chat, or the complete answer arrived after all. Checked until Send, as the
+ * automatic Continue itself was (CodeRabbit on #1960).
+ */
+async function continuedInvalidReason(row: InputEntry): Promise<string | null> {
+  if (!row.continuesQuestionId || !row.sessionId) return null;
+  const question = await readLatestUserMessage(row.sessionId);
+  if (question?.messageId !== row.continuesQuestionId) return 'another user message arrived';
+  const session = await getSession(row.sessionId);
+  if (session?.conversationId && await readCompletedFinal(row.sessionId, session.conversationId)) return 'the complete answer arrived';
+  return null;
+}
+
 /** Holds a queued automatic send the send check refused, until its next ask in 30 s (#1794). */
 export function holdInputForSendCheck(id: string, attempt: number, reason: string, answered: boolean): Promise<boolean> {
   return serial(async () => {
@@ -1792,6 +2353,240 @@ export function holdInputForSendCheck(id: string, attempt: number, reason: strin
   });
 }
 
+const PAGE_HOLD_REASONS = new Set(['still-answering', 'turn-held', 'tool-running']);
+const discardedHoldLogged = new Map<string, number>();
+/** A page holding a hold note this recent is not rewritten: pages repeat it every few seconds. */
+const PAGE_HOLD_REFRESH_MS = 15_000;
+/** How often a still-held message's window is told again; with the refresh above, always under 75 s. */
+const PAGE_HOLD_TELL_MS = 45_000;
+/**
+ * A page reported it holds this queued message until its own turn ends (2026-11-03). Only those
+ * reasons keep it: a page with no message box, or one that moved on, will not send it by waiting.
+ * `new` when the queue's wording changes (a first hold, or another reason), `held` when it stays
+ * held, null when this hold does not keep it.
+ */
+export function noteInputHeld(id: string, reason: string, conversationId: string | null = null): Promise<'new' | 'held' | null> {
+  return serial(async () => {
+    if (!PAGE_HOLD_REASONS.has(reason)) return null;
+    const current = await load();
+    const row = current.find(entry => entry.id === id);
+    if (!row || row.state !== 'queued' || row.sendAuthorizedAt !== undefined) return null;
+    // Only the page of the chat the message goes to now holds it: after a Compact & Resume that is the
+    // new chat, not the one the row was queued for; a new chat has none yet (CodeRabbit on #2054).
+    const goesTo = await target(row).catch(() => undefined);
+    const now = Date.now();
+    if (goesTo === undefined || (goesTo ?? null) !== conversationId) {
+      // Pages repeat their note every few seconds: say once a minute per chat that it does not count.
+      const said = `${id}:${conversationId ?? ''}`;
+      const last = discardedHoldLogged.get(said);
+      if (last === undefined || now - last >= 60_000) {
+        for (const [key, at] of discardedHoldLogged) if (now - at >= 60_000) discardedHoldLogged.delete(key);
+        discardedHoldLogged.set(said, now);
+        logInfo(`input ${id}: a hold from ${conversationId ?? 'a page with no chat'} does not keep it: ` +
+          (goesTo === undefined ? 'its chat could not be looked up' : `it goes to ${goesTo ?? 'a new chat'}`));
+      }
+      return null;
+    }
+    // Another chat's hold (before a Compact & Resume moved the message) is not this one's (CodeRabbit on #2054).
+    const same = row.pageHold?.reason === reason && (row.pageHold.conversationId ?? conversationId) === conversationId;
+    if (same && now - row.pageHold!.at < PAGE_HOLD_REFRESH_MS) return 'held';
+    // The window shows the reason for 75 s after the hold it last heard of: tell it again well before.
+    const tell = !same || now - (row.pageHold!.toldAt ?? row.pageHold!.at) >= PAGE_HOLD_TELL_MS;
+    const toldAt = tell ? now : row.pageHold?.toldAt ?? row.pageHold?.at ?? now;
+    await commit(current.map(entry => entry === row
+      ? { ...entry, pageHold: { reason: reason as NonNullable<InputEntry['pageHold']>['reason'], at: now, toldAt, conversationId } } : entry));
+    return tell ? 'new' : 'held';
+  });
+}
+
+/** How long, and how many, of a chat's own unsent messages a page may recognise as the app's leftover. */
+const OWN_UNSENT_MS = 24 * 60 * 60_000;
+const OWN_UNSENT_MAX = 5;
+
+/**
+ * The exact texts this app put into a chat's composer that never reached Send (#1922): claimed by a page,
+ * then failed or withdrawn before any Send was authorized, with nothing attached. ChatGPT can keep such a
+ * text after the composer changes under it, and every later message for that chat was then refused as if
+ * it were the person's draft. A page that finds exactly one of these in the composer replaces it.
+ */
+export async function ownUnsentTexts(conversationId: string, exceptId: string, now = Date.now()): Promise<string[]> {
+  const rows = await listInputs();
+  // A claim that combined a message with a queued companion went out as one composer text; neither row
+  // alone is what was inserted, so neither is listed (CodeRabbit on #2028).
+  const companions = new Set(rows.flatMap(row => row.companionInputId ? [row.companionInputId] : []));
+  return rows
+    .filter(row => row.id !== exceptId && row.conversationId === conversationId && (row.state === 'failed' || row.state === 'cancelled') &&
+      // Only a claim that needed Send authorization proves, by its missing authorization, that Send never ran;
+      // an older saved claim without it may have been sent (CodeRabbit on #2028).
+      row.requiresAuthorization === true && row.offeredAt !== undefined && row.sendAuthorizedAt === undefined && row.deliveredAt === undefined &&
+      !row.companionInputId && !companions.has(row.id) &&
+      !row.images?.length && !row.attachments?.length && now - row.createdAt < OWN_UNSENT_MS)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, OWN_UNSENT_MAX)
+    .map(row => row.deliveryText ?? row.text);
+}
+
+/**
+ * Each chat's latest automatic send ChatGPT confirmed with a message id (#2074), kept apart from the
+ * outbox: its history keeps only the newest 50 finished rows across all chats, so a busy app could
+ * forget the very Continue a repair needs to recognise while it is still the chat's latest message
+ * (CodeRabbit on #2079). One per chat, at most 200 chats; texts over 20,000 characters are not kept.
+ */
+const OWN_SENT_STATE = 'own-sent-receipts';
+const OWN_SENT_RECEIPTS_MAX = 200;
+const OWN_SENT_TEXT_MAX = 20_000;
+const ownSentReceiptSchema = z.object({ conversationId: z.string().min(1).max(256), text: z.string().min(1).max(OWN_SENT_TEXT_MAX),
+  messageId: z.string().min(1).max(256), at: z.number() });
+type OwnSentReceipt = z.infer<typeof ownSentReceiptSchema>;
+/**
+ * Saved as `{ version: 1, receipts, forgotten }`. `forgotten` names chats deleted in the last 24 h:
+ * a send still being acknowledged for one of them must not record it again (CodeRabbit on #2079).
+ */
+type OwnSentStore = { receipts: OwnSentReceipt[]; forgotten: Array<{ conversationId: string; at: number }> };
+const ownSentForgottenSchema = z.object({ conversationId: z.string().min(1).max(256), at: z.number() });
+let ownSentStore: OwnSentStore | null = null;
+/**
+ * Every change to the store runs in this chain, its own and not the input queue: deletion calls it
+ * from outside that queue, and failInputsForDeletedConversation from inside it (CodeRabbit on #2079).
+ */
+let ownSentChain: Promise<unknown> = Promise.resolve();
+function withOwnSentLock<T>(work: () => Promise<T>): Promise<T> {
+  const run = ownSentChain.then(work, work);
+  ownSentChain = run.catch(() => undefined);
+  return run;
+}
+let ownSentPruneTimer: NodeJS.Timeout | null = null;
+/** Receipts that could not be saved because the store was unreadable; added once it reads again (CodeRabbit on #2079). */
+let ownSentUnsaved: OwnSentReceipt[] = [];
+/** One shared read: two first callers must not each install their own snapshot (CodeRabbit on #2079). */
+let ownSentLoad: Promise<OwnSentStore> | null = null;
+function loadOwnSentStore(): Promise<OwnSentStore> {
+  if (ownSentStore) return Promise.resolve(ownSentStore);
+  // Read strictly: a file whose JSON is damaged still holds its text on disk and is replaced below,
+  // while a missing or unreadable one is simply empty (CodeRabbit on #2079).
+  let damaged = false;
+  ownSentLoad ??= readDurable<unknown>(OWN_SENT_STATE, { strict: true }).catch((error: Error & { damaged?: boolean }) => {
+    if (error?.damaged === true) { damaged = true; return null; }
+    // Unreadable for the moment: not cached as empty, or the next write would replace what is there.
+    // The next access reads the file again (CodeRabbit on #2079).
+    logWarn(`own-sent records could not be read now; trying again on the next access (${error?.message ?? 'error'})`);
+    ownSentLoad = null;
+    throw error;
+  }).then(saved => {
+    const record = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved as { receipts?: unknown; forgotten?: unknown } : null;
+    // A damaged entry is dropped, never guessed at; the rest stay.
+    const valid = <T>(rows: unknown, schema: z.ZodType<T>): T[] => (Array.isArray(rows) ? rows : []).flatMap(row => {
+      const parsed = schema.safeParse(row);
+      return parsed.success ? [parsed.data] : [];
+    });
+    if (!ownSentStore) {
+      const loaded = {
+        receipts: valid(record ? record.receipts : saved, ownSentReceiptSchema),
+        forgotten: valid(record?.forgotten, ownSentForgottenSchema)
+      };
+      ownSentStore = trimOwnSent(loaded);
+      // Sends whose receipt could not be saved while the store was unreadable, unless their chat was deleted since.
+      const late = ownSentUnsaved.filter(row => !ownSentStore!.forgotten.some(gone => gone.conversationId === row.conversationId));
+      ownSentUnsaved = [];
+      if (late.length) {
+        const chats = new Set(late.map(row => row.conversationId));
+        ownSentStore = trimOwnSent({ ...ownSentStore, receipts: [...ownSentStore.receipts.filter(row => !chats.has(row.conversationId)), ...late] });
+        damaged = true;
+      }
+      // Expired, damaged or rejected text leaves the disk when the store is read, not only on the next
+      // send: whatever differs from the cleaned store is rewritten (CodeRabbit on #2079).
+      if (damaged || (saved !== null && JSON.stringify(saved) !== JSON.stringify({ version: 1, ...ownSentStore })))
+        writeDurableSoon(OWN_SENT_STATE, { version: 1, ...ownSentStore });
+      // And while the app stays open: once an hour.
+      ownSentPruneTimer ??= setInterval(() => { void pruneOwnSent().catch(() => undefined); }, 60 * 60_000);
+      ownSentPruneTimer.unref?.();
+    }
+    return ownSentStore;
+  });
+  return ownSentLoad;
+}
+/** Drops what is older than 24 h and saves it, if anything was. */
+function pruneOwnSent(now = Date.now()): Promise<void> {
+  return withOwnSentLock(async () => {
+    const store = await loadOwnSentStore();
+    const next = trimOwnSent(store, now);
+    if (next.receipts.length === store.receipts.length && next.forgotten.length === store.forgotten.length) return;
+    ownSentStore = next;
+    writeDurableSoon(OWN_SENT_STATE, { version: 1, ...next });
+  });
+}
+async function loadOwnSentReceipts(): Promise<OwnSentReceipt[]> { return (await loadOwnSentStore()).receipts; }
+/** Kept without anything older than the window a page may use it in. */
+function trimOwnSent(store: OwnSentStore, now = Date.now()): OwnSentStore {
+  return {
+    receipts: store.receipts.filter(row => now - row.at < OWN_UNSENT_MS).slice(-OWN_SENT_RECEIPTS_MAX),
+    forgotten: store.forgotten.filter(row => now - row.at < OWN_UNSENT_MS).slice(-OWN_SENT_RECEIPTS_MAX)
+  };
+}
+async function rememberOwnSent(entry: InputEntry, current: InputEntry[], conversationId: string, messageId: string): Promise<void> {
+  const text = entry.deliveryText ?? entry.text;
+  if (automaticSendKind(entry) === null || entry.images?.length || entry.attachments?.length || entry.companionInputId ||
+      current.some(row => row.companionInputId === entry.id) || messageId.startsWith('input:') || text.length > OWN_SENT_TEXT_MAX) return;
+  // An unreadable store never fails the acknowledgement it rides on; the receipt waits in memory and is
+  // added once the store reads again.
+  const receipt = { conversationId, text, messageId, at: Date.now() };
+  await withOwnSentLock(async () => {
+    const store = await loadOwnSentStore();
+    // A chat deleted meanwhile stays forgotten, even when its send is acknowledged late (CodeRabbit on #2079).
+    if (store.forgotten.some(row => row.conversationId === conversationId)) return;
+    ownSentStore = trimOwnSent({ ...store, receipts: [...store.receipts.filter(row => row.conversationId !== conversationId),
+      receipt] });
+    writeDurableSoon(OWN_SENT_STATE, { version: 1, ...ownSentStore });
+  }).catch((error: Error) => {
+    logWarn(`input ${entry.id}: its own-sent record waits until the store can be read (${error.message})`);
+    ownSentUnsaved = [...ownSentUnsaved.filter(row => row.conversationId !== conversationId), receipt].slice(-OWN_SENT_RECEIPTS_MAX);
+  });
+}
+/**
+ * A deleted chat's receipt goes with it (CodeRabbit on #2079): a scheduled run's text can be the
+ * person's own words. Called with every ChatGPT conversation the deleted chat had, before the chat
+ * itself is removed, and saved before it returns: a crash right after cannot bring the text back.
+ */
+export async function forgetOwnSent(conversationIds: readonly string[], now = Date.now()): Promise<void> {
+  const ids = new Set(conversationIds.filter(Boolean));
+  if (!ids.size) return;
+  // A receipt still waiting for an unreadable store goes too, at once.
+  ownSentUnsaved = ownSentUnsaved.filter(row => !ids.has(row.conversationId));
+  await withOwnSentLock(async () => {
+    const store = await loadOwnSentStore();
+    const next = trimOwnSent({
+      receipts: store.receipts.filter(row => !ids.has(row.conversationId)),
+      forgotten: [...store.forgotten.filter(row => !ids.has(row.conversationId)), ...[...ids].map(conversationId => ({ conversationId, at: now }))]
+    }, now);
+    await writeDurableNow(OWN_SENT_STATE, { version: 1, ...next });
+    ownSentStore = next;
+  });
+}
+
+/**
+ * The app's own automatic messages ChatGPT received in a chat, with their message ids (#2074): what a
+ * repair's page may treat as the app's leftover when ChatGPT puts one back into the message box after
+ * a reload. Only sends with a known ChatGPT message id (an automatic Continue, a fresh turn, a scheduled
+ * run); never the person's messages, never anything with an image, a file or a companion message, and
+ * never an unsent text, which has no message to prove it (CodeRabbit on #2079). The page also requires
+ * that exact message to be the chat's latest user message.
+ */
+export async function ownSentResidue(conversationId: string, now = Date.now()): Promise<Array<{ text: string; messageId: string }>> {
+  await pruneOwnSent(now);
+  const rows = await listInputs();
+  const companions = new Set(rows.flatMap(row => row.companionInputId ? [row.companionInputId] : []));
+  return rows
+    .filter(row => row.conversationId === conversationId && automaticSendKind(row) !== null && !!row.messageId &&
+      !row.companionInputId && !companions.has(row.id) && !row.images?.length && !row.attachments?.length &&
+      now - row.createdAt < OWN_UNSENT_MS)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, OWN_UNSENT_MAX)
+    .map(row => ({ text: row.deliveryText ?? row.text, messageId: row.messageId! }))
+    .concat((await loadOwnSentReceipts()).filter(row => row.conversationId === conversationId && now - row.at < OWN_UNSENT_MS)
+      .map(row => ({ text: row.text, messageId: row.messageId })))
+    .filter((row, index, all) => !row.messageId.startsWith('input:') && all.findIndex(other => other.messageId === row.messageId) === index);
+}
+
 export function claimBrowserInput(id: string, owner: string, conversationId: string | null, requiresAuthorization = false): Promise<InputEntry | null> {
   return serial(async () => {
     const current = await load();
@@ -1800,17 +2595,27 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (entry.recovery && entry.state === 'browser' && entry.owner !== owner) return null;
     if (entry.recovery?.reloadOwner === owner) return null;
     if (companionOf(current, entry)) return null;
+    if (entry.scheduled && entry.sessionId && hasPendingUserInput(current, entry.sessionId)) return null;
+    if (await continuedInvalidReason(entry)) return null;
     const completedTurnId = entry.state === 'browser' ? entry.completedTurnId : queuedFollowup(entry)
       ? await completedStageBoundary(entry, current) : manualInput(entry) ? await eligibleStageEnd(entry) : undefined;
     if (queuedFollowup(entry) && !completedTurnId) return null;
     if (await target(entry) !== conversationId) return null;
     if (!(await browserInputAllowed(entry))) return null;
+    // Chats working at once (#1694), asked again at the claim: a pause may have started, or the
+    // slot gone, since the offer (CodeRabbit on #2051). Refused, it simply stays queued.
+    if (entry.state === 'queued' && slotGated(entry)) {
+      const refusal = automaticSendRefusal(`input:${entry.id}`, conversationId);
+      noteSlotWait(entry.id, refusal);
+      if (refusal) return null;
+    }
     if (entry.purpose === 'decision' && !decisionWaiters.has(id)) return null;
     if (entry.projectId) await projectWorkspace(entry.projectId);
     if (entry.sessionId) {
       if (current.some((row) => !sameDelivery(entry, row) && row.sessionId === entry.sessionId && ['browser', 'tool'].includes(row.state))) return null;
       // A row the send check holds waits apart: it never holds back a later message (#1794).
-      const first = ordered(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && queuedFollowup(row) === queuedFollowup(entry) &&
+      const first = ordered(current).find((row) => row.sessionId === entry.sessionId && !!row.scheduled === !!entry.scheduled &&
+        row.state === 'queued' && queuedFollowup(row) === queuedFollowup(entry) &&
         row.dueAt <= Date.now() && !heldBySendCheck(row));
       // Follow-ups were already elected by completedStageBoundary with live
       // transport eligibility. Direct messages retain their separate FIFO.
@@ -1823,7 +2628,7 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     // claim. Both authored rows remain intact and share one acceptance receipt.
     const queueHead = session && manualInput(entry) && entry.silenceBoundary && (entry.silenceBoundary.listenUntil ?? 0) <= Date.now() && entry.state === 'queued' &&
       await turnHasMcpCall(session.id, entry.silenceBoundary.conversationId, entry.silenceBoundary.turnId)
-      ? ordered(current).find(row => row.sessionId === entry.sessionId && queuedFollowup(row) && row.state === 'queued') : undefined;
+      ? ordered(current).find(row => row.sessionId === entry.sessionId && !row.scheduled && queuedFollowup(row) && row.state === 'queued') : undefined;
     let companion = entry.companionInputId ? current.find(row => row.id === entry.companionInputId)
       : queueHead && session && queuedAfterTurn(queueHead, session) && !queueHead.finishOwner && queueHead.purpose !== 'decision' && queueHead.attachmentDelivery !== 'tool' ? queueHead : undefined;
     if (entry.companionInputId && (!companion || companion.state !== 'browser' || companion.owner !== entry.owner || companion.sessionId !== entry.sessionId)) return null;
@@ -1859,6 +2664,9 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
         ? { ...entry, state: 'failed', error: (error as Error).message.slice(0, 200) } : row));
       throw error;
     }
+    // Preparation may await project and prompt reads. Recheck scheduled custody
+    // immediately before the durable browser claim so a newly active turn holds it.
+    if (entry.scheduled && !(await browserInputAllowed(entry))) return null;
     await transition(current, current.map((row) => row === entry ? claimed : row === companion ? { ...row,
       state: 'browser', owner, conversationId, offeredAt: claimed.offeredAt, requiresAuthorization, completedTurnId: claimed.completedTurnId } : row),
       entry.state === 'queued' && entry.automation && conversationId && entry.purpose !== 'decision' ? [claimed] : [], 'before-send');
@@ -1981,6 +2789,7 @@ export function acknowledgeBrowserInput(id: string, owner: string, conversationI
       entry.state !== 'cancelled' && (entry.opening || !entry.sessionId) && entry.automation && deliveredConversation && entry.purpose !== 'decision' ? [acknowledged] : [], 'after-send');
     if (entry.completedTurnId && entry.sessionId && deliveredConversation)
       await consumeGoalReplyForInputNow(deliveredConversation, entry.sessionId, entry.completedTurnId);
+    if (messageId && deliveredConversation && entry.state !== 'cancelled') await rememberOwnSent(entry, current, deliveredConversation, messageId);
     // The page saw its edit replace the question: that is known now, before ChatGPT draws its versions.
     if (entry.edit && messageId && entry.sessionId) await noteEditReplacement(entry.sessionId, messageId, entry.edit.messageId)
       .catch((err: Error) => logWarn(`input ${id}: could not mark the edited question (${err.message})`));
@@ -2025,7 +2834,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
     const current = await load();
     // A claimed browser send owns this session until its send outcome is known.
     if (current.some((entry) => entry.sessionId === sessionId && entry.state === 'browser')) return batch;
-    const head = ordered(current).find(row => row.sessionId === sessionId && queuedFollowup(row) &&
+    const head = ordered(current).find(row => row.sessionId === sessionId && !row.scheduled && queuedFollowup(row) &&
       ['queued', 'tool'].includes(row.state) && !terminal(toolInputReceipt(row, sessionId, conversationId, startedAt)));
     const delivered: string[] = [];
     let inputTaken = false;
@@ -2035,6 +2844,9 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
     const observedActivity = deliveryHooks?.activity?.(session);
     const activeToolTurn = session.activeTurnId ?? (observedActivity?.exact ? observedActivity.turnId : undefined);
     const prepareEntry = async (entry: InputEntry): Promise<InputEntry> => {
+      // Schedules are never injected into a model response, even if a legacy or
+      // externally supplied row still says `auto` or carries tool delivery state.
+      if (entry.scheduled) return entry;
       if (entry.sessionId !== sessionId || entry.dueAt > Date.now()) return entry;
       if (entry.attachments?.length && entry.attachmentDelivery !== 'tool' && entry.delivery !== 'tool') return entry;
       if (entry.delivery === 'tool' && entry.toolTurnId !== activeToolTurn) return entry;
@@ -2085,7 +2897,9 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
   });
 }
 
-export function resetInputForTests(): void { entries = null; chain = Promise.resolve(); offered.clear(); decisionWaiters.clear(); declinedRotations.clear(); }
+export function resetInputForTests(): void {
+  ownSentStore = null; ownSentLoad = null; ownSentChain = Promise.resolve(); ownSentUnsaved = [];
+  if (ownSentPruneTimer) { clearInterval(ownSentPruneTimer); ownSentPruneTimer = null; } entries = null; chain = Promise.resolve(); offered.clear(); decisionWaiters.clear(); declinedRotations.clear(); slotWaits.clear(); }
 
 export async function pausedBrowserHelpers(): Promise<Array<{ id: string; sourceSessionId: string }>> {
   return (await listInputs()).filter(row => row.purpose === 'decision' && row.state === 'cancelled' && row.cancelledByUser === true && !row.conversationId && row.decisionSourceSessionId)
@@ -2134,6 +2948,24 @@ export function endRecoveryInput(id: string, conversationId: string): Promise<bo
       entry.offeredAt === undefined && entry.sendAuthorizedAt === undefined);
     if (!row?.sessionId || !row.recovery || (await getSession(row.sessionId))?.conversationId !== conversationId) return false;
     const error = 'Automatic Continue was not needed: the page shows a finished answer.';
+    logWarn(`input ${row.id}: ${error}`);
+    await commit(current.map(entry => entry === row
+      ? { ...entry, state: 'cancelled', owner: null, error, recovery: { ...row.recovery!, ended: 'page-final' } } : entry));
+    return true;
+  });
+}
+
+/**
+ * An automatic Continue whose chat pages kept showing another last question, without a break, for half an
+ * hour (see the bridge's `/page-note`): it would answer the wrong question, so it ends unsent with that
+ * reason. On 2026-11-02 one stayed queued for eleven hours, refused on every offer.
+ */
+export function retireMismatchedRecoveryInput(id: string, conversationId: string): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id && entry.recovery && entry.state === 'queued' && entry.sendAuthorizedAt === undefined);
+    if (!row?.sessionId || !row.recovery || (await getSession(row.sessionId))?.conversationId !== conversationId) return false;
+    const error = 'Automatic Continue was not sent: the chat\'s last question is no longer the one it answers.';
     logWarn(`input ${row.id}: ${error}`);
     await commit(current.map(entry => entry === row
       ? { ...entry, state: 'cancelled', owner: null, error, recovery: { ...row.recovery!, ended: 'page-final' } } : entry));
@@ -2207,12 +3039,17 @@ export function failBrowserInput(id: string, owner: string, error: string, detai
       return false;
     }
     if (entry.sendAuthorizedAt !== undefined && (error === SEND_NOT_TAKEN || error === SEND_WITHDRAWN)) {
-      const retry = (entry.notTakenRetries ?? 0) === 0 && manualInput(entry) && !entry.recovery && !entry.opening &&
+      // A scheduled browser message can be withdrawn by the page when a new
+      // model turn begins after our authorization. This is positive no-send
+      // evidence, so it may safely retry the same durable id once after idle.
+      const retry = (entry.notTakenRetries ?? 0) === 0 && (manualInput(entry) || !!entry.scheduled) && !entry.recovery && !entry.opening &&
         entry.purpose !== 'decision' && !entry.lifetime;
       logWarn(`input ${entry.id}: ${error === SEND_WITHDRAWN ? 'the page withdrew the authorized Send before clicking it'
         : 'ChatGPT did not take the clicked Send'}; ${retry ? 'queued once more' : 'reported as not sent'}`);
       await commit(current.map(row => sameDelivery(entry, row) ? retry
         ? { ...row, state: 'queued', owner: null, offeredAt: undefined, sendAuthorizedAt: undefined, requiresAuthorization: undefined,
+          ...(row.scheduled ? { completedTurnId: undefined } : {}),
+          ...(row.scheduled ? { scheduledPickupSince: undefined } : {}),
           deliveryText: undefined, error: undefined, notTakenRetries: (row.notTakenRetries ?? 0) + 1 }
         : { ...row, state: 'failed', error: NOT_TAKEN_FAILED } : row));
       if (!retry) {
@@ -2271,7 +3108,10 @@ export function failBrowserInput(id: string, owner: string, error: string, detai
       logWarn(`input ${entry.id}: the browser could not send it — ${error.slice(0, 200)}${detail ? ` (${detail.slice(0, 80)})` : ''}; ` +
         (entry.companionInputId ? 'cancelled with its companion' : 'reported as not sent'));
     }
-    decisionWaiters.get(id)?.reject(new Error('goal_browser_send_failed: ' + error.slice(0, 200)));
+    // Only the picker failed to confirm the helper's model: nothing was typed, so Goal may ask again
+    // (on ChatGPT's current selection) instead of stopping for a person (2026-11-01, Mac log).
+    const code = detail === 'model-unconfirmed' && entry.purpose === 'decision' ? 'goal_helper_model_unconfirmed' : 'goal_browser_send_failed';
+    decisionWaiters.get(id)?.reject(new Error(code + ': ' + error.slice(0, 200)));
     decisionWaiters.delete(id);
     return true;
   });
@@ -2287,6 +3127,8 @@ export function failBrowserInput(id: string, owner: string, error: string, detai
  */
 export function failInputsForDeletedConversation(conversationId: string): Promise<number> {
   return serial(async () => {
+    // ChatGPT deleted it: its own-sent receipt goes too (#2074).
+    await forgetOwnSent([conversationId]).catch((error: Error) => logWarn(`own-sent record of ${conversationId} not removed (${error.message})`));
     const current = await load();
     const ended = new Set<string>();
     for (const row of current) {

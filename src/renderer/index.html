@@ -5,6 +5,7 @@
     <title>COS ERP DB</title>
     <link rel="stylesheet" href="./icons.css" />
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./scheduled.css" />
     <link rel="stylesheet" href="./settings.css" />
     <link rel="stylesheet" href="./dictation.css" />
   </head>
@@ -38,6 +39,7 @@
           <button class="btn new-chat" id="newChat" type="button"><i class="ico ph ph-pencil-simple" aria-hidden="true"></i>New chat</button>
           <button class="btn sidebar-primary-link" id="sidebarPlugins" data-sidebar-page="plugins" type="button"><i class="ico ph ph-puzzle-piece" aria-hidden="true"></i>Plugins</button>
           <button class="btn sidebar-primary-link" id="sidebarSkills" data-sidebar-page="skills" type="button"><i class="ico ph ph-cube" aria-hidden="true"></i>Skills</button>
+          <button class="btn sidebar-primary-link" id="sidebarScheduled" data-sidebar-page="scheduled" type="button"><i class="ico ph ph-clock" aria-hidden="true"></i>Scheduled</button>
           <button class="btn sidebar-primary-link" id="sidebarPets" data-sidebar-page="pets" type="button"><i class="ico ph ph-paw-print" aria-hidden="true"></i>Pets</button>
         </div>
       <!-- Settings search: while it holds a query, its results take the page list's place. -->
@@ -153,8 +155,10 @@
           <b id="pluginRefreshOfferTitle">Keep plugins up to date in ChatGPT</b>
           <em>When an update changes a plugin's tools, Chat On Steroids refreshes it in ChatGPT for you. You can change this later in Settings.</em>
         </div>
-        <button class="offer-later" id="pluginRefreshOfferLater" type="button">Not now</button>
-        <button class="offer-accept" id="pluginRefreshOfferAccept" type="button">Turn on</button>
+        <div class="offer-actions">
+          <button class="offer-later" id="pluginRefreshOfferLater" type="button">Not now</button>
+          <button class="offer-accept" id="pluginRefreshOfferAccept" type="button">Turn on</button>
+        </div>
       </div>
       <div class="notice" id="pluginRefreshReminder" role="status" hidden>
         <i class="ico ph ph-activity" aria-hidden="true"></i>
@@ -181,6 +185,11 @@
         <span>The keys saved on this computer could not be read, so new keys cannot be saved. If restarting the app does not help, you can start fresh.</span>
         <button class="btn btn-quiet" id="credentialsStartFresh" type="button">Start fresh…</button>
       </div>
+      <div class="notice" id="automaticPause" role="status" hidden>
+        <i class="ico ph ph-clock" aria-hidden="true"></i>
+        <span id="automaticPauseText"></span>
+        <button class="btn btn-quiet" id="resumeAutomaticSends" type="button" title="Send automatic messages again now. ChatGPT may slow them down again." aria-describedby="automaticPauseText">Resume now</button>
+      </div>
       <div class="notice" id="recordingStorageFull" role="status" hidden>
         <i class="ico ph ph-warning" aria-hidden="true"></i>
         <span>Recording storage is full. New images and long texts are no longer saved in your chats.</span>
@@ -204,6 +213,7 @@
               <header class="settings-section-head"><div><h2>Chats</h2><p>What you see while ChatGPT answers, and what your messages carry.</p></div></header>
               <div class="settings-surface pane appearance-settings-card">
                 <label class="setting"><span class="setting-text"><b>Follow new output</b><em>Stay at the end of the chat while answers grow, here and on ChatGPT. Scrolling up pauses it.</em></span><input id="followOutput" type="checkbox" /></label>
+                <label class="setting"><span class="setting-text"><b>Show message times</b><em>The time above each message. Point at a time for the full date.</em></span><input id="showMessageTimes" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Notify when a chat finishes</b><em>A notification when a chat's answer is done while this window is in the background. Workers and chats with Goal or Loop on don't notify.</em></span><input id="turnNotifications" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Play sounds</b><em>For chats that need you, failures and finished chats. Follows the quiet hours below.</em></span><input id="soundCues" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Messages during a running turn</b><em id="followUpHint" translate="no"></em></span><select id="followUp"><option value="steer">Join the running turn</option><option value="queue">Wait until the turn ends</option></select></label>
@@ -219,21 +229,31 @@
             <section class="appearance-section" id="phonePushSettings">
               <header class="settings-section-head"><div><h2>Phone notifications</h2><p>Hear about your chats on your phone while you are away from this computer.</p></div></header>
               <div class="settings-surface pane appearance-settings-card">
-                <label class="setting"><span class="setting-text"><b>Send notifications to your phone</b><em>Through ntfy, a free notification app.</em></span><input id="phonePushEnabled" type="checkbox" /></label>
+                <label class="setting"><span class="setting-text"><b>Send notifications to your phone</b><em>Through ntfy, a Telegram bot of your own, or both.</em></span><input id="phonePushEnabled" type="checkbox" /></label>
                 <label class="setting"><span class="setting-text"><b>Quiet hours</b><em>No phone notifications and no sounds in these hours.</em></span><select id="phonePushQuiet"><option value="">Off</option><option value="21:00-06:00" translate="no"></option><option value="22:00-07:00" translate="no"></option><option value="23:00-07:00" translate="no"></option><option value="23:00-08:00" translate="no"></option><option value="00:00-08:00" translate="no"></option></select></label>
                 <div id="phonePushOptions" class="phone-push-options" hidden>
-                  <div class="setting phone-push-field"><label class="setting-text" for="phonePushTopic"><b>Topic</b><em>Subscribe to it in the ntfy app. Anyone who has it can read the messages.</em></label><div class="phone-push-control"><input id="phonePushTopic" type="text" maxlength="64" spellcheck="false" autocomplete="off" translate="no" /><button class="btn" id="phonePushCopyTopic" type="button">Copy</button></div></div>
-                  <div class="setting"><span class="setting-text"><b>Send a test</b><em id="phonePushTestStatus" role="status">A test never includes chat text.</em></span><button class="btn" id="phonePushTest" type="button">Send test</button></div>
+                  <label class="setting"><span class="setting-text"><b translate="no">ntfy</b><em>The free ntfy app on your phone.</em></span><input id="phonePushNtfy" type="checkbox" /></label>
+                  <div id="phonePushNtfyOptions" class="phone-push-group">
+                    <div class="setting phone-push-field"><label class="setting-text" for="phonePushTopic"><b>Topic</b><em>Subscribe to it in the ntfy app. Anyone who has it can read the messages.</em></label><div class="phone-push-control"><input id="phonePushTopic" type="text" maxlength="64" spellcheck="false" autocomplete="off" translate="no" /><button class="btn" id="phonePushCopyTopic" type="button">Copy</button></div></div>
+                    <div class="setting"><span class="setting-text"><b>Send a test</b><em id="phonePushTestStatus" role="status">A test never includes chat text.</em></span><button class="btn" id="phonePushTest" type="button">Send test</button></div>
+                    <details class="phone-push-advanced" id="phonePushAdvanced"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Advanced</summary>
+                      <div class="setting phone-push-field"><label class="setting-text" for="phonePushServer"><b>Server</b><em>ntfy.sh, or your own ntfy server.</em></label><div class="phone-push-control"><input id="phonePushServer" type="text" inputmode="url" maxlength="2048" spellcheck="false" autocomplete="off" translate="no" /><button class="btn" id="phonePushServerDefault" type="button" title="Use ntfy.sh">Default</button></div></div>
+                      <div class="setting phone-push-field"><label class="setting-text" for="phonePushToken"><b>Access token</b><em id="phonePushTokenStatus">Only if your server needs one. Kept in secure storage.</em></label><div class="phone-push-control"><input id="phonePushToken" type="password" maxlength="512" autocomplete="off" /><button class="btn" id="phonePushTokenSave" type="button">Save token</button></div></div>
+                      <div class="setting"><span class="setting-text"><b>New topic</b><em>The old topic stops getting messages.</em></span><button class="btn" id="phonePushNewTopic" type="button">New topic</button></div>
+                    </details>
+                  </div>
+                  <div class="setting telegram-row"><span class="setting-text"><b translate="no">Telegram</b><em id="telegramStatus" role="status">Not linked. Notifications can also go to a Telegram bot of your own.</em></span><div class="telegram-actions"><button class="btn" id="telegramTest" type="button" hidden>Send test</button><button class="btn" id="telegramUnlink" type="button" hidden>Unlink</button><button class="btn" id="telegramLink" type="button">Link…</button></div></div>
+                  <div id="telegramSetup" class="phone-push-group telegram-setup" hidden>
+                    <div class="setting phone-push-field" id="telegramTokenStep"><label class="setting-text" for="telegramToken"><b>Bot token</b><em>In Telegram, create a bot with @BotFather and paste the token it gives you. It is kept in secure storage.</em></label><div class="phone-push-control"><input id="telegramToken" type="password" maxlength="256" spellcheck="false" autocomplete="off" /><button class="btn" id="telegramContinue" type="button">Continue</button></div></div>
+                    <div class="setting phone-push-field" id="telegramCodeStep" hidden><label class="setting-text" for="telegramCode"><b>Send the code</b><em id="telegramCodeHint">Send this message to your bot from your own Telegram account. The code works for 10 minutes.</em></label><div class="phone-push-control"><input id="telegramCode" type="text" readonly spellcheck="false" translate="no" /><button class="btn" id="telegramCopyCode" type="button">Copy</button></div></div>
+                    <div class="telegram-setup-actions"><button class="btn" id="telegramCancel" type="button">Cancel</button></div>
+                  </div>
+                  <label class="setting" id="telegramSteerRow" hidden><span class="setting-text"><b>Let replies send messages to chats</b><em>A reply to a notification goes to that chat as your message, and ChatGPT may then run tools on this computer. Anyone who can use your Telegram account could do the same.</em></span><input id="telegramSteer" type="checkbox" /></label>
                   <label class="setting"><span class="setting-text"><b>When a chat needs you</b></span><input id="phonePushNeedsYou" type="checkbox" /></label>
                   <label class="setting"><span class="setting-text"><b>When something fails</b></span><input id="phonePushFailures" type="checkbox" /></label>
                   <label class="setting"><span class="setting-text"><b>When a chat finishes</b></span><select id="phonePushFinished"><option value="never">Never</option><option value="0">Always</option><option value="5">After 5 minutes of work</option><option value="15">After 15 minutes of work</option><option value="30">After 30 minutes of work</option><option value="60">After an hour of work</option></select></label>
                   <label class="setting"><span class="setting-text"><b>Only when you are away</b><em>No input for 3 minutes, or a locked screen.</em></span><input id="phonePushAway" type="checkbox" /></label>
-                  <label class="setting"><span class="setting-text"><b>Include chat names and answers</b><em>They go through the ntfy server, and anyone with the topic can read them.</em></span><input id="phonePushDetails" type="checkbox" /></label>
-                  <details class="phone-push-advanced" id="phonePushAdvanced"><summary><svg class="disclosure-chevron sum-chev" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg>Advanced</summary>
-                    <div class="setting phone-push-field"><label class="setting-text" for="phonePushServer"><b>Server</b><em>ntfy.sh, or your own ntfy server.</em></label><div class="phone-push-control"><input id="phonePushServer" type="text" inputmode="url" maxlength="2048" spellcheck="false" autocomplete="off" translate="no" /><button class="btn" id="phonePushServerDefault" type="button" title="Use ntfy.sh">Default</button></div></div>
-                    <div class="setting phone-push-field"><label class="setting-text" for="phonePushToken"><b>Access token</b><em id="phonePushTokenStatus">Only if your server needs one. Kept in secure storage.</em></label><div class="phone-push-control"><input id="phonePushToken" type="password" maxlength="512" autocomplete="off" /><button class="btn" id="phonePushTokenSave" type="button">Save token</button></div></div>
-                    <div class="setting"><span class="setting-text"><b>New topic</b><em>The old topic stops getting messages.</em></span><button class="btn" id="phonePushNewTopic" type="button">New topic</button></div>
-                  </details>
+                  <label class="setting"><span class="setting-text"><b>Include chat names and answers</b><em>They go through the ntfy or Telegram servers, and anyone with the ntfy topic can read them.</em></span><input id="phonePushDetails" type="checkbox" /></label>
                 </div>
               </div>
             </section>
@@ -341,6 +361,16 @@
                 </div>
               </div>
             </section>
+          </div>
+        </section>
+        <section class="panel plugins-panel" data-panel="scheduled" aria-labelledby="scheduledTitle">
+          <div class="plugins-content scheduled-index">
+            <header class="plugin-page-head">
+              <div><h1 id="scheduledTitle">Scheduled</h1><p id="scheduledDescription">Manage the messages scheduled in your chats.</p></div>
+              <button class="btn" id="scheduledRefresh" type="button"><i class="ico ph ph-arrow-clockwise" aria-hidden="true"></i>Refresh</button>
+            </header>
+            <div id="scheduledStatus" class="scheduled-index-status" role="status" aria-live="polite" hidden></div>
+            <div id="scheduledList" class="scheduled-index-list" aria-live="polite"></div>
           </div>
         </section>
         <section class="panel plugins-panel" data-panel="plugins">
@@ -1096,7 +1126,7 @@
                   <label class="setting"><span class="setting-text"><b>Review Goal completion</b><em>When Goal reports completion without proof, the result stays unverified and the reply stays pending. Session finish keeps its hold active, asks the model to keep the turn open, and may notify you. Off by default.</em></span><input id="finishHoldOnStop" type="checkbox" /></label>
                   <div class="setting"><label class="setting-text" for="goalReviewer"><b>Review each Goal step's changes</b><em>A reviewer worker checks each Goal step's edits; its findings go into the next step. Uses more of your ChatGPT usage and covers only edits made with the edit tools.</em></label><select id="goalReviewer"></select></div>
                   <div class="setting" id="goalReviewerWorkersRow" hidden><span class="setting-text"><b>Sub-agents are off</b><em>The reviewer runs as a worker chat, so it needs Sub-agents. Nothing is reviewed until they are on.</em></span><button class="btn" id="goalReviewerWorkers" type="button">Turn on Sub-agents</button></div>
-                  <label class="setting"><span class="setting-text"><b>Stop and continue when ChatGPT offers no Send</b><em>Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run. Experimental.</em></span><input id="rotateStopFallback" type="checkbox" /></label>
+                  <label class="setting"><span class="setting-text"><b>Stop and continue when ChatGPT offers no Send</b><em>Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.</em></span><input id="rotateStopFallback" type="checkbox" /></label>
                   <div class="setting"><span class="setting-text"><b id="goalBackendTitle">Goal response source</b><em>Where Goal's next message comes from: a separate ChatGPT chat in your account, your API key (most reliable), or Offline (prepared messages, no API cost).</em></span><select id="goalBackend" aria-labelledby="goalBackendTitle"><option value="chatgpt">Separate ChatGPT chat</option><option value="api">API key · Most reliable</option><option value="templates">Offline · No API cost</option></select></div>
                   <div class="setting"><span class="setting-text"><b id="loopBackendTitle">Loop response source</b><em>Where Loop's next message comes from: your API key (most reliable) or a separate ChatGPT chat in your account. Loop keeps going until you turn it off.</em></span><select id="loopBackend" aria-labelledby="loopBackendTitle"><option value="api">API key · Most reliable</option><option value="chatgpt">Separate ChatGPT chat</option></select></div>
                   <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan model</b><em>Model for ChatGPT-generated messages and plans.</em></span><select id="helperModel" aria-label="Goal, Loop and Plan model"></select></div>
@@ -1136,6 +1166,14 @@
                 </div>
                 <header class="settings-section-head automation-section-head"><div><h2 class="settings-section-title">Workers & recovery</h2><p>Set worker limits and which chats can resume after interruptions.</p></div></header>
                 <div class="settings-surface pane">
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b id="chatsAtOnceTitle">Chats working at once</b>
+                      <em>At most this many chats work at the same time, sub-agents included. Messages the app sends by itself wait their turn; a message you send always goes out.</em>
+                    </span>
+                    <select id="chatsAtOnce" aria-labelledby="chatsAtOnceTitle"><option value="0">Off</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option></select>
+                  </div>
+
                   <div class="setting">
                     <span class="setting-text">
                       <b id="maWorkersTitle">Sub-agent workers</b>
@@ -1461,7 +1499,7 @@
 
               </div>
             </div>
-            <div class="composer-dock" id="composerDock"><div class="composer-dock-body"><div class="background-exec-status" id="backgroundExecStatus" role="status" hidden><i class="ico ph ph-terminal-window" aria-hidden="true"></i><span class="queue-label"></span><span class="background-exec-time"></span><svg class="disclosure-chevron background-exec-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false" hidden><path d="M6 3.5 10.5 8 6 12.5"></path></svg><button class="background-exec-stop" type="button"><i class="ico ph ph-power" aria-hidden="true"></i><span></span></button></div><div class="sr-only" id="backgroundExecLiveStatus" role="status" aria-live="polite" hidden></div><div class="background-exec-list" id="backgroundExecList" role="list" hidden></div><section class="agent-plan" id="agentPlan" aria-label="Agent task plan" hidden></section><div id="branchDraft" class="branch-draft" role="status" hidden></div><div id="editDraft" class="edit-draft" role="status" hidden></div><div id="recoveryStatus" role="status" hidden></div><div id="taskPlanPreview" aria-label="Plan stages" hidden></div><div id="finishQueue" aria-label="Queued tasks" hidden></div><div id="scheduleLine" class="schedule-line" role="status" hidden><i class="ico ph ph-clock" aria-hidden="true"></i><span id="scheduleLineText"></span><button class="dock-action" id="scheduleLinePause" type="button"></button><button class="dock-action" id="scheduleLineEdit" type="button"></button></div><div id="activeGoalRow" hidden></div><div class="tour-offer" id="tourOffer" role="status" hidden><span>New here? Take a 1-minute tour.</span><button class="btn btn-quiet" id="tourOfferYes" type="button">Show me</button><button class="btn btn-quiet" id="tourOfferNo" type="button">No thanks</button></div></div></div>
+            <div class="composer-dock" id="composerDock"><div class="composer-dock-body"><div class="background-exec-status" id="backgroundExecStatus" role="status" hidden><i class="ico ph ph-terminal-window" aria-hidden="true"></i><span class="queue-label"></span><span class="background-exec-time"></span><svg class="disclosure-chevron background-exec-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false" hidden><path d="M6 3.5 10.5 8 6 12.5"></path></svg><button class="background-exec-stop" type="button"><i class="ico ph ph-power" aria-hidden="true"></i><span></span></button></div><div class="sr-only" id="backgroundExecLiveStatus" role="status" aria-live="polite" hidden></div><div class="background-exec-list" id="backgroundExecList" role="list" hidden></div><section class="user-requests" id="userRequests" hidden></section><section class="agent-plan" id="agentPlan" aria-label="Agent task plan" hidden></section><div id="branchDraft" class="branch-draft" role="status" hidden></div><div id="editDraft" class="edit-draft" role="status" hidden></div><div id="recoveryStatus" role="status" hidden></div><div id="taskPlanPreview" aria-label="Plan stages" hidden></div><div id="finishQueue" aria-label="Queued tasks" hidden></div><div id="scheduleLine" class="schedule-line" role="status" hidden><i class="ico ph ph-clock" aria-hidden="true"></i><span id="scheduleLineText"></span><button class="dock-action" id="scheduleLinePause" type="button"></button><button class="dock-action" id="scheduleLineEdit" type="button"></button></div><div id="activeGoalRow" hidden></div><div class="tour-offer" id="tourOffer" role="status" hidden><span>New here? Take a 1-minute tour.</span><button class="btn btn-quiet" id="tourOfferYes" type="button">Show me</button><button class="btn btn-quiet" id="tourOfferNo" type="button">No thanks</button></div></div></div>
             <form class="composer" id="composer">
               <div id="skillPicker" class="skill-autocomplete" aria-label="Skills" hidden></div>
               <div id="composerSelectedSkills" class="composer-selected-skills" aria-label="Selected skills" hidden></div>
@@ -1481,7 +1519,7 @@
                   </div>
                 </details>
                   <details class="composer-menu" id="composerSettings">
-                    <summary aria-label="Chat mode" title="Chat mode"><i id="composerModeIcon" class="ico ph ph-chat-circle" aria-hidden="true"></i><span id="composerModeLabel">Normal</span><svg class="disclosure-chevron dropdown-chevron picker-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg></summary>
+                    <summary title="Chat mode"><i id="composerModeIcon" class="ico ph ph-chat-circle" aria-hidden="true"></i><span id="composerModeLabel">Normal</span><svg class="disclosure-chevron dropdown-chevron picker-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 3.5 10.5 8 6 12.5"></path></svg></summary>
                     <div class="composer-popover">
                       <div class="automation-switch" id="automationSwitch" role="radiogroup" aria-label="Chat mode">
                         <button type="button" role="radio" aria-checked="true" data-mode="off"><i class="ico ph ph-chat-circle" aria-hidden="true"></i><span class="mode-copy"><span>Normal</span><small>One request, without automatic continuation.</small></span><i class="ico ph ph-check mode-check" aria-hidden="true"></i></button>
@@ -1504,7 +1542,8 @@
                   <button class="composer-dictation-button" id="dictationButton" type="button" aria-label="Start dictation" aria-pressed="false" aria-describedby="dictationStatus" data-state="idle" title="Start dictation" hidden disabled><i class="ico ph ph-microphone" aria-hidden="true"></i><span class="dictation-recording-dot" aria-hidden="true"></span></button>
                 </div>
                 <div class="context-meter" id="contextMeter">
-                  <button type="button" id="contextMeterButton" aria-label="Estimated session context" aria-expanded="false" aria-controls="contextMeterInfo">
+                  <span id="contextMeterNotice" class="sr-only" role="status" aria-live="polite"></span>
+                  <button type="button" id="contextMeterButton" aria-label="Estimated session context" aria-describedby="contextMeterNotice" aria-expanded="false" aria-controls="contextMeterInfo">
                     <svg viewBox="0 0 16 16" aria-hidden="true"><circle class="context-track" cx="8" cy="8" r="6"/><circle id="contextMeterArc" cx="8" cy="8" r="6" stroke-dasharray="0 37.7"/></svg><span id="contextMeterCompact" aria-hidden="true"></span>
                   </button>
                   <div id="contextMeterInfo" role="dialog" aria-label="Session context · estimated">
@@ -1513,6 +1552,7 @@
                     <button type="button" class="context-action" id="contextDisplay"><i class="ico ph ph-arrows-clockwise" aria-hidden="true"></i><span>Show token values</span></button>
                     <button id="compactSession" class="context-action" type="button" hidden><i class="ico ph ph-copy" aria-hidden="true"></i><span>Compact &amp; resume</span></button>
                     <button id="cancelCompaction" class="context-action" type="button" hidden><i class="ico ph ph-x" aria-hidden="true"></i><span>Cancel compaction</span></button>
+                    <button id="resumeLastSummary" class="context-action" type="button" hidden><i class="ico ph ph-arrow-right" aria-hidden="true"></i><span>Continue in a new chat from the last summary</span></button>
                     <p id="sessionControlStatus" role="status"></p>
                   </div>
                 </div>
@@ -1607,7 +1647,7 @@
                 <button class="btn" id="copyLogText" type="button">
                   <i class="ico ph ph-copy" aria-hidden="true"></i>Text
                 </button>
-                <button class="btn" id="sendFeedback" type="button" title="Report a problem or suggest an idea. GitHub opens with it filled in.">
+                <button class="btn" id="sendFeedback" type="button" title="Report a problem. GitHub opens with it filled in.">
                   <i class="ico ph ph-chat-text" aria-hidden="true"></i>Send feedback
                 </button>
                 <button class="btn" id="saveDiagnosticsReport" type="button" title="Save one file with versions, settings, the connection state and the log, with personal details removed, to attach to a bug report.">
@@ -1709,10 +1749,6 @@
       <div class="plugin-dialog-head"><h2 id="feedbackTitle">Send feedback</h2><button class="btn" id="feedbackClose" type="button">Close</button></div>
       <form id="feedbackForm" class="feedback-form" novalidate>
         <div class="plugin-dialog-body feedback-fields">
-        <div class="feedback-kind" role="radiogroup" aria-label="Kind of feedback">
-          <label><input type="radio" name="feedbackKind" value="bug" checked /><span>Report a problem</span></label>
-          <label><input type="radio" name="feedbackKind" value="idea" /><span>Suggest an idea</span></label>
-        </div>
         <div class="feedback-update" id="feedbackUpdate" hidden><span id="feedbackUpdateText"></span><button class="btn" id="feedbackUpdateOpen" type="button">Open Activity</button></div>
         <div id="feedbackBug">
           <label class="plugin-field" for="feedbackWhat"><span>What happened</span><textarea id="feedbackWhat" rows="3" maxlength="4000" placeholder="What you did, what happened, and what you expected instead."></textarea></label>
@@ -1720,11 +1756,8 @@
           <label class="plugin-field" for="feedbackFrequency"><span>How often does it happen?</span><select id="feedbackFrequency"><option value="">Not sure</option><option value="Every time">Every time</option><option value="Sometimes">Sometimes</option><option value="It happened once">It happened once</option></select></label>
           <div class="setting feedback-report"><span class="setting-text"><b>Diagnostics report</b><em id="feedbackReportNote">Needed for a problem report. Read it before you attach it.</em></span><button class="btn" id="feedbackSaveReport" type="button">Save report…</button></div>
         </div>
-        <div id="feedbackIdea" hidden>
-          <label class="plugin-field" for="feedbackProblem"><span>What problem would it solve?</span><textarea id="feedbackProblem" rows="3" maxlength="4000" placeholder="What you are trying to do, and what gets in the way."></textarea></label>
-          <label class="plugin-field" for="feedbackProposal"><span>What should the app do?</span><textarea id="feedbackProposal" rows="3" maxlength="4000" placeholder="How it would work for you."></textarea></label>
-        </div>
         <p class="feedback-note">GitHub opens with this filled in. You submit it there; the app sends nothing.</p>
+        <p class="feedback-note" id="feedbackFeatures">New features come as pull requests, not issues. <a href="https://github.com/totec448-spec/chat-on-steroids/blob/main/CONTRIBUTING.md#new-features" target="_blank" rel="noopener noreferrer">How to start one</a></p>
         <p id="feedbackError" class="plugin-error" role="alert" hidden></p>
         </div>
         <div class="pet-delete-actions"><button class="btn" id="feedbackCancel" type="button">Cancel</button><button class="btn btn-solid" id="feedbackSubmit" type="submit">Continue on GitHub</button></div>

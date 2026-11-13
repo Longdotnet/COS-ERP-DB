@@ -72,8 +72,14 @@
   const MAX_ROWS = 400;
   /** Mounted section groups read per scan, including user and assistant groups. */
   const MAX_TURNS = 6;
-  /** Connector requests reported for one turn. Far above any real turn's call count. */
+  /**
+   * Connector requests reported for one turn. Far above most turns' call count, but a long working
+   * turn can pass it (297 calls on 2026-11-11, #2157). The limit bounds what is reported, never
+   * the turn's public messages: calls past it are left out of the report, not the turn.
+   */
   const MAX_CALLS = 200;
+  /** Items one turn may hold before it is not read at all; a bound against a runaway tree, far above real turns. */
+  const MAX_TURN_ITEMS = 5000;
   /** Public generated-image descriptors retained per turn. Pixels never cross this boundary. */
   const MAX_GENERATED_IMAGES = 200;
   /** ChatGPT's own turn anchors, which is where a turn's message model hangs. */
@@ -86,7 +92,10 @@
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
   const MARKDOWN = '.markdown, [data-markdown-text-style="assistant-message"]';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents, div:has(> [data-testid="cot-v5-tool-icon-pile"])';
-  const GENERATED_IMAGE = '[class~="group/imagegen-image"] img, [class~="group/generated-image-preview"] img';
+  // A gallery's thumbnails sit beside its large preview, outside both groups (#2005, seen 2026-11-02/03):
+  // `div[role=group] > button[aria-pressed] > img`. Being matched here is not ownership: each node still
+  // needs its exact typed image below.
+  const GENERATED_IMAGE = '[class~="group/imagegen-image"] img, [class~="group/generated-image-preview"] img, [role="group"] > button[aria-pressed] > img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
   const MAX_RENDERED_HTML = 120_000;
   // An exact, stable assistant final can have far more than 120k of decorative
@@ -791,6 +800,27 @@
    * uploads and every other role/channel is private or unknown. Only the provider message UUID,
    * sediment file id and bounded geometry cross worlds; no signed URL or arbitrary metadata does.
    */
+  /**
+   * The sediment file one mounted gallery image shows, or null. The gallery's own shell item is only its
+   * first image, so each image is found by its id among this turn's typed images (#2005: the large
+   * preview showing another image, and every thumbnail, were all "Image preview unavailable"). The large
+   * preview names its image (`imageId`) and says it is complete and not a preview; a thumbnail names its
+   * image object. Exactly one typed image of this turn must have that id, the same message and the
+   * same source, and be completed.
+   */
+  function galleryImageAsset(control, shown, shellImages) {
+    if (control && (control.isComplete !== true || control.isPreview !== false)) return null;
+    const wanted = control ? control.imageId : shown?.id;
+    if (typeof wanted !== 'string' || !wanted) return null;
+    if (control && shown && shown.id !== wanted) return null;
+    const matches = [...shellImages.keys()].filter(item => item?.id === wanted);
+    if (matches.length !== 1) return null;
+    const item = matches[0];
+    if (item.status !== 'completed' || item.isPreview === true) return null;
+    if (shown && (shown.chatGptMessageId !== item.chatGptMessageId || (typeof shown.src === 'string' && shown.src !== item.src))) return null;
+    return shellImages.get(item);
+  }
+
   function generatedImagesOf(sections, messages, exactImageNodes, shellImages = new Map()) {
     const out = [];
     const seen = new Set();
@@ -854,13 +884,13 @@
             // Current image previews use blob pixels. Only the mounted typed item
             // and its exact per-image control can identify those pixels; a blob URL
             // or a nearby gallery alone is not an asset identity.
-            let control = null;
+            let control = null, shown = null;
             for (let at = fiberOf(node), up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
               const props = at.memoizedProps;
               if (props?.imageId && !control) control = props;
+              if (props?.image && typeof props.image === 'object' && !shown) shown = props.image;
               if (shellImages.has(props?.item)) {
-                if (control?.imageId === props.item.id && control.isComplete === true && control.isPreview === false)
-                  assetId = shellImages.get(props.item);
+                assetId = galleryImageAsset(control, shown, shellImages);
                 break;
               }
               if (props?.entry) break;
@@ -1762,12 +1792,48 @@
     return null;
   }
 
-  /** Projects only public user/final assistant bytes from the typed search-unit turn model. */
+  /**
+   * Projects only public user/assistant bytes from the typed search-unit turn model: the turn's own
+   * questions and answers, and the interim updates inside its working groups (#2157; the shell
+   * reader reads the same ones). A bound on working rows or tool calls never costs the turn its answer.
+   */
   function messagesFromTurnView(turn) {
-    if (!turn || typeof turn !== 'object' || !Array.isArray(turn.items)) return null;
-    const out = [], seen = new Set();
+    if (!turn || typeof turn !== 'object' || !Array.isArray(turn.items) || turn.items.length > MAX_TURN_ITEMS) return null;
+    const out = [], seen = new Set(), interim = { remaining: MAX_TRACE_TEXT };
+    const topLevel = new Set(turn.items.filter(item => item?.type === 'assistant-message').map(item => str(item.messageId) || str(item.latestMessageId)).filter(Boolean));
+    const assistant = (item, nested) => {
+      const id = str(item.messageId) || str(item.latestMessageId);
+      if (!id || seen.has(id) || (nested && topLevel.has(id))) return;
+      // Interim updates share a small text budget, so they cannot use up the turn's own for its final answer.
+      const body = nested ? budgetedText(typeof item.content === 'string' ? item.content : '', interim, MAX_TRACE_SAY)
+        : typeof item.content === 'string' ? item.content.slice(0, MAX_RENDERED_TEXT) : '';
+      if (nested && (!body || ONLY_CONTENT_REFERENCES.test(body))) return;
+      const phase = str(item.phase), complete = item.completed === true;
+      const terminal = !nested && complete && phase === 'final_answer' && turn.status === 'complete';
+      const exchange = str(item.turnExchangeId);
+      seen.add(id);
+      out.push({
+        id, author: { role: 'assistant' }, recipient: 'all',
+        ...(!nested && phase === 'final_answer' ? { channel: 'final' } : nested ? { channel: 'commentary' } : {}),
+        ...(num(item.sentAtMs) !== null ? { create_time: item.sentAtMs / 1000 } : {}),
+        status: complete ? 'finished_successfully' : 'in_progress', end_turn: terminal,
+        content: { content_type: 'text', parts: body ? [body] : [] },
+        metadata: { message_type: 'next', ...(exchange ? { turn_exchange_id: exchange } : {}) }
+      });
+    };
+    let work = 0;
+    // Working rows are read until the row limit; the turn's own items always are.
+    const working = items => {
+      if (!Array.isArray(items)) return;
+      for (const item of items) {
+        if (++work > MAX_ROWS) return;
+        if (!item || typeof item !== 'object') continue;
+        if (item.type === 'chatgpt-reasoning-group') working(item.items);
+        else if (item.type === 'assistant-message') assistant(item, true);
+      }
+    };
     for (const item of turn.items) {
-      if (!item || typeof item !== 'object' || out.length >= MAX_CALLS) continue;
+      if (!item || typeof item !== 'object') continue;
       if (item.type === 'user-message') {
         const id = str(item.messageId) || str(item.serverMessageId);
         const body = typeof item.message === 'string' ? item.message.slice(0, MAX_RENDERED_TEXT) : '';
@@ -1778,24 +1844,8 @@
           ...(num(item.sentAtMs) !== null ? { create_time: item.sentAtMs / 1000 } : {}),
           content: { content_type: 'text', parts: [body] }, metadata: {}
         });
-        continue;
-      }
-      if (item.type !== 'assistant-message') continue;
-      const id = str(item.messageId) || str(item.latestMessageId);
-      if (!id || seen.has(id)) continue;
-      const body = typeof item.content === 'string' ? item.content.slice(0, MAX_RENDERED_TEXT) : '';
-      const phase = str(item.phase), complete = item.completed === true;
-      const terminal = complete && phase === 'final_answer' && turn.status === 'complete';
-      const exchange = str(item.turnExchangeId);
-      seen.add(id);
-      out.push({
-        id, author: { role: 'assistant' }, recipient: 'all',
-        ...(phase === 'final_answer' ? { channel: 'final' } : {}),
-        ...(num(item.sentAtMs) !== null ? { create_time: item.sentAtMs / 1000 } : {}),
-        status: complete ? 'finished_successfully' : 'in_progress', end_turn: terminal,
-        content: { content_type: 'text', parts: body ? [body] : [] },
-        metadata: { message_type: 'next', ...(exchange ? { turn_exchange_id: exchange } : {}) }
-      });
+      } else if (item.type === 'assistant-message') assistant(item, false);
+      else if (item.type === 'chatgpt-reasoning-group') working(item.items);
     }
     return out;
   }
@@ -2253,7 +2303,7 @@
     for (let at = fiber, up = 0; at && up < 16; up++, at = at.return) {
       if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; entryFiber = at; break; }
     }
-    if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_ROWS) return null;
+    if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_TURN_ITEMS) return null;
     const place = shellQuestionPlace(entryFiber, entry, section);
     const messages = [], calls = [], slots = [], seen = new Set(), callSources = new Map(), executionIds = [], images = new Map();
     let lastAnswer = null, previousId = null;
@@ -2262,8 +2312,33 @@
     // group while the turn runs. A top-level item owns its id; a nested copy of it is not read twice.
     const topLevel = new Set(entry.turn.items.filter(item => item?.type === 'assistant-message').map(item => str(item.messageId)).filter(Boolean));
     let work = 0;
+    const interim = { remaining: MAX_TRACE_TEXT };
+    const interimText = value => typeof value === 'string' && value ? budgetedText(value, interim, MAX_TRACE_SAY) : '';
+    // ChatGPT's own times for this turn (#2005): a question found in older history was recorded at the
+    // moment it was read, hours or months late. The question was sent when the turn's work started
+    // (its own `sentAtMs` once ChatGPT keeps it), and a finished answer was written when it completed.
+    // Only a plausible ChatGPT time counts: after 2020 and not later than a day from now (CodeRabbit on #2064).
+    const at = value => Number.isFinite(value) && value >= 1577836800000 && value <= Date.now() + 86_400_000 ? value : undefined;
+    const startedAt = at(entry.turn.workStartedAtMs), completedAt = at(entry.turn.workCompletedAtMs);
+    const appendGeneratedImage = item => {
+      const id = str(item.chatGptMessageId);
+      const asset = typeof item.src === 'string' && /^sediment:\/\/(file_[A-Za-z0-9_-]{8,100})$/.exec(item.src)?.[1];
+      if (!id || !asset || !Array.isArray(entry.turn.messageIds) || !entry.turn.messageIds.includes(id)) return;
+      images.set(item, asset);
+      // Only typed public output metadata crosses this boundary, wherever the
+      // page places that output. A nested image is not a top-level final answer.
+      const made = item.status === 'completed' && item.isPreview !== true && entry.turn.status === 'complete' ? completedAt : undefined;
+      messages.push({ id, author: { role: 'tool' }, recipient: 'all', channel: 'final',
+        ...(made !== undefined ? { create_time: made } : {}),
+        status: item.status === 'completed' && item.isPreview !== true ? 'finished_successfully' : 'in_progress',
+        content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
+          asset_pointer: item.src, width: item.width, height: item.height }] } });
+    };
+    // The turn's start is its opening question's; its end is its last answer's. A follow-up sent into the
+    // running answer, or an answer a retry replaced, keeps only a time of its own.
+    const opening = entry.turn.items.findIndex(item => item?.type === 'user-message');
+    const closing = entry.turn.items.findLastIndex(item => item?.type === 'assistant-message' && item.phase === 'final_answer');
     for (const [index, item] of entry.turn.items.entries()) {
-      if (++work > MAX_ROWS) return null;
       if (item?.type === 'user-message' || item?.type === 'assistant-message') {
         const user = item.type === 'user-message', id = str(item.messageId) || (user ? str(item.serverMessageId) : null);
         if (!id) continue;
@@ -2272,39 +2347,54 @@
         const final = !user && item.phase === 'final_answer';
         if (final) lastAnswer = item;
         const completed = final && item.completed === true && entry.turn.status === 'complete';
+        const written = user ? at(item.sentAtMs) ?? (index === opening ? startedAt : undefined)
+          : completed && index === closing ? completedAt : undefined;
         messages.push({ id, author: { role }, content: { content_type: 'text', parts: [typeof text === 'string' ? text : ''] },
+          ...(written !== undefined ? { create_time: written } : {}),
           channel: user ? null : final ? 'final' : 'commentary', end_turn: completed,
           status: completed ? 'finished_successfully' : 'in_progress',
           // The turn's place belongs to its first message. A message sent into the running answer
           // follows the message before it in this turn; given the turn's place it read as a version
           // of the turn's question, and Edit & resubmit folded that question away (2.1.41 round).
+          // A final_answer item is consolidated as the turn's closing answer and becomes the next
+          // turn's parent; do not advance previousId onto it before a steered user-message.
           metadata: !user ? {} : previousId ? { parent_id: previousId, clf_parent_exact: true }
             : place ? { parent_id: place.parentId, clf_parent_exact: place.versioned } : {} });
-        previousId = id;
+        if (!final) previousId = id;
         const key = `${turnId}:${index}:${role}`;
         const nodes = [...section.querySelectorAll('[data-content-search-unit-key]')].filter(node =>
           node.closest('[data-turn-key]') === section && node.getAttribute('data-content-search-unit-key') === key);
         if (nodes.length === 1) slots.push({ node: nodes[0], id });
       } else if (item?.type === 'generated-image') {
         lastAnswer = item;
-        const id = str(item.chatGptMessageId);
-        const asset = typeof item.src === 'string' && /^sediment:\/\/(file_[A-Za-z0-9_-]{8,100})$/.exec(item.src)?.[1];
-        if (!id || !asset || !Array.isArray(entry.turn.messageIds) || !entry.turn.messageIds.includes(id)) continue;
-        images.set(item, asset);
-        // Typed generated outputs are public tool media, never assistant prose.
-        // Multiple assets may share their owning provider message.
-        messages.push({ id, author: { role: 'tool' }, recipient: 'all', channel: 'final',
-          status: item.status === 'completed' && item.isPreview !== true ? 'finished_successfully' : 'in_progress',
-          content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
-            asset_pointer: item.src, width: item.width, height: item.height }] } });
+        appendGeneratedImage(item);
       } else {
         const steps = item?.type === 'chatgpt-reasoning-group' && Array.isArray(item.items) ? item.items : [item];
         for (const step of steps) {
-          if (++work > MAX_ROWS) return null;
+          // Past the row limit the working rows are not reported; the turn's own questions and answers
+          // (the top-level items) always are, so a long turn can still end (#2157). Their identities are
+          // still checked, so a repeated one refuses the turn however far down it sits.
+          if (++work > MAX_ROWS) {
+            if (work > MAX_TURN_ITEMS) return null;
+            const counted = step?.type === 'dynamic-tool-call' ? step.tool === 'exec'
+              : step?.type === 'mcp-tool-call' && ownServerName(step.invocation?.server);
+            const spare = counted ? str(step.callId) : null;
+            if (spare && !remember(spare)) return null;
+            continue;
+          }
+          if (step?.type === 'generated-image') {
+            appendGeneratedImage(step);
+            continue;
+          }
           if (step?.type === 'assistant-message' && item !== step) {
             // Interim prose whatever phase it carries: only a top-level answer can end the turn.
-            const id = str(step.messageId), text = shellItemText(step);
-            if (!id || topLevel.has(id) || !remember(id) || !text || ONLY_CONTENT_REFERENCES.test(text)) continue;
+            const id = str(step.messageId);
+            if (!id || topLevel.has(id) || seen.has(id)) continue;
+            // An empty or reference-only copy reserves nothing, so a later copy with text is still read.
+            const shown = shellItemText(step);
+            if (!shown || ONLY_CONTENT_REFERENCES.test(shown)) continue;
+            const text = interimText(shown);
+            if (!text || !remember(id)) continue;
             messages.push({ id, author: { role: 'assistant' }, content: { content_type: 'text', parts: [text] },
               channel: 'commentary', end_turn: false, status: step.completed === true ? 'finished_successfully' : 'in_progress', metadata: {} });
             continue;
@@ -2312,14 +2402,16 @@
           if (step?.type === 'dynamic-tool-call' && step.tool === 'exec') {
             const id = str(step.callId);
             if (!id) continue;
-            if (!remember(id) || executionIds.length >= MAX_CALLS) return null;
+            if (!remember(id)) return null; // a repeated identity is never trusted
+            if (executionIds.length >= MAX_CALLS) continue;
             executionIds.push(id);
             continue;
           }
           if (step?.type !== 'mcp-tool-call' || !ownServerName(step.invocation?.server)) continue;
           const id = str(step.callId), tool = toolName(step.invocation?.tool);
           if (!id || !tool) continue;
-          if (!remember(id) || calls.length >= MAX_CALLS) return null;
+          if (!remember(id)) return null;
+          if (calls.length >= MAX_CALLS) continue;
           calls.push({ messageId: id, tool, order: calls.length, answered: step.completed === true, requestId: null, createTime: null });
           callSources.set(id, { id: str(step.widgetStateSource?.messageId), server: step.invocation.server });
         }
@@ -2948,7 +3040,7 @@
    * `danger*` coloured; either marker disqualifies a control in any language. Every CoS connector refresh on the new layout failed with "the connector settings
    * card could not be read", so ChatGPT kept whatever tool list it had before an update.
    */
-  function pagePluginSnapshot(appId) {
+  function pagePluginSnapshot(appId, refresh) {
     const buttons = [...document.querySelectorAll('main button')].slice(0, 200);
     let connector = null, control = null;
     for (const button of buttons) {
@@ -2973,7 +3065,10 @@
       }
     }
     if (!connector || !Array.isArray(connector.actions) || typeof connector.name !== 'string') return null;
-    const externalPlugins = pluginsConnectorApp(connector.name, connector.id);
+    // A surface-qualified native refresh may know the durable App ID before the learned
+    // aliases catch up with a rename. This sets only the read bound, never refresh authority.
+    const surface = refresh?.appId === appId && SURFACES.includes(refresh.surface) ? refresh.surface : null;
+    const externalPlugins = surface ? surface === 'plugins' : pluginsConnectorApp(connector.name, connector.id);
     // A sanity bound, not a catalog: the app's own Core and Desktop declare a few dozen tools at most
     // (Windows Desktop 24 in 2.1.44, which the old bound of 16 refused, #1763); Plugins holds every
     // enabled external plugin's tools. A test keeps 64 above what Core and Desktop declare.
@@ -2991,9 +3086,9 @@
     return { appId, connectorName: connector.name.slice(0, 100), versionId: str(connector.app_metadata?.version_id), tools, refreshAvailable: !!control, tunnelId, settled: true };
   }
 
-  function pluginSnapshot() {
+  function pluginSnapshot(refresh) {
     const pageRoute = /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname);
-    if (pageRoute && !location.hash) return pagePluginSnapshot(pageRoute[1]);
+    if (pageRoute && !location.hash) return pagePluginSnapshot(pageRoute[1], refresh);
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
     if (!route) return null;
     // The hash already names one exact installed connector settings route. Provider tab labels
@@ -3127,7 +3222,7 @@
     }
     if (data.source === 'clf-plugin-ask') {
       let plugin = null;
-      try { plugin = pluginSnapshot(); } catch { /* Unrecognized installed settings. */ }
+      try { plugin = pluginSnapshot(data.refresh); } catch { /* Unrecognized installed settings. */ }
       post({ source: 'clf-plugin-reply', nonce, v: 1, plugin }, location.origin);
       return;
     }

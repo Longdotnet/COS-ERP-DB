@@ -86,7 +86,9 @@
    floor; expanded details left it a 23 px sliver in an 882 px window. */
 .activity-content { grid-template-rows: auto auto minmax(0, 1fr); }
 @media (min-height: 760px) { .activity-content { grid-template-rows: auto minmax(0, max-content) minmax(min(260px, 40vh), 1fr); } }
-[data-panel='activity'] .update-readiness { grid-template-rows: max-content max-content minmax(0, 1fr) max-content; align-content: start; margin-bottom: 20px; padding: 20px; gap: 12px; }
+/* Long translated failures can exceed even the fixed status/actions tracks. Let the card
+   scroll in that case rather than clipping its recovery action; details keep their own scroll. */
+[data-panel='activity'] .update-readiness { grid-template-rows: max-content max-content minmax(0, 1fr) max-content; align-content: start; margin-bottom: 20px; padding: 20px; gap: 12px; overflow-y: auto; }
 .update-readiness h2 { min-height: 0; padding: 0; }
 .update-readiness ul { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
 .update-readiness .check > div { min-width: 0; overflow-wrap: anywhere; }
@@ -95,6 +97,10 @@
 .update-readiness-status, .update-readiness-actions { display: grid; gap: 8px; min-width: 0; }
 .update-readiness-status > p, .update-readiness-actions > p { margin: 0; overflow-wrap: anywhere; }
 .update-readiness-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+/* With no button to show, the actions row and its grid track take no space (its notice stays the
+   Update all button's description). */
+.update-readiness-actions:not(:has(.update-readiness-buttons > :not([hidden]))) { display: none; }
+[data-panel='activity'] .update-readiness:not(.is-compact):not(:has(.update-readiness-buttons > :not([hidden]))) { grid-template-rows: max-content max-content minmax(0, 1fr); }
 .update-readiness-header { display: flex; align-items: center; gap: 14px; min-width: 0; }
 .update-readiness .update-readiness-toggle { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 4px 0; border: 0; background: transparent; text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .update-readiness-header > #updateAll { flex: 0 0 auto; }

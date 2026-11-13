@@ -258,14 +258,15 @@
 .feedback-form[hidden] { display: none; }
 .feedback-fields { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .feedback-form > .pet-delete-actions { flex-shrink: 0; margin: 0; }
-.feedback-kind { display: flex; flex-wrap: wrap; gap: 4px; width: fit-content; max-width: 100%; padding: 4px; border: 1px solid var(--edge); border-radius: 12px; background: var(--sunk); }
-.feedback-kind label { position: relative; display: flex; align-items: center; min-height: 34px; padding: 6px 14px; border-radius: 9px; color: var(--soft); font-size: calc(13px * var(--text-scale, 1)); cursor: pointer; }
-.feedback-kind label:hover { color: var(--ink); }
-.feedback-kind input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
-.feedback-kind label:has(input:checked) { background: var(--accent-wash); box-shadow: inset 0 0 0 1px var(--accent-edge); color: var(--ink); }
-.feedback-kind label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .feedback-update { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin: 16px 0 0; padding: 10px 12px; border-radius: var(--r-sm); background: var(--accent-wash); }
 .feedback-update[hidden] { display: none; }
+/* The form opens with the update notice or, without one, the first field: no extra space above either
+   (the kind switch that used to come first went with the idea form, 2026-11-01). */
+.feedback-fields > .feedback-update:first-child { margin-top: 0; }
+/* Scrolled into view in a short window, the error keeps some room below it instead of ending flush
+   against the scroll area's edge (a fraction of a pixel past it on CI's small screen). */
+#feedbackError { scroll-margin-bottom: 12px; }
+.feedback-fields > .feedback-update[hidden]:first-child + #feedbackBug > .plugin-field:first-child { margin-top: 0; }
 .feedback-update span { flex: 1 1 16rem; min-width: 0; }
 .feedback-dialog .plugin-field small { color: var(--faint); font-size: inherit; font-weight: 400; }
 .feedback-dialog .plugin-field textarea, .feedback-dialog .plugin-field select { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--edge); border-radius: var(--r-sm); background: var(--sunk); color: var(--ink); font: inherit; font-weight: 400; line-height: 1.5; }
@@ -275,8 +276,10 @@
 .feedback-report .btn { flex-shrink: 0; }
 .feedback-report.is-saved .setting-text em { color: var(--green); }
 .feedback-note { margin: 10px 0 0; color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); }
+/* Same quiet inline link as the Usage formula's sources. */
+.feedback-note a { color: var(--ink); text-decoration-color: var(--edge); text-underline-offset: 3px; }
+.feedback-note a:hover { text-decoration-color: currentColor; }
 .feedback-dialog .plugin-error { margin: 12px 0 0; }
-.feedback-fields > .feedback-kind { margin-top: 0; }
 .feedback-dialog .plugin-field { margin: 14px 0; }
 .feedback-done > p:first-child { margin-top: 0; }
 .plugin-card-error { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--red); font-size: calc(11px * var(--text-scale, 1)); }
@@ -346,6 +349,11 @@
   --red-wash: #fbf0f0;
   --red-line: #eccdcd;
 
+  /* A chat the app genuinely stopped recovering (#1883): amber, with words, never color alone. */
+  --warn-ink: #8a5300;
+  --warn-wash: #fdf5e7;
+  --warn-line: #efdcb5;
+
   /* Card lift. Barely there on paper, absent in the dark theme below. */
   --lift: 0 1px 1px rgb(12 12 14 / 3%), 0 10px 26px -18px rgb(12 12 14 / 22%);
   /* The switch knob has to read against its own track in both states, and the track
@@ -400,6 +408,10 @@
   --red: #ef8a8a;
   --red-wash: #241416;
   --red-line: #4a262a;
+
+  --warn-ink: #e8b866;
+  --warn-wash: #241c0f;
+  --warn-line: #4a3a1c;
 
   /* No drop shadow in the dark: the hairline is the edge, and a black shadow on a
      black page is only mud. */
@@ -1368,11 +1380,15 @@ main {
 #desktopAccessNotice .btn { flex: none; }
 
 /* A one-time offer, not a warning: the What's New dialog's icon tile and buttons, in a notice row. */
-.notice.offer-card { gap: 14px; padding: 12px 18px; animation: offer-card-arrive .42s cubic-bezier(.16, 1, .3, 1) both; }
+/* In a narrow window the buttons take their own line, right-aligned, instead of squeezing the explanation
+   into a tall column beside them (2.1.51 polish pass). */
+.notice.offer-card { flex-wrap: wrap; gap: 10px 14px; padding: 12px 18px; animation: offer-card-arrive .42s cubic-bezier(.16, 1, .3, 1) both; }
 .offer-icon { display: grid; place-items: center; flex: none; width: 34px; height: 34px; border-radius: 10px;
   background: var(--hover); color: var(--ink); box-shadow: 0 0 0 1px var(--line), 0 6px 16px -10px #0008; }
 .offer-icon .ico { --ico: 16px; --glyph: 16px; color: var(--ink); }
-.offer-text { display: grid; gap: 2px; flex: 1; min-width: 0; }
+.offer-text { display: grid; gap: 2px; flex: 1 1 240px; min-width: 0; }
+/* Both buttons move together: in a narrow window they take their own line, at its right end. */
+.offer-actions { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
 .offer-text b { font-size: calc(12.5px * var(--text-scale, 1)); font-weight: 600; }
 .offer-text em { font-style: normal; color: var(--soft); line-height: 1.4; }
 .offer-later, .offer-accept { flex: none; border: 0; font: inherit; font-size: calc(12px * var(--text-scale, 1)); cursor: pointer;
@@ -1634,6 +1650,27 @@ main {
 
 .tools .tool.is-static:hover {
   background: none;
+}
+
+.tools .linux-consent-row button {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 9px;
+  padding: 7px 12px;
+  border: 1px solid var(--edge);
+  border-radius: var(--r-sm);
+  background: var(--card);
+  color: var(--ink);
+  cursor: pointer;
+}
+.tools .linux-consent-row button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+.tools .linux-consent-row .linux-consent-result {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
 }
 
 /* The tools this group actually publishes, named as the model sees them. Set apart from
@@ -2686,8 +2723,21 @@ input[readonly] {
 
 .sess { position: relative; display: flex; align-items: center; min-height: 36px; padding: 7px 10px; margin: 2px 0; border-radius: 8px; cursor: pointer; }
 .sess:hover, .sess.is-pointed, .sess.is-sel { background: var(--hover); }
+/* Date headings in a chat list (#1919): quiet text on the rows' text edge, no count or icon. The
+   first one sits close under its list's heading; later ones keep a little air above. */
+.chat-date-section { padding: 10px 10px 3px; color: var(--faint); font-size: calc(11px * var(--text-scale, 1)); font-weight: 600; line-height: 1.4; user-select: none; }
+.chat-date-section:first-child { padding-top: 4px; }
 .sess-top { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
 .sess-top b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: calc(14px * var(--text-scale, 1)); font-weight: 400; line-height: 22px; }
+/* Compact the existing Projects/Chats tree without changing the separate multi-line Inbox cards.
+   Keep the focusable row control at least 24px high and the overlaid menu at 26px; larger text grows naturally. */
+#sessionList:not(.is-inbox) .sess:not(.sess-card) { min-height: 32px; margin-block: 1px; padding-block: 4px; }
+#sessionList:not(.is-inbox) .sess:not(.sess-card) .sess-top { min-height: 24px; }
+#sessionList:not(.is-inbox) .sess:not(.sess-card) .sess-top > b { line-height: 1.4; }
+/* The title mask used to reserve the menu column also masked the keyboard outline. Paint focus on
+   the unmasked row instead, without changing the hover fade or the row's measured size. */
+#sessionList:not(.is-inbox) .sess:has(> .sess-top:focus-visible) { outline: 2px solid var(--blue); outline-offset: -2px; }
+#sessionList:not(.is-inbox) .sess:has(> .sess-top:focus-visible) > .sess-top { outline: none; }
 .sess-top .sess-rename { flex: 1; min-width: 0; margin: -1px 0; padding: 0 6px; height: 24px; border: 1px solid var(--accent); border-radius: 6px;
   background: var(--card); color: var(--ink); font: inherit; font-size: calc(14px * var(--text-scale, 1)); line-height: 22px; outline: none;
   cursor: text; user-select: text; }
@@ -2858,6 +2908,20 @@ input[readonly] {
 .ev-body {
   min-width: 0;
 }
+
+/* "Show message times" (Settings → General): a small time above each message, on the message's own
+   side. Activity rows (tool calls, progress) keep their compact log without one. */
+.show-message-times :is(.ev-user_message, .ev-assistant_message, .ev-native_image, .ev-agent_message, .ev-chat_error, .ev-compaction) {
+  row-gap: 3px;
+}
+.show-message-times :is(.ev-user_message, .ev-assistant_message, .ev-native_image, .ev-agent_message, .ev-chat_error, .ev-compaction) > time {
+  display: block;
+  padding-top: 0;
+  font-family: inherit;
+  font-size: calc(11.5px * var(--text-scale, 1));
+  white-space: nowrap;
+}
+.show-message-times .ev-user_message > time { justify-self: end; }
 
 /* Activity is a compact log; authored messages keep their own breathing room. */
 .ev-tool_call, .ev-page_tool, .ev-agent_message {
@@ -3762,6 +3826,8 @@ input.num:disabled { opacity: .5; cursor: default; }
 .phone-push-options > .setting:first-child { border-top: 1px solid var(--line); }
 .phone-push-field .phone-push-control, .setting-text-field .setting-text-control { display: flex; flex: 1 1 280px; gap: 8px; min-width: 0; }
 .phone-push-control input, .setting-text-control input { flex: 1 1 auto; min-width: 0; }
+/* The explanation keeps a readable width; below that the field moves under it (design audit 2026-11-01). */
+.setting.phone-push-field > .setting-text, .setting.setting-text-field > .setting-text { flex-basis: 20rem; }
 .phone-push-control .btn { flex: 0 0 auto; justify-content: flex-end; text-align: end; }
 .phone-push-advanced { border-top: 1px solid var(--line); }
 .phone-push-advanced > summary { display: flex; align-items: center; gap: 6px; width: fit-content; padding: 12px 2px; cursor: pointer; color: var(--soft); font-size: calc(12.5px * var(--text-scale, 1)); list-style: none; }
@@ -3771,6 +3837,11 @@ input.num:disabled { opacity: .5; cursor: default; }
 /* The chevron's glyph sits 5px inside its box; its ink starts on the rows' text edge. */
 .phone-push-advanced > summary .sum-chev { margin-left: -5px; }
 .phone-push-advanced > .setting:first-of-type { border-top: 1px solid var(--line); }
+/* ntfy's own rows and the Telegram setup (#1934) are groups among the card's rows: the same lines
+   between rows, on the same edges. */
+.phone-push-group > .setting:first-child, .phone-push-group + .setting, .phone-push-group + .phone-push-group { border-top: 1px solid var(--line); }
+.telegram-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 8px; max-width: 100%; }
+.telegram-setup-actions { display: flex; justify-content: flex-end; padding: 0 2px 13px; }
 
 /* Inside a settings row the switch is one of several controls, not the thing the
    row pushes to the far end. */
@@ -3985,6 +4056,21 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
   box-shadow: 0 8px 24px -8px rgb(0 0 0 / 45%);
   z-index: 10;
 }
+/* One action (Undo) after the message, on the same line while it fits. */
+.toast.has-action { display: flex; align-items: center; gap: 12px; text-align: start; padding-inline-end: 8px; }
+.toast-action {
+  flex: none;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  background: color-mix(in srgb, var(--page) 16%, transparent);
+  border: 0;
+  border-radius: 8px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.toast-action:hover { background: color-mix(in srgb, var(--page) 26%, transparent); }
+.toast-action:focus-visible { outline: 2px solid var(--page); outline-offset: 1px; }
 
 /* ------------------------------------------------------------- the goal loop */
 
@@ -4592,6 +4678,13 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
 #attachmentMenu > summary .ico { display: block; --ico: 17px; --glyph: 17px; transform: scale(calc(20 / 17)); }
 .composer-menu > summary:hover, .composer-menu[open] > summary { color: var(--ink); background: var(--hover); }
 .composer-popover { position: absolute; z-index: 30; bottom: calc(100% + 12px); left: 0; width: 224px; padding: 7px; background: var(--popover, var(--card)); border: 1px solid var(--edge); border-radius: 14px; box-shadow: 0 8px 30px #0005; }
+/* The + menu fits its longest item, so no language wraps a label onto two lines (design audit 2026-11-01). */
+/* The composer is the space the menu opens into: it starts at the composer's left edge, so it is
+   capped to the composer's width (a narrow window at high zoom leaves little beside the sidebar). A label
+   longer than the cap wraps, and a single long word breaks (CodeRabbit on #2006). */
+.composer { container-type: inline-size; }
+#attachmentMenu > .composer-popover { width: max-content; min-width: min(224px, calc(100cqi - 24px)); max-width: min(360px, calc(100cqi - 24px)); }
+#attachmentMenu > .composer-popover button { overflow-wrap: anywhere; }
 .model-menu .composer-popover { left: auto; right: 0; width: 300px; max-width: calc(100vw - 32px); max-height: 70vh; overflow-y: auto; padding: 8px; }
 .model-menu { width: max-content; max-width: 100%; min-width: 0; }
 .model-menu > summary { width: 100%; min-width: 0; justify-content: center; }
@@ -4841,7 +4934,7 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 /* Its center 27px from the menu's, where a chat row's sub-agent arrow sits beside its "⋯" on hover. */
 .project-heading > .project-new { width: 24px; margin-inline-end: -7px; }
 /* Heading: 8px padding + 17px folder + 9px gap. Rows already supply 10px padding. */
-.project-group > .sess, .project-group > .worker-group { margin-inline-start: 24px; }
+.project-group > .sess, .project-group > .worker-group, .project-group > .chat-date-section { margin-inline-start: 24px; }
 .project-show-more { margin-inline-start: 34px; color: var(--faint); font-size: calc(14px * var(--text-scale, 1)); padding: 6px 0; border: 0; background: transparent; }
 /* Chat groups inside a project (#1038): one step in, a heading like the project's, its chats one more step in. */
 .project-group > .chat-group { position: relative; margin: 2px 0 2px 24px; }
@@ -4866,6 +4959,8 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 :is(.sess, .project-group, .chat-group).is-sorting { opacity: .45; }
 :is(.sess, .project-group, .chat-group).sort-before::before, :is(.sess, .project-group, .chat-group).sort-after::after { content: ''; position: absolute; inset-inline: 0; height: 2px; border-radius: 2px; background: var(--blue); pointer-events: none; }
 :is(.sess, .project-group, .chat-group).sort-before::before { top: -2px; }
+/* A project or group a dragged chat would move into (#1919): the row's own hover shape, in the accent. */
+:is(.project-heading, .chat-group-heading).is-drop-target { background: color-mix(in srgb, var(--blue) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--blue) 55%, transparent); }
 :is(.sess, .project-group, .chat-group).sort-after::after { bottom: -2px; }
 
 /* Right-side work panes. Files and Sub-agents are mutually exclusive projections of the
@@ -5199,6 +5294,26 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .file-entry-dialog-input:focus { outline: 2px solid var(--ink); outline-offset: 2px; }
 .file-entry-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .file-entry-dialog-actions .btn { padding: 8px 12px; }
+/* Related folders (#1689): the file panel's dialog, with a list, an approved-folder picker and an Unavailable state in words. */
+.related-folders-dialog { width: min(460px, calc(100vw - 32px)); }
+.related-folders-intro, .related-folders-empty, .related-folders-hint { margin: -6px 0 0; color: var(--soft); font-size: calc(12px * var(--text-scale, 1)); line-height: 1.45; }
+.related-folders-empty, .related-folders-hint { margin: 0; }
+.related-folders-list { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; max-height: 260px; overflow-y: auto; }
+.related-folders-list:empty { display: none; }
+.related-folders-item { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 6px 4px 6px 8px; border-radius: 8px; }
+.related-folders-item:hover { background: var(--hover); }
+.related-folders-item > .ico { flex: none; color: var(--soft); }
+.related-folders-text { display: grid; flex: 1; min-width: 0; }
+.related-folders-name, .related-folders-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.related-folders-path { color: var(--soft); font-size: calc(11px * var(--text-scale, 1)); }
+.related-folders-item.is-unavailable .related-folders-name { color: var(--soft); }
+.related-folders-state { flex: none; color: var(--soft); font-size: calc(11px * var(--text-scale, 1)); }
+.related-folders-remove { flex: none; }
+.related-folders-add { display: flex; gap: 8px; }
+.related-folders-add .related-folders-select { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The opened list keeps each folder on one line too; its tooltip names it in full (CodeRabbit on #2092). */
+.related-folders-select option { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
+.related-folders-add .btn { flex: none; padding: 8px 12px; }
 .file-confirm-dialog-body { display: grid; gap: 12px; padding: 20px; }
 .file-confirm-dialog-body h2 { margin: 0; font-size: calc(16px * var(--text-scale, 1)); font-weight: 650; }
 .file-confirm-dialog-message { margin: 0; color: var(--ink); font-size: calc(13px * var(--text-scale, 1)); line-height: 1.5; overflow-wrap: anywhere; }
@@ -5238,6 +5353,53 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .agent-plan-step[data-status='in_progress'] .agent-plan-marker { border-color: var(--ink); color: var(--ink); }
 .agent-plan-step[data-status='completed'] .agent-plan-marker { color: var(--soft); border-color: transparent; }
 .agent-plan-details { padding: 0 14px 10px 32px; color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A step handed to the person (#1695): one card in the timeline and in the list above the composer. */
+/* The card is the row: it lines up with the messages and carries its own surface, so the open
+   call's sunk background and its outdent (.ev-tool_call .tool) do not apply. */
+.ev-tool_call .tool.is-user-request { margin: 4px 0 14px; background: transparent; }
+.tool.is-user-request > summary { display: none; }
+.user-request { display: grid; gap: 10px; min-width: 0; padding: 12px 14px; border: 1px solid var(--edge); border-radius: 12px; background: var(--card); color: var(--ink); font-size: calc(13px * var(--text-scale, 1)); }
+.user-request-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.user-request-head .ico { --ico: 15px; color: var(--soft); }
+.user-request-head b { flex: 1; min-width: 0; font-weight: 600; }
+.user-request-state { flex: none; color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); }
+.user-request[data-state='open'] .user-request-state { color: var(--ink); font-weight: 550; }
+.user-request-from { margin: 0; color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); overflow-wrap: anywhere; }
+.user-request-purpose { margin: 0; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* One look wherever the card stands (inside a call row the well styles differ). */
+.user-request .user-request-command { border: 0; border-radius: var(--r-sm); background: var(--page); }
+.user-request .user-request-command > .tool-output-header { min-height: 24px; padding: 4px 8px 0; border-bottom: 0; background: transparent; }
+.user-request .tool-copy { opacity: 1; }
+.user-request .user-request-command > .pre { margin: 0; padding: 4px 10px 9px; border-radius: 0; background: transparent; color: var(--ink); max-height: 220px; }
+.user-request-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; }
+.user-request-facts dt { color: var(--faint); }
+.user-request-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.user-request-facts code { font-family: var(--mono); font-size: calc(12px * var(--text-scale, 1)); }
+.user-request-files { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.user-request-files li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; }
+.user-request-file-state { color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); }
+.user-request-file-state[data-found='found'] { color: var(--ink); }
+.user-request-more { min-width: 0; }
+.user-request-more > summary { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 0; border-radius: 6px; color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); list-style: none; cursor: pointer; }
+.user-request-more > summary::-webkit-details-marker { display: none; }
+.user-request-more > summary:hover { color: var(--ink); }
+.user-request-more > summary:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.user-request-more > summary .disclosure-chevron { width: 14px; height: 14px; transition: transform 120ms ease; }
+.user-request-more[open] > summary .disclosure-chevron { transform: rotate(90deg); }
+.user-request-more > .user-request-facts { margin-top: 6px; }
+.user-request-note, .user-request-answered { margin: 0; color: var(--faint); font-size: calc(12px * var(--text-scale, 1)); line-height: 1.5; }
+.user-request-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.user-requests { min-width: 0; border-bottom: 1px solid var(--edge); color: var(--soft); font-size: calc(13px * var(--text-scale, 1)); overflow: hidden; }
+.user-requests[hidden], .app[data-screen='settings'] .user-requests { display: none; }
+.user-requests-shell > summary { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 8px 12px; list-style: none; cursor: pointer; }
+.user-requests-shell > summary::-webkit-details-marker { display: none; }
+.user-requests-shell > summary:hover { background: var(--hover); color: var(--ink); }
+.user-requests-shell > summary:focus-visible { outline: 2px solid var(--ink); outline-offset: -3px; border-radius: 7px; }
+.user-requests-shell > summary .ico { --ico: 15px; }
+.user-requests-shell > summary::after { content: ''; width: 7px; height: 7px; flex: none; margin: 0 4px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); }
+.user-requests-shell[open] > summary::after { transform: rotate(225deg); }
+.user-requests-title { flex: 1; font-weight: 550; color: var(--ink); }
+.user-requests-body { display: grid; gap: 8px; max-height: min(360px, 40vh); overflow-y: auto; overscroll-behavior: contain; padding: 0 8px 8px; }
 
 .composer-dock { --edge: var(--composer-edge); min-height: 0; width: min(836px, calc(100% - 72px)); margin: 15px auto -15px; border: 1px solid var(--edge); border-block-width: 0; border-radius: 16px 16px 0 0; background: var(--card); overflow: hidden; opacity: 0; pointer-events: none; transition: opacity 120ms ease-in, margin-top 140ms ease-out; }
 /* Visibility and borders follow the actual occupants, not an observer's cached size. */
@@ -5254,21 +5416,52 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .background-exec-chevron { flex: 0 0 16px; width: 16px; height: 16px; color: var(--faint); transition: transform 120ms ease; }
 .background-exec-status.is-expanded .background-exec-chevron { transform: rotate(90deg); }
 .background-exec-list[hidden] { display: none; }
-.background-exec-list { max-height: min(220px, 30vh); overflow-y: auto; overscroll-behavior: contain; background: var(--card); }
+.background-exec-list { max-height: min(220px, 30vh); overflow-y: auto; overscroll-behavior: contain; background: var(--card); container-type: inline-size; }
 .background-exec-process { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 6px 12px 6px 37px; border-bottom: 1px solid var(--edge); color: var(--soft); font-size: calc(12.5px * var(--text-scale, 1)); }
-.background-exec-process-command { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.background-exec-process-command { flex: 1; min-width: 4em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
 .background-exec-time { flex-shrink: 0; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.background-exec-stop { flex-shrink: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 6px; padding: 5px 7px; background: transparent; color: var(--soft); font: inherit; cursor: pointer; }
-.background-exec-stop:hover { color: var(--ink); background: var(--hover); }
+.background-exec-stop, .background-exec-output { flex-shrink: 0; display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 6px; padding: 5px 7px; background: transparent; color: var(--soft); font: inherit; cursor: pointer; }
+.background-exec-stop:hover, .background-exec-output:hover { color: var(--ink); background: var(--hover); }
 .background-exec-stop:disabled { cursor: default; opacity: .55; }
+/* The chat column, not the window, decides: with a sidebar open a 640px window leaves a column of
+   about 300px, where a row's time, Output and Stop would push Stop past the edge. The button labels
+   go first (both keep their icon and accessible name); the elapsed time stays as long as it fits. */
+@container (max-width: 340px) { .background-exec-stop > span, .background-exec-output > span { display: none; } .background-exec-stop, .background-exec-output { padding-inline: 5px; } }
+/* A long elapsed label (an hour count in French or German) shrinks with an ellipsis before it can push Stop out. */
+.background-exec-process-time { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+@container (max-width: 230px) { .background-exec-process-time { display: none; } .background-exec-list .background-exec-process { gap: 4px; padding-inline: 8px; } }
 @media (max-width: 480px) {
   /* Preserve the actionable process row at laptop zoom / phone-width windows. The row tooltip
      still carries elapsed time and full commands; the Stop control keeps its accessible label. */
-  .background-exec-time, .background-exec-stop > span { display: none; }
-  .background-exec-stop { padding-inline: 5px; }
+  .background-exec-time, .background-exec-stop > span, .background-exec-output > span { display: none; }
+  .background-exec-stop, .background-exec-output { padding-inline: 5px; }
   .background-exec-process { padding-left: 28px; }
 }
 .recovery-countdown { flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
+/* A recovery episode (#1883): since when and how many tries, and the tries themselves on demand. */
+/* One line only beside the episode control, whose list holds every step in full. */
+.recovery-notice:has(.recovery-episode-meta) .queue-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* In a narrow pane the summary takes its own line under the reason, so neither is cut (Haz and CodeRabbit on #2062). */
+#recoveryStatus { container-type: inline-size; }
+@container (max-width: 560px) {
+  .recovery-notice:has(.recovery-episode-meta) { flex-wrap: wrap; row-gap: 0; }
+  .recovery-notice .recovery-episode-meta { order: 10; flex-basis: 100%; justify-content: flex-start; margin: -4px 0 0 18px; }
+}
+.recovery-episode-meta > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.recovery-episode-meta { flex-shrink: 0; min-width: 0; display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 6px; padding: 4px 6px; background: transparent; color: var(--faint); font: inherit; font-size: calc(12px * var(--text-scale, 1)); white-space: nowrap; cursor: pointer; }
+.recovery-episode-meta:hover { color: var(--ink); background: var(--hover); }
+.recovery-episode-meta:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+.recovery-episode-meta .disclosure-chevron { width: 14px; height: 14px; transition: transform 120ms ease; }
+.recovery-episode-meta[aria-expanded="true"] .disclosure-chevron { transform: rotate(90deg); }
+.recovery-episode-list[hidden] { display: none; }
+.recovery-episode-item { display: flex; align-items: baseline; gap: 10px; padding: 5px 12px 5px 37px; border-bottom: 1px solid var(--edge); color: var(--soft); font-size: calc(12.5px * var(--text-scale, 1)); }
+.recovery-episode-item time { flex-shrink: 0; color: var(--faint); font-variant-numeric: tabular-nums; }
+.recovery-episode-item span { min-width: 0; overflow-wrap: anywhere; }
+.recovery-notice.is-stopped { color: var(--warn-ink); background: var(--warn-wash); border-bottom-color: var(--warn-line); }
+.recovery-notice.is-stopped > .ico, .recovery-notice.is-stopped .recovery-episode-meta { color: var(--warn-ink); }
+@media (max-width: 480px) {
+  .recovery-episode-item { padding-left: 28px; }
+}
 .composer-dock-body > :nth-last-child(1 of :not([hidden])) { border-bottom: 0; }
 .composer-dock-body > :nth-last-child(1 of :not([hidden])) > .queued-input:last-child { border-bottom: 0; }
 .composer-dock:not([hidden]):has(> .composer-dock-body > :not([hidden])) + .composer { border-top-left-radius: 12px; border-top-right-radius: 12px; }
@@ -5287,6 +5480,9 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .composer-dock button { flex-shrink: 0; }
 .composer-dock .dock-action { border: 0; border-radius: 5px; background: transparent; color: var(--soft); padding: 4px; display: inline-flex; align-items: center; cursor: pointer; }
 .composer-dock .dock-action:hover { color: var(--ink); background: var(--hover); }
+/* A dock action with its words (Continue now): the one thing to do about the row, so it is said. */
+.composer-dock .dock-action.is-labelled { gap: 5px; padding: 3px 8px; color: var(--ink); font: inherit; font-size: calc(12px * var(--text-scale, 1)); font-weight: 550; white-space: nowrap; }
+.composer-dock .dock-action.is-labelled:disabled { opacity: .55; cursor: default; }
 .composer-dock .queued-input.is-editing { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 10px; }
 .composer-dock .queued-input.is-editing textarea { grid-row: 1 / span 2; min-width: 0; width: 100%; }
 .composer-dock .queued-input.is-editing > button { grid-column: 2; justify-self: center; }
@@ -5298,7 +5494,7 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
      and the two large sublists independently scrollable. Wide desktop layouts are unchanged. */
   .composer-dock-body { max-height: 46vh; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
   .background-exec-status { position: sticky; top: 0; z-index: 2; background: var(--card); }
-  .agent-plan-body, #finishQueue { max-height: 22vh; }
+  .agent-plan-body, .user-requests-body, #finishQueue { max-height: 22vh; }
   #taskPlanPreview { max-height: 28vh; }
 }
 /* Status spans need a real row: inline padding does not contribute to dock height. */
@@ -5320,6 +5516,9 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 
 .context-meter { position: relative; flex: 0 0 auto; }
 #contextMeterButton { display: flex; align-items: center; gap: 5px; height: 32px; padding: 0 5px; border: 0; border-radius: 8px; background: transparent; color: var(--soft); cursor: pointer; }
+/* A Compact & Resume waiting too long for its summary: a dot says the popover has a way on (2026-11-01). */
+#contextMeter[data-attention] #contextMeterButton { position: relative; }
+#contextMeter[data-attention] #contextMeterButton::after { content: ''; position: absolute; top: 4px; right: 3px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent-fill, var(--accent)); box-shadow: 0 0 0 2px var(--card); }
 /* A toolbar label like Mode, Plan and Model: same face and size, with tabular digits so the value
    does not shift as it changes. The 10px monospace of the old token chip broke the row's line. */
 #contextMeterButton { font: inherit; }
@@ -5521,6 +5720,11 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 :is(.work-dock-tab, .terminal-tab) > .btn.btn-icon .ico { --ico: 12px; }
 .work-dock-bar .work-dock-tab > .btn.btn-icon:hover:not(:disabled), .terminal-tab > .btn.btn-icon:hover:not(:disabled) { color: var(--ink); background: color-mix(in srgb, var(--ink) 9%, transparent); }
 .terminal-tab > .btn:focus-visible { outline: 1px solid var(--accent-edge); outline-offset: -1px; }
+/* An agent's command, read-only (#1920): a quiet badge before its command, and Stop beside the close button. */
+/* The command's own output may show the cursor again (Windows consoles often do): never in a read-only tab. */
+#workspaceTerminal .terminal-screen.is-agent .xterm-rows .xterm-cursor, #workspaceTerminal .terminal-screen.is-agent .xterm-rows .xterm-cursor.xterm-cursor-block,
+#workspaceTerminal .terminal-screen.is-agent .xterm-rows.xterm-focus .xterm-cursor.xterm-cursor-block { background-color: transparent !important; color: inherit !important; outline: none !important; box-shadow: none !important; }
+.terminal-agent-badge { flex: none; padding: 0 5px; border: 1px solid var(--edge); border-radius: 4px; color: var(--soft); font-size: calc(10.5px * var(--text-scale, 1)); line-height: 16px; }
 /* Reordering: the dragged pill rides above its neighbours, which slide aside (tab-reorder.ts). */
 :is(.work-dock-tabs, .terminal-tabs).is-reordering { cursor: grabbing; }
 :is(.work-dock-tab, .terminal-tab).is-dragging { position: relative; z-index: 1; background: color-mix(in srgb, var(--page) 84%, var(--ink)); pointer-events: none; }

@@ -1,9 +1,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { WebSocket } = require('ws');
 const { transformSync, buildSync } = require('esbuild');
+const { startSnapProfileWatchdog } = require('./fixtures/snap-chromium-watchdog.cjs');
+const { snapChromiumPaths, isSnapChromiumLauncher } = require('./fixtures/snap-chromium-launchers.cjs');
 
 const root = path.resolve(__dirname, '..');
 const reactRuntime = process.argv.find(value => value.startsWith('--react-runtime='))?.slice('--react-runtime='.length);
@@ -56,10 +59,23 @@ const executable = [
     .flatMap(base => [path.join(base, 'Google/Chrome/Application/chrome.exe'), path.join(base, 'Microsoft/Edge/Application/msedge.exe')]),
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'
+  '/usr/bin/google-chrome', '/usr/bin/chromium',
+  // Ubuntu's Chromium package is installed as a snap on supported desktops.
+  ...snapChromiumPaths, '/usr/bin/chromium-browser'
 ].find(candidate => candidate && fs.existsSync(candidate));
 assert(executable, 'No Chromium found; set COS_CHROME to a Chrome or Chromium executable.');
-const profile = path.join(output, 'profile');
+// Snap Chromium has a private /tmp, so the verifier must share its profile
+// directory with the confined browser in ~/snap/chromium/common.
+// On Ubuntu /usr/bin/chromium-browser can be a wrapper for the Chromium snap.
+// An explicit COS_CHROME override may still choose that wrapper or an alternate
+// snapd launcher; both need the Snap-accessible profile and watchdog.
+const snapChromium = isSnapChromiumLauncher(executable);
+const snapProfileRoot = path.join(os.homedir(), 'snap/chromium/common');
+if (snapChromium) fs.mkdirSync(snapProfileRoot, { recursive: true });
+const profile = snapChromium ? fs.mkdtempSync(path.join(snapProfileRoot, 'cos-shell-runtime-')) : path.join(output, 'profile');
+// Arm cleanup BEFORE the browser is launched: the UI runner may force-kill
+// this verifier, bypassing finally, and the Snap wrapper may outlive it.
+if (snapChromium) startSnapProfileWatchdog(profile);
 fs.rmSync(path.join(profile, 'DevToolsActivePort'), { force: true });
 const browser = spawn(executable, [`--user-data-dir=${profile}`, '--headless=new', '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', '--disable-background-networking', 'about:blank'], { windowsHide: true, stdio: 'ignore' });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -161,6 +177,17 @@ async function evaluate(expression) {
       checks.push('native picker discovery selected versions and closed cleanly');
       if (!(await f.api.selectModelSettings('future-pro', 'pro'))) throw new Error('Worker model selection failed');
       checks.push('exact worker model and reasoning selection succeeded');
+      const selectionReports = [];
+      if (await f.api.selectModelSettings('unoffered-diagnostic-model', 'high', () => true, trace => selectionReports.push(trace)))
+        throw Error('An unoffered native model was accepted');
+      const selectionFailure = selectionReports.at(-1);
+      if (selectionFailure?.failedPhase !== 'resolve' || selectionFailure.failure !== 'not-offered' ||
+          selectionFailure.restore !== 'confirmed' || selectionFailure.closed !== true ||
+          JSON.stringify(selectionFailure.before) !== JSON.stringify(selectionFailure.after) ||
+          /PRIVATE|conversation|modelsData/.test(JSON.stringify(selectionReports)))
+        throw Error('Native model diagnostic did not retain failure, restoration and privacy proof');
+      checks.push('native selector reports the failed phase and restores its exact original selection without exposing provider props');
+
       if (f.api.generating() || !f.api.composerSubmitReady()) throw new Error('Completed composer remains blocked');
       checks.push('completed shell composer is ready');
       for (let at = 1; at <= 3; at++) {
@@ -263,7 +290,8 @@ async function evaluate(expression) {
       let workerRecorder;
       try {
         workerRecorder = await recorder(worker, { redeem: () => ({ ok: true,
-          command: { id: 'native-event-worker', type: 'worker', agent: 'worker-1', text: bootstrap } }) }, false);
+          command: { id: 'native-event-worker', type: 'worker', agent: 'worker-1', text: bootstrap,
+            model: 'gpt-5-6-thinking', reasoningEffort: 'high' } }) }, false);
         const workerDeadline = Date.now() + 5000;
         while ((!workerRecorder.sent.some(message => message.type === 'ack') ||
             !workerRecorder.sent.some(message => message.type === 'correlate' && message.calls.some(call => call.requestId === OTHER))) && Date.now() < workerDeadline)
@@ -275,12 +303,38 @@ async function evaluate(expression) {
         if (!workerRecorder.sent.some(message => message.type === 'correlate' && message.calls.some(call => call.requestId === OTHER)))
           throw Error('Fresh worker request identity did not reach the recorder');
         checks.push('fresh worker sends, binds and correlates from native events while background polling timers are deferred');
+        const diagnostics = workerRecorder.sent.filter(message => message.type === 'command_step' && message.step === 'model-diagnostic');
+        const selected = diagnostics.at(-1)?.modelSelection;
+        if (selected?.outcome !== 'confirmed' || selected.attempt !== 1 || selected.selected?.effort !== 'high' ||
+            !diagnostics.every(message => message.id === 'native-event-worker') ||
+            workerRecorder.sent.some(message => message.type === 'command_step' && message.step === 'model-unconfirmed'))
+          throw Error('Native worker bootstrap lost its model diagnostic or changed its selection policy');
+        checks.push('actual native worker bootstrap forwards picker phase snapshots and exact High confirmation under one command id');
+
       } finally {
         window.__CLF_CONTENT_RECORDER__?.stop(); window.setTimeout = nativeTimeout;
         history.replaceState({}, '', '/c/' + THREAD);
       }
       return { ok: true, checks, userAgent: navigator.userAgent };
     })()`);
+    // Use a separate tab in this verifier's throwaway browser, never a personal browser/profile.
+    const other = await cdp('Target.createTarget', { url: 'about:blank', newWindow: false, background: false }, null);
+    const otherSession = (await cdp('Target.attachToTarget', { targetId: other.targetId, flatten: true }, null)).sessionId;
+    await cdp('Page.bringToFront', {}, otherSession);
+    report.modelDiagnostic = await evaluate(`(async () => {
+      const f = fixture(), reports = [], visibility = document.visibilityState, selectedReports = [];
+      const high = await f.api.selectModelSettings('gpt-5-6-thinking', 'high', () => true, value => selectedReports.push(value));
+      const selected = selectedReports.at(-1);
+      if (!high || selected?.outcome !== 'confirmed' || selected.after?.effort !== 'high' || selected.visibility !== visibility)
+        throw Error('Native background High selection or its diagnostic failed');
+      const ok = await f.api.selectModelSettings('unoffered-diagnostic-model', 'high', () => true, value => reports.push(value));
+      const final = reports.at(-1);
+      if (ok || final?.failedPhase !== 'resolve' || final.restore !== 'confirmed' || final.closed !== true ||
+          final.visibility !== visibility) throw Error('Native background diagnostic or selection restoration failed');
+      return { visibility, high: selected, final, phases: reports.map(value => value.phase) };
+    })()`);
+    report.checks.push('separate-tab native High selection succeeds and an unoffered request preserves failure/restoration details with actual visibility');
+    await cdp('Target.closeTarget', { targetId: other.targetId }, null);
     if (reactRuntime) {
       const realReact = buildSync({ stdin: { contents: fs.readFileSync(path.join(__dirname, 'fixtures/shell-react-runtime.js'), 'utf8'),
         resolveDir: path.resolve(root, reactRuntime) }, bundle: true, write: false, platform: 'browser', format: 'iife',
@@ -292,7 +346,15 @@ async function evaluate(expression) {
     fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify(report, null, 2));
     console.log(JSON.stringify(report, null, 2));
   } finally {
-    if (socket?.readyState === WebSocket.OPEN) { try { await cdp('Browser.close', {}, null); } catch {} socket.close(); }
+    if (socket?.readyState === WebSocket.OPEN) { try { await cdp('Browser.close', {}, null); } catch {} }
+    // Wait for Chromium itself to close its CDP connection before deleting the
+    // Snap profile; the launcher can exit while Chromium still writes cache files.
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      await Promise.race([new Promise(resolve => socket.once('close', resolve)), delay(3000)]);
+      socket.close();
+    }
     browser.kill();
+    // The independent watchdog retires the Snap profile after this process
+    // exits, whether normally or because a test timeout killed it.
   }
 })().catch(error => { console.error(error.message); process.exitCode = 1; });

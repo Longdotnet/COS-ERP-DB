@@ -480,6 +480,144 @@ describe('native Project entry readiness', () => {
     expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready');
   });
 
+  // #2068: within one tab ChatGPT keeps the Project home's text after it was sent, so the next resume
+  // found its predecessor's brief there and gave up. Only a brief this page typed itself, unchanged, is
+  // cleared (CodeRabbit on #2069); anything else stays and the entry fails as before.
+  it.each([
+    ['a brief this page typed', 'own', true],
+    ['the same brief with a hard line break ChatGPT escaped', 'escaped', true],
+    ['that brief with a person\'s note added', 'edited', false],
+    ['a brief this page never typed', 'foreign', false],
+    ['a person\'s own words', 'person', false]
+  ] as const)('on the Project home, clears %s only when it is the app\'s own', async (_name, kind, cleared) => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    const link = sourceLink();
+    box.textContent = '';
+    // The previous resume, typed and sent from this page.
+    if (kind !== 'foreign') { expect(api.insertPrompt(brief, true)).toBe(true); box.textContent = ''; }
+    // A hard line break inside one paragraph: ChatGPT stores it as a backslash before the line feed.
+    const left = kind === 'escaped' ? brief.replace(']]\n\n', ']]\\\n') : kind === 'edited' ? `${brief}\n\nAlso check the SMTP port.`
+      : kind === 'person' ? 'Remember to ask about the SMTP port' : brief;
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...left.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    if (cleared) expect(box.textContent).toBe('');
+    else {
+      expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready');
+      expect(box.textContent?.length).toBeGreaterThan(0);
+    }
+  });
+
+  // 2026-11-12 (Windows VM, Project chat started through the app): ChatGPT also keeps the Project home's text
+  // after the app's FIRST message of a chat was sent from there (its context block, the message and the
+  // connector mention's label). The next Compact & Resume in that Project found it, waited for an empty
+  // editor and gave up: "could not open the source Project", every time. That message is the app's own, so
+  // it is recognised like a brief; the mention label that follows it is allowed, a person's words are not.
+  it.each([
+    ['the first message of a chat this app typed, followed by its mention label', 'own', ' Chat On Steroids Core', true],
+    ['that message with no label', 'own', '', true],
+    ['that message followed by a label that is not this installation\'s connector', 'own', ' Some Other App', false],
+    ['that message followed by a person\'s note', 'own', '\n\nAlso check the SMTP port, please, and then summarise what you found about the mail service in three short paragraphs for the team lead.', false],
+    ['a first message this app never typed', 'foreign', ' Chat On Steroids Core', false]
+  ] as const)('on the Project home, clears %s only when it is the app\'s own', async (_name, kind, suffix, cleared) => {
+    const typed = '[[COS_CONTEXT:21006]]You are a coding agent working with the user.\n\nRoots: /project\n[[/COS_CONTEXT]]Compaction live test: reply with exactly PROJ-OK-1.';
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    const link = sourceLink();
+    box.textContent = '';
+    // The first message, typed and sent from this page; ChatGPT keeps its text on the Project home.
+    if (kind === 'own') { expect(api.insertPrompt(typed, true)).toBe(true); box.textContent = ''; }
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceChildren(...(typed + suffix).split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    if (cleared) expect(box.textContent).toBe('');
+    else {
+      expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready');
+      expect(box.textContent?.length).toBeGreaterThan(0);
+    }
+  });
+
+  // #2115: the page that typed a brief is gone (a reload, an app restart, another tab); ChatGPT still holds the
+  // text in the Project home. The brief is the app's own whoever typed it, so it is recognised from storage.
+  // ChatGPT may also put the draft back after it was cleared, so one clear is not enough.
+  it.each([
+    ['a brief an earlier page of this tab typed', 0, true],
+    ['that brief put back twice while the source turns are still going away', 2, true],
+    ['that brief put back four times (it stops, so a busy page cannot loop forever)', 4, false]
+  ] as const)('on the Project home, clears %s', async (_name, restores, cleared) => {
+    const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+    const brief = resumeBootstrapText('# TASK — the original goal\n\nShip the mail service.', 'pTYR0VjLJ5Xtz2FHFqajqA');
+    document.execCommand = (command: string, _ui?: boolean, value?: string) => {
+      const selection = document.getSelection();
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range) return false;
+      if (command === 'delete') { range.deleteContents(); return true; }
+      if (command !== 'insertHTML') return false;
+      range.deleteContents();
+      const template = document.createElement('template');
+      template.innerHTML = value || '';
+      range.insertNode(template.content);
+      return true;
+    };
+    box.textContent = '';
+    expect(api.insertPrompt(brief, true)).toBe(true);
+    box.textContent = '';
+    // The page reloads: its memory of what it typed is gone, the stored fingerprint is not.
+    dom.window.eval(source);
+    api = (dom.window as unknown as { CLF_DOM: DomApi }).CLF_DOM;
+    const put = () => box.replaceChildren(...brief.split(/\n\n/).map(part => { const p = document.createElement('p'); p.textContent = part; return p; }));
+    const link = sourceLink();
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      put();
+      // The source chat's turns are still on the page for a moment, and ChatGPT puts the draft back meanwhile.
+      user('Earlier turn');
+      for (let index = 1; index <= restores; index++) setTimeout(() => { if (box.textContent === '') put(); }, 400 * index);
+      setTimeout(() => { document.querySelector('[data-testid="conversation-turn-1"]')?.remove(); }, 400 * (restores + 1));
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(cleared);
+    if (!cleared) expect(failure).toHaveBeenCalledWith('transition-timeout:last=composer-not-ready');
+  });
+
   it('reports visible source turns as the last observation when the Project transition times out', async () => {
     const link = sourceLink();
     box.textContent = '';
@@ -1056,6 +1194,50 @@ describe('native image readiness', () => {
     expect(await draft.clear()).toBe(true);
     expect(api.hasComposerAttachments()).toBe(false); draft.dispose();
   });
+  // #1942 (2026-10-30): in German the remove label is "<name> entfernen", the name first, so no file was
+  // ever recognized and every message with an attachment hung until "upload not confirmed".
+  it.each([['German', 'notes.zip entfernen'], ['no name in the label', 'Datei entfernen']])('accepts the two-button file tile whatever its remove label says (%s)', async (_case, removal) => {
+    const input = upload(); input.accept = '';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    input.addEventListener('change', () => {
+      const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+      host.innerHTML = `<span><span><span>notes.zip</span><button type="button" aria-label="notes.zip"></button></span><button type="button" aria-label="${removal}"></button></span>`;
+      document.querySelector('form')!.append(host);
+    });
+    const file = new dom.window.File(['exact bytes'], 'notes.zip', { type: 'application/zip' });
+    expect(await api.uploadImages([], () => true, draft, [file])).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(true);
+    draft.dispose();
+  });
+  // #1986 (2026-11-01, Spanish ChatGPT on Windows): the open button's label is the file name twice, and
+  // the remove label repeats it too; the tile was never recognized and the message waited 10 minutes.
+  it('accepts a file tile whose open label repeats the name twice, by the name it shows', async () => {
+    const input = upload(); input.accept = '';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    input.addEventListener('change', () => {
+      const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+      host.innerHTML = '<span><span><span>notes.zip</span><button type="button" aria-label="notes.zipnotes.zip"></button></span><button type="button" aria-label="Quitar notes.zipnotes.zip"></button></span>';
+      document.querySelector('form')!.append(host);
+    });
+    const file = new dom.window.File(['exact bytes'], 'notes.zip', { type: 'application/zip' });
+    expect(await api.uploadImages([], () => true, draft, [file])).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(true);
+    draft.dispose();
+  });
+  it.each([['a different name repeated', 'other.zipother.zip'], ['the name and more', 'notes.zip (copy)'], ['the name three times', 'notes.zipnotes.zipnotes.zip']])(
+    'still refuses an open label that is not the shown name or exactly it twice (%s)', (_case, label) => {
+      const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+      host.innerHTML = `<span><span><span>notes.zip</span><button type="button" aria-label="${label}"></button></span><button type="button" aria-label="Quitar ${label}"></button></span>`;
+      document.querySelector('form')!.append(host);
+      expect(api.hasComposerAttachments()).toBe(false);
+    });
+  // CodeRabbit on #1944: a blank label, or the file name with spaces around it, names no remove control.
+  it.each(['notes.zip', ' notes.zip ', '   ', ''])('still refuses a tile whose second button is not a remove control (label "%s")', label => {
+    const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+    host.innerHTML = `<span><span><span>notes.zip</span><button type="button" aria-label="notes.zip"></button></span><button type="button" aria-label="${label}"></button></span>`;
+    document.querySelector('form')!.append(host);
+    expect(api.hasComposerAttachments()).toBe(false);
+  });
   it.each(['Quitar', 'Remove', '削除'])('accepts the current two-button file tile before authorizing Send (%s)', async removeLabel => {
     const input = upload(); input.accept = '';
     const draft = api.captureComposerDraft('Exact app prompt');
@@ -1486,6 +1668,19 @@ describe('rendered temporary-chat state independent of language', () => {
     currentToggle(label, true);
     expect(api.temporaryChatReady()).toBe(true);
   });
+  it.each([[true, true], [false, false]])('reads the checked glyph behind the codex-icon- sprite prefix (checked %s)', (checked, active) => {
+    // The sprite ids gained a `codex-icon-` prefix on 2026-11-02 (see the microphone anchor).
+    const control = toggle('beliebig', checked);
+    for (const use of control.querySelectorAll('use')) use.setAttribute('href', use.getAttribute('href')!.replace('#chat-temp', '#codex-icon-chat-temp'));
+    expect(api.temporaryChatReady()).toBe(active);
+  });
+  it('does not take a checked glyph whose own <use> is hidden', () => {
+    const control = toggle('beliebig', false);
+    // The visible svg holds the checked glyph, but the <use> element itself is hidden.
+    const svg = control.querySelector('svg')!;
+    svg.innerHTML = '<use href="/cdn/assets/icons-anyhash.svg#codex-icon-chat-temp-checked" style="display:none"></use>';
+    expect(api.temporaryChatReady()).toBe(false);
+  });
   it('does not mistake the current three-path inactive temporary-chat icon for active mode', () => {
     currentToggle('Temporary chat', false);
     expect(api.temporaryChatReady()).toBe(false);
@@ -1582,6 +1777,26 @@ describe('locale-independent provider composer evidence', () => {
       '<div><button type="button" aria-label="Sprachchat starten"><svg><use href="/cdn/sprites.svg#voice-regular-20"></use></svg></button></div></div></div>';
     expect(api.sendButton()).toBeNull();
     expect(api.composerActions()).toEqual({ host: document.getElementById('row'), before: document.getElementById('mic-wrap') });
+  });
+
+  it.each(['microphone-light-20', 'codex-icon-microphone-light-20'])('anchors to the microphone whatever prefix the sprite carries (%s)', glyph => {
+    // ChatGPT 2026-11-02 (German UI, logged in): the sprite ids gained a `codex-icon-` prefix
+    // (`#codex-icon-microphone-light-20`, `#codex-icon-voice-regular-20`), so an empty composer
+    // had no anchor again and the app's composer control never appeared until something was typed.
+    document.documentElement.lang = 'de-DE';
+    document.querySelector('form')!.innerHTML = '<div id="prompt-textarea" contenteditable="true"></div>' +
+      '<div class="flex justify-end"><div><div><span><button type="button" aria-label="ChatGPT-Modell auswählen">5.6</button></span></div></div>' +
+      `<div id="row"><div id="mic-wrap" class="flex shrink-0 items-center empty:hidden"><button type="button" aria-label="Diktieren"><svg><use href="/cdn/assets/icons-anyhash.svg#${glyph.replace('20', '16')}"></use></svg><svg><use href="/cdn/assets/icons-anyhash.svg#${glyph}"></use></svg></button></div>` +
+      '<div><button type="button" aria-label="Sprachchat starten"><svg><use href="/cdn/assets/icons-anyhash.svg#codex-icon-voice-regular-20"></use></svg></button></div></div></div>';
+    expect(api.sendButton()).toBeNull();
+    expect(api.composerActions()).toEqual({ host: document.getElementById('row'), before: document.getElementById('mic-wrap') });
+  });
+
+  it('does not take a sprite that only ends like the microphone for it', () => {
+    button.parentElement!.removeAttribute('data-testid');
+    button.removeAttribute('data-testid'); button.removeAttribute('aria-label');
+    button.innerHTML = '<svg><use href="#codex-icon-notmicrophone-light-20"></use></svg>';
+    expect(api.composerActions()).toBeNull();
   });
 
   it('does not anchor to a microphone glyph in prose or outside the composer', () => {

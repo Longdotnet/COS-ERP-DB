@@ -180,6 +180,8 @@ const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   // Preserve the historical behavior unless the user explicitly opts into a cap shared by
   // independent prime families. Existing per-family maxWorkers remains authoritative too.
   globalMaxWorkers: 0,
+  // Off: automatic sends go out as soon as their chat is ready, however many chats work (#1694).
+  chatsAtOnce: 0,
   allowUnattributedCalls: false,
   strictChatAllowlist: false,
   // Off: Goal/Loop chats are always recovered, and reopening anything else — a worker, a prime,
@@ -369,6 +371,19 @@ const configSchema = z.object({
       logWarn('config: the saved ui.desktopAsk was damaged; the app asks before every desktop step until it is chosen again');
       return 'always' as const;
     }),
+    /**
+     * Desktop control for a call the app cannot tie to a chat (see mcp/desktop-caller.ts). Off unless
+     * chosen, and separate from multiAgent.allowUnattributedCalls on purpose.
+     */
+    desktopUnattributed: z.boolean().optional().catch(() => {
+      logWarn('config: the saved ui.desktopUnattributed was damaged; desktop control is used only for chats the app can name until it is chosen again');
+      return undefined;
+    }),
+    /** Browser screen/control grants never opt Linux into native AT-SPI or portal access. */
+    linuxDesktopEnabled: z.boolean().default(false).catch(() => {
+      logWarn('config: the saved ui.linuxDesktopEnabled was damaged; native Linux Desktop access remains off');
+      return false;
+    }),
     developerMode: z.boolean().optional(),
     playfulStatus: z.boolean().optional(),
     playfulContinue: z.boolean().optional(),
@@ -387,6 +402,11 @@ const configSchema = z.object({
       : typeof value === 'string' ? value.trim().slice(0, 300) || undefined : 'damaged').optional(),
     /** Keep the chat at its end while it grows, in the app and on ChatGPT, until the reader scrolls up. */
     followOutput: z.boolean().optional().default(true),
+    /** Each chat message's time above it. Off unless chosen; a damaged value reads as off. */
+    showMessageTimes: z.boolean().optional().catch(() => {
+      logWarn('config: the saved ui.showMessageTimes was damaged; message times stay hidden until the switch is set again');
+      return undefined;
+    }),
     mentionCore: z.boolean().optional().default(true),
     mentionPlugins: z.boolean().optional().default(false),
     language: z.enum(UI_LANGUAGES).optional(),
@@ -419,7 +439,11 @@ const configSchema = z.object({
     sounds: z.boolean().optional().default(false),
     // #1402: a fresh turn after this many minutes of one (0 = off). A malformed value keeps the default.
     rotateTurnMinutes: z.number().int().min(0).max(120).optional().default(30).catch(30),
-    rotateStopFallback: z.boolean().optional().default(false).catch(false),
+    // On by default since 2.1.49 (user decision 2026-10-31); see adoptStopFallback for earlier configs.
+    rotateStopFallback: z.boolean().optional().default(true).catch(true),
+    /** Set once the default-on stop fallback was applied to this config (adoptStopFallback). */
+    // A damaged marker reads as adopted: a person's saved off is kept (CodeRabbit on #1954).
+    rotateStopFallbackAdopted: z.boolean().optional().catch(true),
     // Reading Codex's and Claude Code's own logs for the Usage page (#482). Missing means on.
     localAppUsage: z.boolean().optional().default(true),
     keepAwake: z.boolean().optional().default(true),
@@ -437,6 +461,8 @@ const configSchema = z.object({
       return { ...raw, enabled: false, server: '' };
     }, z.object({
       enabled: z.boolean().catch(false),
+      // ntfy as a destination; Telegram (#1934) is the other. Settings from before Telegram: on.
+      ntfy: z.boolean().optional().default(true).catch(true),
       server: z.string().max(2048).optional().default(DEFAULT_PHONE_PUSH.server).catch(''),
       topic: z.string().max(64).catch(''),
       needsYou: z.boolean().catch(true),
@@ -444,7 +470,9 @@ const configSchema = z.object({
       finishedAfterMinutes: z.number().int().min(0).max(240).nullable().catch(DEFAULT_PHONE_PUSH.finishedAfterMinutes),
       onlyWhenAway: z.boolean().catch(true),
       quietHours: z.object({ from: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), to: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/) }).nullable().catch(null),
-      includeDetails: z.boolean().catch(false)
+      includeDetails: z.boolean().catch(false),
+      // Replies from Telegram as messages (phase 2, 2026-10-31): missing or damaged is off.
+      telegramSteer: z.boolean().optional().catch(undefined)
     })).optional().catch(undefined),
     // Masking credentials in tool output before ChatGPT sees them (#1797). On unless turned off.
     secretsShield: z.boolean().optional().default(true),
@@ -512,6 +540,7 @@ const configSchema = z.object({
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
       maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers),
       globalMaxWorkers: z.number().int().min(0).max(64).optional().default(DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0),
+      chatsAtOnce: z.number().int().min(0).max(10).optional().catch(0).default(DEFAULT_MULTI_AGENT.chatsAtOnce ?? 0),
       allowUnattributedCalls: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedCalls),
       strictChatAllowlist: z.boolean().optional().default(DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false),
       recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs),
@@ -525,6 +554,7 @@ const configSchema = z.object({
       enabled: DEFAULT_MULTI_AGENT.enabled,
       maxWorkers: DEFAULT_MULTI_AGENT.maxWorkers,
       globalMaxWorkers: DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0,
+      chatsAtOnce: DEFAULT_MULTI_AGENT.chatsAtOnce ?? 0,
       allowUnattributedCalls: DEFAULT_MULTI_AGENT.allowUnattributedCalls,
       strictChatAllowlist: DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false,
       recoverAgentTabs: DEFAULT_MULTI_AGENT.recoverAgentTabs,
@@ -676,7 +706,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     // Fresh installs refresh changed connector tools on their own: a permission chosen in Setup
     // changes the tool list, and nothing else tells a new user to refresh the plugin in ChatGPT.
     // Older configs keep the schema default (off).
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, sounds: false, rotateTurnMinutes: 30, rotateStopFallback: false, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false,
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, sounds: false, rotateTurnMinutes: 30, rotateStopFallback: true, rotateStopFallbackAdopted: true, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false, linuxDesktopEnabled: false,
       // The built-in browser is opt-in: Chrome with the companion stays the default for new and
       // existing installs alike, and the built-in one runs only once someone chooses it.
       chatBrowser: 'chrome' },
@@ -820,7 +850,7 @@ export async function loadConfig(): Promise<Config> {
       current = conservativeRecoveryConfig();
       recovered = true;
     } else {
-      current = adoptCurrentGoalPrompt(adoptWiderWindow(adoptAutoCompaction(recalibrateTokens(parsed.data))));
+      current = adoptStopFallback(adoptCurrentGoalPrompt(adoptWiderWindow(adoptAutoCompaction(recalibrateTokens(parsed.data)))));
       // Duplicate root names would make a virtual path ambiguous.
       const seen = new Set<string>();
       current.roots = current.roots.filter((r) => {
@@ -899,6 +929,17 @@ function adoptAutoCompaction(config: Config): Config {
  * that already holds it, whether from 1.7 or from a person, simply keeps it.
  */
 const SUPERSEDED_AUTO_DEFAULTS = { auto: true, autoTokens: 300_000 };
+
+/**
+ * The stop-and-continue fallback for fresh turns became the default in 2.1.49: in long chats
+ * ChatGPT often shows only Stop at a tool result, so the fresh turn's Continue had no Send and
+ * rotation gave up (user decision 2026-10-31). Until then every save wrote the old default, off,
+ * so a saved false is not a choice: such a config is turned on once and marked; a later off stays.
+ */
+function adoptStopFallback(config: Config): Config {
+  if (config.ui.rotateStopFallbackAdopted === true) return config;
+  return { ...config, ui: { ...config.ui, rotateStopFallback: true, rotateStopFallbackAdopted: true } };
+}
 
 function adoptWiderWindow(config: Config): Config {
   const { auto, autoTokens } = config.compaction;
