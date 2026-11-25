@@ -904,7 +904,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // The COS fork keeps bounded find and its ERP tools alongside shell execution, plus upstream's user-step and usage tools.
-    expect(names).toEqual(['agents', 'apply_patch', 'ask_user_to_run', 'database', 'engineering', 'exec', 'exec_command', 'find', 'knowledge', 'read', 'save_image', 'update_plan', 'usage', 'user_request_status', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'ask_user_to_run', 'database', 'engineering', 'exec', 'exec_command', 'find', 'knowledge', 'read', ...(IS_WINDOWS ? ['runtime_debug'] : []), 'save_image', 'update_plan', 'usage', 'user_request_status', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -1247,7 +1247,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // COS keeps bounded find and local ERP knowledge beside shell execution, plus upstream user-step and usage tools.
-    expect(coreTools).toHaveLength(16);
+    expect(coreTools).toHaveLength(IS_WINDOWS ? 17 : 16);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -1261,7 +1261,7 @@ describe('surface boundaries', () => {
     // removes repeated repo/doc/DB scans from later turns. Keep only measured headroom.
     // The COS ERP DB fork adds compact knowledge/engineering/database schemas to upstream Core.
     // Current merged discovery is 26,593 bytes after upstream's two user-step tools; keep only modest measured headroom.
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(26_800);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(IS_WINDOWS ? 28_000 : 26_800);
     expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(IS_WINDOWS ? 24_000 : 24_500);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
