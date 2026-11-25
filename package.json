@@ -65,17 +65,17 @@
     "fflate": "^0.8.3",
     "js-yaml": "4.3.2",
     "katex": "0.19.1",
-    "koffi": "3.3.5",
-    "marked": "18.2.0",
-    "mssql": "^12.7.2",
+    "koffi": "3.3.8",
+    "marked": "18.2.1",
+    "mssql": "^12.8.0",
     "node-pty": "1.2.0-beta.18",
-    "pdfjs-dist": "^6.4.299",
+    "pdfjs-dist": "^6.5.438",
     "quickjs-emscripten-core": "0.32.0",
     "sharp": "0.35.4",
     "smol-toml": "1.9.1",
     "tree-sitter": "0.25.1",
     "tree-sitter-bash": "0.25.1",
-    "ws": "8.22.0",
+    "ws": "8.23.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -85,14 +85,14 @@
     "@types/mssql": "^12.3.0",
     "@types/node": "^24.19.2",
     "@types/ws": "8.18.2",
-    "axe-core": "4.14.0",
+    "axe-core": "4.14.1",
     "electron": "44.3.0",
     "electron-builder": "^26.18.0",
     "electron-vite": "^5.0.0",
     "jsdom": "30.1.1",
     "typescript": "^7.0.2",
-    "vite": "^7.3.7",
-    "vitest": "^5.0.5"
+    "vite": "^7.3.8",
+    "vitest": "^5.1.1"
   },
   "overrides": {
     "@anthropic-ai/mcpb": {
