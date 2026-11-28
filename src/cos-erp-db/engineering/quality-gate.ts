@@ -243,7 +243,14 @@ export async function engineeringQualityGate(
       blockers.push('One or more prepared reference analogue evidence items are stale, unauthorized or mismatched.');
     }
     const preparedAnalogueCount = task.analogueEvidence.length + task.referenceAnalogueEvidence.length;
-    if (preparedAnalogueCount < 3) {
+    if (task.authorizedReferences.length) {
+      if (!task.analogueEvidence.length) blockers.push('Prepared reference workflow lacks evidence from the existing target project counterpart.');
+      for (const reference of task.authorizedReferences) {
+        if (!task.referenceAnalogueEvidence.some(ref => ref.referenceRootIdentity === reference.rootIdentity)) {
+          blockers.push(`Prepared reference workflow lacks implementation evidence from ${reference.virtualPath}.`);
+        }
+      }
+    } else if (preparedAnalogueCount < 3) {
       blockers.push(`Prepared workflow has only ${preparedAnalogueCount} independent analogue(s) from the current project or authorized references; at least 3 are required before project-native implementation is considered grounded.`);
     }
     if (preparedAnalogueCount > 7) {

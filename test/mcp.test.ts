@@ -1573,6 +1573,22 @@ describe('capability gating', () => {
     expect(textOf(deleted)).toContain('Delete files is disabled');
   });
 
+  it('rejects a scoped patch outside its declared module before writing any file', async () => {
+    ctx.readOnly = false;
+    ctx.caps = withCaps({ create: true, edit: true, move: true, deleteFile: true });
+    await fs.mkdir(path.join(approved, 'CRM'));
+    await fs.mkdir(path.join(approved, 'CRM6.0'));
+    const reply = await core('tools/call', {
+      name: 'apply_patch', arguments: { writeScope: ['/workspace/CRM'], patch: ['*** Begin Patch','*** Add File: /workspace/CRM/ok.txt','+ok','*** Add File: /workspace/CRM6.0/no.txt','+no','*** End Patch'].join('\n') }
+    });
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toContain('CHANGE_SCOPE_VIOLATION');
+    await expect(fs.stat(path.join(approved,'CRM','ok.txt'))).rejects.toThrow();
+    const accepted = await core('tools/call', { name: 'apply_patch', arguments: { writeScope: ['/workspace/CRM'], patch: addPatch('/workspace/CRM/ok.txt',['ok']) } });
+    expect(accepted.body.result?.isError).toBeFalsy();
+    expect(await fs.readFile(path.join(approved,'CRM','ok.txt'),'utf8')).toBe('ok\n');
+  });
+
   it('keeps command execution off unless it is explicitly enabled', async () => {
     ctx.readOnly = false;
     expect(toolNames(await core('tools/list'))).not.toContain('exec_command');

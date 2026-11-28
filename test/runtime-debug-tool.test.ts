@@ -13,6 +13,8 @@ describe('runtime_debug', () => {
   it('validates target identity and rejects mixed actions', () => {
     expect(runtimeDebugSchema.safeParse({ action: 'start', pid: 123 }).success).toBe(false);
     expect(runtimeDebugSchema.safeParse({ action: 'processes', pid: 123 }).success).toBe(false);
+    expect(runtimeDebugSchema.safeParse({ action: 'processes', connection: 'noibo' }).success).toBe(false);
+    expect(runtimeDebugSchema.safeParse({ ...start, connection: 'noibo' }).success).toBe(true);
     expect(runtimeDebugSchema.safeParse({ action: 'start', pid: 123, processStartUtc: "x'; whoami" }).success).toBe(false);
   });
 

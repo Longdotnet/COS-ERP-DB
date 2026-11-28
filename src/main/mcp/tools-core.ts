@@ -1,5 +1,6 @@
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
+import { outsideChangeScope } from '../../cos-erp-db/engineering/change-scope.js';
 import { registerUserRequestTools } from './user-request-tools.js';
 import { goalWorkerChat, imageExportCapable } from '../bridge.js';
 import { exportImage, ImageExportError } from '../image-export.js';
@@ -719,11 +720,12 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         description: APPLY_PATCH_DESCRIPTION,
         inputSchema: z
           .object({
-            patch: z.string().describe(APPLY_PATCH_ARGUMENT_DESCRIPTION)
+            patch: z.string().describe(APPLY_PATCH_ARGUMENT_DESCRIPTION),
+            writeScope: z.array(z.string().trim().min(1).max(4096)).min(1).max(16).optional().describe('Explicit permitted directories for this patch. Use when the user limits changes to specific modules; all resolved source and destination paths must remain inside these directories.')
           })
           .strict()
       })),
-      async ({ patch }) =>
+      async ({ patch, writeScope }) =>
         guard('apply_patch', async () => {
           if (!caps.create && !caps.edit && !caps.move && !caps.deleteFile) {
             return fail(
@@ -765,7 +767,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           }
           const base = await resolveIn(ctx.roots, baseVirtual, { remote: true });
           await validatedWorkspace();
-          return (await runParsedPatch(args, ctx.roots, base, caps)).result;
+          return (await runParsedPatch(args, ctx.roots, base, caps, writeScope)).result;
         })
     );
   }
@@ -1917,7 +1919,8 @@ async function runParsedPatch(
   args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null },
   roots: readonly Root[],
   base: { real: string; virtual: string },
-  caps?: Capabilities
+  caps?: Capabilities,
+  writeScope?: readonly string[]
 ): Promise<ParsedPatchRun> {
   if (caps !== undefined) {
     // Product permission gates around the otherwise ported Codex patch runtime. exec_command's
@@ -1956,6 +1959,17 @@ async function runParsedPatch(
   let resolution: PatchResolution;
   try {
     resolution = await resolvePatchPaths(roots, effectiveBase.virtual, effectiveArgs.hunks);
+    if (writeScope) {
+      if (resolution.fs !== localFs) throw new Error('Explicit patch writeScope currently supports local folders only.');
+      const permitted: string[] = [];
+      for (const scope of writeScope) {
+        const target = await resolveIn(roots, scope, { base: effectiveBase.virtual });
+        if (target.root.remote || !(await fs.stat(target.real)).isDirectory()) throw new Error('writeScope must name an approved local directory.');
+        permitted.push(target.real);
+      }
+      const outside = outsideChangeScope(resolution.virtualPaths.keys(), permitted);
+      if (outside.length) throw new Error('CHANGE_SCOPE_VIOLATION: ' + outside.map(file => resolution.virtualPaths.get(file)).join(', '));
+    }
   } catch (error) {
     return { result: fail(friendlyError(error)), content: null, exitCode: null };
   }

@@ -35,6 +35,13 @@ it('publishes a small credential-free database schema and returns structured que
   expect(json).toContain('connection');
   expect(json).toContain('sql');
   expect(json).toContain('search_objects');
+  expect(json).toContain('business_trace');
+  expect(json).toContain('business_graph');
+  expect(json).toContain('result_compare');
+  expect(json).toContain('object_verify');
+  expect(json).toContain('migration_audit');
+  expect(json).toContain('migration_preflight');
+  expect(json).toContain('object_details');
   expect(json).toContain('growth_diagnostics');
   expect(json).toContain('incident_workspace');
   expect(json).toContain('incident_diagnose');
@@ -55,6 +62,18 @@ it('publishes a small credential-free database schema and returns structured que
   expect(json).toContain('cursor');
   expect(json).not.toMatch(/password|server|user|domain/i);
   expect(declaration.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+  expect(schema.safeParse({ action: 'business_trace', search: 'CHAMCONG07' }).success).toBe(false);
+  expect(schema.safeParse({ action: 'business_trace', connection: 'linkq-test', search: 'CHAMCONG07' }).success).toBe(true);
+  expect(schema.safeParse({ action: 'business_graph', connection: 'linkq-test', search: 'CHAMCONG07', depth: 3 }).success).toBe(true);
+  expect(schema.safeParse({ action: 'business_graph', connection: 'linkq-test', search: 'CHAMCONG07', depth: 5 }).success).toBe(false);
+  expect(schema.safeParse({ action: 'business_compare', baselineConnection: 'r2', currentConnection: 'lamha', search: 'L81DMTHUE' }).success).toBe(true);
+  expect(schema.safeParse({ action: 'business_compare', currentConnection: 'lamha', search: 'L81DMTHUE' }).success).toBe(false);
+  expect(schema.safeParse({ action: 'object_details', connection: 'linkq-test', objectId: 42, section: 'ddl' }).success).toBe(true);
+  expect(schema.safeParse({ action: 'object_details', connection: 'linkq-test', objectId: 42 }).success).toBe(false);
+  expect(schema.safeParse({ action: 'result_compare' }).success).toBe(false);
+  expect(schema.safeParse({ action: 'result_compare', comparison: { baseline: { connection: 'db', sql: 'SELECT 1' }, candidate: { connection: 'db', sql: 'SELECT 1' } } }).success).toBe(true);
+  expect(schema.safeParse({ action: 'migration_audit', scriptPath: '/workspace/test.sql' }).success).toBe(true);
+  expect(schema.safeParse({ action: 'object_verify', verification: { connection: 'db', object: 'dbo.v' } }).success).toBe(true);
 
   const result = await invoke({ action: 'query', connection: 'linkq-test', sql: 'SELECT TOP 10 * FROM dbo.L00ZONES' });
   expect(execute).toHaveBeenCalledWith({ action: 'query', connection: 'linkq-test', sql: 'SELECT TOP 10 * FROM dbo.L00ZONES' });

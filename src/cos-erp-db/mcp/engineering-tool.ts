@@ -7,6 +7,11 @@ import { engineeringProfile } from '../engineering/profiles/index.js';
 import { engineeringPrepareInputSchema, prepareEngineeringTask } from '../engineering/prepare-service.js';
 import { getEngineeringPerformance, observeEngineeringInvocation } from '../engineering/performance.js';
 import { engineeringQualityGate } from '../engineering/quality-gate.js';
+import { collectDatabaseHistoryBenchmark, databaseHistoryBenchmarkSchema } from '../engineering/evals/database-history.js';
+import { collectCodexHistory, codexHistorySchema } from '../engineering/evals/codex-history.js';
+import { currentCaller } from '../../main/mcp/call-context.js';
+import { provenSession } from '../../main/codex/ownership.js';
+import { getSession } from '../../main/session/store.js';
 import { getEngineeringImpact, putEngineeringImpactReview } from '../engineering/impact-service.js';
 import { recordIncidentMachineVerification } from '../engineering/incident-verification-service.js';
 import { getEngineeringTaskHistory, getEngineeringTasks, putEngineeringTask } from '../engineering/task-service.js';
@@ -36,6 +41,8 @@ type EngineeringAction =
   | 'impact_put'
   | 'incident_verify'
   | 'performance_get'
+  | 'history_benchmark'
+  | 'codex_history_benchmark'
   | 'quality_gate';
 
 function result(value: unknown): ToolResult {
@@ -57,14 +64,14 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
     'engineering',
     toolDeclaration('engineering', () => ({
       title: 'Project-Native Engineering',
-      description: 'Project-bound preparation, evidence-backed task packets, deliberation, changed-file impact review, incident verification receipts, durable learning bindings, Core-owned validation, profiles and quality gates.',
+      description: 'Project-bound task prep, evidence, impact review, incident verification, learning, validation, profiles and quality gates. history_benchmark reads aggregate metrics from recorded COS chats with explicit scope. codex_history_benchmark reads aggregate metrics for explicitly selected local Codex sessionIds (item JSON).',
       inputSchema: z.object({
         action: z.enum([
           'context', 'profile_get', 'prepare', 'discover',
           'task_put', 'task_get', 'task_history',
           'convention_put', 'convention_search', 'convention_get', 'convention_history',
           'validation_run', 'validation_get', 'impact_get', 'impact_put', 'incident_verify', 'performance_get',
-          'quality_gate'
+          'history_benchmark', 'codex_history_benchmark', 'quality_gate'
         ] satisfies EngineeringAction[]),
         profile: z.string().trim().min(1).max(80).optional(),
         runtimeFamily: z.string().trim().min(1).max(120).optional(),
@@ -75,7 +82,7 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
         limit: z.number().int().min(1).max(50).optional()
       }).strict().superRefine((input, ctx) => {
         const put = input.action === 'prepare' || input.action === 'task_put' || input.action === 'convention_put'
-          || input.action === 'validation_run' || input.action === 'impact_put' || input.action === 'incident_verify';
+          || input.action === 'validation_run' || input.action === 'impact_put' || input.action === 'incident_verify' || input.action === 'history_benchmark' || input.action === 'codex_history_benchmark';
         const search = input.action === 'discover' || input.action === 'convention_search';
         const keyed = ['task_get', 'task_history', 'convention_get', 'convention_history', 'validation_get', 'impact_get', 'performance_get', 'quality_gate'].includes(input.action);
         if (put !== (input.item !== undefined)) {
@@ -101,6 +108,19 @@ export function registerEngineeringTool(reg: SurfaceRegistrar): void {
       const run = async (): Promise<ToolResult> => {
         try {
           if (input.action === 'profile_get') return result(engineeringProfile(input.profile));
+          if (input.action === 'codex_history_benchmark') {
+            const request = codexHistorySchema.parse(parseJson<unknown>(input.item, 'codex_history_benchmark'));
+            return result(await collectCodexHistory(request));
+          }
+          if (input.action === 'history_benchmark') {
+            const request = databaseHistoryBenchmarkSchema.parse(parseJson<unknown>(input.item, 'history_benchmark'));
+            const caller = currentCaller();
+            const sessionId = provenSession(caller.requestId, caller.sessionId ?? null);
+            if (!sessionId) throw new Error('History benchmark requires a proven local chat session.');
+            const session = await getSession(sessionId);
+            if (!session) throw new Error('Current local session is unavailable.');
+            return result(await collectDatabaseHistoryBenchmark(request, session.projectId ?? null));
+          }
           const resolved = await resolveEngineeringLineage({
             profile: input.profile,
             runtimeFamily: input.runtimeFamily,

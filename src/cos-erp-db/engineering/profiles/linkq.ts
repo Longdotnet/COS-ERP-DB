@@ -6,15 +6,17 @@ export const LINKQ_ENGINEERING_PROFILE = {
   title: 'LINKQ Engineering',
   principles: [
     'Preserve LINKQ engineering identity, not historical implementation mistakes.',
-    'Prefer analogues from the same runtime family and module before broader repository examples.',
+    'For an explicitly designated working implementation, inspect and follow that reference first; use current-project analogues to preserve compatibility and style.',
+    'Otherwise prefer analogues from the same runtime family and module before broader repository examples.',
     'Infer conventions from multiple implementations; one existing file is evidence, not a standard.',
     'Classify findings as convention, business rule, legacy debt or engineering improvement before copying them.',
-    'Keep deltas minimal and compatible unless evidence shows the existing contract cannot meet correctness or scale needs.',
+    'Keep deltas minimal and compatible. For a scoped bug fix or reference port, reuse the existing forms, helpers, service and configuration path; introduce no new architecture or optional improvements without explicit scope or verified necessity.',
     'Match project naming, SQL, comments and summaries while avoiding AI-style explanatory noise.',
     'Treat large-data claims as unproven without production-scale or runtime evidence.'
   ],
   analogueTarget: { min: 3, max: 7 },
   preferredEvidenceOrder: [
+    'user-designated working implementation for the requested behavior',
     'same runtime family and module',
     'same feature family',
     'current project policy and skills',

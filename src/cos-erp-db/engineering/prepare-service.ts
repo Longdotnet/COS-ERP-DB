@@ -208,9 +208,14 @@ export async function prepareEngineeringTask(
       origin: 'authorized_reference' as const,
       referenceRootIdentity: item.referenceRootIdentity
     }));
-  const insufficientAnalogueQuestion = preparedAnalogues.length >= 3
-    ? []
-    : [`Only ${preparedAnalogues.length} independent authorized implementation analogue(s) were found; resolve the project-native pattern before coding.`];
+  const insufficientAnalogueQuestion = authorizedReferences.length
+    ? [
+        ...(!analogueEvidence.length ? ['Read the existing target counterpart before porting a reference.'] : []),
+        ...authorizedReferences.filter(reference => !referenceAnalogueEvidence.some(ref => ref.referenceRootIdentity === reference.rootIdentity))
+          .map(reference => `Read the designated implementation in ${reference.virtualPath} before coding.`)
+      ]
+    : preparedAnalogues.length >= 3 ? []
+      : [`Only ${preparedAnalogues.length} independent authorized implementation analogue(s) were found; resolve the project-native pattern before coding.`];
   const requirementComparisons = input.requirements.map(requirement => ({
     requirement,
     status: 'investigate' as const,
@@ -287,7 +292,7 @@ export async function prepareEngineeringTask(
     },
     referencePolicy: {
       autoDiscovery: false,
-      statement: 'Cross-project evidence is allowed only from explicit task-scoped authorizedReferences. Profile similarity or repository naming never grants reference authority.'
+      statement: 'Cross-project evidence is allowed only from explicit task-scoped authorizedReferences. Profile similarity or repository naming never grants reference authority. When the user directs parity with a working implementation, compare the exact reference and target counterpart, port its behavior using the target conventions, and record only necessary deviations. Do not introduce optional new architecture. A target counterpart and evidence from each designated reference are sufficient for the analogue coverage gate; relevance and classification still require review.'
     },
     executionCapsule: {
       taskKey: task.key,

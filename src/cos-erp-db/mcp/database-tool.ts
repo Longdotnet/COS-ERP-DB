@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { executeDatabaseAction, MAX_DATABASE_SQL_CHARS, type DatabaseActionInput, type DatabaseActionOutput } from '../../main/database/service.js';
 import { MAX_DATABASE_OBJECT_PAGE_SIZE, MAX_DATABASE_OBJECT_SEARCH_CHARS } from '../../main/database/metadata.js';
+import { investigateBusinessObject } from '../investigation/business-trace.js';
+import { compareBusinessObject } from '../investigation/business-compare.js';
+import { compareQueryResults, resultCompareSchema, verifyDeployedObject, objectVerificationSchema } from '../investigation/result-verification.js';
+import { auditMigrationScript } from '../investigation/migration-audit.js';
+import { migrationPreflight, migrationPreflightSchema } from '../investigation/migration-preflight.js';
 import {
   diagnoseIncident,
   executeColumnProfile,
@@ -126,7 +131,7 @@ export function registerDatabaseTool(
     'database',
     toolDeclaration('database', () => ({
       title: 'SQL Server',
-      description: 'Read SQL Server data/schema and incident evidence. Read-only; credentials stay local.',
+      description: 'Read SQL Server data/schema and incident evidence. Start with business_trace or business_graph for ERP identifiers, business_compare for scoped cross-database differences, object_details for columns/DDL/indexes/dependencies. result_compare compares bounded read-only SELECT results; object_verify fingerprints a deployed definition; migration_preflight compares selected source/target table mappings; migration_audit inspects a local SQL payload without running it. Read-only; credentials stay local.',
       inputSchema: z
         .object({
           action: z.enum([
@@ -137,6 +142,14 @@ export function registerDatabaseTool(
             'incident_diagnose',
             'incident_history',
             'search_objects',
+            'business_trace',
+            'business_graph',
+            'business_compare',
+            'result_compare',
+            'object_verify',
+            'migration_audit',
+            'migration_preflight',
+            'object_details',
             'workspace_context',
             'column_search',
             'column_profile',
@@ -156,24 +169,41 @@ export function registerDatabaseTool(
             'test'
           ]),
           connection: z.string().min(1).max(64).optional().describe('Configured id; omit for default.'),
+          comparison: resultCompareSchema.optional().describe('result_compare only: two explicit connections and read-only SELECT queries with identical projections.'),
+          verification: objectVerificationSchema.optional().describe('object_verify only: explicit connection, schema.object and optional expected definition SHA256.'),
+          scriptPath: z.string().trim().min(1).max(4096).optional().describe('migration_audit only: approved local SQL payload file; inspect without executing.'),
+          migration: migrationPreflightSchema.optional().describe('migration_preflight only: explicit source/target connections and up to 12 schema-qualified table pairs.'),
           scope: z.string().trim().max(120).optional(),
           symptom: z.string().trim().max(1000).optional(),
           sql: z.string().min(1).max(MAX_DATABASE_SQL_CHARS).optional().describe('SELECT SQL for query, or captured SQL for incident_cause_trace.'),
-          search: z.string().max(MAX_DATABASE_OBJECT_SEARCH_CHARS).optional(),
+          search: z.string().max(MAX_DATABASE_OBJECT_SEARCH_CHARS).optional().describe('search_objects: object name; column_search: column name; business_trace/business_graph/business_compare: exact ERP identifier or SQL object name.'),
+          depth: z.number().int().min(1).max(4).optional().describe('business_graph only: bounded expansion depth (default 3).'),
           types: z.array(z.enum(['table', 'view', 'procedure', 'function', 'synonym'])).min(1).max(5).optional(),
-          limit: z.number().int().min(1).max(MAX_DATABASE_OBJECT_PAGE_SIZE).optional(),
+          limit: z.number().int().min(1).max(MAX_DATABASE_OBJECT_PAGE_SIZE).optional().describe('Only search_objects or data_timeline.'),
           incidentLimit: z.number().int().min(1).max(10).optional().describe('Recent local incident snapshots to return for incident_history.'),
           cursor: z.string().min(1).max(1024).optional(),
-          objectId: z.number().int().positive().optional().describe('SQL Server object_id for field investigation actions.'),
+          objectId: z.number().int().positive().optional().describe('SQL Server object_id for object_details or field investigation actions.'),
+          section: z.enum(['columns', 'keys_indexes', 'ddl', 'dependencies']).optional().describe('Required only for object_details.'),
           column: z.string().min(1).max(256).optional().describe('Column name for field investigation actions.'),
           subject: z.string().trim().min(3).max(1300).optional().describe('data_timeline only: Column=Value.'),
-          sourceRoot: z.string().trim().min(1).max(4096).optional().describe('Approved source folder for source-trace actions.'),
+          sourceRoot: z.string().trim().min(1).max(4096).optional().describe('Required for source_trace and incident_cause_trace; optional for business_trace and business_graph.'),
           hours: z.union([z.literal(1), z.literal(6), z.literal(24), z.literal(168)]).optional().describe('Query Store lookback window.'),
           sort: z.enum(['duration', 'cpu', 'reads', 'executions']).optional().describe('Query Store ordering.'),
-          baselineConnection: z.string().min(1).max(64).optional().describe('Baseline connection for schema_compare.'),
-          currentConnection: z.string().min(1).max(64).optional().describe('Current connection for schema_compare.')
+          baselineConnection: z.string().min(1).max(64).optional().describe('Baseline connection for schema_compare, deployment_compare or business_compare.'),
+          currentConnection: z.string().min(1).max(64).optional().describe('Current connection for schema_compare, deployment_compare or business_compare.')
         })
         .superRefine((input, ctx) => {
+          if ((input.scriptPath !== undefined) !== (input.action === 'migration_audit')) {
+            ctx.addIssue({ code: 'custom', path: ['scriptPath'], message: 'scriptPath is required only for migration_audit' });
+          }
+          for (const [field, action] of [['comparison','result_compare'],['verification','object_verify'],['migration','migration_preflight']] as const) {
+            if ((input[field] !== undefined) !== (input.action === action)) {
+              ctx.addIssue({ code: 'custom', path: [field], message: field + ' is required only for ' + action });
+            }
+          }
+          if (['result_compare','object_verify','migration_audit','migration_preflight'].includes(input.action) && input.connection !== undefined) {
+            ctx.addIssue({ code: 'custom', path: ['connection'], message: 'Specify connection inside the action-specific request.' });
+          }
           if (input.action === 'incident_workspace') {
             if (!input.scope) ctx.addIssue({ code: 'custom', path: ['scope'], message: 'scope is required for action=incident_workspace' });
             if (!input.symptom) ctx.addIssue({ code: 'custom', path: ['symptom'], message: 'symptom is required for action=incident_workspace' });
@@ -188,11 +218,20 @@ export function registerDatabaseTool(
           if (!sqlActions.has(input.action) && input.sql !== undefined) {
             ctx.addIssue({ code: 'custom', path: ['sql'], message: 'sql is only valid for query or incident_cause_trace' });
           }
-          if (input.action === 'column_search' && !input.search?.trim()) {
-            ctx.addIssue({ code: 'custom', path: ['search'], message: 'search is required for action=column_search' });
+          if (['column_search', 'business_trace', 'business_graph', 'business_compare'].includes(input.action) && !input.search?.trim()) {
+            ctx.addIssue({ code: 'custom', path: ['search'], message: `search is required for action=${input.action}` });
           }
-          if (!['search_objects', 'column_search'].includes(input.action) && input.search !== undefined) {
-            ctx.addIssue({ code: 'custom', path: ['search'], message: 'search is only valid for search_objects or column_search' });
+          if (!['search_objects', 'column_search', 'business_trace', 'business_graph', 'business_compare'].includes(input.action) && input.search !== undefined) {
+            ctx.addIssue({ code: 'custom', path: ['search'], message: 'search is only valid for search_objects, column_search, business_trace, business_graph or business_compare' });
+          }
+          if (input.action !== 'business_graph' && input.depth !== undefined) {
+            ctx.addIssue({ code: 'custom', path: ['depth'], message: 'depth is only valid for business_graph' });
+          }
+          if (['business_trace', 'business_graph', 'object_details'].includes(input.action) && !input.connection?.trim()) {
+            ctx.addIssue({ code: 'custom', path: ['connection'], message: 'Choose an explicit configured connection for this action.' });
+          }
+          if (input.action === 'object_details' ? input.section === undefined : input.section !== undefined) {
+            ctx.addIssue({ code: 'custom', path: ['section'], message: 'section is required only for action=object_details' });
           }
           for (const field of ['types', 'cursor'] as const) {
             if (input.action !== 'search_objects' && input[field] !== undefined) {
@@ -205,7 +244,7 @@ export function registerDatabaseTool(
           if (input.action !== 'incident_history' && input.incidentLimit !== undefined) {
             ctx.addIssue({ code: 'custom', path: ['incidentLimit'], message: 'incidentLimit is only valid for action=incident_history' });
           }
-          const objectActions = ['column_profile', 'table_scale_profile', 'field_consumers', 'source_trace', 'data_timeline'];
+          const objectActions = ['column_profile', 'table_scale_profile', 'field_consumers', 'source_trace', 'data_timeline', 'object_details'];
           if (objectActions.includes(input.action)) {
             if (input.objectId === undefined) ctx.addIssue({ code: 'custom', path: ['objectId'], message: `objectId is required for action=${input.action}` });
           } else if (input.objectId !== undefined) {
@@ -227,15 +266,15 @@ export function registerDatabaseTool(
           if (sourceActions.includes(input.action) && input.sourceRoot === undefined) {
             ctx.addIssue({ code: 'custom', path: ['sourceRoot'], message: `sourceRoot is required for action=${input.action}` });
           }
-          if (!sourceActions.includes(input.action) && input.sourceRoot !== undefined) {
-            ctx.addIssue({ code: 'custom', path: ['sourceRoot'], message: 'sourceRoot is only valid for source_trace or incident_cause_trace' });
+          if (!sourceActions.includes(input.action) && !['business_trace', 'business_graph'].includes(input.action) && input.sourceRoot !== undefined) {
+            ctx.addIssue({ code: 'custom', path: ['sourceRoot'], message: 'sourceRoot is only valid for source_trace, incident_cause_trace, business_trace or business_graph' });
           }
           for (const field of ['hours', 'sort'] as const) {
             if (input.action !== 'query_store' && input[field] !== undefined) {
               ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid for action=query_store` });
             }
           }
-          const compareActions = ['schema_compare', 'deployment_compare'];
+          const compareActions = ['schema_compare', 'deployment_compare', 'business_compare'];
           if (compareActions.includes(input.action)) {
             if (input.baselineConnection === undefined) ctx.addIssue({ code: 'custom', path: ['baselineConnection'], message: 'baselineConnection is required for compare actions' });
             if (input.currentConnection === undefined) ctx.addIssue({ code: 'custom', path: ['currentConnection'], message: 'currentConnection is required for compare actions' });
@@ -243,7 +282,7 @@ export function registerDatabaseTool(
             if (input.baselineConnection !== undefined) ctx.addIssue({ code: 'custom', path: ['baselineConnection'], message: 'baselineConnection is only valid for compare actions' });
             if (input.currentConnection !== undefined) ctx.addIssue({ code: 'custom', path: ['currentConnection'], message: 'currentConnection is only valid for compare actions' });
           }
-          if (['workspace_context', 'list_connections', 'schema_compare', 'deployment_compare'].includes(input.action) && input.connection !== undefined) {
+          if (['workspace_context', 'list_connections', ...compareActions].includes(input.action) && input.connection !== undefined) {
             ctx.addIssue({ code: 'custom', path: ['connection'], message: `connection is not used for action=${input.action}` });
           }
         })
@@ -300,6 +339,33 @@ export function registerDatabaseTool(
             if (!incident.columnSearch) throw new Error('COLUMN_SEARCH_UNAVAILABLE');
             const result = await incident.columnSearch(await connectionId(), input.search!);
             return structured({ action: 'column_search', ...result } as unknown as Record<string, unknown>);
+          }
+          if (input.action === 'business_trace' || input.action === 'business_graph') {
+            if (input.sourceRoot && !reg.ctx.caps.read) throw new Error('Source tracing requires file read permission.');
+            const result = await investigateBusinessObject({
+              connection: input.connection!, search: input.search!, sourceRoot: input.sourceRoot,
+              ...(input.action === 'business_graph' ? { graphDepth: input.depth ?? 3 } : {})
+            }, execute, call?.signal);
+            return structured({ action: input.action, ...result });
+          }
+          if (input.action === 'migration_preflight') {
+            return structured({ action: input.action, ...await migrationPreflight(input.migration!, execute, call?.signal) });
+          }
+          if (input.action === 'migration_audit') {
+            if (!reg.ctx.caps.read) throw new Error('Migration audit requires file read permission.');
+            return structured({ action: input.action, ...await auditMigrationScript(input.scriptPath!, reg.ctx.roots, call?.signal) });
+          }
+          if (input.action === 'result_compare') {
+            return structured({ action: input.action, ...await compareQueryResults(input.comparison!, execute, call?.signal) });
+          }
+          if (input.action === 'object_verify') {
+            return structured({ action: input.action, ...await verifyDeployedObject(input.verification!, execute, call?.signal) });
+          }
+          if (input.action === 'business_compare') {
+            const result = await compareBusinessObject({
+              baselineConnection: input.baselineConnection!, connection: input.currentConnection!, search: input.search!
+            }, execute, call?.signal);
+            return structured({ action: 'business_compare', ...result });
           }
           if (input.action === 'column_profile') {
             if (!incident.columnProfile) throw new Error('COLUMN_PROFILE_UNAVAILABLE');

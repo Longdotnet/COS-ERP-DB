@@ -1,22 +1,27 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 import { currentCall, currentCaller } from '../../main/mcp/call-context.js';
 import { fail, type SurfaceRegistrar, type ToolResult } from '../../main/mcp/kernel.js';
 import { toolDeclaration } from '../../main/mcp/tool-declarations.js';
 import { provenSession } from '../../main/codex/ownership.js';
 import { captureClrExceptions } from '../runtime/capture-clr.js';
+import { RuntimeSqlCapture, correlateRuntimeExceptions } from '../runtime/capture-sql.js';
 
 export const runtimeDebugSchema = z.object({
   action: z.enum(['processes', 'start', 'status', 'stop']),
   pid: z.number().int().positive().max(2147483647).optional(),
   processStartUtc: z.iso.datetime().optional(),
   seconds: z.number().int().min(10).max(120).optional(),
+  connection: z.string().trim().min(1).max(64).optional().describe('Optional configured SQL Server connection for process-scoped active SQL sampling during start.'),
   traceId: z.uuid().optional()
 }).strict().superRefine((a, ctx) => {
   const start = a.action === 'start';
   const follow = a.action === 'status' || a.action === 'stop';
   if (start !== (a.pid !== undefined && a.processStartUtc !== undefined)
-    || (!start && (a.pid !== undefined || a.processStartUtc !== undefined || a.seconds !== undefined))
+    || (!start && (a.pid !== undefined || a.processStartUtc !== undefined || a.seconds !== undefined || a.connection !== undefined))
     || follow !== (a.traceId !== undefined)) {
     ctx.addIssue({ code: 'custom', message: 'start requires pid and processStartUtc; status/stop require traceId; processes takes no other fields' });
   }
@@ -30,6 +35,7 @@ type Capture = {
   ready?: Record<string, unknown>; result?: Record<string, unknown>;
   state: 'starting' | 'capturing' | 'stopping' | 'completed' | 'failed';
   error?: string; busy: boolean; buffer: string;
+  connection?: string; sql?: RuntimeSqlCapture; sqlError?: string;
 };
 
 function response(value: Record<string, unknown>): ToolResult {
@@ -49,14 +55,30 @@ const PROCESS_COMMAND = "Get-Process | Where-Object MainWindowTitle | ForEach-Ob
 
 export class RuntimeDebugService {
   private traces = new Map<string, Capture>();
-  constructor(private readonly owns = sameOwner) {}
+  constructor(private readonly owns = sameOwner, private readonly createSql = (connection: string, pid: number, deadline: string, id: string) => new RuntimeSqlCapture(
+    connection, pid, deadline, undefined, undefined, undefined,
+    () => existsSync(path.join(tmpdir(), 'COS-LiveDebug-' + id.replaceAll('-', ''), 'active.signal'))
+  )) {}
 
   private view(t: Capture): ToolResult {
     const { id, pid, state, ready, result, error } = t;
+    const sql = t.sql?.snapshot(typeof result?.captureEndUtc === 'string' ? result.captureEndUtc : undefined);
     return response({ traceId: id, pid, state, ...(ready ? { target: ready } : {}),
       ...(result ? { evidence: result } : {}), ...(error ? { error } : {}),
+      ...(sql ? { sqlEvidence: sql, sqlExceptionCandidates: correlateRuntimeExceptions(sql, result) } : {}),
+      ...(t.sqlError ? { sqlCaptureError: t.sqlError } : {}),
       ...(state === 'capturing' ? { guidance: 'Ask the user to reproduce the issue before deadlineUtc, then call stop.' } : {}),
       ...(state === 'completed' ? { guidance: 'First-chance exceptions are evidence, not a confirmed root cause. Correlate with source and database.' } : {}) });
+  }
+
+  private syncSql(t: Capture): void {
+    if (t.state === 'completed' || t.state === 'failed' || t.state === 'stopping') { t.sql?.stop(); return; }
+    if (!t.connection || t.sql || t.sqlError || t.state !== 'capturing') return;
+    try {
+      if (typeof t.ready?.deadlineUtc !== 'string') throw new Error('Collector did not confirm the capture deadline.');
+      t.sql = this.createSql(t.connection, t.pid, t.ready.deadlineUtc, t.id);
+      t.sql.start();
+    } catch (error) { t.sqlError = error instanceof Error ? error.message : String(error); }
   }
 
   private consume(t: Capture, r: ToolResult): void {
@@ -108,7 +130,7 @@ export class RuntimeDebugService {
     if (!owner.requestId && !owner.sessionId) return fail('Runtime debugging requires a proven session or request identity.');
     const now = Date.now();
     for (const [id, trace] of this.traces) {
-      if (!trace.busy && now - trace.created > 30 * 60_000) this.traces.delete(id);
+      if (!trace.busy && now - trace.created > 30 * 60_000) { trace.sql?.stop(); this.traces.delete(id); }
     }
     if (input.action === 'start') {
       const active = [...this.traces.values()].filter(t => !['completed', 'failed'].includes(t.state) && now - t.created < 180_000);
@@ -118,7 +140,7 @@ export class RuntimeDebugService {
         if (!oldest) return fail('Trace retention limit reached.');
         this.traces.delete(oldest.id);
       }
-      const t: Capture = { id: randomUUID(), pid: input.pid!, owner, created: now, state: 'starting', busy: true, buffer: '' };
+      const t: Capture = { id: randomUUID(), pid: input.pid!, owner, created: now, state: 'starting', busy: true, buffer: '', connection: input.connection };
       this.traces.set(t.id, t);
       try {
         const key = t.id.replaceAll('-', '');
@@ -130,10 +152,12 @@ export class RuntimeDebugService {
         if (t.state === 'starting' && t.terminal) {
           this.consume(t, await runner('write_stdin', { session_id: t.terminal, chars: '', yield_time_ms: 1000 }));
         }
+        this.syncSql(t);
         return this.view(t);
       } catch (error) {
         if (!t.terminal) t.state = 'failed';
         t.error = error instanceof Error ? error.message : String(error);
+        this.syncSql(t);
         return this.view(t);
       } finally { t.busy = false; }
     }
@@ -151,8 +175,10 @@ export class RuntimeDebugService {
           + "'; if ([IO.Directory]::Exists($folder)) { try { [IO.File]::WriteAllText((Join-Path $folder 'stop.signal'), '') } catch [IO.DirectoryNotFoundException] {} }");
         if (r.isError || terminalOutput(r)?.exit_code !== 0) return r;
         t.state = 'stopping';
+        this.syncSql(t);
       }
       this.consume(t, await runner('write_stdin', { session_id: t.terminal, chars: '', yield_time_ms: 1000 }));
+      this.syncSql(t);
       return this.view(t);
     } finally { t.busy = false; }
   }
@@ -164,7 +190,7 @@ export function registerRuntimeDebugTool(reg: SurfaceRegistrar): void {
   if (process.platform !== 'win32' || !reg.exposedCaps.command) return;
   reg.register('runtime_debug', toolDeclaration('runtime_debug', () => ({
     title: 'Runtime debugging',
-    description: 'Windows .NET exception trace: list processes, start a bounded capture, ask the user to reproduce, then stop or read status in the same chat. Returns timestamped exception evidence.',
+    description: 'Windows .NET exception trace: list processes, start a bounded capture, ask the user to reproduce, then stop or read status in the same chat. Optional explicit connection on start adds read-only active SQL sampling scoped to the local target PID and host. Returns timestamped evidence and temporal candidates, not a lossless SQL trace.',
     inputSchema: runtimeDebugSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
   })), async input => reg.guarded('command', 'runtime_debug', async () => {
@@ -173,6 +199,7 @@ export function registerRuntimeDebugTool(reg: SurfaceRegistrar): void {
     if (!parent || !root) return fail('Runtime debugging requires a local approved workspace and call context.');
     const caller = currentCaller();
     try {
+      if (input.connection && !reg.ctx.caps.read) return fail('SQL capture requires database read permission.');
       return await service.run(input, { requestId: caller.requestId, sessionId: caller.sessionId ?? null },
         (name, args) => reg.invokeNested(name, args, parent), '/' + root.name);
     } catch (error) { return fail('Runtime debug failed: ' + (error instanceof Error ? error.message : String(error))); }

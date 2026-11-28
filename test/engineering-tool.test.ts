@@ -35,6 +35,8 @@ it('publishes a compact project-native engineering surface and serves profiles w
   expect(schema).toContain('impact_put');
   expect(schema).toContain('incident_verify');
   expect(schema).toContain('performance_get');
+  expect(schema).toContain('history_benchmark');
+  expect(schema).toContain('codex_history_benchmark');
   expect(schema).toContain('quality_gate');
   expect(declaration.annotations).toMatchObject({ destructiveHint: false });
 
@@ -61,6 +63,8 @@ it('publishes a compact project-native engineering surface and serves profiles w
   expect(declaration.inputSchema.safeParse({ action: 'impact_get', items: ['task-a', 'task-b'] }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'quality_gate', items: ['task-a', 'task-b'] }).success).toBe(false);
   expect(declaration.inputSchema.safeParse({ action: 'performance_get', items: ['task-a', 'task-b'] }).success).toBe(false);
+  expect(declaration.inputSchema.safeParse({ action: 'history_benchmark', item: '{"scope":"project"}' }).success).toBe(true);
+  expect(declaration.inputSchema.safeParse({ action: 'history_benchmark' }).success).toBe(false);
 
   await server.close();
 });

@@ -142,7 +142,7 @@ const DEFAULT_RUNTIME: DatabaseRuntime = {
       }))
     };
   },
-  query: (connection, sql) => querySqlServer(connection, sql),
+  query: (connection, sql, options) => querySqlServer(connection, sql, undefined, options),
   searchObjects: (connection, input, options) => searchSqlServerObjects(connection, input, options),
   tablePage: (connection, input, options) => readSqlServerTablePage(connection, input, options),
   tableCellUpdate: (connection, input, options) => updateSqlServerTableCell(connection, input, options),

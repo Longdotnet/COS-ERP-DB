@@ -21,6 +21,7 @@ $session = 'COS-LiveDebug-' + $TraceKey
 $folder = Join-Path ([IO.Path]::GetTempPath()) $session
 $etl = Join-Path $folder 'exceptions.etl'
 $stopFile = Join-Path $folder 'stop.signal'
+$activeFile = Join-Path $folder 'active.signal'
 $started = $false
 $stopped = $false
 $captured = New-Object 'System.Collections.Generic.List[object]'
@@ -39,6 +40,7 @@ try {
     $started = $true
     $captureStart = [DateTime]::UtcNow
     $deadline = $captureStart.AddSeconds($captureDuration)
+    [IO.File]::WriteAllText($activeFile, '')
     'TRACE_READY ' + ([ordered]@{ session = $session; pid = $TargetProcessId; process = $target.ProcessName; window = $target.MainWindowTitle; processStartUtc = $targetStart.ToString('o'); captureStartUtc = $captureStart.ToString('o'); deadlineUtc = $deadline.ToString('o'); stopFile = $stopFile } | ConvertTo-Json -Compress)
 
     if ($SelfTest) { try { [void][int]::Parse('COS_LIVE_DEBUG_PROBE') } catch {} }
@@ -49,6 +51,7 @@ try {
         Start-Sleep -Milliseconds 250
     }
     $captureEnd = [DateTime]::UtcNow
+    [IO.File]::Delete($activeFile)
     Stop-Trace
     $stopped = $true
 
@@ -65,6 +68,7 @@ try {
     'TRACE_RESULT ' + ([ordered]@{ session = $session; pid = $TargetProcessId; reason = $reason; captureStartUtc = $captureStart.ToString('o'); captureEndUtc = $captureEnd.ToString('o'); matchingEvents = $matching; circularBufferMB = 16; truncated = ($matching -gt $captured.Count); events = @($captured.ToArray()) } | ConvertTo-Json -Depth 5 -Compress)
     if ($SelfTest -and -not ($captured | Where-Object { $_.type -eq 'System.FormatException' })) { throw 'Self-test failed: expected FormatException not captured' }
 } finally {
+    [IO.File]::Delete($activeFile)
     if ($started -and -not $stopped) {
         try { Stop-Trace; $stopped = $true } catch { Write-Warning $_.Exception.Message }
     }

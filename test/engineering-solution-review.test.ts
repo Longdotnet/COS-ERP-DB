@@ -143,6 +143,34 @@ it('uses only an explicit task-scoped reference and keeps its Knowledge isolated
   expect(leaked.hits).toEqual([]);
 });
 
+it('accepts target plus designated reference coverage without inventing a third analogue, but rejects an unread reference', async () => {
+  const project = resolved(currentProject, '/current');
+  await writePattern(currentProject, 'Local', 'TaxLookupPortPattern', 1);
+  await writePattern(referenceA, 'Reference', 'TaxLookupPortPattern', 1);
+  const reference = {
+    path: '/reference-a', role: 'implementation_reference',
+    scope: ['tax-lookup'], reason: 'User requests the exact working reference.'
+  };
+  const prepared = await prepareEngineeringTask(project, {
+    taskKey: 'tax-lookup-port', goal: 'Port TaxLookupPortPattern to the existing form.',
+    analogueQuery: 'TaxLookupPortPattern', authorizedReferences: [reference]
+  }, roots);
+  expect(prepared.task.analogueEvidence).toHaveLength(1);
+  expect(prepared.task.referenceAnalogueEvidence).toHaveLength(1);
+  expect(prepared.task.openQuestions).toEqual([]);
+  const gate = await engineeringQualityGate(project.lineage, prepared.task.key, roots, project.workspace);
+  expect(gate.blockers.join(' ')).not.toContain('independent analogue');
+  expect(gate.blockers.join(' ')).not.toContain('lacks implementation evidence');
+  const incomplete = await prepareEngineeringTask(project, {
+    taskKey: 'tax-lookup-missing-reference', goal: 'Port TaxLookupPortPattern.',
+    analogueQuery: 'TaxLookupPortPattern',
+    authorizedReferences: [reference, { ...reference, path: '/reference-b' }]
+  }, roots);
+  expect(incomplete.task.openQuestions.join(' ')).toContain('/reference-b');
+  const blocked = await engineeringQualityGate(project.lineage, incomplete.task.key, roots, project.workspace);
+  expect(blocked.blockers.join(' ')).toContain('lacks implementation evidence from /reference-b');
+});
+
 it('blocks a blind spot until its business/process decision is recorded, then preserves review across implementation validation', async () => {
   const project = resolved(currentProject, '/current');
   await writePattern(currentProject, 'Local', 'MachineTransferPattern', 1);
